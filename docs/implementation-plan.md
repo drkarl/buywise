@@ -106,7 +106,7 @@ Phase 5 tasks (P5):
 
 ## Phase 0 — CLI Validation
 
-**Gate:** Run the CLI against a reconstructed real weekly shop using live BasketWatch data. If realistic monthly savings < €50, stop. If ≥ €100, continue to Phase 1 with confidence.
+**Gate:** Two modes — (1) **fixture smoke test** (`buywise-cli optimise --list fixtures/weekly-shop.json` with `BUYWISE_LOCAL_ONLY=1`): validates the pipeline locally, runs in CI, but uses static fixture prices so the saving estimate is illustrative only. (2) **Live validation**: run `ingest-basketwatch` (live API) → `seed-matches --from fixtures/product_matches_live.csv` → `optimise` against real data. The gate value comes from mode 2. If realistic monthly savings < €50, stop. If ≥ €50, continue to Phase 1.
 
 ---
 
@@ -865,7 +865,9 @@ pub struct Plan {
     pub stores: Vec<Retailer>,
     pub items: Vec<PlanItem>,
     pub total_cents: Cents,
-    pub saving_vs_best_single: Cents,   // 0 for BestSingleStore itself
+    pub missing_items: Vec<CanonicalItemId>,  // items with no offer at any store in this plan
+    pub is_complete: bool,                    // missing_items.is_empty()
+    pub saving_vs_best_single: Cents,         // 0 for BestSingleStore itself; computed over priced items only
     pub clears_convenience_threshold: bool,
 }
 
@@ -889,11 +891,15 @@ pub struct OptimiserOutput {
 
 **Algorithm:**
 
-1. For each `BasketItem`, load `product_matches WHERE status = 'accepted' AND household_id = ?` filtered by `canonical_item_id`. If no accepted matches, fall through to `status = 'suggested'` as a fallback. If still none, skip this item (add to `unresolved_items`).
+1. For each `BasketItem`:
+   - If `canonical_item_id IS NULL` → add to `unresolved_items` (language/item not resolved yet); skip.
+   - Otherwise load `product_matches WHERE status = 'accepted' AND household_id = ?` filtered by `canonical_item_id`. If no accepted matches, fall through to `status = 'suggested'` as a fallback. If still none → add to `no_valid_offer_items` (canonical item is resolved but has no usable retailer product); skip. **Do not add to `unresolved_items` — the canonical item is known.**
 2. For each accepted/suggested match, load the latest offer per `retailer_product_id` (ORDER BY `fetched_at DESC LIMIT 1`). Apply loyalty prices: use `loyalty_price_cents` if non-null and the scheme is `'clubcard'` or `'real_rewards'` (household is assumed to have both cards).
-3. **Single-store plan:** For each of the 5 retailers, compute the total cost of the full basket using that retailer's best matching product for each item. Items with no match at a retailer are tracked as `missing_count` for that retailer. **Fulfilment rule:** rank plans by `(missing_count ASC, total_cost ASC)` — a store missing 3 items can never beat a store missing 0 items, even if its priced subtotal is lower. A plan where any required item is missing must be clearly labelled "incomplete" in the output. The winning single-store plan is the one with the fewest missing items; ties broken by lowest cost.
-4. **Two-store plan:** For each pair of the 5 retailers, assign each item to the cheaper store. Compute total. Pick the pair with the lowest total.
-5. **Theoretical minimum:** Each item goes to whichever retailer offers the lowest price, regardless of total store count.
+**Fulfilment rule (applies to all plan types):** rank candidate plans by `(missing_count ASC, total_cost ASC)`. A plan missing 3 items can never beat a plan missing 0 items, even if its priced subtotal is lower. Each `Plan` carries `missing_items: Vec<CanonicalItemId>` and `is_complete: bool` so the API and UI can explain why a cheaper subtotal lost.
+
+3. **Single-store plan:** For each of the 5 retailers, compute the total cost using that retailer's best matching product per item; track items with no offer at this retailer in `missing_items`. Apply the fulfilment rule; pick the candidate with `(fewest missing, lowest cost)`.
+4. **Two-store plan:** For each pair of the 5 retailers, assign each item to the cheaper store (falling back to the other if one store has no offer). Track items missing at both stores in `missing_items`. Apply the fulfilment rule to select the best pair.
+5. **Theoretical minimum:** Each item goes to its cheapest retailer across all 5 stores. An item missing at all retailers goes into `missing_items`. Apply the fulfilment rule (here `missing_items` reflects items with no offer anywhere — these are also in `no_valid_offer_items`).
 6. **Recommended plan:** Apply convenience thresholds (see design §10): `best_single.total - two_store.total > convenience_threshold_2` → recommend two-store; otherwise recommend best single. For three stores, check against `convenience_threshold_3` — but note the design doc specifies the recommended plan is between single, two-store, and three-store; "three-store" plan is implied by the theoretical minimum when it uses ≤ 3 stores. Implement as: if `theoretical_minimum` uses ≤ 3 stores and saving vs two-store > €20 incremental, compare against `convenience_threshold_3`.
 
 **Freshness confidence computation** (see design §7 and §12):
@@ -916,7 +922,7 @@ This is computed per offer at query time — no additional JOIN needed beyond th
 **Acceptance Criteria:**
 - [ ] With fixture data: `best_single.stores` has exactly one retailer, `best_two_store.stores` has exactly two
 - [ ] Unresolved items appear in `unresolved_items` and are excluded from `total_cents`
-- [ ] `theoretical_minimum.total_cents` ≤ `best_two_store.total_cents` ≤ `best_single.total_cents` (invariant)
+- [ ] Among complete plans only (all `is_complete = true`): `theoretical_minimum.total_cents` ≤ `best_two_store.total_cents` ≤ `best_single.total_cents`. If no complete plan exists, each plan's `missing_items` is non-empty and the invariant is not required to hold (a two-store plan missing 1 item may cost less than a single-store plan missing 2 items even though it visits more stores).
 - [ ] Loyalty prices (Clubcard, Real Rewards) are used when present
 - [ ] Freshness confidence is `Unknown` when `current_source_run_number IS NULL`
 - [ ] Dunnes voucher flag appears when applicable
@@ -941,6 +947,7 @@ Implement the three CLI commands in `crates/cli/src/main.rs` using `clap` derive
 buywise-cli validate-basket <fixture-path>
 buywise-cli optimise --list <fixture-path> [--threshold2 <cents>] [--threshold3 <cents>]
 buywise-cli ingest-basketwatch [--dry-run]
+buywise-cli seed-matches --from <csv-path>
 ```
 
 **`validate-basket <fixture-path>`:**
@@ -970,27 +977,31 @@ Trigger the BasketWatch adapter. `--dry-run` sets `BUYWISE_LOCAL_ONLY=1` interna
 - `fixtures/offers.json` — static snapshot of BasketWatch-format data for a subset of items, used when `BUYWISE_LOCAL_ONLY=1`
 - `fixtures/product_matches.json` — pre-defined `canonical_item → retailer_product` mappings for the validation basket (used in local mode only)
 
-**Live product-match seeding (required for the Phase 0 gate against live data):**
-
-After running `buywise-cli ingest-basketwatch` against the live API, `retailer_products` and `product_offers` are populated but `product_matches` is empty — so the optimiser has no candidates. Bridge this with a manual seeding step:
-
-Add a CLI command `buywise-cli seed-matches --from fixtures/product_matches_live.csv` that reads a CSV of `(canonical_item_id, retailer_product_id, status, matched_by)` rows and upserts them into `product_matches`. This CSV is created manually after a live ingest run: query `retailer_products` for recognisable products, map them to canonical items by hand, export. This is intentionally low-tech for Phase 0 — Phase 5 adds the automated match-feedback loop. Without this step, the Phase 0 live gate cannot produce a savings estimate.
+**`seed-matches --from <csv-path>`:**
+Reads a CSV of `(canonical_item_id, retailer_product_id, status, matched_by)` rows and upserts them into `product_matches` using `INSERT OR REPLACE`. This command is required for the Phase 0 live gate — after `ingest-basketwatch`, `retailer_products` and `product_offers` are populated but `product_matches` is empty, so the optimiser has no candidates. The workflow: run `ingest-basketwatch`, query `retailer_products` for recognisable products, map them to canonical items by hand in a CSV (`fixtures/product_matches_live.csv`), then run `seed-matches`. This is intentionally low-tech for Phase 0 — Phase 5 adds the automated match-feedback loop.
 
 **Files / Areas Touched:**
 - `crates/cli/src/main.rs`
-- `crates/cli/src/commands/` (create subdirectory: `validate.rs`, `optimise.rs`, `ingest.rs`)
+- `crates/cli/src/commands/` (create subdirectory: `validate.rs`, `optimise.rs`, `ingest.rs`, `seed_matches.rs`)
 - `fixtures/items.json` (create)
 - `fixtures/weekly-shop.json` (create)
 - `fixtures/offers.json` (create)
-- `fixtures/product_matches.json` (create)
+- `fixtures/product_matches.json` (create — used in local/dry-run mode)
+- `fixtures/product_matches_live.csv` (create after first live ingest run — not committed with dummy data)
 
 **Acceptance Criteria:**
 - [ ] `buywise-cli validate-basket fixtures/items.json` runs without panic; prints resolution table
 - [ ] `buywise-cli optimise --list fixtures/weekly-shop.json` prints four plans and a saving estimate
 - [ ] `buywise-cli ingest-basketwatch --dry-run` completes without network calls; prints "local mode"
-- [ ] Estimated monthly saving from `fixtures/weekly-shop.json` is printed as a number; this is the Phase 0 gate value
+- [ ] `buywise-cli seed-matches --from fixtures/product_matches.json` upserts rows into `product_matches` and prints count
+- [ ] After `ingest-basketwatch` (live) + `seed-matches`, `buywise-cli optimise` produces a non-zero savings estimate
+- [ ] Estimated monthly saving is printed as a number; this is the Phase 0 gate value
 
-**Phase 0 gate:** The printed monthly saving must be ≥ €50 to proceed. Document the result in `docs/phase0-results.md`.
+**Phase 0 gate:** The printed monthly saving (from live data, after `seed-matches`) must be ≥ €50 to proceed. Document the result in `docs/phase0-results.md`.
+
+**Two operating modes:**
+- **Fixture smoke test** (`--dry-run` / `BUYWISE_LOCAL_ONLY=1`): uses `fixtures/offers.json` + `fixtures/product_matches.json`; validates the pipeline without network calls; runs in CI.
+- **Live validation**: `ingest-basketwatch` (live API) → `seed-matches --from fixtures/product_matches_live.csv` → `optimise`; produces the Phase 0 gate value; run manually before proceeding to Phase 1.
 
 **Testing Expectations:**
 - Integration test that runs `validate-basket` on `fixtures/items.json` and asserts ≥ 90% resolution rate
@@ -1902,11 +1913,13 @@ The cascade is run asynchronously after the mutation is accepted. The result (`S
 2. Spawn a `tokio::spawn` to run the cascade:
    - Step 1: alias lookup (normalised exact match in `item_aliases`)
    - Step 2: fuzzy match against `canonical_items.name_en`, `canonical_items.name_es`, and all `item_aliases` for this household
-3. If `SingleMatch`: attempt `UPDATE list_entries SET resolution_status='resolved', canonical_item_id=..., effective_constraint_hash=<computed> WHERE id=<this_entry_id>`. The hash must be computed via `compute_constraint_hash(constraints)` — do **not** hardcode `'default'` unless the item genuinely has no constraints.
-   - **Dedup conflict on resolution:** after the UPDATE, check whether another `active` row with the same `(list_id, canonical_item_id, effective_constraint_hash)` already exists (i.e. a previously-resolved entry, or another unresolved entry that resolved first). If so, the unique index will block the UPDATE — catch the constraint violation and handle it explicitly:
-     - Increment `quantity` on the existing active row.
-     - Set `status = 'merged'` on the current entry (do not delete — keeps the audit trail in `list_entry_events`).
-     - Broadcast two SSE events: the merged entry's deletion and the surviving entry's updated quantity.
+3. If `SingleMatch`: open a write transaction and attempt `UPDATE list_entries SET resolution_status='resolved', canonical_item_id=..., effective_constraint_hash=<computed> WHERE id=<this_entry_id>`. The hash must be computed via `compute_constraint_hash(constraints)` — do **not** hardcode `'default'` unless the item genuinely has no constraints. The unique index fires *during* the UPDATE (before it completes) if a conflicting row exists, so the conflict must be caught as a constraint violation error from the database, not checked afterwards.
+   - **Dedup conflict on resolution:** the unique index fires *before* the UPDATE succeeds — catch the constraint violation, then in the same transaction:
+     1. Query the surviving active row (same `list_id`, `canonical_item_id`, `effective_constraint_hash`).
+     2. Increment `quantity` on the survivor.
+     3. Set `status = 'deleted'` on the current entry (`'merged'` is not a valid status per the schema CHECK constraint).
+     4. Insert a `list_entry_events` row on the current entry with `event_type = 'merged'` and `payload = { "merged_into": "<survivor_entry_id>" }` — this preserves the audit trail.
+     5. Broadcast two SSE events: the current entry's deletion and the survivor's updated quantity.
    - This covers the case where two "leche" entries are added offline and both try to resolve to the same canonical item + hash.
 4. If `MultipleCandidates`: UPDATE `list_entries SET resolution_status='ambiguous', resolution_candidates_json=[...ids]`, broadcast SSE update. No dedup conflict possible (canonical_item_id stays NULL).
 5. If `NoMatch`: leave as `unresolved` (Phase 3 will add LLM fallback in P3-T2).
