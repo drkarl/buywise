@@ -1,0 +1,7 @@
+[package]
+name = "buywise-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+buywise-core = { path = "../core" }

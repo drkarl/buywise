@@ -28,15 +28,25 @@ Built for two adults and two children. Not a public product.
 ## Repository layout
 
 ```
-backend/     Rust — Axum API, optimiser, ingestion adapters, CLI validation tool
-frontend/    SvelteKit — PWA, shopping list UI, optimiser UI
+Cargo.toml         Rust workspace manifest
+crates/
+  core/            Domain model, optimiser, matching, normalisation (shared heart)
+  api/             Axum server — depends on core
+  ingest/          BasketWatch + Lidl adapters — depends on core
+  cli/             Validation CLI (Phase 0) — depends on core
+frontend/          SvelteKit PWA
+migrations/        SQLite migrations
+fixtures/          Fixture data for CLI validation (Phase 0)
+deploy/
+  systemd/         Service unit files
+  litestream.yml   Litestream → Cloudflare R2 config
 docs/
-  design/    Architecture and design documents
+  design.md        Architecture and design document
 ```
 
 ## Design document
 
-See [`docs/design/design.md`](docs/design/design.md) for the full architecture, schema, sync protocol, bilingual resolution cascade, and phased build plan.
+See [`docs/design.md`](docs/design.md) for the full architecture, schema, sync protocol, bilingual resolution cascade, and phased build plan.
 
 ## Build phases
 

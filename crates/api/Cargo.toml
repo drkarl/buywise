@@ -1,0 +1,7 @@
+[package]
+name = "buywise-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+buywise-core = { path = "../core" }

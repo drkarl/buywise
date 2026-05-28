@@ -1,0 +1,11 @@
+[package]
+name = "buywise-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "buywise-cli"
+path = "src/main.rs"
+
+[dependencies]
+buywise-core = { path = "../core" }
