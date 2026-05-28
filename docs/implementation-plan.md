@@ -160,7 +160,9 @@ source_runs
 product_matches
 ```
 
-The remaining tables (`shopping_lists`, `list_entries`, `mutations`, `users`, `households`, `household_members`, `sessions`, `list_entry_events`, `store_category_orders`, `recommendation_runs`, `savings_events`, `api_usage_events`, `match_feedback`) are deferred to Phase 1 (P1-T1). Do not define them here; sqlx migrations are applied in order and Phase 1 will append them cleanly.
+**`api_usage_events` must also be created in Phase 0** — the BasketWatch adapter (P0-T8) reads and writes it before every request batch to enforce quota guardrails. Including it in Phase 1 would make live API validation in Phase 0 impossible.
+
+The remaining tables (`shopping_lists`, `list_entries`, `mutations`, `users`, `households`, `household_members`, `sessions`, `list_entry_events`, `store_category_orders`, `recommendation_runs`, `savings_events`, `match_feedback`) are deferred to Phase 1 (P1-T1). Do not define them here; sqlx migrations are applied in order and Phase 1 will append them cleanly.
 
 **Schema details** (see design §7, replicated here for completeness):
 
@@ -260,7 +262,7 @@ CREATE UNIQUE INDEX uq_retailer_products_source_external
 CREATE TABLE product_offers (
     id                                    TEXT PRIMARY KEY,
     retailer_product_id                   TEXT NOT NULL REFERENCES retailer_products(id),
-    price_cents                           INTEGER NOT NULL,     -- euro cents × 100; no floats
+    price_cents                           INTEGER NOT NULL,     -- euros × 100 (integer cents); no floats
     unit_price_eur_micros                 INTEGER,              -- €/unit × 1_000_000
     unit_price_basis                      TEXT,                 -- per_kg | per_l | per_each | per_sheet | ...
     previous_price_cents                  INTEGER,
@@ -292,13 +294,26 @@ CREATE TABLE product_matches (
 );
 CREATE UNIQUE INDEX uq_product_matches_household_item_product
     ON product_matches(household_id, canonical_item_id, retailer_product_id);
+
+-- api_usage_events included in Phase 0 because the BasketWatch adapter
+-- reads/writes it before each request batch to enforce quota guardrails.
+CREATE TABLE api_usage_events (
+    id             TEXT PRIMARY KEY,
+    source         TEXT NOT NULL,
+    endpoint       TEXT NOT NULL,
+    requests_count INTEGER NOT NULL,
+    month_year     TEXT NOT NULL,   -- YYYY-MM
+    created_at     TEXT NOT NULL
+);
 ```
 
 Write the SQL into `migrations/001_phase0_schema.sql`. Run it via sqlx's CLI (`sqlx migrate run`) or in-process via `sqlx::migrate!()`.
 
+**JSON1 dependency:** the `list_entries` CHECK constraint `json_array_length(resolution_candidates_json) > 0` requires SQLite's JSON1 extension. SQLite ships with JSON1 enabled by default since 3.38 (2022-02-22), but verify this at startup and in CI. With sqlx, use the `bundled` feature (`sqlx = { features = ["sqlite", "bundled"] }`) to pin a known-good SQLite version and avoid environment differences. Add a startup assertion: `SELECT json_array_length('[]')` — if this errors, abort with a clear message.
+
 **Files / Areas Touched:**
 - `migrations/001_phase0_schema.sql` (create)
-- `crates/core/src/db.rs` (create: connection setup, `sqlx::migrate!()` call)
+- `crates/core/src/db.rs` (create: connection setup, `sqlx::migrate!()` call, JSON1 startup check)
 - `crates/core/src/lib.rs` (expose `db` module)
 
 **Acceptance Criteria:**
@@ -327,13 +342,13 @@ Create `migrations/002_seed.sql` with the 11 categories and 226 canonical items 
 INSERT OR IGNORE INTO categories (id, name_en, name_es, icon, default_order) VALUES
   ('c1000000-0000-0000-0000-000000000001', 'Produce',     'Frutas y Verduras',  'carrot',      1),
   ('c1000000-0000-0000-0000-000000000002', 'Meat & Fish', 'Carne y Pescado',    'beef',        2),
-  ('c1000000-0000-0000-0000-000000000003', 'Dairy',       'Lacteos',            'milk',        3),
-  ('c1000000-0000-0000-0000-000000000004', 'Bakery',      'Panaderia',          'bread-slice', 4),
+  ('c1000000-0000-0000-0000-000000000003', 'Dairy',       'Lácteos',            'milk',        3),
+  ('c1000000-0000-0000-0000-000000000004', 'Bakery',      'Panadería',          'bread-slice', 4),
   ('c1000000-0000-0000-0000-000000000005', 'Pantry',      'Despensa',           'package',     5),
   ('c1000000-0000-0000-0000-000000000006', 'Frozen',      'Congelados',         'snowflake',   6),
   ('c1000000-0000-0000-0000-000000000007', 'Snacks',      'Snacks',             'cookie',      7),
   ('c1000000-0000-0000-0000-000000000008', 'Drinks',      'Bebidas',            'cup-soda',    8),
-  ('c1000000-0000-0000-0000-000000000009', 'Baby',        'Bebe',               'baby',        9),
+  ('c1000000-0000-0000-0000-000000000009', 'Baby',        'Bebé',               'baby',        9),
   ('c1000000-0000-0000-0000-000000000010', 'Household',   'Hogar y Limpieza',   'spray-can',  10),
   ('c1000000-0000-0000-0000-000000000011', 'Toiletries',  'Higiene Personal',   'bath',       11);
 ```
@@ -732,7 +747,7 @@ Implement `crates/ingest/src/basketwatch.rs`. This adapter fetches price data fr
 4. On success: open `BEGIN IMMEDIATE` transaction:
    - `SELECT MAX(successful_run_number) FROM source_runs WHERE source = 'basketwatch'`
    - `UPDATE source_runs SET status='success', successful_run_number=MAX+1, finished_at=now(), items_fetched=N, items_normalised=M WHERE id=<run_id>`
-   - For each product: `INSERT OR IGNORE INTO retailer_products` (the partial unique index handles dedup; update `last_seen_at` on conflict with `INSERT OR REPLACE` or an explicit `ON CONFLICT DO UPDATE SET last_seen_at = excluded.last_seen_at`)
+   - For each product: use `INSERT INTO retailer_products (...) ON CONFLICT(source, retailer, external_id) WHERE source != 'manual' AND external_id IS NOT NULL DO UPDATE SET last_seen_at = excluded.last_seen_at`. **Never use `INSERT OR REPLACE`** — SQLite REPLACE is a DELETE + INSERT which breaks stable primary keys and invalidates any `product_offers` rows referencing the old id via FK.
    - For each offer: `INSERT INTO product_offers` with `last_successful_source_run_id` = this run's id and `source_successful_run_number_at_fetch` = MAX+1
    - COMMIT
 5. On network or parse failure: short transaction: `UPDATE source_runs SET status='failed', error_message=..., finished_at=now() WHERE id=<run_id>`
@@ -1112,14 +1127,7 @@ CREATE TABLE store_category_orders (
     UNIQUE(household_id, store, category_id)
 );
 
-CREATE TABLE api_usage_events (
-    id             TEXT PRIMARY KEY,
-    source         TEXT NOT NULL,
-    endpoint       TEXT NOT NULL,
-    requests_count INTEGER NOT NULL,
-    month_year     TEXT NOT NULL,   -- YYYY-MM
-    created_at     TEXT NOT NULL
-);
+-- api_usage_events is defined in Phase 0 (001_phase0_schema.sql); do not redefine here.
 
 CREATE TABLE recommendation_runs (
     id                       TEXT PRIMARY KEY,
@@ -1878,7 +1886,7 @@ The cascade is run asynchronously after the mutation is accepted. The result (`S
 2. Spawn a `tokio::spawn` to run the cascade:
    - Step 1: alias lookup (normalised exact match in `item_aliases`)
    - Step 2: fuzzy match against `canonical_items.name_en`, `canonical_items.name_es`, and all `item_aliases` for this household
-3. If `SingleMatch`: UPDATE `list_entries SET resolution_status='resolved', canonical_item_id=..., effective_constraint_hash='default'`, broadcast SSE update.
+3. If `SingleMatch`: UPDATE `list_entries SET resolution_status='resolved', canonical_item_id=..., effective_constraint_hash=<computed>`, broadcast SSE update. The hash must be computed by calling the same `compute_constraint_hash(constraints)` helper used at list-entry creation time — do **not** hardcode `'default'` unless the resolved item genuinely has no constraints. Using the wrong hash breaks the dedup index and product eligibility matching.
 4. If `MultipleCandidates`: UPDATE `list_entries SET resolution_status='ambiguous', resolution_candidates_json=[...ids]`, broadcast SSE update.
 5. If `NoMatch`: leave as `unresolved` (Phase 3 will add LLM fallback in P3-T2).
 
@@ -1912,7 +1920,7 @@ Add step 3 of the resolution cascade: when step 2 returns `NoMatch`, make a chea
 
 **LLM call design:**
 
-- Use a cheap model (e.g. GPT-4o-mini or Claude Haiku). Model and API key are env vars: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`.
+- Model and API key are env vars: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`. Use a cheap, fast model — consult current provider pricing at implementation time; do not bake in specific model names as they change frequently.
 - Prompt: provide the `raw_text`, the list of `canonical_items.name_en` for the household, and ask: "Which of these grocery items is this most likely referring to? Return only the item name from the list, or 'none' if there is no plausible match."
 - Parse the response: if it matches exactly one canonical item name → `SingleMatch`; otherwise → fall through to user clarification (step 4).
 - Commit the result to `item_aliases` with `source = 'llm'`.
@@ -2215,7 +2223,7 @@ Update the optimiser (P0-T10) to filter out products with `product_matches.statu
 
 **Acceptance Criteria:**
 - [ ] A rejected product does not appear in any plan for that household
-- [ ] If all products for a canonical item are rejected, the item appears in `unresolved_items`
+- [ ] If all products for a canonical item are rejected, the item appears in `no_valid_offer_items` (not `unresolved_items` — the canonical item is resolved; it simply has no acceptable retailer product remaining)
 - [ ] A different household's rejections do not affect this household's plans
 
 **Testing Expectations:**
