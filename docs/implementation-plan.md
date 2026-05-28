@@ -106,7 +106,7 @@ Phase 5 tasks (P5):
 
 ## Phase 0 — CLI Validation
 
-**Gate:** Two modes — (1) **fixture smoke test** (`buywise-cli optimise --list fixtures/weekly-shop.json`, no `--db`): validates the pipeline locally, runs in CI, but uses static fixture prices so the saving estimate is illustrative only. (2) **Live validation**: `ingest-basketwatch --db buywise.db` → `seed-matches --from fixtures/product_matches_live.csv --db buywise.db` → `optimise --list fixtures/weekly-shop.json --db buywise.db`; uses real prices from SQLite. The gate value comes from mode 2. If realistic monthly savings < €50, stop. If ≥ €50, continue to Phase 1.
+**Gate:** Two modes — (1) **fixture smoke test** (`buywise-cli optimise --list fixtures/weekly-shop.json`, no `--db`): validates the pipeline locally, runs in CI, but uses static fixture prices so the saving estimate is illustrative only. (2) **Live validation**: `ingest-basketwatch --db buywise.db` → `seed-matches --from fixtures/product_matches_live.csv --db buywise.db --household-id 00000000-0000-0000-0000-000000000001` → `optimise --list fixtures/weekly-shop.json --db buywise.db`; uses real prices from SQLite. The gate value comes from mode 2. If realistic monthly savings < €50, stop. If ≥ €50, continue to Phase 1.
 
 ---
 
@@ -355,7 +355,7 @@ INSERT OR IGNORE INTO categories (id, name_en, name_es, icon, default_order) VAL
 
 **Canonical items and aliases:** Write a build script or `build.rs` that reads the Shoppy `dictionary.ts` (or a JSON export of it) and generates the SQL INSERT statements. Alternatively, hand-write them. For each `DictionaryEntry`:
 
-- One row in `canonical_items`: `id` = new UUID v4, `household_id` = a fixed dev household UUID (`h0000000-0000-0000-0000-000000000001`), `name_en` = `termEn`, `name_es` = `termEs`, `category_id` = corresponding category UUID, `default_constraint_policy` = `'any'`
+- One row in `canonical_items`: `id` = deterministic `hex(SHA-256(household_id + ":" + slug))` where `slug` comes from the `slug` field in `fixtures/dictionary.json` (required — seed generation fails if missing). **Not** a random UUID v4. Using an explicit slug (rather than `normalize(name_en)`) means IDs survive display-name renames and are not sensitive to normalisation differences. `slug` is the permanent immutable identifier for a dictionary entry; it must never change even if `name_en` is corrected. `household_id` = a fixed dev household UUID (`00000000-0000-0000-0000-000000000001`), `name_en` = `name_en`/`termEn`, `name_es` = `name_es`/`termEs`, `category_id` = corresponding category UUID, `default_constraint_policy` = the entry's `default_constraint_policy` from `fixtures/dictionary.json` (default to `'any'` only when omitted). The DB seed and generated fixtures must use the same dictionary-derived policy so fixture and live mode cannot drift.
 - One or more rows in `item_aliases`: one for `termEn` (language `en`, source `manual`), one for `termEs` (language `es`, source `manual`), and one per entry in `variants` (language inferred — English word → `en`, Spanish → `es`; default to `en` if uncertain)
 
 Note the Shoppy normaliser removes punctuation completely (`"coca-cola" → "cocacola"`). The design doc specifies the Rust normaliser must differ: punctuation becomes a space (`"coca-cola" → "coca cola"`, exception for known brand compaction rules). Aliases stored in the seed must use the design doc's normalisation rules, not Shoppy's. Pre-normalise all alias strings before inserting (strip accents, lowercase, punctuation → space, whitespace collapse).
@@ -364,7 +364,7 @@ The fixed dev household UUID is used in Phase 0 only. Phase 1 creates real house
 
 **Files / Areas Touched:**
 - `migrations/002_seed.sql` (create)
-- `fixtures/dictionary.json` (create: JSON export of all 226 entries for easy reference and test fixture use)
+- `fixtures/dictionary.json` (create: JSON export of all 226 entries; **must include a `slug` field** on every entry — slug is the stable machine identifier used to derive `canonical_items.id`. `default_constraint_policy` may be omitted and then defaults to `"any"`, but must be explicit for items with brand/other policies. Format: `{ "slug": "whole_milk", "name_en": "Whole Milk", "name_es": "Leche Entera", "category": "dairy", "default_constraint_policy": "any", "variants": [...] }`. The seed generator must fail with a clear error if any entry is missing a slug or if any two entries share the same slug. `fixtures/canonical_items.json` is **generated** from `dictionary.json` — it is not hand-maintained. Run `cargo run -p buywise-cli -- generate-fixtures` (or a build script) to regenerate it whenever `dictionary.json` changes. This is the single source of truth for IDs and policies.)
 
 **Acceptance Criteria:**
 - [ ] `SELECT COUNT(*) FROM categories` returns 11
@@ -373,9 +373,11 @@ The fixed dev household UUID is used in Phase 0 only. Phase 1 creates real house
 - [ ] Querying `item_aliases WHERE alias = 'leche'` returns the row for `canonical_items.name_en = 'Milk'`
 - [ ] All aliases are normalised (lowercase, accent-stripped, punctuation-to-space, whitespace-collapsed)
 - [ ] No duplicate `(household_id, lower(alias), language)` — the unique index enforces this
+- [ ] All `canonical_items.id` values are unique — assert `SELECT COUNT(DISTINCT id) = COUNT(*)` to catch any slug collisions in the seed data
 
 **Testing Expectations:**
 - Integration test: apply migrations 001 + 002 to `:memory:`, assert the row counts above
+- Stability test: run the seed generation twice on `:memory:` and assert all IDs are identical between runs — catches any accidental randomness in the ID derivation
 
 ---
 
@@ -396,6 +398,10 @@ pub type Micros = i64;      // unit price in micros (price × 1_000_000)
 
 pub enum Retailer { Tesco, Dunnes, SuperValu, Aldi, Lidl }
 pub enum Source { BasketWatch, LidlDirect, Manual }
+// Both enums must implement as_db_str() returning the exact DB CHECK constraint value:
+//   Retailer::Tesco => "tesco", Retailer::Dunnes => "dunnes", Retailer::SuperValu => "supervalu", etc.
+//   Source::BasketWatch => "basketwatch", Source::LidlDirect => "lidl_direct", Source::Manual => "manual"
+// This is the canonical serialisation used by stable_product_id() and all DB writes.
 pub enum ResolutionStatus { Unresolved, Resolved, Ambiguous }
 pub enum ItemStatus { Active, Bought, Skipped, Deleted }
 pub enum MatchStatus { Accepted, Rejected, Suggested, Pending }
@@ -405,6 +411,20 @@ pub enum ConstraintPolicy { Any, Brand, AllowedSet, OwnLabel, Exact, Ask }
 pub enum SubstitutionPolicy { Any, Ask, Strict }
 pub enum SizeBasis { Grams, Millilitres, Each }
 pub enum UnitPriceBasis { PerKg, PerL, PerEach, PerSheet, PerNappy, PerWash, PerPod, PerRoll }
+
+pub struct RequestedSize {
+    pub value: f64,       // normalised SI value: grams for weight, millilitres for volume, count for Each
+    pub basis: SizeBasis, // Grams | Millilitres | Each — input units ("L", "kg", "cl") are converted
+                          // during parsing, e.g. "1L" → { value: 1000.0, basis: Millilitres }
+}
+
+pub struct ParsedInput {
+    pub text: String,                          // normalised text with count/size stripped
+    pub count: u32,                            // how many items to buy (default 1)
+    pub requested_size: Option<RequestedSize>, // size constraint for product matching, not multiplied by price
+    pub original: String,
+}
+// Note: ParsedInput and RequestedSize live in domain.rs and are used by normalise.rs.
 
 pub struct Category { pub id: String, pub name_en: String, pub name_es: String, pub icon: String, pub default_order: i32 }
 
@@ -550,20 +570,13 @@ pub fn normalize(text: &str) -> String
 /// Capitalise first letter, leave rest unchanged.
 pub fn to_display_name(text: &str) -> String
 
-pub struct ParsedInput {
-    pub text: String,       // text stripped of quantity/unit
-    pub quantity: u32,      // default 1
-    pub unit: Option<String>,
-    pub original: String,
-}
-
-/// Parse quantity and unit from free text.
-/// Handles "2x", "x2", "500g", "1.5kg", "dos litros" (Spanish long-form units).
-/// Extend Shoppy's UNITS list to include Spanish long-form:
-///   "litro" | "litros" | "gramo" | "gramos" | "kilogramo" | "kilogramos" | "mililitro" | "mililitros"
+/// Parse count and size from free text.
+/// Handles "2x", "x2", "dos leches" (count), "500g" (size), "leche 2L" (size), "dos litros leche" (size).
 /// Word numbers: English zero–twelve + Spanish cero, uno/una, dos, tres, cuatro, cinco, seis, siete, ocho, nueve, diez, once, doce
-pub fn parse_quantity_and_unit(input: &str) -> ParsedInput
+pub fn parse_count_and_size(input: &str) -> ParsedInput
 ```
+
+`parse_count_and_size` returns `ParsedInput` (defined in `domain.rs` — see P0-T4). `count` feeds `BasketItem.count` (multiplied by price). `requested_size` is a size constraint used during product matching — it is **not** multiplied by price. "500g rice" means "I want one 500g pack of rice", not "500 packs".
 
 Use the `unicode-normalization` crate for NFD. Use `char::is_alphabetic` and `char::is_numeric` to identify non-punctuation characters.
 
@@ -576,9 +589,10 @@ Use the `unicode-normalization` crate for NFD. Use `char::is_alphabetic` and `ch
 - [ ] `normalize("Jamón")` → `"jamon"`
 - [ ] `normalize("coca-cola")` → `"coca cola"` (space, not deletion — this is different from Shoppy)
 - [ ] `normalize("  multiple   spaces  ")` → `"multiple spaces"`
-- [ ] `parse_quantity_and_unit("dos litros leche")` → `ParsedInput { text: "leche", quantity: 2, unit: Some("litros"), original: "dos litros leche" }`
-- [ ] `parse_quantity_and_unit("500g rice")` → `ParsedInput { text: "rice", quantity: 500, unit: Some("g"), ... }`
-- [ ] `parse_quantity_and_unit("milk")` → `ParsedInput { text: "milk", quantity: 1, unit: None, ... }`
+- [ ] `parse_count_and_size("dos litros leche")` → `ParsedInput { text: "leche", count: 1, requested_size: Some(RequestedSize { value: 2000.0, basis: Millilitres }), ... }` (normalised to ml; one 2L bottle)
+- [ ] `parse_count_and_size("500g rice")` → `ParsedInput { text: "rice", count: 1, requested_size: Some(RequestedSize { value: 500.0, basis: Grams }), ... }`
+- [ ] `parse_count_and_size("2x milk")` → `ParsedInput { text: "milk", count: 2, requested_size: None, ... }`
+- [ ] `parse_count_and_size("milk")` → `ParsedInput { text: "milk", count: 1, requested_size: None, ... }`
 
 **Testing Expectations:**
 - Unit tests covering: all word numbers (EN + ES), Spanish long-form units, punctuation-to-space rule, accent stripping, brand compaction exceptions
@@ -731,6 +745,25 @@ pub fn validate_unit_price(
 
 ---
 
+> **Shared ingest rule — deterministic product IDs (applies to all non-manual sources):**
+> `retailer_products.id` must be derived as `hex(SHA-256(source + ":" + retailer + ":" + external_id))` rather than a random UUID v4. This guarantees the same `external_id` always maps to the same primary key, regardless of which database or which ingest run first created it. Without stable IDs, `fixtures/product_matches.csv` (which hardcodes `retailer_product_id` values) would break every time a fresh DB is populated. Expose this as a shared helper in `crates/ingest/src/product_id.rs` used by both BasketWatch and Lidl adapters:
+> ```rust
+> pub fn stable_product_id(source: Source, retailer: Retailer, external_id: &str) -> String {
+>     // Accept typed enums, not raw strings, so callers cannot pass mismatched values.
+>     // Source and Retailer must implement as_db_str() returning the canonical DB CHECK value.
+>     let key = format!(
+>         "{}:{}:{}",
+>         source.as_db_str(),   // e.g. "basketwatch", "lidl_direct"
+>         retailer.as_db_str(), // e.g. "tesco", "lidl"
+>         external_id.trim()    // trimmed but not lowercased — retailers may use case-sensitive IDs
+>     );
+>     hex::encode(Sha256::digest(key.as_bytes()))
+> }
+> ```
+> `Source` and `Retailer` enums (defined in `domain.rs`) must implement `as_db_str() -> &'static str` returning the exact value used in the migration CHECK constraints. This centralises serialization so a renamed enum variant cannot silently change the hash. Use the `sha2` and `hex` crates (already in the dependency list).
+
+---
+
 ### P0-T8: BasketWatch ingest adapter
 
 **Type:** feature
@@ -756,9 +789,9 @@ Implement `crates/ingest/src/basketwatch.rs`. This adapter fetches price data fr
 
 **Network control:** Two separate env vars with distinct semantics:
 - `BUYWISE_NO_NETWORK=1` — adapter skips live API calls and reads from `fixtures/offers.json` instead, but **still writes** `source_runs` and `product_offers` rows to the DB. Used by `--dry-run`. Enables full end-to-end pipeline testing without a real API key.
-- `BUYWISE_LOCAL_ONLY=1` — `optimise` and `validate-basket` load offer/match data entirely from fixture files (no SQLite). The ingest adapter is not invoked. Used for pure in-process smoke tests with no DB dependency.
+- `BUYWISE_LOCAL_ONLY=1` — `optimise` and `validate-basket` create an in-memory SQLite database, apply the Phase 0 schema migration only (`001_phase0_schema.sql`), seed it from fixture files, then run the normal resolver/optimiser code paths. No persistent SQLite file is created. The ingest adapter is not invoked. Used for pure in-process smoke tests without a DB file or network.
 
-Do not conflate these: `BUYWISE_NO_NETWORK` controls whether the network is hit; `BUYWISE_LOCAL_ONLY` controls whether SQLite is used at all.
+Do not conflate these: `BUYWISE_NO_NETWORK` controls whether the network is hit; `BUYWISE_LOCAL_ONLY` controls whether a persistent SQLite file is used. Local-only mode still uses `:memory:` SQLite so it exercises the same SQL-backed resolver and optimiser paths as live mode.
 
 **Rate limiting:** self-imposed 40 RPM cap. Use `tokio::time::sleep` between request batches to stay below this. The 60 RPM limit is from BasketWatch's Pro plan; 40 RPM provides a safety buffer.
 
@@ -769,11 +802,12 @@ Do not conflate these: `BUYWISE_NO_NETWORK` controls whether the network is hit;
 **Files / Areas Touched:**
 - `crates/ingest/src/lib.rs` (expose modules)
 - `crates/ingest/src/basketwatch.rs` (create)
+- `crates/ingest/src/product_id.rs` (create: `stable_product_id` helper — shared with Lidl)
 - `crates/ingest/src/error.rs` (create: `IngestError` enum)
 - `crates/core/src/db.rs` (add query helpers for source_runs, retailer_products, product_offers)
 
 **Acceptance Criteria:**
-- [ ] With `BUYWISE_LOCAL_ONLY=1`, the adapter returns `Ok(LocalModeSkipped)` without any network call
+- [ ] With `BUYWISE_NO_NETWORK=1`, the adapter reads from `fixtures/offers.json` instead of making API calls, and still writes `source_runs` and `product_offers` rows to the DB
 - [ ] In live mode, a `source_runs` row with `status='running'` is committed before any fetch
 - [ ] After a successful run, `successful_run_number` = previous max + 1
 - [ ] After a failed run, `successful_run_number` IS NULL on the run row
@@ -784,8 +818,9 @@ Do not conflate these: `BUYWISE_NO_NETWORK` controls whether the network is hit;
 
 **Testing Expectations:**
 - Unit tests for the normalisation step using mock JSON responses (no live network)
-- Integration test using `BUYWISE_LOCAL_ONLY=1` that verifies `source_runs` is written correctly
-- Integration test for deduplication: ingest fixture data twice, assert `retailer_products` count unchanged
+- Integration test using `BUYWISE_NO_NETWORK=1` that verifies `source_runs` and `product_offers` are written correctly (the adapter is invoked with a real DB, just no network)
+- Integration test for deduplication: ingest fixture data twice with `BUYWISE_NO_NETWORK=1`, assert `retailer_products` count unchanged
+- **Brand fixture test:** `fixtures/offers.json` must include at least one product with a non-null `brand` (e.g. Fairy washing-up liquid). After dry-run ingest, assert `SELECT brand FROM retailer_products WHERE name LIKE '%Fairy%'` returns a non-null value. This proves brand data flows through ingest so that brand constraints in the optimiser have real data to filter against. If the BasketWatch API does not return brand as a top-level field, document the extraction path (e.g. parsed from product name) so it is not silently NULL.
 
 ---
 
@@ -797,13 +832,13 @@ Do not conflate these: `BUYWISE_NO_NETWORK` controls whether the network is hit;
 
 Implement `crates/ingest/src/lidl.rs`. The Lidl.ie adapter fetches product data directly from Lidl.ie (see design §12: "Lidl.ie product search", confidence medium).
 
-The adapter follows the same `source_runs` flow as BasketWatch (P0-T8). Set `source_confidence_at_ingest = 'medium'` on all Lidl offer rows.
+The adapter follows the same `source_runs` flow as BasketWatch (P0-T8). Use `stable_product_id` from `crates/ingest/src/product_id.rs` for all `retailer_products.id` values (see shared ingest rule above P0-T8). Set `source_confidence_at_ingest = 'medium'` on all Lidl offer rows.
 
 **Isolation:** Lidl adapter failure must not affect the BasketWatch pipeline. Run them independently with separate error handling. A Lidl parse error should produce a failed `source_runs` row for `source='lidl_direct'` and leave BasketWatch data untouched.
 
 The Lidl feed embeds size in the product name — the pack-size parser from P0-T7 is used to extract it.
 
-Note: §16 open question — Lidl.ie reliability is uncertain. Build the adapter but gate it behind `BUYWISE_LOCAL_ONLY`. In live mode, wrap the entire Lidl ingest in a `tokio::spawn` so a failure is logged but does not block or fail the BasketWatch run.
+Note: §16 open question — Lidl.ie reliability is uncertain. Build the adapter but gate it behind `BUYWISE_NO_NETWORK` for no-network testing (same as BasketWatch). In all modes, wrap the entire Lidl ingest in a `tokio::spawn` so a failure is logged but does not block or fail the BasketWatch run.
 
 **Files / Areas Touched:**
 - `crates/ingest/src/lidl.rs` (create)
@@ -837,8 +872,13 @@ pub type CanonicalItemId = String;  // defined here for use in Plan and Optimise
 pub struct BasketItem {
     pub canonical_item_id: Option<CanonicalItemId>,  // None for unresolved entries (resolution_status != 'resolved')
     pub raw_text: String,                   // always present; used in unresolved_items output
-    pub quantity: u32,
-    pub constraints: Option<ItemConstraints>,
+    pub count: u32,
+    pub constraint_policy: ConstraintPolicy, // copied from canonical_items.default_constraint_policy;
+                                             // defaults to Any if canonical_item_id is None
+    pub constraints: Option<ItemConstraints>, // merged constraints: load canonical item's row from
+                                              // item_constraints (if any), then override
+                                              // preferred_size_value/basis with ParsedInput.requested_size
+                                              // if present. Never replace — merge, so brand + size both apply.
 }
 
 pub struct OptimiserInput {
@@ -858,9 +898,10 @@ pub struct PlanItem {
     pub canonical_item_id: String,
     pub retailer_product_id: String,
     pub retailer: Retailer,
-    pub unit_price_cents: Cents,     // price for one unit (from product_offers, loyalty-adjusted)
-    pub quantity: u32,               // from BasketItem.quantity
-    pub line_total_cents: Cents,     // unit_price_cents * quantity; contributes to Plan.total_cents
+    pub selected_price_cents: Cents, // shelf/loyalty price for the chosen product (from product_offers, loyalty-adjusted);
+                                     // this is the total price paid at the till for one of this product, not a per-kg/per-L unit price
+    pub count: u32,                  // from BasketItem.count (how many to buy)
+    pub line_total_cents: Cents,     // selected_price_cents * count; contributes to Plan.total_cents
     pub unit_price_eur_micros: Option<Micros>,
     pub unit_price_basis: Option<UnitPriceBasis>,
     pub source_confidence: SourceConfidence,
@@ -900,10 +941,33 @@ pub struct OptimiserOutput {
 
 **Algorithm:**
 
+**Pre-step (done by caller, before constructing `OptimiserInput`):** For each parsed basket entry, call `parse_count_and_size` on the raw text. The parser converts all input units to normalised SI values before returning:
+
+| Input text | `requested_size.basis` | `requested_size.value` |
+|---|---|---|
+| `"500g"` | `Grams` | 500.0 |
+| `"1kg"` | `Grams` | 1000.0 |
+| `"250ml"` | `Millilitres` | 250.0 |
+| `"25cl"` | `Millilitres` | 250.0 |
+| `"2L"` / `"dos litros"` | `Millilitres` | 2000.0 |
+| `"6 pack"` / `"x6"` | `Each` | 6.0 |
+
+For each resolved basket entry (where `canonical_item_id` is known), the caller must also:
+1. Load `canonical_items.default_constraint_policy` → set `BasketItem.constraint_policy`.
+2. Load the `item_constraints` row for this `canonical_item_id` (if any) → this is the base constraints object.
+3. If `ParsedInput.requested_size` is `Some(size)`, **merge** it into the base constraints: set/override `preferred_size_value = size.value` and `preferred_size_basis = size.basis`. This merged object becomes `BasketItem.constraints`.
+
+The merge preserves brand and other fields from `item_constraints` — "Fairy 500ml" keeps `brand = 'Fairy'` and adds the 500ml size. `constraint_policy` travels alongside `constraints` so the optimiser's 1c filter can enforce the `brand` policy error path (policy=brand but brand field NULL → config error → `no_valid_offer_items`).
+
 1. For each `BasketItem`:
-   - If `canonical_item_id IS NULL` → add to `unresolved_items` (language/item not resolved yet); skip.
-   - Otherwise load `product_matches WHERE status = 'accepted' AND household_id = ?` filtered by `canonical_item_id`. If no accepted matches, fall through to `status = 'suggested'` as a fallback. If still none → add to `no_valid_offer_items` (canonical item is resolved but has no usable retailer product); skip. **Do not add to `unresolved_items` — the canonical item is known.**
-2. For each accepted/suggested match, load the latest offer per `retailer_product_id` (ORDER BY `fetched_at DESC LIMIT 1`). Apply loyalty prices: use `loyalty_price_cents` if non-null and the scheme is `'clubcard'` or `'real_rewards'` (household is assumed to have both cards). The resolved price is `unit_price_cents`. Multiply by `BasketItem.quantity` to get `line_total_cents`. `Plan.total_cents` = sum of all `PlanItem.line_total_cents`.
+   - **1a.** If `canonical_item_id IS NULL` → add to `unresolved_items` (language/item not resolved yet); skip.
+   - **1b.** Otherwise load `product_matches WHERE status IN ('accepted', 'suggested') AND household_id = ? AND canonical_item_id = ?`. Load all non-rejected candidates so the optimiser can compare every valid product across all stores. The `accepted`/`suggested` distinction is a **confidence signal, not a priority gate**: for pricing and plan selection, the primary criterion is always cheapest price. `accepted` status is used only as a tie-breaker when two products have the same price — prefer the accepted match. If no candidates exist at all → add to `no_valid_offer_items`; skip. **Do not add to `unresolved_items` — the canonical item is known.**
+   - **1c. Filter by constraints (Phase 0 scope):** If `BasketItem.constraints` is `Some(c)`, join each candidate match to `retailer_products` and apply the following filters in order. If no candidates survive, treat the item as having no valid offer (→ `no_valid_offer_items`); **never fall back to unfiltered candidates** — a 500g pack is not a substitute for a 1kg pack, and a generic brand is not a substitute for a named brand.
+     - **`default_constraint_policy` in Phase 0:** the only policy values that affect Phase 0 filtering are `any` (no additional filtering) and `brand` (enforce the brand constraint from `item_constraints.brand` for this canonical item). The brand value comes exclusively from `item_constraints.brand`; `canonical_items` has no primary brand field. If the policy is `brand` but the `item_constraints` row is missing or its `brand` field is NULL, this is a **configuration error** — do not fall back to `any`. Instead, treat the item as if all candidates were filtered out (→ `no_valid_offer_items`) and log a structured warning: `"canonical_item {id} has policy=brand but no brand constraint set"`. Silently relaxing a brand constraint produces wrong recommendations. All other policy values (`allowed_set`, `own_label`, `exact`, `ask`) are stored but not enforced in Phase 0; they are part of Backlog-T1. If the seed dictionary leaves all policies as `any`, this branch is only exercised by targeted fixtures; if any seed item uses `brand`, it must have a matching `item_constraints.brand` row.
+     - **Size** (Phase 0): if `c.preferred_size_value` is set, accept only products whose `size_value` is within ±20% of the preferred value and whose `size_unit` normalises to the same `SizeBasis`. "500g rice" must not match a 1kg bag.
+     - **Brand** (Phase 0): if `c.brand` is `Some(b)`, accept only products where `normalize(retailer_products.brand) == normalize(b)`. "Fairy" must not match Tesco own-label washing-up liquid.
+     - **Allowed/excluded brands, pack count, form factor, dietary flags, substitution policy** — **out of Phase 0 scope**. These fields are stored in `ItemConstraints` and in the schema but are not evaluated by the optimiser yet. They must be enforced before the app is useful for nappies size selection, cans vs bottles, zero sugar, or dietary requirements (dairy-free, gluten-free). This is a **named gap**: see the post-Phase-5 backlog task "Full constraint enforcement" to be added when Phase 5 is complete. Do not silently discard these fields at ingest.
+2. For each accepted/suggested match (post-filter), load the latest offer per `retailer_product_id` (ORDER BY `fetched_at DESC LIMIT 1`). Apply loyalty prices: use `loyalty_price_cents` if non-null and the scheme is `'clubcard'` or `'real_rewards'` (household is assumed to have both cards). The resolved shelf price becomes `selected_price_cents`. Multiply by `BasketItem.count` to get `line_total_cents`. `Plan.total_cents` = sum of all `PlanItem.line_total_cents`.
 **Fulfilment rule (applies to all plan types):** rank candidate plans by `(missing_count ASC, total_cost ASC)`. A plan missing 3 items can never beat a plan missing 0 items, even if its priced subtotal is lower. Each `Plan` carries `missing_items: Vec<CanonicalItemId>` and `is_complete: bool` so the API and UI can explain why a cheaper subtotal lost.
 
 3. **Single-store plan:** For each of the 5 retailers, compute the total cost using that retailer's best matching product per item; track items with no offer at this retailer in `missing_items`. Apply the fulfilment rule; pick the candidate with `(fewest missing, lowest cost)`.
@@ -941,9 +1005,12 @@ This is computed per offer at query time — no additional JOIN needed beyond th
 - [ ] Freshness confidence is `Unknown` when `current_source_run_number IS NULL`
 - [ ] Dunnes voucher flag appears when applicable
 - [ ] `recommended.clears_convenience_threshold = false` when saving < €10
+- [ ] **Brand constraint rejection:** with a fixture `item_constraints` row for "washing-up liquid" (`canonical_item_id = <Fairy item>`, `brand = 'Fairy'`) and fixture candidates including one Fairy product and one own-label product, only the Fairy product appears in the plan — the own-label candidate is excluded
+- [ ] If brand constraint eliminates all candidates for an item, the item appears in `no_valid_offer_items`, not `unresolved_items`
 
 **Testing Expectations:**
 - Unit tests with in-memory SQLite and fixture data covering: single-store best, two-store split, loyalty price application, freshness confidence computation, convenience threshold boundary values, Dunnes voucher boundary (€44.99, €45.00, €49.99, €50.00)
+- Add `fixtures/item_constraints.json` (one row per item that has a non-`any` constraint in Phase 0 tests, e.g. `{ "canonical_item_id": "<fairy-id>", "brand": "Fairy" }`); load this in optimiser unit tests alongside `fixtures/offers.json`
 
 ---
 
@@ -953,7 +1020,7 @@ This is computed per offer at query time — no additional JOIN needed beyond th
 
 **Description:**
 
-Implement the four CLI commands in `crates/cli/src/main.rs` using `clap` derive macros.
+Implement the five CLI commands in `crates/cli/src/main.rs` using `clap` derive macros.
 
 **Commands:**
 
@@ -961,23 +1028,24 @@ Implement the four CLI commands in `crates/cli/src/main.rs` using `clap` derive 
 buywise-cli validate-basket <fixture-path>
 buywise-cli optimise --list <fixture-path> [--db <sqlite-path>] [--threshold2 <cents>] [--threshold3 <cents>]
 buywise-cli ingest-basketwatch --db <sqlite-path> [--dry-run]
-buywise-cli seed-matches --from <csv-path> --db <sqlite-path> [--household-id <uuid>]
+buywise-cli seed-matches --from <csv-path> --db <sqlite-path> --household-id <uuid>
+buywise-cli generate-fixtures
 ```
 
 **`validate-basket <fixture-path>`:**
-Load `fixtures/items.json` (an array of `{ raw_text, expected_canonical }` pairs). For each entry, run `resolve()` from P0-T6. Print a table: raw text | resolution outcome | expected | match/fail. Print summary: N resolved, M unresolved, P ambiguous, Q failures. This command validates the resolution cascade against known-good mappings.
+Load `fixtures/items.json` (an array of `{ raw_text, expected_canonical }` pairs). Unless `--db` is added later, this command uses the same fixture bootstrap as `optimise` fixture mode: create an in-memory SQLite database, apply the Phase 0 schema migration only (`001_phase0_schema.sql`), seed categories/canonical items/aliases from `fixtures/canonical_items.json`, then run `resolve()` from P0-T6. Do not apply `002_seed.sql` in fixture mode, because the generated fixture file supplies the seed data. Print a table: raw text | resolution outcome | expected | match/fail. Print summary: N resolved, M unresolved, P ambiguous, Q failures. This command validates the resolution cascade against known-good mappings.
 
 **`optimise --list <fixture-path> [--db <sqlite-path>]`:**
 Load a basket file of the form:
 ```json
 [
-  { "raw_text": "leche entera 2L", "quantity": 1 },
-  { "raw_text": "nappies size 4", "quantity": 1 },
+  { "raw_text": "leche entera 2L", "count": 1 },
+  { "raw_text": "pan de molde", "count": 1 },
   ...
 ]
 ```
 Two modes determined by the presence of `--db`:
-- **Fixture mode** (no `--db`): loads offer and match data from `fixtures/offers.json` and `fixtures/product_matches.csv` in memory; no SQLite required. Used for CI smoke tests.
+- **Fixture mode** (no `--db`): creates an **in-memory SQLite database**, applies the Phase 0 schema migration only (`001_phase0_schema.sql`), seeds it from `fixtures/canonical_items.json`, `fixtures/item_constraints.json`, `fixtures/offers.json`, and `fixtures/product_matches.csv`, then runs the full resolution and optimisation pipeline against it. Do not apply `002_seed.sql` here, because the generated fixture file supplies categories, canonical items, and aliases. No persistent DB file is created. This reuses the same resolver and optimiser code paths as live mode — there is no parallel no-DB code path. `canonical_items.json` supplies categories, canonical item rows, aliases, and policy data; `item_constraints.json` supplies constraint values; the in-memory DB supports the policy-driven config-error path and brand filtering in CI.
 - **Live mode** (`--db buywise.db`): reads `retailer_products`, `product_offers`, and `product_matches` from the specified SQLite database (populated by `ingest-basketwatch` + `seed-matches`). This is the mode used for the Phase 0 gate.
 
 Print for both modes:
@@ -991,12 +1059,14 @@ Print for both modes:
 
 **Fixture files to create:**
 - `fixtures/items.json` — validation basket of ~30 items covering all 11 categories, mix of EN and ES text, some ambiguous terms
-- `fixtures/weekly-shop.json` — representative weekly shop (~40 items) for savings estimation
-- `fixtures/offers.json` — static snapshot of BasketWatch-format data for a subset of items, used when `BUYWISE_NO_NETWORK=1` (dry-run ingest) or `BUYWISE_LOCAL_ONLY=1` (no-DB optimise mode)
+- `fixtures/weekly-shop.json` — representative weekly shop (~40 items) for savings estimation. **Phase 0 constraint scope:** only include items whose optimisation is valid under Phase 0 filtering (size and brand constraints only). Do not include items where correctness depends on form_factor, dietary flags, or allowed/excluded brands — or mark such rows with a `"constraint_gap": true` field. Practical guidance: branded items like Fairy (brand-filterable), staples with no constraint, and items with a distinct canonical slug per size/variant (e.g. `nappies_size_4` and `nappies_size_5` as separate canonical items, not a single "nappies" item with a size constraint) are safe in Phase 0 — size is baked into the canonical identity, not evaluated at runtime. Items whose variant selection requires runtime constraint evaluation (form_factor, dietary flags, cans vs bottles) are not safe in Phase 0.
+- `fixtures/offers.json` — static snapshot of BasketWatch-format data for a subset of items, used when `BUYWISE_NO_NETWORK=1` (dry-run ingest) or `BUYWISE_LOCAL_ONLY=1` (in-memory SQLite fixture mode)
 - `fixtures/product_matches.csv` — pre-defined `canonical_item → retailer_product` mappings for the validation basket; same CSV format as `product_matches_live.csv` so `seed-matches` accepts both with no format branching
+- `fixtures/canonical_items.json` — **generated from `fixtures/dictionary.json`**, not hand-maintained. Contains everything needed to seed fixture-mode lookup tables without rereading the dictionary: `categories`, `canonical_items` rows (`id`, `household_id`, `slug`, `name_en`, `name_es`, `category_id`, `default_constraint_policy`, `created_at`) and `item_aliases` rows (`id`, `household_id`, `canonical_item_id`, `alias`, `language`, `source`, `created_at`). `slug` is fixture metadata used to audit deterministic IDs and is ignored when inserting into the DB, because `canonical_items` has no `slug` column. Regenerate with `cargo run -p buywise-cli -- generate-fixtures` whenever `dictionary.json` changes. Committed to the repo so CI does not need to run the generator; the generator is run locally and the output is committed.
+- `fixtures/item_constraints.json` — array of `{ canonical_item_id, brand?, preferred_size_value?, preferred_size_basis? }` rows used in fixture mode; must include at least one brand-constrained item (e.g. Fairy) to exercise brand filtering in CI
 
 **`seed-matches --from <csv-path> --db <sqlite-path> --household-id <uuid>`:**
-CSV columns: `(canonical_item_id, retailer_product_id, status, matched_by)` — no `household_id` in the file; `--household-id` is required and supplies it for every row. For Phase 0, always pass `--household-id h0000000-0000-0000-0000-000000000001`. This avoids ambiguity and makes the CSV portable across environments.
+CSV columns: `(canonical_item_id, retailer_product_id, status, matched_by)` — no `household_id` in the file; `--household-id` is required and supplies it for every row. For Phase 0, always pass `--household-id 00000000-0000-0000-0000-000000000001`. This avoids ambiguity and makes the CSV portable across environments. Because `retailer_products.id` is a deterministic SHA-256 hash of `(source, retailer, external_id)` (see P0-T8), the `retailer_product_id` values in the CSV are stable across fresh DB populations — the same product from BasketWatch always gets the same ID.
 
 Upserts into `product_matches` using:
 ```sql
@@ -1009,30 +1079,37 @@ DO UPDATE SET status = excluded.status, matched_by = excluded.matched_by, update
 
 `--db` is required: this command always writes to SQLite; there is no in-memory fixture mode.
 
-The workflow: run `ingest-basketwatch --db buywise.db`, query `retailer_products` for recognisable products, map them to canonical items by hand in `fixtures/product_matches_live.csv`, then `seed-matches --from fixtures/product_matches_live.csv --db buywise.db`. This is intentionally low-tech for Phase 0 — Phase 5 adds the automated match-feedback loop.
+The workflow: run `ingest-basketwatch --db buywise.db`, query `retailer_products` for recognisable products, map them to canonical items by hand in `fixtures/product_matches_live.csv`, then `seed-matches --from fixtures/product_matches_live.csv --db buywise.db --household-id 00000000-0000-0000-0000-000000000001`. This is intentionally low-tech for Phase 0 — Phase 5 adds the automated match-feedback loop.
+
+**Item constraints in live mode:** the Phase 0 seed migration uses `default_constraint_policy` from `fixtures/dictionary.json`, but it does not automatically create `item_constraints` rows for every constrained item. If an entry uses `default_constraint_policy = 'brand'`, live validation must also seed the corresponding `item_constraints.brand` row, or the optimiser will correctly mark that item as a configuration error and place it in `no_valid_offer_items`. For Phase 0 there are two valid approaches: keep dictionary policies as `any` and include only constraint-valid products in `product_matches_live.csv`, or add a small `seed-constraints --from fixtures/item_constraints.json --db buywise.db` command before optimisation. Do not rely on product matches alone for any item whose dictionary policy is `brand`.
+
+**`generate-fixtures`:**
+Reads `fixtures/dictionary.json` and writes `fixtures/canonical_items.json`. Fails with a clear error if any entry is missing a `slug`, has a duplicate slug, references an unknown category, or has an invalid `default_constraint_policy` value. The generated file must contain enough data to insert rows into `categories`, `canonical_items`, and `item_aliases` in an in-memory SQLite database; fixture-only metadata such as `slug` must be skipped by the DB insert code. Run locally and commit the output; CI does not run the generator (it uses the committed file). This is the only command that touches `fixtures/canonical_items.json` — never edit it by hand.
 
 **Files / Areas Touched:**
 - `crates/cli/src/main.rs`
-- `crates/cli/src/commands/` (create subdirectory: `validate.rs`, `optimise.rs`, `ingest.rs`, `seed_matches.rs`)
+- `crates/cli/src/commands/` (create subdirectory: `validate.rs`, `optimise.rs`, `ingest.rs`, `seed_matches.rs`, `generate_fixtures.rs`)
 - `fixtures/items.json` (create)
 - `fixtures/weekly-shop.json` (create)
 - `fixtures/offers.json` (create)
 - `fixtures/product_matches.csv` (create — used in local/dry-run mode)
+- `fixtures/canonical_items.json` (generated from `dictionary.json` — do not edit by hand; commit the output)
+- `fixtures/item_constraints.json` (create — loaded by fixture mode alongside offers.json; must include at least one brand-constrained item)
 - `fixtures/product_matches_live.csv` (create after first live ingest run — not committed with dummy data)
 
 **Acceptance Criteria:**
 - [ ] `buywise-cli validate-basket fixtures/items.json` runs without panic; prints resolution table
 - [ ] `buywise-cli optimise --list fixtures/weekly-shop.json` prints four plans and a saving estimate
 - [ ] `buywise-cli ingest-basketwatch --db test.db --dry-run` completes without network calls (sets `BUYWISE_NO_NETWORK=1`); writes a `source_runs` row and fixture offer rows to `test.db`; prints "dry-run mode"
-- [ ] `buywise-cli seed-matches --from fixtures/product_matches.csv --db test.db` (with a fresh DB that has run migrations) upserts rows into `product_matches` and prints count; running it twice is idempotent
-- [ ] After `ingest-basketwatch --db buywise.db` (live) + `seed-matches --from fixtures/product_matches_live.csv --db buywise.db`, `buywise-cli optimise --list fixtures/weekly-shop.json --db buywise.db` produces a non-zero savings estimate
+- [ ] `buywise-cli seed-matches --from fixtures/product_matches.csv --db test.db --household-id 00000000-0000-0000-0000-000000000001` upserts rows and prints count; running it twice is idempotent. **Prerequisites:** fresh DB with migrations applied + `ingest-basketwatch --db test.db --dry-run` already run (to populate `retailer_products` so FK constraints on `retailer_product_id` are satisfied)
+- [ ] After `ingest-basketwatch --db buywise.db` (live) + `seed-matches --from fixtures/product_matches_live.csv --db buywise.db --household-id 00000000-0000-0000-0000-000000000001`, `buywise-cli optimise --list fixtures/weekly-shop.json --db buywise.db` produces a non-zero savings estimate
 - [ ] Estimated monthly saving is printed as a number; this is the Phase 0 gate value
 
 **Phase 0 gate:** The printed monthly saving (from live data, after `seed-matches`) must be ≥ €50 to proceed. Document the result in `docs/phase0-results.md`.
 
 **Two operating modes:**
-- **Fixture smoke test** (`BUYWISE_LOCAL_ONLY=1`, no `--db`): `optimise` loads offer and match data from fixture files in memory; no SQLite, no network; runs in CI.
-- **Live validation**: `ingest-basketwatch --db buywise.db` → `seed-matches --from fixtures/product_matches_live.csv --db buywise.db` → `optimise --list fixtures/weekly-shop.json --db buywise.db`; produces the Phase 0 gate value; run manually before proceeding to Phase 1.
+- **Fixture smoke test** (`BUYWISE_LOCAL_ONLY=1`, no `--db`): `optimise` and `validate-basket` use an **in-memory SQLite database** seeded from the fixture files at startup — they apply the Phase 0 schema migration only (`001_phase0_schema.sql`) and insert rows from `canonical_items.json`, `item_constraints.json`, `offers.json`, and `product_matches.csv` into `:memory:` before running. This avoids re-implementing a parallel no-DB resolution path and avoids double-seeding from `002_seed.sql`. `weekly-shop.json` still contains only `raw_text` (resolution runs normally against the in-memory DB). No persistent SQLite file is created; the in-memory DB is discarded after the command exits.
+- **Live validation**: `ingest-basketwatch --db buywise.db` → `seed-matches --from fixtures/product_matches_live.csv --db buywise.db --household-id 00000000-0000-0000-0000-000000000001` → `optimise --list fixtures/weekly-shop.json --db buywise.db`; produces the Phase 0 gate value; run manually before proceeding to Phase 1.
 
 **Testing Expectations:**
 - Integration test that runs `validate-basket` on `fixtures/items.json` and asserts ≥ 90% resolution rate
@@ -1225,10 +1302,10 @@ Also create `migrations/004_seed_phase1.sql`:
 
 ```sql
 -- IMPORTANT: use the same household UUID that Phase 0 seeded canonical_items with.
--- The Phase 0 migration uses h0000000-0000-0000-0000-000000000001 as household_id.
+-- The Phase 0 migration uses 00000000-0000-0000-0000-000000000001 as household_id.
 -- If Phase 1 seeds a different household UUID, /api/items returns nothing for real users.
 INSERT OR IGNORE INTO households (id, name, created_at) VALUES
-  ('h0000000-0000-0000-0000-000000000001', 'Home', datetime('now'));
+  ('00000000-0000-0000-0000-000000000001', 'Home', datetime('now'));
 
 -- Seed the two household users (password hashes provided at deploy time via env vars or seed script)
 -- Seed default store_category_orders for all 5 retailers × 11 categories
@@ -2275,25 +2352,25 @@ Server: upsert `product_matches` (update `status` in place) and insert `match_fe
 
 ---
 
-### P5-T2: Rejected suggestion suppression in the optimiser
+### P5-T2: Regression test — rejected matches excluded from plans after Phase 5 write path
 
-**Type:** feature
+**Type:** test / regression
 
 **Description:**
 
-Update the optimiser (P0-T10) to filter out products with `product_matches.status = 'rejected'` for the requesting household. These products are excluded from plan computation as if they had no offer.
+The optimiser already loads only `status IN ('accepted', 'suggested')` candidates (implemented in P0-T10), so rejected products are excluded from the start. This task exists to verify that exclusion still holds end-to-end after the Phase 5 `match_feedback` write path (P5-T1) is wired up — specifically, that rejecting a match via the API immediately removes it from subsequent optimiser runs for that household.
 
 **Files / Areas Touched:**
-- `crates/core/src/optimiser.rs` (update: filter rejected matches)
-- `crates/core/src/db.rs` (update: join with product_matches in candidate query)
+- `crates/core/src/optimiser.rs` (verify no regression — no code change expected)
+- Integration tests only
 
 **Acceptance Criteria:**
-- [ ] A rejected product does not appear in any plan for that household
-- [ ] If all products for a canonical item are rejected, the item appears in `no_valid_offer_items` (not `unresolved_items` — the canonical item is resolved; it simply has no acceptable retailer product remaining)
-- [ ] A different household's rejections do not affect this household's plans
+- [ ] After calling the match-rejection endpoint (P5-T1), re-running `optimise` for the same household excludes the rejected product
+- [ ] If all products for a canonical item are rejected, the item appears in `no_valid_offer_items` (not `unresolved_items`)
+- [ ] A different household's rejections do not affect this household's plans (household isolation)
 
 **Testing Expectations:**
-- Unit test: seed two products for one item, reject one, assert only the other appears in plans
+- Integration test: seed two products for one item; reject one via the Phase 5 write path; assert only the other appears in plans and the plan total reflects the remaining product's price
 
 ---
 
@@ -2370,6 +2447,29 @@ Fetch from a new `GET /api/savings/summary` endpoint:
 
 ---
 
+### Backlog-T1: Full constraint enforcement in the optimiser
+
+**Type:** feature (post-Phase 5)
+
+**Description:**
+
+Extend the optimiser's constraint filtering (step 1c) to honour all `ItemConstraints` fields beyond size and brand. This task exists to close the named gap left by Phase 0.
+
+Constraints to implement:
+- `allowed_brands`: accept only products whose brand is in the allow-list
+- `excluded_brands`: reject products whose brand appears in the block-list
+- `pack_count`: filter by `retailer_products.pack_count` (column already exists in schema)
+- `form_factor`: filter by product form (e.g. "can", "bottle", "spray") — **requires a schema migration** to add `form_factor TEXT` to `retailer_products` (the column does not currently exist), and ingest changes to populate it; the `item_constraints.form_factor` column already exists but has no matching column to compare against in `retailer_products`
+- `dietary_flags`: filter by dietary attributes (e.g. `["gluten_free", "dairy_free"]`) — **requires a schema migration** to add `dietary_flags TEXT` (JSON array) to `retailer_products`, and ingest changes to extract these from product data; define a standard set of flag strings before implementing
+- `substitution_policy = Strict`: do not offer any substitute if the exact matched product has no current offer; show as missing rather than recommending an alternative
+- `substitution_policy = Ask`: surface the item to the user for confirmation rather than auto-selecting
+
+Until this task is complete, recommendations for constrained items (nappies size, cans vs bottles, dietary needs) may be incorrect. The schema stores all constraint fields in `item_constraints`; the `retailer_products` side is missing `form_factor` and `dietary_flags` columns.
+
+**Dependencies:** Phase 5 complete; migrations for `retailer_products.form_factor` and `retailer_products.dietary_flags`; ingest adapter changes to populate those fields.
+
+---
+
 ## Cross-Cutting Notes
 
 ### Migration versioning
@@ -2392,9 +2492,14 @@ The fields `source_confidence_at_ingest` (stored) and freshness confidence (comp
 
 All six CHECK constraints must be in the initial `CREATE TABLE` statement in `migrations/003_phase1_schema.sql`. They cannot be added later via `ALTER TABLE` in SQLite. If a bug is found in them, the fix requires a new migration that recreates the table (copy, drop, rename).
 
-### Local-only dev mode
+### Dev mode environment variables
 
-`BUYWISE_LOCAL_ONLY=1` disables all external API calls throughout the ingest crates. The CLI and API both respect this flag. CI always sets this flag to prevent accidental BasketWatch API consumption.
+Two flags with distinct scopes — do not conflate them:
+
+| Flag | Scope | Effect |
+|---|---|---|
+| `BUYWISE_NO_NETWORK=1` | Ingest crates | Skips live API calls; reads from `fixtures/offers.json`; still writes `source_runs` and `product_offers` to SQLite. Used by `ingest-basketwatch --dry-run`. CI sets this to prevent accidental API consumption. |
+| `BUYWISE_LOCAL_ONLY=1` | CLI `optimise`/`validate-basket` | Creates an in-memory SQLite database, applies the Phase 0 schema migration only (`001_phase0_schema.sql`), seeds it from fixture files, and runs the normal resolver/optimiser paths. No persistent SQLite file or network is required. The ingest adapter is not invoked. |
 
 ### CSRF token pattern
 
