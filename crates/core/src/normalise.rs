@@ -9,6 +9,11 @@ use crate::domain::{Micros, UnitPriceBasis};
 
 /// A pack size normalised to a base unit: weight in grams, volume in
 /// millilitres, or a discrete count.
+///
+/// `PartialEq` compares the `f64` fields bit-for-bit. It is reliable for exact
+/// conversions (e.g. `"2L"` → `2000.0`) but **do not** `assert_eq!` on
+/// `Weight`/`Volume` produced by non-exact conversions such as `lb`/`oz`/`pt`
+/// — compare the field within an epsilon instead (see the imperial tests).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NormalisedSize {
     Weight { grams: f64 },
@@ -75,8 +80,10 @@ pub fn parse_pack_size(text: &str) -> Option<NormalisedSize> {
 
     // Discrete count: keywords (or no unit at all) → each.
     if is_count_unit(unit) {
-        // Counts are whole numbers; reject fractional pack counts.
-        if number.fract() != 0.0 || number < 0.0 {
+        // Counts are whole numbers; reject fractional pack counts. (`number`
+        // cannot be negative here: `split_number_unit` only consumes ASCII
+        // digits and '.', so a leading '-' is never part of the number.)
+        if number.fract() != 0.0 {
             return None;
         }
         return Some(NormalisedSize::Count {
@@ -133,12 +140,13 @@ fn is_count_unit(unit: &str) -> bool {
             | "tablets"
             | "bag"
             | "bags"
+            // "tin"/"tins" are intentionally counts: tinned goods (e.g. "4 tins
+            // of beans") are compared per-tin, and the actual content size is
+            // carried separately by the pack-size text. By contrast "bottle"/
+            // "can" denote volume containers and are *not* counts here — a bottle
+            // is parsed via its volume text (e.g. "750ml") so €/L stays correct.
             | "tin"
             | "tins"
-            | "can"
-            | "cans"
-            | "bottle"
-            | "bottles"
             | "unit"
             | "units"
     )
@@ -150,16 +158,25 @@ fn is_count_unit(unit: &str) -> bool {
 /// `PerL`/`PerKg` divide by the base quantity expressed in litres/kilograms
 /// (millilitres or grams ÷ 1000). All count-based bases (`PerEach`,
 /// `PerNappy`, `PerPod`, `PerWash`, `PerSheet`, `PerRoll`) divide by the item
-/// count. Returns `None` if the size is zero/negative or the size and basis are
-/// dimensionally incompatible (e.g. `PerL` with a `Count` size).
+/// count. Returns `None` if `price_cents` is zero/negative, the size is
+/// zero/negative, or the size and basis are dimensionally incompatible (e.g.
+/// `PerL` with a `Count` size).
 ///
-/// Computed with integer arithmetic to avoid floating-point money error; the
-/// worked example €2.99 / 2L yields exactly `1_495_000`.
+/// The count path is pure `i128` integer arithmetic (no floating-point money
+/// error); the `PerL`/`PerKg` weight/volume paths divide by a fractional base
+/// (e.g. 1.5kg → 1500.0) using an `f64` step then round to the nearest micro.
+/// That step is exact for realistic prices (`cents × 1e10` stays integer-exact
+/// in `f64` below ~€9k). The worked example €2.99 / 2L yields exactly
+/// `1_495_000`.
 pub fn compute_unit_price_micros(
     price_cents: i64,
     size: &NormalisedSize,
     basis: UnitPriceBasis,
 ) -> Option<Micros> {
+    // A non-positive price is meaningless for a unit-price comparison.
+    if price_cents <= 0 {
+        return None;
+    }
     // micros = cents × 10_000  (cents → € is ÷100, € → micros is ×1_000_000).
     // We fold the per-base division into one integer expression.
     match (basis, size) {
@@ -222,25 +239,52 @@ fn div_round_nearest(numerator: i128, denominator: i128) -> i128 {
 
 /// Map a product's display text to a [`UnitPriceBasis`] using category
 /// keywords (see design §9). First match wins; defaults to `PerEach`.
+///
+/// Matching is by whole word, not substring, so "dishwasher" does not match
+/// the "wash" keyword and "washing-up liquid" is not mis-read as `PerWash`.
+/// More-specific categories (pod/capsule, liquid) are checked before the
+/// broader "wash" category so e.g. "dishwasher pods" resolves to `PerPod`.
+///
+/// Retained as the design §9 category classifier for the phase-1 path that will
+/// infer a basis from a product *name* (not pack-size text); `validate_unit_price`
+/// no longer calls it (see its doc comment). `#[allow(dead_code)]` until that
+/// caller is wired up.
+#[allow(dead_code)]
 fn infer_basis_from_text(text: &str) -> UnitPriceBasis {
     let t = text.to_lowercase();
+    // Whole-word membership test: split on any non-alphanumeric character so
+    // "washing-up" yields the tokens ["washing", "up"], not a "wash" match.
+    let has_word = |kw: &str| t.split(|c: char| !c.is_alphanumeric()).any(|w| w == kw);
+
     // Toilet/kitchen roll → €/sheet (€/roll is the fallback handled elsewhere).
     if t.contains("toilet roll") || t.contains("kitchen roll") {
         return UnitPriceBasis::PerSheet;
     }
-    if t.contains("napp") {
+    // "napp" covers "nappy"/"nappies"; check the token prefix explicitly.
+    if t.split(|c: char| !c.is_alphanumeric())
+        .any(|w| w.starts_with("napp"))
+    {
         return UnitPriceBasis::PerNappy;
     }
-    if t.contains("laundry") || t.contains("detergent") || t.contains("wash") {
-        return UnitPriceBasis::PerWash;
-    }
-    if t.contains("pod") || t.contains("capsule") {
-        return UnitPriceBasis::PerPod;
-    }
-    if t.contains("milk") || t.contains("juice") || t.contains("liquid") {
+    // Liquids → €/L. Checked before "wash" so "washing-up liquid" → PerL.
+    if has_word("milk") || has_word("juice") || has_word("liquid") {
         return UnitPriceBasis::PerL;
     }
-    if t.contains("rice") || t.contains("pasta") || t.contains("flour") || t.contains("dry") {
+    // Pods/capsules/tablets → €/pod (dosed units). Checked before "wash" so
+    // "dishwasher pods"/"dishwasher tablets" → PerPod, not PerWash.
+    if has_word("pod")
+        || has_word("pods")
+        || has_word("capsule")
+        || has_word("capsules")
+        || has_word("tablet")
+        || has_word("tablets")
+    {
+        return UnitPriceBasis::PerPod;
+    }
+    if has_word("laundry") || has_word("detergent") || has_word("wash") || has_word("washes") {
+        return UnitPriceBasis::PerWash;
+    }
+    if has_word("rice") || has_word("pasta") || has_word("flour") || has_word("dry") {
         return UnitPriceBasis::PerKg;
     }
     UnitPriceBasis::PerEach
@@ -254,19 +298,27 @@ fn infer_basis_from_text(text: &str) -> UnitPriceBasis {
 /// trusted. If it diverges by more than 2%, the computed value is returned
 /// instead.
 ///
-/// "Warning" semantics: core has no logging facility yet and we deliberately
-/// add no logging dependency, so the divergence is surfaced by *recomputing*
-/// (the returned value changes) plus a best-effort `eprintln!`. If a pack size
-/// is unavailable we cannot recompute, so the provided value is passed through.
+/// The basis is taken from `provided_basis`. It is **not** inferred from
+/// `pack_size_text`, which carries a size (e.g. "2L", "500g") rather than a
+/// product category, so when `provided_basis` is `None` the returned basis is
+/// also `None` (and no recompute is attempted).
+///
+/// "Warning" semantics: a >2% divergence is surfaced by *recomputing* — the
+/// returned value differs from the provided one. If a pack size is unavailable
+/// we cannot recompute, so the provided value is passed through.
+// TODO(phase-1): add a structured divergence signal (e.g. a tracing event or a
+// returned diagnostic) when a consumer needs to observe corrections, rather
+// than only inferring it from a changed return value. Deferred here to avoid a
+// speculative public-API change.
 pub fn validate_unit_price(
     price_cents: i64,
     pack_size_text: Option<&str>,
     provided_micros: Option<Micros>,
     provided_basis: Option<UnitPriceBasis>,
 ) -> (Option<Micros>, Option<UnitPriceBasis>) {
-    // Determine the basis: trust the provided basis, otherwise infer it from
-    // the pack-size text (best effort).
-    let basis = provided_basis.or_else(|| pack_size_text.map(infer_basis_from_text));
+    // The basis is whatever the caller provided; pack-size text is a size, not
+    // a category, so it cannot supply a basis.
+    let basis = provided_basis;
 
     // Attempt to compute a reference value from the pack size.
     let computed = match (pack_size_text, basis) {
@@ -282,11 +334,6 @@ pub fn validate_unit_price(
             if within_tolerance(provided, computed, DIVERGENCE_TOLERANCE) {
                 (Some(provided), basis)
             } else {
-                eprintln!(
-                    "validate_unit_price: provided unit price {provided} micros diverges \
-                     >{:.0}% from computed {computed} micros; using computed value",
-                    DIVERGENCE_TOLERANCE * 100.0
-                );
                 (Some(computed), basis)
             }
         }
@@ -421,6 +468,24 @@ mod tests {
             NormalisedSize::Volume { ml } => assert!((ml - 568.261).abs() < 0.001),
             other => panic!("expected volume, got {other:?}"),
         }
+        // 8oz ≈ 226.796 g.
+        match parse_pack_size("8oz").unwrap() {
+            NormalisedSize::Weight { grams } => assert!((grams - 8.0 * 28.3495).abs() < 0.001),
+            other => panic!("expected weight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bottle_and_can_are_not_counts() {
+        // "bottle"/"can" denote volume containers, not counts; without a numeric
+        // volume unit they are unparseable (the volume text carries the size).
+        assert_eq!(parse_pack_size("1 bottle"), None);
+        assert_eq!(parse_pack_size("6 cans"), None);
+        // "tin"/"tins" remain intentional counts.
+        assert_eq!(
+            parse_pack_size("4 tins"),
+            Some(NormalisedSize::Count { each: 4 })
+        );
     }
 
     #[test]
@@ -531,6 +596,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compute_rejects_zero_and_negative_price() {
+        // A non-positive shelf price is meaningless for a unit-price comparison.
+        let vol = NormalisedSize::Volume { ml: 2000.0 };
+        assert_eq!(
+            compute_unit_price_micros(0, &vol, UnitPriceBasis::PerL),
+            None
+        );
+        assert_eq!(
+            compute_unit_price_micros(-100, &vol, UnitPriceBasis::PerL),
+            None
+        );
+        let count = NormalisedSize::Count { each: 12 };
+        assert_eq!(
+            compute_unit_price_micros(-100, &count, UnitPriceBasis::PerEach),
+            None
+        );
+        // And validate_unit_price propagates None sanely: no computed reference,
+        // so the provided value passes through.
+        let (micros, basis) = validate_unit_price(
+            -100,
+            Some("2L"),
+            Some(1_500_000),
+            Some(UnitPriceBasis::PerL),
+        );
+        assert_eq!(micros, Some(1_500_000));
+        assert_eq!(basis, Some(UnitPriceBasis::PerL));
+    }
+
     // ---- validate_unit_price: 2% tolerance edges ----
 
     #[test]
@@ -616,12 +710,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_infers_basis_from_text_when_absent() {
-        // Basis not provided and pack text is not a parseable size, so basis is
-        // inferred by keyword ("milk" → PerL) but no recompute is possible.
-        let (micros, basis) = validate_unit_price(299, Some("milk"), None, None);
-        assert_eq!(basis, Some(UnitPriceBasis::PerL));
+    fn validate_does_not_infer_basis_from_pack_size_text() {
+        // Realistic input: a pack size ("2L") with no provided basis. Pack-size
+        // text is a size, not a category, so the basis stays None and no
+        // recompute is attempted (we have nothing to divide by). The provided
+        // unit price (if any) is passed through unchanged.
+        let (micros, basis) = validate_unit_price(299, Some("2L"), None, None);
+        assert_eq!(basis, None);
         assert_eq!(micros, None);
+
+        let (micros, basis) = validate_unit_price(299, Some("500g"), Some(1_234_000), None);
+        assert_eq!(basis, None);
+        assert_eq!(micros, Some(1_234_000), "provided value passes through");
     }
 
     #[test]
@@ -664,6 +764,29 @@ mod tests {
         assert_eq!(
             infer_basis_from_text("tin of beans"),
             UnitPriceBasis::PerEach
+        );
+    }
+
+    #[test]
+    fn infer_basis_avoids_substring_collisions() {
+        // "dishwasher" must not match the "wash" keyword; pods win.
+        assert_eq!(
+            infer_basis_from_text("dishwasher pods"),
+            UnitPriceBasis::PerPod
+        );
+        assert_eq!(
+            infer_basis_from_text("dishwasher tablets"),
+            UnitPriceBasis::PerPod
+        );
+        // "washing-up liquid" is a liquid (€/L), not a wash.
+        assert_eq!(
+            infer_basis_from_text("washing-up liquid"),
+            UnitPriceBasis::PerL
+        );
+        // A genuine "wash" word still maps to PerWash.
+        assert_eq!(
+            infer_basis_from_text("non-bio wash detergent"),
+            UnitPriceBasis::PerWash
         );
     }
 }
