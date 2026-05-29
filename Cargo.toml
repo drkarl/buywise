@@ -17,6 +17,8 @@ buywise-core = { path = "crates/core" }
 buywise-ingest = { path = "crates/ingest" }
 
 # Shared third-party dependencies (versions pinned here for consistency)
+# Minimal feature set: no `migrate` and no TLS driver (local SQLite only). Re-add
+# `migrate` here if a later task uses `sqlx::migrate!`.
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +30,8 @@ hex = "0.4"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
+# Minimal feature set: drops default http2 and gzip/brotli decompression. Re-add
+# (`http2`, `gzip`, …) if the ingest adapters need them.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 anyhow = "1"
 tracing = "0.1"
@@ -36,4 +40,7 @@ clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 argon2 = "0.5"
-rand = "0.9"
+# Pinned to 0.8 (rand_core 0.6) to match argon2 0.5 / password-hash 0.5, whose
+# `SaltString::generate` expects a rand_core 0.6 RNG. Bumping to rand 0.9 would
+# pull a second rand_core (0.9) and break the api crate's password hashing.
+rand = "0.8"
