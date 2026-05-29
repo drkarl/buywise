@@ -15,7 +15,10 @@ fn default_policy() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dictionary {
     /// Free-text note (ignored by the generator; documents the file's contract).
+    /// Parsed for round-trip completeness but intentionally not emitted, hence
+    /// `dead_code` is allowed to pre-empt a future lint.
     #[serde(rename = "_note", default)]
+    #[allow(dead_code)]
     pub note: String,
     pub household_id: String,
     pub categories: Vec<Category>,
