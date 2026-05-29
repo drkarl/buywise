@@ -231,10 +231,14 @@ dependencies = [
  "buywise-core",
  "buywise-ingest",
  "clap",
+ "hex",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
 ]
 
 [[package]]

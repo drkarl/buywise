@@ -1,0 +1,2740 @@
+{
+  "_note": "Single source of truth for BuyWise seed data. Ported from Shoppy's src/lib/matching/dictionary.ts (226 entries) + supabase/migrations/002_seed_categories.sql. Generated fixtures/canonical_items.json and migrations/002_seed.sql are produced by `cargo run -p buywise-cli -- generate-fixtures`. Edit this file, then regenerate; do not hand-edit outputs. Alias variants are verbatim here (NOT normalised); the generator applies the BuyWise normaliser (punctuation -> space) and dual-inserts each variant under both 'en' and 'es' as INPUT-LOCALE MATCHING BUCKETS (not linguistic assertions). Future matching MUST treat item_aliases.language as a ranking hint, not a hard filter, and GROUP BY canonical_item_id so dual-inserted aliases don't double-count.",
+  "household_id": "00000000-0000-0000-0000-000000000001",
+  "categories": [
+    {
+      "key": "produce",
+      "uuid": "c1000000-0000-0000-0000-000000000001",
+      "name_en": "Produce",
+      "name_es": "Frutas y Verduras",
+      "icon": "carrot",
+      "default_order": 1
+    },
+    {
+      "key": "meat_fish",
+      "uuid": "c1000000-0000-0000-0000-000000000002",
+      "name_en": "Meat & Fish",
+      "name_es": "Carne y Pescado",
+      "icon": "beef",
+      "default_order": 2
+    },
+    {
+      "key": "dairy",
+      "uuid": "c1000000-0000-0000-0000-000000000003",
+      "name_en": "Dairy",
+      "name_es": "Lácteos",
+      "icon": "milk",
+      "default_order": 3
+    },
+    {
+      "key": "bakery",
+      "uuid": "c1000000-0000-0000-0000-000000000004",
+      "name_en": "Bakery",
+      "name_es": "Panadería",
+      "icon": "bread-slice",
+      "default_order": 4
+    },
+    {
+      "key": "pantry",
+      "uuid": "c1000000-0000-0000-0000-000000000005",
+      "name_en": "Pantry",
+      "name_es": "Despensa",
+      "icon": "package",
+      "default_order": 5
+    },
+    {
+      "key": "frozen",
+      "uuid": "c1000000-0000-0000-0000-000000000006",
+      "name_en": "Frozen",
+      "name_es": "Congelados",
+      "icon": "snowflake",
+      "default_order": 6
+    },
+    {
+      "key": "snacks",
+      "uuid": "c1000000-0000-0000-0000-000000000007",
+      "name_en": "Snacks",
+      "name_es": "Snacks",
+      "icon": "cookie",
+      "default_order": 7
+    },
+    {
+      "key": "drinks",
+      "uuid": "c1000000-0000-0000-0000-000000000008",
+      "name_en": "Drinks",
+      "name_es": "Bebidas",
+      "icon": "cup-soda",
+      "default_order": 8
+    },
+    {
+      "key": "baby",
+      "uuid": "c1000000-0000-0000-0000-000000000009",
+      "name_en": "Baby",
+      "name_es": "Bebé",
+      "icon": "baby",
+      "default_order": 9
+    },
+    {
+      "key": "household",
+      "uuid": "c1000000-0000-0000-0000-000000000010",
+      "name_en": "Household",
+      "name_es": "Hogar y Limpieza",
+      "icon": "spray-can",
+      "default_order": 10
+    },
+    {
+      "key": "toiletries",
+      "uuid": "c1000000-0000-0000-0000-000000000011",
+      "name_en": "Toiletries",
+      "name_es": "Higiene Personal",
+      "icon": "bath",
+      "default_order": 11
+    }
+  ],
+  "items": [
+    {
+      "slug": "apple",
+      "name_en": "Apple",
+      "name_es": "Manzana",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "apples",
+        "manzanas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "banana",
+      "name_en": "Banana",
+      "name_es": "Platano",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "bananas",
+        "platanos",
+        "guineo",
+        "guineos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "orange",
+      "name_en": "Orange",
+      "name_es": "Naranja",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "oranges",
+        "naranjas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lemon",
+      "name_en": "Lemon",
+      "name_es": "Limon",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "lemons",
+        "limones"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lime",
+      "name_en": "Lime",
+      "name_es": "Lima",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "limes",
+        "limas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "grape",
+      "name_en": "Grape",
+      "name_es": "Uva",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "grapes",
+        "uvas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "strawberry",
+      "name_en": "Strawberry",
+      "name_es": "Fresa",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "strawberries",
+        "fresas",
+        "frutilla",
+        "frutillas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "blueberry",
+      "name_en": "Blueberry",
+      "name_es": "Arandano",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "blueberries",
+        "arandanos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "watermelon",
+      "name_en": "Watermelon",
+      "name_es": "Sandia",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sandias"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "melon",
+      "name_en": "Melon",
+      "name_es": "Melon",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "melons",
+        "melones",
+        "cantaloupe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pineapple",
+      "name_en": "Pineapple",
+      "name_es": "Pina",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pineapples",
+        "pinas",
+        "anana"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mango",
+      "name_en": "Mango",
+      "name_es": "Mango",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mangos",
+        "mangoes"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "peach",
+      "name_en": "Peach",
+      "name_es": "Durazno",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "peaches",
+        "duraznos",
+        "melocoton",
+        "melocotones"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pear",
+      "name_en": "Pear",
+      "name_es": "Pera",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pears",
+        "peras"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "avocado",
+      "name_en": "Avocado",
+      "name_es": "Aguacate",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "avocados",
+        "aguacates",
+        "palta",
+        "paltas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tomato",
+      "name_en": "Tomato",
+      "name_es": "Tomate",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "tomatoes",
+        "tomates",
+        "jitomate",
+        "jitomates"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "potato",
+      "name_en": "Potato",
+      "name_es": "Papa",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "potatoes",
+        "papas",
+        "patata",
+        "patatas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "onion",
+      "name_en": "Onion",
+      "name_es": "Cebolla",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "onions",
+        "cebollas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "garlic",
+      "name_en": "Garlic",
+      "name_es": "Ajo",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "ajos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "carrot",
+      "name_en": "Carrot",
+      "name_es": "Zanahoria",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "carrots",
+        "zanahorias"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "broccoli",
+      "name_en": "Broccoli",
+      "name_es": "Brocoli",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lettuce",
+      "name_en": "Lettuce",
+      "name_es": "Lechuga",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "lechugas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "spinach",
+      "name_en": "Spinach",
+      "name_es": "Espinaca",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "espinacas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cucumber",
+      "name_en": "Cucumber",
+      "name_es": "Pepino",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cucumbers",
+        "pepinos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "bell pepper",
+      "name_en": "Bell pepper",
+      "name_es": "Pimiento",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "bell peppers",
+        "pimientos",
+        "chile morron",
+        "chiles morrones"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "celery",
+      "name_en": "Celery",
+      "name_es": "Apio",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "corn",
+      "name_en": "Corn",
+      "name_es": "Maiz",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "elote",
+        "elotes",
+        "choclo"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mushroom",
+      "name_en": "Mushroom",
+      "name_es": "Champiñon",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mushrooms",
+        "champiñones",
+        "hongo",
+        "hongos",
+        "champinon",
+        "champinones"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "zucchini",
+      "name_en": "Zucchini",
+      "name_es": "Calabacin",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "zucchinis",
+        "calabacines",
+        "calabaza italiana"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "eggplant",
+      "name_en": "Eggplant",
+      "name_es": "Berenjena",
+      "category": "produce",
+      "default_constraint_policy": "any",
+      "variants": [
+        "eggplants",
+        "berenjenas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chicken",
+      "name_en": "Chicken",
+      "name_es": "Pollo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chicken breast",
+      "name_en": "Chicken breast",
+      "name_es": "Pechuga de pollo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chicken breasts",
+        "pechugas de pollo",
+        "pechuga"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chicken thigh",
+      "name_en": "Chicken thigh",
+      "name_es": "Muslo de pollo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chicken thighs",
+        "muslos de pollo"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ground beef",
+      "name_en": "Ground beef",
+      "name_es": "Carne molida",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "beef mince",
+        "minced beef",
+        "carne picada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "beef steak",
+      "name_en": "Beef steak",
+      "name_es": "Bistec",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "steak",
+        "steaks",
+        "bistecs",
+        "filete",
+        "filetes"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pork",
+      "name_en": "Pork",
+      "name_es": "Cerdo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "puerco",
+        "cochino"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pork chop",
+      "name_en": "Pork chop",
+      "name_es": "Chuleta de cerdo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pork chops",
+        "chuletas de cerdo",
+        "chuleta"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "bacon",
+      "name_en": "Bacon",
+      "name_es": "Tocino",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "panceta",
+        "tocineta"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ham",
+      "name_en": "Ham",
+      "name_es": "Jamon",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sausage",
+      "name_en": "Sausage",
+      "name_es": "Salchicha",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sausages",
+        "salchichas",
+        "chorizo",
+        "chorizos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "turkey",
+      "name_en": "Turkey",
+      "name_es": "Pavo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lamb",
+      "name_en": "Lamb",
+      "name_es": "Cordero",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "borrego"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "fish",
+      "name_en": "Fish",
+      "name_es": "Pescado",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "salmon",
+      "name_en": "Salmon",
+      "name_es": "Salmon",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tuna",
+      "name_en": "Tuna",
+      "name_es": "Atun",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "shrimp",
+      "name_en": "Shrimp",
+      "name_es": "Camaron",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "shrimps",
+        "camarones",
+        "gamba",
+        "gambas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cod",
+      "name_en": "Cod",
+      "name_es": "Bacalao",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tilapia",
+      "name_en": "Tilapia",
+      "name_es": "Tilapia",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "crab",
+      "name_en": "Crab",
+      "name_es": "Cangrejo",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "crabs",
+        "cangrejos",
+        "jaiba"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lobster",
+      "name_en": "Lobster",
+      "name_es": "Langosta",
+      "category": "meat_fish",
+      "default_constraint_policy": "any",
+      "variants": [
+        "lobsters",
+        "langostas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "milk",
+      "name_en": "Milk",
+      "name_es": "Leche",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "whole milk",
+      "name_en": "Whole milk",
+      "name_es": "Leche entera",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "skim milk",
+      "name_en": "Skim milk",
+      "name_es": "Leche descremada",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "nonfat milk",
+        "leche desnatada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "butter",
+      "name_en": "Butter",
+      "name_es": "Mantequilla",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "manteca"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cheese",
+      "name_en": "Cheese",
+      "name_es": "Queso",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cheeses",
+        "quesos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cheddar cheese",
+      "name_en": "Cheddar cheese",
+      "name_es": "Queso cheddar",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cheddar"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mozzarella",
+      "name_en": "Mozzarella",
+      "name_es": "Mozzarella",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "queso mozzarella"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cream cheese",
+      "name_en": "Cream cheese",
+      "name_es": "Queso crema",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "parmesan",
+      "name_en": "Parmesan",
+      "name_es": "Parmesano",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "queso parmesano"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "yogurt",
+      "name_en": "Yogurt",
+      "name_es": "Yogur",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "yoghurt",
+        "yogures"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "greek yogurt",
+      "name_en": "Greek yogurt",
+      "name_es": "Yogur griego",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "eggs",
+      "name_en": "Eggs",
+      "name_es": "Huevos",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "egg",
+        "huevo"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sour cream",
+      "name_en": "Sour cream",
+      "name_es": "Crema agria",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "crema acida",
+        "nata agria"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "heavy cream",
+      "name_en": "Heavy cream",
+      "name_es": "Crema de leche",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "whipping cream",
+        "nata para montar",
+        "crema para batir"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "half and half",
+      "name_en": "Half and half",
+      "name_es": "Media crema",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cottage cheese",
+      "name_en": "Cottage cheese",
+      "name_es": "Requeson",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ricotta",
+      "name_en": "Ricotta",
+      "name_es": "Ricotta",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "queso ricotta"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "oat milk",
+      "name_en": "Oat milk",
+      "name_es": "Leche de avena",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "almond milk",
+      "name_en": "Almond milk",
+      "name_es": "Leche de almendra",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "leche de almendras"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "soy milk",
+      "name_en": "Soy milk",
+      "name_es": "Leche de soya",
+      "category": "dairy",
+      "default_constraint_policy": "any",
+      "variants": [
+        "leche de soja"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "bread",
+      "name_en": "Bread",
+      "name_es": "Pan",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "breads",
+        "panes"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "white bread",
+      "name_en": "White bread",
+      "name_es": "Pan blanco",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "whole wheat bread",
+      "name_en": "Whole wheat bread",
+      "name_es": "Pan integral",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "wheat bread",
+        "pan de trigo integral"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baguette",
+      "name_en": "Baguette",
+      "name_es": "Baguette",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "baguettes",
+        "pan frances"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "roll",
+      "name_en": "Roll",
+      "name_es": "Bolillo",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "rolls",
+        "bolillos",
+        "panecillo",
+        "panecillos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tortilla",
+      "name_en": "Tortilla",
+      "name_es": "Tortilla",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "tortillas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "flour tortilla",
+      "name_en": "Flour tortilla",
+      "name_es": "Tortilla de harina",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "flour tortillas",
+        "tortillas de harina"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "corn tortilla",
+      "name_en": "Corn tortilla",
+      "name_es": "Tortilla de maiz",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "corn tortillas",
+        "tortillas de maiz"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "croissant",
+      "name_en": "Croissant",
+      "name_es": "Croissant",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "croissants",
+        "cuerno",
+        "cuernos",
+        "medialuna"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "muffin",
+      "name_en": "Muffin",
+      "name_es": "Muffin",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "muffins",
+        "panque",
+        "panques"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "donut",
+      "name_en": "Donut",
+      "name_es": "Dona",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "donuts",
+        "doughnut",
+        "doughnuts",
+        "donas",
+        "rosquilla"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "bagel",
+      "name_en": "Bagel",
+      "name_es": "Bagel",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "bagels"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pita bread",
+      "name_en": "Pita bread",
+      "name_es": "Pan pita",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pita",
+        "pitas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cake",
+      "name_en": "Cake",
+      "name_es": "Pastel",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cakes",
+        "pasteles",
+        "torta",
+        "bizcocho"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pie",
+      "name_en": "Pie",
+      "name_es": "Pay",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pies",
+        "tarta",
+        "tartas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cookies",
+      "name_en": "Cookies",
+      "name_es": "Galletas",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cookie",
+        "galleta"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "brownie",
+      "name_en": "Brownie",
+      "name_es": "Brownie",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "brownies"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cupcake",
+      "name_en": "Cupcake",
+      "name_es": "Cupcake",
+      "category": "bakery",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cupcakes",
+        "panquecito",
+        "pastelito"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "rice",
+      "name_en": "Rice",
+      "name_es": "Arroz",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "white rice",
+      "name_en": "White rice",
+      "name_es": "Arroz blanco",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "brown rice",
+      "name_en": "Brown rice",
+      "name_es": "Arroz integral",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pasta",
+      "name_en": "Pasta",
+      "name_es": "Pasta",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pastas",
+        "fideos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "spaghetti",
+      "name_en": "Spaghetti",
+      "name_es": "Espagueti",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "espaguetis"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "macaroni",
+      "name_en": "Macaroni",
+      "name_es": "Macarrones",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "coditos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "flour",
+      "name_en": "Flour",
+      "name_es": "Harina",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sugar",
+      "name_en": "Sugar",
+      "name_es": "Azucar",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "brown sugar",
+      "name_en": "Brown sugar",
+      "name_es": "Azucar morena",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "piloncillo",
+        "panela"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "salt",
+      "name_en": "Salt",
+      "name_es": "Sal",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pepper",
+      "name_en": "Pepper",
+      "name_es": "Pimienta",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "black pepper",
+        "pimienta negra"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "olive oil",
+      "name_en": "Olive oil",
+      "name_es": "Aceite de oliva",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "vegetable oil",
+      "name_en": "Vegetable oil",
+      "name_es": "Aceite vegetal",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cooking oil",
+        "aceite de cocina"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "vinegar",
+      "name_en": "Vinegar",
+      "name_es": "Vinagre",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "soy sauce",
+      "name_en": "Soy sauce",
+      "name_es": "Salsa de soya",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "salsa de soja"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ketchup",
+      "name_en": "Ketchup",
+      "name_es": "Ketchup",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "catsup",
+        "salsa catsup"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mustard",
+      "name_en": "Mustard",
+      "name_es": "Mostaza",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mayonnaise",
+      "name_en": "Mayonnaise",
+      "name_es": "Mayonesa",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mayo"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "hot sauce",
+      "name_en": "Hot sauce",
+      "name_es": "Salsa picante",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chile sauce"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "honey",
+      "name_en": "Honey",
+      "name_es": "Miel",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "peanut butter",
+      "name_en": "Peanut butter",
+      "name_es": "Crema de cacahuate",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mantequilla de mani",
+        "crema de mani"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "jam",
+      "name_en": "Jam",
+      "name_es": "Mermelada",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "jelly",
+        "jalea"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "canned beans",
+      "name_en": "Canned beans",
+      "name_es": "Frijoles enlatados",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "beans",
+        "frijoles"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "black beans",
+      "name_en": "Black beans",
+      "name_es": "Frijoles negros",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "canned tomatoes",
+      "name_en": "Canned tomatoes",
+      "name_es": "Tomates enlatados",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "diced tomatoes",
+        "jitomates enlatados"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tomato sauce",
+      "name_en": "Tomato sauce",
+      "name_es": "Salsa de tomate",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pure de tomate"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chicken broth",
+      "name_en": "Chicken broth",
+      "name_es": "Caldo de pollo",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chicken stock",
+        "consomé de pollo"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cereal",
+      "name_en": "Cereal",
+      "name_es": "Cereal",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cereals",
+        "cereales"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "oatmeal",
+      "name_en": "Oatmeal",
+      "name_es": "Avena",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "oats",
+        "hojuelas de avena"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "coffee",
+      "name_en": "Coffee",
+      "name_es": "Cafe",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tea",
+      "name_en": "Tea",
+      "name_es": "Te",
+      "category": "pantry",
+      "default_constraint_policy": "any",
+      "variants": [
+        "teas",
+        "tes"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ice cream",
+      "name_en": "Ice cream",
+      "name_es": "Helado",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "helados",
+        "nieve"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen pizza",
+      "name_en": "Frozen pizza",
+      "name_es": "Pizza congelada",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen vegetables",
+      "name_en": "Frozen vegetables",
+      "name_es": "Verduras congeladas",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "vegetales congelados"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen fruit",
+      "name_en": "Frozen fruit",
+      "name_es": "Fruta congelada",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "frutas congeladas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen peas",
+      "name_en": "Frozen peas",
+      "name_es": "Chicharos congelados",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "peas",
+        "chicharos",
+        "guisantes congelados"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen corn",
+      "name_en": "Frozen corn",
+      "name_es": "Maiz congelado",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "elote congelado"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen chicken",
+      "name_en": "Frozen chicken",
+      "name_es": "Pollo congelado",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen fish",
+      "name_en": "Frozen fish",
+      "name_es": "Pescado congelado",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen shrimp",
+      "name_en": "Frozen shrimp",
+      "name_es": "Camarones congelados",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen fries",
+      "name_en": "Frozen fries",
+      "name_es": "Papas congeladas",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "french fries",
+        "papas fritas congeladas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen waffles",
+      "name_en": "Frozen waffles",
+      "name_es": "Waffles congelados",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "waffles"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ice",
+      "name_en": "Ice",
+      "name_es": "Hielo",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "hielos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen burrito",
+      "name_en": "Frozen burrito",
+      "name_es": "Burrito congelado",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "frozen burritos",
+        "burritos congelados"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen lasagna",
+      "name_en": "Frozen lasagna",
+      "name_es": "Lasaña congelada",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "lasagna"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen dinner",
+      "name_en": "Frozen dinner",
+      "name_es": "Comida congelada",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "tv dinner",
+        "cena congelada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "popsicle",
+      "name_en": "Popsicle",
+      "name_es": "Paleta",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "popsicles",
+        "paletas",
+        "ice pop"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "frozen berries",
+      "name_en": "Frozen berries",
+      "name_es": "Moras congeladas",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [
+        "berries congeladas",
+        "frutos rojos congelados"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sorbet",
+      "name_en": "Sorbet",
+      "name_es": "Sorbete",
+      "category": "frozen",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chips",
+      "name_en": "Chips",
+      "name_es": "Papas fritas",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "potato chips",
+        "papitas",
+        "frituras"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tortilla chips",
+      "name_en": "Tortilla chips",
+      "name_es": "Totopos",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "nachos",
+        "chips de tortilla"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "popcorn",
+      "name_en": "Popcorn",
+      "name_es": "Palomitas",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "palomitas de maiz",
+        "pochoclo",
+        "cotufas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pretzels",
+      "name_en": "Pretzels",
+      "name_es": "Pretzels",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pretzel"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "crackers",
+      "name_en": "Crackers",
+      "name_es": "Galletas saladas",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cracker",
+        "galletas de soda"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "nuts",
+      "name_en": "Nuts",
+      "name_es": "Nueces",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mixed nuts",
+        "nueces mixtas",
+        "frutos secos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "peanuts",
+      "name_en": "Peanuts",
+      "name_es": "Cacahuates",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "peanut",
+        "cacahuate",
+        "mani",
+        "manies"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "almonds",
+      "name_en": "Almonds",
+      "name_es": "Almendras",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "almond",
+        "almendra"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "granola bar",
+      "name_en": "Granola bar",
+      "name_es": "Barra de granola",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "granola bars",
+        "barras de granola"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "chocolate",
+      "name_en": "Chocolate",
+      "name_es": "Chocolate",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chocolates"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "candy",
+      "name_en": "Candy",
+      "name_es": "Dulces",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "candies",
+        "dulce",
+        "caramelos",
+        "golosinas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "gum",
+      "name_en": "Gum",
+      "name_es": "Chicle",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "chewing gum",
+        "chicles"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "dried fruit",
+      "name_en": "Dried fruit",
+      "name_es": "Fruta seca",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "frutas secas",
+        "fruta deshidratada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "raisins",
+      "name_en": "Raisins",
+      "name_es": "Pasas",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "raisin",
+        "pasa",
+        "pasitas",
+        "uvas pasas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "trail mix",
+      "name_en": "Trail mix",
+      "name_es": "Mezcla de frutos secos",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "beef jerky",
+      "name_en": "Beef jerky",
+      "name_es": "Cecina",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "jerky",
+        "carne seca"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cheese puffs",
+      "name_en": "Cheese puffs",
+      "name_es": "Cheetos",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cheese balls",
+        "bolitas de queso"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "rice cakes",
+      "name_en": "Rice cakes",
+      "name_es": "Tortitas de arroz",
+      "category": "snacks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "rice cake",
+        "galletas de arroz"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "water",
+      "name_en": "Water",
+      "name_es": "Agua",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "bottled water",
+        "agua embotellada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sparkling water",
+      "name_en": "Sparkling water",
+      "name_es": "Agua mineral",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "seltzer",
+        "agua con gas",
+        "agua gasificada"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "juice",
+      "name_en": "Juice",
+      "name_es": "Jugo",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "juices",
+        "jugos",
+        "zumo",
+        "zumos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "orange juice",
+      "name_en": "Orange juice",
+      "name_es": "Jugo de naranja",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "oj",
+        "zumo de naranja"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "apple juice",
+      "name_en": "Apple juice",
+      "name_es": "Jugo de manzana",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "zumo de manzana"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "soda",
+      "name_en": "Soda",
+      "name_es": "Refresco",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "soft drink",
+        "pop",
+        "refrescos",
+        "gaseosa"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cola",
+      "name_en": "Cola",
+      "name_es": "Cola",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "coke",
+        "coca cola",
+        "pepsi"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lemonade",
+      "name_en": "Lemonade",
+      "name_es": "Limonada",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "iced tea",
+      "name_en": "Iced tea",
+      "name_es": "Te helado",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "ice tea",
+        "te frio"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "energy drink",
+      "name_en": "Energy drink",
+      "name_es": "Bebida energetica",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "energy drinks",
+        "bebidas energeticas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sports drink",
+      "name_en": "Sports drink",
+      "name_es": "Bebida deportiva",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sports drinks",
+        "bebida isotonica",
+        "gatorade"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "beer",
+      "name_en": "Beer",
+      "name_es": "Cerveza",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "beers",
+        "cervezas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "wine",
+      "name_en": "Wine",
+      "name_es": "Vino",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "wines",
+        "vinos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "red wine",
+      "name_en": "Red wine",
+      "name_es": "Vino tinto",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "white wine",
+      "name_en": "White wine",
+      "name_es": "Vino blanco",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "coconut water",
+      "name_en": "Coconut water",
+      "name_es": "Agua de coco",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "smoothie",
+      "name_en": "Smoothie",
+      "name_es": "Batido",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "smoothies",
+        "batidos",
+        "licuado"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "hot chocolate",
+      "name_en": "Hot chocolate",
+      "name_es": "Chocolate caliente",
+      "category": "drinks",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cocoa",
+        "cacao"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "diapers",
+      "name_en": "Diapers",
+      "name_es": "Pañales",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "diaper",
+        "pañal",
+        "panales",
+        "panal"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby wipes",
+      "name_en": "Baby wipes",
+      "name_es": "Toallitas para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "wipes",
+        "toallitas humedas",
+        "toallitas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby formula",
+      "name_en": "Baby formula",
+      "name_es": "Formula para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "formula",
+        "leche de formula",
+        "leche para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby food",
+      "name_en": "Baby food",
+      "name_es": "Comida para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "papilla",
+        "papillas",
+        "pure para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby cereal",
+      "name_en": "Baby cereal",
+      "name_es": "Cereal para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby bottle",
+      "name_en": "Baby bottle",
+      "name_es": "Biberon",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "baby bottles",
+        "biberones",
+        "mamila",
+        "mamadera"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "pacifier",
+      "name_en": "Pacifier",
+      "name_es": "Chupete",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pacifiers",
+        "chupetes",
+        "chupon",
+        "chupones"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby lotion",
+      "name_en": "Baby lotion",
+      "name_es": "Locion para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "crema para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby shampoo",
+      "name_en": "Baby shampoo",
+      "name_es": "Champu para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "shampoo para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby powder",
+      "name_en": "Baby powder",
+      "name_es": "Talco para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "talco",
+        "polvo para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "diaper cream",
+      "name_en": "Diaper cream",
+      "name_es": "Crema para rozaduras",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "diaper rash cream",
+        "crema antipañalitis"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "baby oil",
+      "name_en": "Baby oil",
+      "name_es": "Aceite para bebe",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "teething ring",
+      "name_en": "Teething ring",
+      "name_es": "Mordedor",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "teether",
+        "teethers",
+        "mordedores"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sippy cup",
+      "name_en": "Sippy cup",
+      "name_es": "Vaso entrenador",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sippy cups",
+        "vasos entrenadores",
+        "vaso para bebe"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "paper towels",
+      "name_en": "Paper towels",
+      "name_es": "Toallas de papel",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "paper towel",
+        "servitoallas",
+        "papel de cocina"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "toilet paper",
+      "name_en": "Toilet paper",
+      "name_es": "Papel higienico",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "toilet tissue",
+        "papel de baño"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "tissues",
+      "name_en": "Tissues",
+      "name_es": "Pañuelos desechables",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "tissue",
+        "kleenex",
+        "pañuelos de papel"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "trash bags",
+      "name_en": "Trash bags",
+      "name_es": "Bolsas de basura",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "garbage bags",
+        "bolsas para basura"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "dish soap",
+      "name_en": "Dish soap",
+      "name_es": "Jabon para trastes",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "dishwashing liquid",
+        "lavatrastes",
+        "detergente para platos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "laundry detergent",
+      "name_en": "Laundry detergent",
+      "name_es": "Detergente para ropa",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "laundry soap",
+        "detergente",
+        "jabon para ropa"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "fabric softener",
+      "name_en": "Fabric softener",
+      "name_es": "Suavizante",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "suavizante de ropa",
+        "suavitel"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "bleach",
+      "name_en": "Bleach",
+      "name_es": "Cloro",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "blanqueador",
+        "lejia"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "all purpose cleaner",
+      "name_en": "All purpose cleaner",
+      "name_es": "Limpiador multiusos",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "multi purpose cleaner",
+        "limpiador"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "glass cleaner",
+      "name_en": "Glass cleaner",
+      "name_es": "Limpiador de vidrios",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "window cleaner",
+        "limpiavidrios"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sponge",
+      "name_en": "Sponge",
+      "name_es": "Esponja",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sponges",
+        "esponjas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "aluminum foil",
+      "name_en": "Aluminum foil",
+      "name_es": "Papel aluminio",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "foil",
+        "aluminio",
+        "papel de aluminio"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "plastic wrap",
+      "name_en": "Plastic wrap",
+      "name_es": "Plastico adherente",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cling wrap",
+        "saran wrap",
+        "papel film"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "ziplock bags",
+      "name_en": "Ziplock bags",
+      "name_es": "Bolsas con cierre",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "ziploc",
+        "bolsas hermeticas",
+        "bolsas ziploc"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "batteries",
+      "name_en": "Batteries",
+      "name_es": "Pilas",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "battery",
+        "pila",
+        "baterias"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "light bulb",
+      "name_en": "Light bulb",
+      "name_es": "Foco",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "light bulbs",
+        "bulb",
+        "focos",
+        "bombilla",
+        "bombillas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "candles",
+      "name_en": "Candles",
+      "name_es": "Velas",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "candle",
+        "vela"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "matches",
+      "name_en": "Matches",
+      "name_es": "Cerillos",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "match",
+        "cerillo",
+        "fosforos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "broom",
+      "name_en": "Broom",
+      "name_es": "Escoba",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "escobas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mop",
+      "name_en": "Mop",
+      "name_es": "Trapeador",
+      "category": "household",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mops",
+        "trapeadores",
+        "fregona"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "shampoo",
+      "name_en": "Shampoo",
+      "name_es": "Champu",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "shampoos",
+        "champus"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "conditioner",
+      "name_en": "Conditioner",
+      "name_es": "Acondicionador",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "hair conditioner",
+        "acondicionadores"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "body wash",
+      "name_en": "Body wash",
+      "name_es": "Jabon liquido corporal",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "shower gel",
+        "gel de ducha",
+        "gel de baño"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "soap",
+      "name_en": "Soap",
+      "name_es": "Jabon",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "soaps",
+        "jabones",
+        "bar soap",
+        "jabon en barra"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "toothpaste",
+      "name_en": "Toothpaste",
+      "name_es": "Pasta de dientes",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "pasta dental",
+        "crema dental"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "toothbrush",
+      "name_en": "Toothbrush",
+      "name_es": "Cepillo de dientes",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "toothbrushes",
+        "cepillos de dientes",
+        "cepillo dental"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "mouthwash",
+      "name_en": "Mouthwash",
+      "name_es": "Enjuague bucal",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "mouth rinse",
+        "enjuague dental"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "dental floss",
+      "name_en": "Dental floss",
+      "name_es": "Hilo dental",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "floss"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "deodorant",
+      "name_en": "Deodorant",
+      "name_es": "Desodorante",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "deodorants",
+        "desodorantes",
+        "antitranspirante"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "razor",
+      "name_en": "Razor",
+      "name_es": "Rastrillo",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "razors",
+        "rastrillos",
+        "navaja de afeitar",
+        "maquinilla"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "shaving cream",
+      "name_en": "Shaving cream",
+      "name_es": "Crema de afeitar",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "shaving foam",
+        "espuma de afeitar"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "lotion",
+      "name_en": "Lotion",
+      "name_es": "Crema corporal",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "body lotion",
+        "crema humectante",
+        "locion corporal"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "sunscreen",
+      "name_en": "Sunscreen",
+      "name_es": "Protector solar",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sunblock",
+        "bloqueador solar",
+        "bronceador"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "hand sanitizer",
+      "name_en": "Hand sanitizer",
+      "name_es": "Gel antibacterial",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "sanitizer",
+        "desinfectante de manos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cotton balls",
+      "name_en": "Cotton balls",
+      "name_es": "Bolitas de algodon",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "cotton",
+        "algodon"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "cotton swabs",
+      "name_en": "Cotton swabs",
+      "name_es": "Hisopos",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "q tips",
+        "qtips",
+        "cotonetes",
+        "bastoncillos"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "band aids",
+      "name_en": "Band aids",
+      "name_es": "Curitas",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "bandages",
+        "bandaids",
+        "tiritas",
+        "venditas"
+      ],
+      "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "feminine products",
+      "name_en": "Feminine products",
+      "name_es": "Productos femeninos",
+      "category": "toiletries",
+      "default_constraint_policy": "any",
+      "variants": [
+        "tampons",
+        "pads",
+        "toallas sanitarias",
+        "tampones"
+      ],
+      "provenance": "shoppy_seed"
+    }
+  ]
+}

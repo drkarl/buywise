@@ -306,16 +306,20 @@ mod tests {
         // Repeatedly acquire connections and query a migrated table. If the
         // pool opened independent in-memory DBs, one of these would hit an
         // empty connection and fail with "no such table".
+        // `categories` is seeded by 002_seed.sql with 11 rows; a consistent
+        // non-zero count on every checkout proves the migrated+seeded schema is
+        // shared (an independent empty DB would return 0 or "no such table").
         for _ in 0..5 {
             let mut conn = pool.acquire().await.expect("acquire connection");
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM categories")
                 .fetch_one(&mut *conn)
                 .await
                 .expect("categories table visible on this connection");
-            assert_eq!(count, 0);
+            assert_eq!(count, 11);
         }
 
-        // The same must hold when querying through the pool directly.
+        // The same must hold when querying through the pool directly. The seed
+        // does not touch product_offers, so it stays empty.
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_offers")
             .fetch_one(&pool)
             .await
