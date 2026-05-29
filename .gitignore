@@ -4,6 +4,9 @@ target/
 *.db-shm
 *.db-wal
 
+# Local git worktrees
+.worktrees/
+
 # SvelteKit
 frontend/node_modules/
 frontend/.svelte-kit/
