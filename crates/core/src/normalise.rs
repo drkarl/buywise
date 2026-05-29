@@ -29,10 +29,10 @@ use unicode_normalization::UnicodeNormalization;
 /// Keep this table short and explicit. Anything not listed here follows the
 /// default rule, so e.g. `"coca-cola"` stays `"coca cola"`.
 const BRAND_COMPACTIONS: &[(&str, &str)] = &[
-    // The canonical design-doc example: "7-up" is the brand "7up".
+    // The canonical design-doc example: "7-up" is the brand "7up". Only the
+    // hyphenated form is compacted: a spaced "7 up" entry would be a substring
+    // replace that corrupts unrelated text (e.g. "level 7 update").
     ("7-up", "7up"),
-    // "7 up" (already spaced) should also compact to the brand token.
-    ("7 up", "7up"),
 ];
 
 /// Normalise text for matching.
@@ -65,9 +65,7 @@ pub fn normalize(text: &str) -> String {
     // 2. Brand compaction (before punctuation handling). Case-insensitive is
     //    unnecessary now that we have already lowercased.
     for (from, to) in BRAND_COMPACTIONS {
-        if lowered.contains(from) {
-            lowered = lowered.replace(from, to);
-        }
+        lowered = lowered.replace(from, to);
     }
 
     // 3. NFD + strip combining marks. 4. Punctuation → space.
@@ -191,7 +189,10 @@ fn split_number_unit(token: &str) -> Option<(f64, String)> {
         .or_else(|| token.strip_suffix('x'))
         .unwrap_or(token);
 
-    // The numeric prefix: digits and at most one decimal point.
+    // The numeric prefix: digits and at most one decimal point. Note: the '.'
+    // is only consumed here as part of a number token; a free-standing decimal
+    // in raw item text (e.g. the "2.5" in "2.5 milk", which is not a recognised
+    // count/size token) is later turned into a space by normalize().
     let mut num = String::new();
     let mut rest_start = 0;
     let mut seen_dot = false;
@@ -217,6 +218,20 @@ fn split_number_unit(token: &str) -> Option<(f64, String)> {
     Some((value, unit))
 }
 
+/// Validate a parsed numeric value as a count.
+///
+/// A count must be a finite, positive (`> 0`) integer that fits in `u32`.
+/// Anything else — a fraction, zero, a negative, or a value too large for
+/// `u32` — is rejected (returns `None`) so the token is left in the item text
+/// and the count defaults to 1, rather than silently saturating at
+/// [`u32::MAX`] via an `as` cast.
+fn count_from_value(value: f64) -> Option<u32> {
+    if !value.is_finite() || value.fract() != 0.0 || value <= 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(value as u32)
+}
+
 /// Try to classify a single token as a count or a size constraint.
 ///
 /// * A bare number, `"2x"`, or `"x2"` → [`Token::Count`].
@@ -229,17 +244,13 @@ fn classify_token(token: &str) -> Option<Token> {
         return Some(Token::Count(n));
     }
 
-    let had_x = token.starts_with('x') || token.ends_with('x');
     let (value, unit) = split_number_unit(token)?;
 
     if unit.is_empty() {
-        // Bare number or "2x"/"x2": a count. Fractional counts are not
-        // meaningful, so a non-integer bare number is not treated as a count.
-        if value.fract() != 0.0 {
-            return None;
-        }
-        let _ = had_x; // 'x' just confirms intent; a bare number counts too.
-        return Some(Token::Count(value as u32));
+        // Bare number or "2x"/"x2": a count. Only a finite, positive integer in
+        // u32 range is a valid count; anything else (fraction, zero, negative,
+        // out-of-range) is left in the item text with count defaulting to 1.
+        return count_from_value(value).map(Token::Count);
     }
 
     // Number + unit: a size constraint, if the unit is recognised.
@@ -248,6 +259,25 @@ fn classify_token(token: &str) -> Option<Token> {
         value: value * multiplier,
         basis,
     }))
+}
+
+/// Try to read a spaced `<number> <unit>` pair, where `num_token` is a digit
+/// number (`"500"`, `"2.5"`) or a word-number (`"dos"`) and `unit_token` is a
+/// recognised (long- or short-form) unit. Returns the [`RequestedSize`] in SI
+/// units, or `None` if either token does not fit.
+fn spaced_number_unit(num_token: &str, unit_token: &str) -> Option<RequestedSize> {
+    let (basis, multiplier) = unit_to_basis(&unit_token.to_lowercase())?;
+    let value =
+        word_number(num_token)
+            .map(f64::from)
+            .or_else(|| match split_number_unit(num_token) {
+                Some((value, unit)) if unit.is_empty() => Some(value),
+                _ => None,
+            })?;
+    Some(RequestedSize {
+        value: value * multiplier,
+        basis,
+    })
 }
 
 /// Build a [`ParsedInput`] from the chosen count/size token and the residual
@@ -283,6 +313,9 @@ fn build(original: &str, residual: &[&str], token: Option<Token>) -> ParsedInput
 ///
 /// Follows Shoppy's first-token-then-last-token strategy: the first token is
 /// tried; failing that, the last token (only when there are at least two).
+///
+/// A quantity-only input such as `"500g"` is intentionally allowed to yield an
+/// empty `text`: the size is consumed and there is no residual item name.
 pub fn parse_count_and_size(input: &str) -> ParsedInput {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -300,21 +333,17 @@ pub fn parse_count_and_size(input: &str) -> ParsedInput {
     // token, e.g. "dos litros leche" or "500 gramos jamon" → a size. (The
     // joined form like "500g" is a single token handled by classify_token;
     // this covers the spaced form, common with Spanish long-form units.)
+    //
+    // Try the *leading* pair (tokens 0..=1), then the *trailing* pair
+    // (last two tokens, e.g. "leche 2 litros" / "leche dos litros"). The
+    // leading pair takes precedence to mirror the first-then-last strategy.
     if tokens.len() >= 2 {
-        if let Some((basis, multiplier)) = unit_to_basis(&tokens[1].to_lowercase()) {
-            let leading_value = word_number(tokens[0]).map(f64::from).or_else(|| {
-                match split_number_unit(tokens[0]) {
-                    Some((value, unit)) if unit.is_empty() => Some(value),
-                    _ => None,
-                }
-            });
-            if let Some(value) = leading_value {
-                let size = RequestedSize {
-                    value: value * multiplier,
-                    basis,
-                };
-                return build(input, &tokens[2..], Some(Token::Size(size)));
-            }
+        if let Some(size) = spaced_number_unit(tokens[0], tokens[1]) {
+            return build(input, &tokens[2..], Some(Token::Size(size)));
+        }
+        let last = tokens.len() - 1;
+        if let Some(size) = spaced_number_unit(tokens[last - 1], tokens[last]) {
+            return build(input, &tokens[..last - 1], Some(Token::Size(size)));
         }
     }
 
@@ -439,13 +468,22 @@ mod tests {
 
     #[test]
     fn normalize_brand_compaction() {
-        // Brand-compaction table: "7-up" and "7 up" compact to "7up".
+        // Brand-compaction table: only the hyphenated "7-up" compacts to "7up".
         assert_eq!(normalize("7-up"), "7up");
         assert_eq!(normalize("7-Up Zero"), "7up zero");
-        assert_eq!(normalize("7 up"), "7up");
         // Not in the table → default punctuation→space rule.
         assert_eq!(normalize("coca-cola"), "coca cola");
         assert_eq!(normalize("pepsi-max"), "pepsi max");
+    }
+
+    #[test]
+    fn normalize_brand_compaction_does_not_over_reach() {
+        // A spaced "7 up" entry would substring-replace into unrelated text;
+        // it was removed. These must NOT be compacted.
+        assert_eq!(normalize("level 7 update"), "level 7 update");
+        assert_eq!(normalize("lot 7 upgrade"), "lot 7 upgrade");
+        // The hyphenated brand form still compacts.
+        assert_eq!(normalize("7-up"), "7up");
     }
 
     // ---- to_display_name ----------------------------------------------------
@@ -671,6 +709,56 @@ mod tests {
         assert_eq!(p.text, "leche");
     }
 
+    #[test]
+    fn parse_trailing_spaced_number_plus_long_unit() {
+        // M1: a trailing "<number> <long-unit>" pair, mirroring the leading
+        // path. Previously "leche 2 litros" yielded no size.
+        let p = parse_count_and_size("leche 2 litros");
+        assert_eq!(p.text, "leche");
+        assert_eq!(p.count, 1);
+        assert_eq!(size(&p).value, 2000.0);
+        assert_eq!(size(&p).basis, SizeBasis::Millilitres);
+
+        // Trailing word-number pair.
+        let p = parse_count_and_size("leche dos litros");
+        assert_eq!(p.text, "leche");
+        assert_eq!(p.count, 1);
+        assert_eq!(size(&p).value, 2000.0);
+        assert_eq!(size(&p).basis, SizeBasis::Millilitres);
+
+        // Trailing digit + grams.
+        let p = parse_count_and_size("jamon 500 gramos");
+        assert_eq!(p.text, "jamon");
+        assert_eq!(size(&p).value, 500.0);
+        assert_eq!(size(&p).basis, SizeBasis::Grams);
+
+        // Leading pair still takes precedence when both could match.
+        let p = parse_count_and_size("dos litros leche");
+        assert_eq!(p.text, "leche");
+        assert_eq!(size(&p).value, 2000.0);
+    }
+
+    #[test]
+    fn parse_count_bounds_check() {
+        // M2: a value too large for u32 must not silently saturate; the token
+        // stays in the item text and count defaults to 1.
+        let p = parse_count_and_size("999999999999999 items");
+        assert_eq!(p.count, 1);
+        assert_eq!(p.text, "999999999999999 items");
+        assert!(p.requested_size.is_none());
+
+        // Zero is not a meaningful count → not consumed, count defaults to 1.
+        let p = parse_count_and_size("0 milk");
+        assert_eq!(p.count, 1);
+        assert_eq!(p.text, "0 milk");
+        assert!(p.requested_size.is_none());
+
+        // The boundary value u32::MAX is still a valid count.
+        let p = parse_count_and_size(&format!("{} items", u32::MAX));
+        assert_eq!(p.count, u32::MAX);
+        assert_eq!(p.text, "items");
+    }
+
     // ---- parse_count_and_size: edge cases -----------------------------------
 
     #[test]
@@ -717,11 +805,14 @@ mod tests {
     #[test]
     fn parse_imperial_units_are_not_sizes() {
         // INTENTIONAL DIFFERENCE: Shoppy recognised lb/oz/pt/etc. as units.
-        // BuyWise's SizeBasis only covers SI weight/volume, so "2lb" has no
-        // SI basis and is treated as a count of 2 with residual unit text.
-        // The important guarantee is no size is produced.
+        // BuyWise's SizeBasis only covers SI weight/volume, so an unknown unit
+        // like "lb" is not a size. "1lb" is a single token with a non-empty,
+        // unrecognised unit, so it is not a count either: the token is left in
+        // the item text and count defaults to 1.
         let p = parse_count_and_size("1lb butter");
         assert!(p.requested_size.is_none());
+        assert_eq!(p.count, 1);
+        assert_eq!(p.text, "1lb butter");
     }
 
     #[test]
