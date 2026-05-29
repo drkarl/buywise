@@ -25,16 +25,42 @@ pub enum DbError {
     Json1Unavailable,
 }
 
+/// True for URLs that resolve to a private (non-shared-cache) in-memory database.
+///
+/// Each connection to `sqlite::memory:` (or `sqlite://:memory:`) opens its OWN
+/// independent database. With a multi-connection pool, a migration applied on
+/// one connection would be invisible to queries that later acquire a different,
+/// empty connection. We special-case these URLs to a single connection so the
+/// schema is shared across all pool checkouts.
+///
+/// URLs that opt into a shared cache (`cache=shared`) genuinely share one
+/// in-memory database across connections and are left untouched.
+fn is_private_memory_url(database_url: &str) -> bool {
+    let lower = database_url.to_ascii_lowercase();
+    let is_memory = lower.contains(":memory:") || lower.contains("mode=memory");
+    is_memory && !lower.contains("cache=shared")
+}
+
 /// Open a pooled connection to `database_url`.
 ///
-/// For file-backed URLs the database is created if missing. `PRAGMA
-/// foreign_keys = ON` is applied to every connection in the pool.
+/// For file-backed URLs the database is created if missing and the pool may hold
+/// multiple connections. `PRAGMA foreign_keys = ON` is applied to every
+/// connection in the pool.
+///
+/// Private in-memory URLs (e.g. `sqlite::memory:`) are capped at a single
+/// connection: a wider pool would give each connection its own empty database,
+/// making a migration run on one connection invisible to the next checkout.
 pub async fn connect(database_url: &str) -> Result<SqlitePool, DbError> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true);
 
-    let pool = SqlitePoolOptions::new().connect_with(options).await?;
+    let mut pool_options = SqlitePoolOptions::new();
+    if is_private_memory_url(database_url) {
+        pool_options = pool_options.max_connections(1);
+    }
+
+    let pool = pool_options.connect_with(options).await?;
     Ok(pool)
 }
 
@@ -56,12 +82,26 @@ pub async fn assert_json1(pool: &SqlitePool) -> Result<(), DbError> {
     let length: i64 = sqlx::query_scalar("SELECT json_array_length('[]')")
         .fetch_one(pool)
         .await
-        .map_err(|_| DbError::Json1Unavailable)?;
+        .map_err(map_json1_error)?;
 
     if length != 0 {
         return Err(DbError::Json1Unavailable);
     }
     Ok(())
+}
+
+/// Classify the error from the JSON1 probe query.
+///
+/// Only a genuine "no such function" database error means JSON1 is missing; any
+/// other failure (closed pool, I/O error, ...) is propagated unchanged via
+/// [`DbError::Sqlx`] rather than being misreported as JSON1-unavailable.
+fn map_json1_error(err: sqlx::Error) -> DbError {
+    if let Some(db_err) = err.as_database_error() {
+        if db_err.message().contains("no such function") {
+            return DbError::Json1Unavailable;
+        }
+    }
+    DbError::Sqlx(err)
 }
 
 #[cfg(test)]
@@ -165,11 +205,15 @@ mod tests {
         let pool = fresh_pool().await;
 
         // CHECK constraints are stored inline in the table DDL in sqlite_master.
+        // Assert the *full* enum list per column so a narrowed enum is caught.
         let canonical = object_sql(&pool, "table", "canonical_items")
             .await
             .expect("canonical_items DDL");
         assert!(canonical.contains("CHECK"));
-        assert!(canonical.contains("'own_label'"));
+        assert!(canonical.contains(
+            "default_constraint_policy IN\n              \
+             ('any','brand','allowed_set','own_label','exact','ask')"
+        ));
 
         let aliases = object_sql(&pool, "table", "item_aliases")
             .await
@@ -181,26 +225,33 @@ mod tests {
             .await
             .expect("item_constraints DDL");
         assert!(constraints.contains("substitution_policy IN ('any','ask','strict')"));
+        assert!(constraints.contains("preferred_size_basis IN ('g','ml','each')"));
+        assert!(constraints.contains("min_size_basis IN ('g','ml','each')"));
+        assert!(constraints.contains("max_size_basis IN ('g','ml','each')"));
 
         let runs = object_sql(&pool, "table", "source_runs")
             .await
             .expect("source_runs DDL");
         assert!(runs.contains("status IN ('running','success','failed')"));
+        assert!(runs.contains("source IN ('basketwatch','lidl_direct','manual')"));
 
         let products = object_sql(&pool, "table", "retailer_products")
             .await
             .expect("retailer_products DDL");
         assert!(products.contains("retailer IN ('tesco','dunnes','supervalu','aldi','lidl')"));
+        assert!(products.contains("source IN ('basketwatch','lidl_direct','manual')"));
 
         let offers = object_sql(&pool, "table", "product_offers")
             .await
             .expect("product_offers DDL");
         assert!(offers.contains("source_confidence_at_ingest IN ('high','medium','low')"));
+        assert!(offers.contains("loyalty_scheme IN ('clubcard','real_rewards')"));
 
         let matches = object_sql(&pool, "table", "product_matches")
             .await
             .expect("product_matches DDL");
         assert!(matches.contains("status IN ('accepted','rejected','suggested','pending')"));
+        assert!(matches.contains("matched_by IN ('user','system','llm')"));
     }
 
     #[tokio::test]
@@ -242,5 +293,104 @@ mod tests {
         assert_json1(&pool)
             .await
             .expect("JSON1 should be available");
+    }
+
+    /// M1: with a private in-memory URL the pool must be capped at one
+    /// connection, so the schema applied during migration is visible to every
+    /// subsequent checkout. Acquire several connections and query a migrated
+    /// table on each to prove the schema is shared.
+    #[tokio::test]
+    async fn in_memory_schema_visible_across_connections() {
+        let pool = fresh_pool().await;
+
+        // Repeatedly acquire connections and query a migrated table. If the
+        // pool opened independent in-memory DBs, one of these would hit an
+        // empty connection and fail with "no such table".
+        for _ in 0..5 {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM categories")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("categories table visible on this connection");
+            assert_eq!(count, 0);
+        }
+
+        // The same must hold when querying through the pool directly.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_offers")
+            .fetch_one(&pool)
+            .await
+            .expect("schema visible through pool");
+        assert_eq!(count, 0);
+    }
+
+    /// M3: foreign keys are enabled per connection; inserting a child row that
+    /// references a non-existent parent must fail.
+    #[tokio::test]
+    async fn foreign_keys_are_enforced() {
+        let pool = fresh_pool().await;
+
+        // PRAGMA reports enforcement is on for this connection.
+        let fk_on: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("query PRAGMA foreign_keys");
+        assert_eq!(fk_on, 1, "foreign key enforcement should be enabled");
+
+        // product_offers.retailer_product_id references a missing retailer product.
+        let result = sqlx::query(
+            "INSERT INTO product_offers \
+             (id, retailer_product_id, price_cents, fetched_at, source_confidence_at_ingest) \
+             VALUES ('offer-1', 'does-not-exist', 100, '2026-01-01T00:00:00Z', 'high')",
+        )
+        .execute(&pool)
+        .await;
+
+        let err = result.expect_err("insert with dangling FK must fail");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "expected foreign key violation, got: {err}"
+        );
+    }
+
+    /// L2: file-backed URLs exercise `create_if_missing` (never hit by the
+    /// in-memory tests). Use a unique temp path with no extra crate dependency
+    /// and clean it up afterwards.
+    #[tokio::test]
+    async fn file_backed_database_is_created_and_migrated() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("buywise-test-{}-{nanos}.db", std::process::id()));
+        assert!(!path.exists(), "temp db should not pre-exist");
+
+        let url = format!("sqlite://{}", path.display());
+        let pool = connect(&url).await.expect("connect file-backed");
+        run_migrations(&pool)
+            .await
+            .expect("run migrations on file db");
+
+        assert!(path.exists(), "create_if_missing should create the file");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name != '_sqlx_migrations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count tables");
+        assert_eq!(count, 9, "nine tables in the file-backed database");
+
+        pool.close().await;
+
+        // Clean up the temp file (and any -wal/-shm sidecars). Verified to live
+        // under the system temp dir.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }
