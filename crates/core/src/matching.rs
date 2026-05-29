@@ -165,11 +165,12 @@ async fn load_corpus(household_id: &str, db: &SqlitePool) -> Result<Vec<Candidat
             .fetch_all(db)
             .await?;
 
-    let aliases: Vec<(String, String)> =
-        sqlx::query_as("SELECT canonical_item_id, alias FROM item_aliases WHERE household_id = ?1")
-            .bind(household_id)
-            .fetch_all(db)
-            .await?;
+    let aliases: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT canonical_item_id, alias FROM item_aliases WHERE household_id = ?1",
+    )
+    .bind(household_id)
+    .fetch_all(db)
+    .await?;
 
     let mut corpus = Vec::with_capacity(names.len() * 2 + aliases.len());
     for (id, name_en, name_es) in names {
@@ -276,6 +277,16 @@ mod tests {
             .expect("canonical item exists")
     }
 
+    /// Look up a canonical id by its exact `name_en`, so a test can assert a
+    /// known item is present without hard-coding the SHA-256 slug.
+    async fn id_by_name_en(pool: &SqlitePool, name_en: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM canonical_items WHERE name_en = ?1")
+            .bind(name_en)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| panic!("canonical item {name_en:?} exists in seed"))
+    }
+
     fn single(outcome: ResolutionOutcome) -> String {
         match outcome {
             ResolutionOutcome::SingleMatch { canonical_item_id } => canonical_item_id,
@@ -287,12 +298,12 @@ mod tests {
 
     #[test]
     fn fuzzy_levenshtein_boundary() {
-        // Distance exactly 2 matches; 3 does not (both strings ≥ 4 long).
-        assert!(is_fuzzy_similar("melon", "lemon")); // distance 2 (swap m/l)
+        // Distance ≤ 2 matches; 3 does not (both strings ≥ 4 long).
+        assert!(is_fuzzy_similar("melon", "lemon")); // distance 2 (two substitutions)
         assert!(is_fuzzy_similar("milks", "milk")); // distance 1
         assert!(is_fuzzy_similar("tomato", "tomatos")); // distance 1
-        assert!(!is_fuzzy_similar("milk", "water")); // distance 4
-                                                     // Construct an exact-distance-3 pair: "abcd" vs "abxyz" — but keep ≥4.
+        assert!(!is_fuzzy_similar("milk", "water")); // distance 5
+                                                     // Exact-distance pairs at the boundary (both ≥ 4 long).
         assert!(is_fuzzy_similar("abcde", "abxye")); // distance 2
         assert!(!is_fuzzy_similar("abcde", "axyze")); // distance 3
     }
@@ -410,6 +421,19 @@ mod tests {
                 );
                 let dedup: BTreeSet<&String> = candidates.iter().collect();
                 assert_eq!(dedup.len(), candidates.len(), "candidates must be unique");
+                // The candidate set must contain the concrete known cream items,
+                // so an accidental over- or under-match is caught. Ids are looked
+                // up by name to stay robust against seed-slug changes.
+                let sour_cream = id_by_name_en(&pool, "Sour cream").await;
+                let ice_cream = id_by_name_en(&pool, "Ice cream").await;
+                assert!(
+                    candidates.contains(&sour_cream),
+                    "expected Sour cream ({sour_cream}) among candidates: {candidates:?}"
+                );
+                assert!(
+                    candidates.contains(&ice_cream),
+                    "expected Ice cream ({ice_cream}) among candidates: {candidates:?}"
+                );
             }
             other => panic!("expected MultipleCandidates, got {other:?}"),
         }
