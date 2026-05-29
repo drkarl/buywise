@@ -30,50 +30,89 @@ const DIVERGENCE_TOLERANCE: f64 = 0.02;
 /// Handles weight (`"500g"`, `"1.5kg"`, `"1lb"`), volume (`"2L"`, `"750ml"`,
 /// `"1pt"`), and discrete counts (`"12 pack"`, `"6 rolls"`, `"40 sheets"`).
 /// Matching is case-insensitive and tolerant of an optional space between the
-/// number and the unit. Returns `None` for unparseable input.
+/// number and the unit.
+///
+/// The size token may be **embedded** in a longer product name (the Lidl feed
+/// puts the size in the product name, see design §9): the first
+/// `<number><optional space><recognised unit>` token is parsed, e.g.
+/// `"Lidl Semi Skimmed Milk 2L"` → `Volume { ml: 2000.0 }`. To avoid false
+/// positives inside multi-word names, a number is only extracted when it is
+/// followed by a recognised weight/volume unit or a count keyword; a bare
+/// trailing number (no unit) is ignored unless the whole input is just that
+/// number (`"12"` → `Count { each: 12 }`). A number followed by `%`
+/// (e.g. `"2% Milk 1L"`) is skipped so the real size is picked.
+///
+/// Returns `None` for unparseable input.
 ///
 /// ```
 /// use buywise_core::normalise::{parse_pack_size, NormalisedSize};
 /// assert_eq!(parse_pack_size("2L"), Some(NormalisedSize::Volume { ml: 2000.0 }));
 /// assert_eq!(parse_pack_size("500g"), Some(NormalisedSize::Weight { grams: 500.0 }));
 /// assert_eq!(parse_pack_size("12 pack"), Some(NormalisedSize::Count { each: 12 }));
+/// assert_eq!(
+///     parse_pack_size("Basmati Rice 1kg"),
+///     Some(NormalisedSize::Weight { grams: 1000.0 })
+/// );
 /// ```
 pub fn parse_pack_size(text: &str) -> Option<NormalisedSize> {
     let lower = text.trim().to_lowercase();
-    let (number, unit) = split_number_unit(&lower)?;
 
+    // Standalone case: the whole (trimmed) input is a `<number><unit?>` token.
+    // This preserves the bare-number behaviour (`"12"` → Count{12}) and all the
+    // existing single-token formats ("2L", "500g", "12 pack").
+    if let Some((number, unit)) = split_number_unit(&lower) {
+        if let Some(size) = size_from_number_unit(number, unit) {
+            return size;
+        }
+    }
+
+    // Embedded case: scan the name for the first `<number><optional space><unit>`
+    // where `<unit>` is a recognised measurement unit or count keyword. A bare
+    // number with no recognised unit, or one followed by '%', is skipped to
+    // avoid false positives in multi-word names.
+    //
+    // TODO(phase-1): multipack arithmetic (e.g. "6 x 330ml" → 1980ml) is out of
+    // scope here; we parse only the first recognised size token.
+    scan_embedded_size(&lower)
+}
+
+/// Convert a parsed `(number, unit)` pair into a [`NormalisedSize`]. Returns
+/// `Some(None)` when the unit is recognised as a count but the number is a
+/// fractional (invalid) pack count, `Some(Some(..))` on a successful parse, and
+/// `None` when the unit is not recognised at all.
+fn size_from_number_unit(number: f64, unit: &str) -> Option<Option<NormalisedSize>> {
     // Weight units → grams.
     match unit {
         "kg" => {
-            return Some(NormalisedSize::Weight {
+            return Some(Some(NormalisedSize::Weight {
                 grams: number * 1000.0,
-            })
+            }))
         }
         "g" | "gr" | "grams" | "gram" => {
-            return Some(NormalisedSize::Weight { grams: number });
+            return Some(Some(NormalisedSize::Weight { grams: number }));
         }
         "lb" | "lbs" => {
-            return Some(NormalisedSize::Weight {
+            return Some(Some(NormalisedSize::Weight {
                 grams: number * 453.592,
-            })
+            }))
         }
         "oz" => {
-            return Some(NormalisedSize::Weight {
+            return Some(Some(NormalisedSize::Weight {
                 grams: number * 28.3495,
-            })
+            }))
         }
         // Volume units → millilitres.
         "l" | "ltr" | "litre" | "litres" | "liter" | "liters" => {
-            return Some(NormalisedSize::Volume {
+            return Some(Some(NormalisedSize::Volume {
                 ml: number * 1000.0,
-            });
+            }));
         }
-        "cl" => return Some(NormalisedSize::Volume { ml: number * 10.0 }),
-        "ml" => return Some(NormalisedSize::Volume { ml: number }),
+        "cl" => return Some(Some(NormalisedSize::Volume { ml: number * 10.0 })),
+        "ml" => return Some(Some(NormalisedSize::Volume { ml: number })),
         "pt" | "pint" | "pints" => {
-            return Some(NormalisedSize::Volume {
+            return Some(Some(NormalisedSize::Volume {
                 ml: number * 568.261,
-            })
+            }))
         }
         _ => {}
     }
@@ -81,14 +120,14 @@ pub fn parse_pack_size(text: &str) -> Option<NormalisedSize> {
     // Discrete count: keywords (or no unit at all) → each.
     if is_count_unit(unit) {
         // Counts are whole numbers; reject fractional pack counts. (`number`
-        // cannot be negative here: `split_number_unit` only consumes ASCII
-        // digits and '.', so a leading '-' is never part of the number.)
+        // cannot be negative here: the number is built from ASCII digits and
+        // '.', so a leading '-' is never part of the number.)
         if number.fract() != 0.0 {
-            return None;
+            return Some(None);
         }
-        return Some(NormalisedSize::Count {
+        return Some(Some(NormalisedSize::Count {
             each: number as u32,
-        });
+        }));
     }
 
     None
@@ -107,6 +146,67 @@ fn split_number_unit(s: &str) -> Option<(f64, &str)> {
     let number: f64 = s[..split_at].parse().ok()?;
     let unit = s[split_at..].trim();
     Some((number, unit))
+}
+
+/// Scan a lowercased product name for the first embedded size token, i.e. a
+/// `<number><optional space><recognised unit>` sequence. The unit must be a
+/// recognised weight/volume unit or count keyword; a number followed by `%`, or
+/// a bare number with no unit, is rejected to avoid false positives.
+fn scan_embedded_size(s: &str) -> Option<NormalisedSize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find the start of a numeric run (a digit). We only start a number at a
+        // word boundary so e.g. "size4" is not split mid-token; a digit
+        // immediately preceded by an alphanumeric is skipped.
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+
+        // Consume the number (digits and '.').
+        let num_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        let number: f64 = match s[num_start..i].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Skip a single optional space between number and unit.
+        let mut j = i;
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+
+        // A '%' immediately after the number (e.g. "2%") is not a size token.
+        if j < bytes.len() && bytes[j] == b'%' {
+            continue;
+        }
+
+        // Consume the trailing unit token: contiguous alphabetic characters.
+        let unit_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        let unit = &s[unit_start..j];
+
+        // Only accept a *recognised measurement unit* when scanning embedded:
+        // a bare number (empty unit) is too ambiguous inside a longer name, so
+        // require a non-empty recognised unit/keyword here.
+        if !unit.is_empty() {
+            if let Some(Some(size)) = size_from_number_unit(number, unit) {
+                return Some(size);
+            }
+        }
+        // Not a recognised token; keep scanning from where the unit ended.
+    }
+    None
 }
 
 /// Whether a trailing token denotes a discrete count (or is empty, meaning a
@@ -237,21 +337,20 @@ fn div_round_nearest(numerator: i128, denominator: i128) -> i128 {
     }
 }
 
-/// Map a product's display text to a [`UnitPriceBasis`] using category
-/// keywords (see design §9). First match wins; defaults to `PerEach`.
+/// Infer a [`UnitPriceBasis`] from a product *name* using category keywords
+/// (see design §9). First match wins; defaults to `PerEach`.
 ///
 /// Matching is by whole word, not substring, so "dishwasher" does not match
 /// the "wash" keyword and "washing-up liquid" is not mis-read as `PerWash`.
 /// More-specific categories (pod/capsule, liquid) are checked before the
 /// broader "wash" category so e.g. "dishwasher pods" resolves to `PerPod`.
 ///
-/// Retained as the design §9 category classifier for the phase-1 path that will
-/// infer a basis from a product *name* (not pack-size text); `validate_unit_price`
-/// no longer calls it (see its doc comment). `#[allow(dead_code)]` until that
-/// caller is wired up.
-#[allow(dead_code)]
-fn infer_basis_from_text(text: &str) -> UnitPriceBasis {
-    let t = text.to_lowercase();
+/// This is the design §9 category classifier used by [`unit_price_for_product`]
+/// to derive a basis for direct-source feeds (e.g. Lidl) that carry a product
+/// name rather than a pre-classified basis. `validate_unit_price` does **not**
+/// call it — that path takes the basis from the caller (see its doc comment).
+pub fn infer_basis(product_name: &str) -> UnitPriceBasis {
+    let t = product_name.to_lowercase();
     // Whole-word membership test: split on any non-alphanumeric character so
     // "washing-up" yields the tokens ["washing", "up"], not a "wash" match.
     let has_word = |kw: &str| t.split(|c: char| !c.is_alphanumeric()).any(|w| w == kw);
@@ -356,6 +455,40 @@ fn within_tolerance(provided: i64, reference: i64, tolerance: f64) -> bool {
     diff / (reference.abs() as f64) <= tolerance
 }
 
+/// Resolve a unit price (micros) and basis for a product from its name and shelf
+/// price. This is the direct-source path (e.g. Lidl, design §9), where a feed
+/// supplies a product *name* and a shelf price but no pre-classified basis.
+///
+/// The basis is inferred from `product_name` via [`infer_basis`] (design §9
+/// categories). The pack size is taken from `pack_size_text` when given, else
+/// scanned out of `product_name` (the Lidl feed embeds the size in the name).
+/// Returns `(Some(micros), basis)` when a size is parseable and dimensionally
+/// compatible with the inferred basis, and `(None, basis)` otherwise — the
+/// inferred basis is always returned so callers can record it even when no size
+/// is available.
+///
+/// ```
+/// use buywise_core::normalise::unit_price_for_product;
+/// use buywise_core::domain::UnitPriceBasis;
+/// let (micros, basis) =
+///     unit_price_for_product(299, "Lidl Semi Skimmed Milk 2L", None);
+/// assert_eq!(basis, UnitPriceBasis::PerL);
+/// assert_eq!(micros, Some(1_495_000));
+/// ```
+pub fn unit_price_for_product(
+    price_cents: i64,
+    product_name: &str,
+    pack_size_text: Option<&str>,
+) -> (Option<Micros>, UnitPriceBasis) {
+    let basis = infer_basis(product_name);
+
+    // Prefer an explicit pack-size string; otherwise scan it out of the name.
+    let micros = parse_pack_size(pack_size_text.unwrap_or(product_name))
+        .and_then(|size| compute_unit_price_micros(price_cents, &size, basis));
+
+    (micros, basis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +517,49 @@ mod tests {
             parse_pack_size("12 pack"),
             Some(NormalisedSize::Count { each: 12 })
         );
+    }
+
+    // ---- parse_pack_size: embedded size in product name (Lidl feed, §9) ----
+
+    #[test]
+    fn parse_embedded_volume_in_name() {
+        assert_eq!(
+            parse_pack_size("Lidl Semi Skimmed Milk 2L"),
+            Some(NormalisedSize::Volume { ml: 2000.0 })
+        );
+    }
+
+    #[test]
+    fn parse_embedded_weight_in_name() {
+        assert_eq!(
+            parse_pack_size("Basmati Rice 1kg"),
+            Some(NormalisedSize::Weight { grams: 1000.0 })
+        );
+    }
+
+    #[test]
+    fn parse_embedded_count_in_name() {
+        assert_eq!(
+            parse_pack_size("Andrex Toilet Roll 9 Pack"),
+            Some(NormalisedSize::Count { each: 9 })
+        );
+    }
+
+    #[test]
+    fn parse_embedded_skips_percentage() {
+        // "2%" must be skipped so the real size "1L" is picked.
+        assert_eq!(
+            parse_pack_size("2% Milk 1L"),
+            Some(NormalisedSize::Volume { ml: 1000.0 })
+        );
+    }
+
+    #[test]
+    fn parse_embedded_no_size_token_is_none() {
+        // A multi-word name with no recognised size token (a bare trailing
+        // number is too ambiguous to extract) → None.
+        assert_eq!(parse_pack_size("Organic Free Range Eggs"), None);
+        assert_eq!(parse_pack_size("Lidl Choc Bar 42"), None);
     }
 
     // ---- parse_pack_size: format coverage ----
@@ -731,62 +907,77 @@ mod tests {
         assert_eq!(basis, None);
     }
 
-    // ---- infer_basis_from_text: category mapping ----
+    // ---- infer_basis: category mapping ----
 
     #[test]
     fn infer_basis_keyword_mapping() {
-        assert_eq!(infer_basis_from_text("Fresh milk"), UnitPriceBasis::PerL);
-        assert_eq!(infer_basis_from_text("orange juice"), UnitPriceBasis::PerL);
-        assert_eq!(infer_basis_from_text("basmati rice"), UnitPriceBasis::PerKg);
-        assert_eq!(infer_basis_from_text("penne pasta"), UnitPriceBasis::PerKg);
-        assert_eq!(infer_basis_from_text("plain flour"), UnitPriceBasis::PerKg);
-        assert_eq!(
-            infer_basis_from_text("size 4 nappies"),
-            UnitPriceBasis::PerNappy
-        );
-        assert_eq!(
-            infer_basis_from_text("laundry detergent"),
-            UnitPriceBasis::PerWash
-        );
-        assert_eq!(infer_basis_from_text("coffee pods"), UnitPriceBasis::PerPod);
-        assert_eq!(
-            infer_basis_from_text("coffee capsules"),
-            UnitPriceBasis::PerPod
-        );
-        assert_eq!(
-            infer_basis_from_text("toilet roll 9 pack"),
-            UnitPriceBasis::PerSheet
-        );
-        assert_eq!(
-            infer_basis_from_text("kitchen roll"),
-            UnitPriceBasis::PerSheet
-        );
-        assert_eq!(
-            infer_basis_from_text("tin of beans"),
-            UnitPriceBasis::PerEach
-        );
+        assert_eq!(infer_basis("Fresh milk"), UnitPriceBasis::PerL);
+        assert_eq!(infer_basis("orange juice"), UnitPriceBasis::PerL);
+        assert_eq!(infer_basis("basmati rice"), UnitPriceBasis::PerKg);
+        assert_eq!(infer_basis("penne pasta"), UnitPriceBasis::PerKg);
+        assert_eq!(infer_basis("plain flour"), UnitPriceBasis::PerKg);
+        assert_eq!(infer_basis("size 4 nappies"), UnitPriceBasis::PerNappy);
+        assert_eq!(infer_basis("laundry detergent"), UnitPriceBasis::PerWash);
+        assert_eq!(infer_basis("coffee pods"), UnitPriceBasis::PerPod);
+        assert_eq!(infer_basis("coffee capsules"), UnitPriceBasis::PerPod);
+        assert_eq!(infer_basis("toilet roll 9 pack"), UnitPriceBasis::PerSheet);
+        assert_eq!(infer_basis("kitchen roll"), UnitPriceBasis::PerSheet);
+        assert_eq!(infer_basis("tin of beans"), UnitPriceBasis::PerEach);
     }
 
     #[test]
     fn infer_basis_avoids_substring_collisions() {
         // "dishwasher" must not match the "wash" keyword; pods win.
-        assert_eq!(
-            infer_basis_from_text("dishwasher pods"),
-            UnitPriceBasis::PerPod
-        );
-        assert_eq!(
-            infer_basis_from_text("dishwasher tablets"),
-            UnitPriceBasis::PerPod
-        );
+        assert_eq!(infer_basis("dishwasher pods"), UnitPriceBasis::PerPod);
+        assert_eq!(infer_basis("dishwasher tablets"), UnitPriceBasis::PerPod);
         // "washing-up liquid" is a liquid (€/L), not a wash.
-        assert_eq!(
-            infer_basis_from_text("washing-up liquid"),
-            UnitPriceBasis::PerL
-        );
+        assert_eq!(infer_basis("washing-up liquid"), UnitPriceBasis::PerL);
         // A genuine "wash" word still maps to PerWash.
         assert_eq!(
-            infer_basis_from_text("non-bio wash detergent"),
+            infer_basis("non-bio wash detergent"),
             UnitPriceBasis::PerWash
         );
+    }
+
+    #[test]
+    fn infer_basis_public_examples() {
+        // Now public: spot-check the categories called out in the issue.
+        assert_eq!(infer_basis("dishwasher pods"), UnitPriceBasis::PerPod);
+        assert_eq!(infer_basis("washing-up liquid"), UnitPriceBasis::PerL);
+    }
+
+    // ---- unit_price_for_product: Lidl/direct path (name → basis + size) ----
+
+    #[test]
+    fn unit_price_for_product_milk_from_name() {
+        // €2.99 / 2L = 1_495_000 micros; basis inferred from "milk".
+        let (micros, basis) = unit_price_for_product(299, "Lidl Semi Skimmed Milk 2L", None);
+        assert_eq!(basis, UnitPriceBasis::PerL);
+        assert_eq!(micros, Some(1_495_000));
+    }
+
+    #[test]
+    fn unit_price_for_product_rice_from_name() {
+        // Basis inferred from "rice" → PerKg; size 1kg = 1000g.
+        let (micros, basis) = unit_price_for_product(199, "Basmati Rice 1kg", None);
+        assert_eq!(basis, UnitPriceBasis::PerKg);
+        // €1.99 / 1kg = €1.99/kg = 1_990_000 micros.
+        assert_eq!(micros, Some(1_990_000));
+    }
+
+    #[test]
+    fn unit_price_for_product_no_size_returns_basis_only() {
+        // No parseable size → (None, inferred basis).
+        let (micros, basis) = unit_price_for_product(199, "Organic Free Range Eggs", None);
+        assert_eq!(micros, None);
+        assert_eq!(basis, UnitPriceBasis::PerEach);
+    }
+
+    #[test]
+    fn unit_price_for_product_explicit_pack_size_wins() {
+        // Explicit pack-size text is used in preference to scanning the name.
+        let (micros, basis) = unit_price_for_product(299, "Semi Skimmed Milk", Some("2L"));
+        assert_eq!(basis, UnitPriceBasis::PerL);
+        assert_eq!(micros, Some(1_495_000));
     }
 }
