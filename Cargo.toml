@@ -19,6 +19,12 @@ buywise-ingest = { path = "crates/ingest" }
 # Shared third-party dependencies (versions pinned here for consistency)
 # Minimal feature set: no TLS driver (local SQLite only). `migrate` is enabled
 # for `sqlx::migrate!` / `sqlx::migrate::Migrator` (used from P0-T2 onward).
+#
+# Bundled SQLite: sqlx 0.8 has NO separate `bundled` feature. The `sqlite`
+# feature bundles SQLite intrinsically (via libsqlite3-sys, JSON1 included);
+# the opt-out is `sqlite-unbundled`, which we deliberately do not enable. So
+# enabling `sqlite` already satisfies P0-T2's "bundled" requirement — no extra
+# feature to add.
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
