@@ -10,3 +10,30 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[workspace.dependencies]
+# Internal crates
+buywise-core = { path = "crates/core" }
+buywise-ingest = { path = "crates/ingest" }
+
+# Shared third-party dependencies (versions pinned here for consistency)
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+strsim = "0.11"
+unicode-normalization = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+argon2 = "0.5"
+rand = "0.9"
