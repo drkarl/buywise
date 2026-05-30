@@ -32,11 +32,13 @@
 //!
 //! The Lidl feed's reliability is uncertain. A Lidl failure must never block or
 //! fail the BasketWatch pipeline, so the orchestration entry point
-//! [`spawn_ingest`] runs the whole ingest on a detached [`tokio::spawn`] task:
-//! any error — *or panic* — is logged and swallowed, and the caller is handed a
-//! [`JoinHandle`](tokio::task::JoinHandle) it can await for observability but is
-//! free to ignore. Because Lidl has its own `Source::LidlDirect` run rows and
-//! run-number sequence, it is fully independent of the BasketWatch run history.
+//! [`spawn_ingest`] runs the whole ingest on a detached task and catches an
+//! *inner* `tokio::spawn` so that any error — *or panic* — is logged and
+//! swallowed. The caller is handed a
+//! [`JoinHandle`](tokio::task::JoinHandle) that always resolves to `Ok(())`: it
+//! can await it for observability but never sees a Lidl error or panic. Because
+//! Lidl has its own `Source::LidlDirect` run rows and run-number sequence, it is
+//! fully independent of the BasketWatch run history.
 
 use std::time::Duration;
 
@@ -203,8 +205,9 @@ pub fn normalise(raw: Vec<RawLidlProduct>, fetched_at: &str) -> NormaliseResult 
 
         // Lidl embeds the pack size in the name and supplies no basis: derive
         // both from the name (design §9). `pack_size_text` records the size
-        // parsed out of the name (rendered to canonical "2L"/"500g" text) so it
-        // is stored on the product and queryable later. We pass `None` to
+        // parsed out of the name, rendered to its canonical *base-unit* text
+        // ("2000ml" / "500g" / "6 pack"), so it is stored on the product and
+        // queryable later. We pass `None` to
         // `unit_price_for_product` so it scans the *same* name for the size,
         // keeping the stored size and the priced size consistent.
         let pack_size_text =
@@ -406,42 +409,69 @@ pub async fn ingest(pool: &SqlitePool) -> Result<RunSummary, IngestError> {
         })
         .await
     } else {
-        let fetch_pool = pool.clone();
-        let clock = fetched_at.clone();
-        run_ingest(pool, &fetched_at, move || live_fetch(fetch_pool, clock)).await
+        run_ingest(pool, &fetched_at, live_fetch).await
     }
 }
 
 /// Orchestration entry point: run the Lidl ingest on a **detached task** so a
-/// failure (or panic) is logged and swallowed rather than propagated.
+/// failure — *or panic* — is logged and swallowed rather than propagated.
 ///
 /// This is the isolation boundary the issue mandates: the BasketWatch pipeline
 /// must be unaffected by Lidl. The caller gets a [`JoinHandle`] it may await for
-/// observability, but the task itself never returns an error or unwinds into the
-/// caller — `ingest`'s `Result` is consumed and logged here, and a panic inside
-/// the task is contained by `tokio::spawn` (it surfaces as a `JoinError` on the
-/// handle, not as an abort of the parent).
+/// observability, but the returned handle **always resolves to `Ok(())`**: it
+/// never yields an `IngestError` and never surfaces a `JoinError`.
+///
+/// To guarantee that, the real ingest runs on an *inner* `tokio::spawn`, and the
+/// outer task awaits that inner handle and consumes **both** outcomes — an
+/// `Err(IngestError)` (a handled run failure) and an `Err(JoinError)` (a panic
+/// caught by the inner task) — logging each and then returning `()`. Awaiting the
+/// outer handle therefore can never observe the panic, so a Lidl panic cannot
+/// abort or fail anyone who awaits it.
 pub fn spawn_ingest(pool: SqlitePool) -> JoinHandle<()> {
+    spawn_swallowing(async move { ingest(&pool).await })
+}
+
+/// Run `work` on a detached task whose returned [`JoinHandle`] **always resolves
+/// to `Ok(())`**, swallowing both a handled `Err(IngestError)` and a panic.
+///
+/// The work runs on an *inner* `tokio::spawn` so a panic inside it is captured as
+/// a `JoinError` here rather than unwinding through the outer task and surfacing
+/// on the handle the caller awaits. The outer task consumes all three arms — `Ok`,
+/// handled `Err`, and panic — logging each and returning `()`.
+fn spawn_swallowing<W>(work: W) -> JoinHandle<()>
+where
+    W: std::future::Future<Output = Result<RunSummary, IngestError>> + Send + 'static,
+{
     tokio::spawn(async move {
-        match ingest(&pool).await {
-            Ok(summary) => tracing::info!(
+        // Inner task so a panic inside `work` is converted into a `JoinError` we
+        // can catch here, instead of unwinding through the outer task and
+        // surfacing on the handle the caller awaits.
+        let inner = tokio::spawn(work);
+        match inner.await {
+            Ok(Ok(summary)) => tracing::info!(
                 run_id = %summary.run_id,
                 run_number = summary.run_number,
                 items_normalised = summary.items_normalised,
                 skipped = summary.skipped,
                 "Lidl ingest completed"
             ),
-            Err(err) => tracing::error!(
+            Ok(Err(err)) => tracing::error!(
                 error = %err,
                 "Lidl ingest failed; swallowed so BasketWatch is unaffected"
+            ),
+            Err(join_err) => tracing::error!(
+                error = %join_err,
+                "Lidl ingest panicked; swallowed so BasketWatch is unaffected"
             ),
         }
     })
 }
 
 /// Render a parsed [`NormalisedSize`](buywise_core::normalise::NormalisedSize)
-/// back to canonical pack-size text (`"2L"` / `"500g"` / `"6 pack"`), matching
-/// the free-text format the other adapters store in `pack_size_text`.
+/// back to canonical *base-unit* pack-size text (`"2000ml"` / `"500g"` /
+/// `"6 pack"`), matching the free-text format the other adapters store in
+/// `pack_size_text`. Note this keeps the base unit (millilitres / grams) rather
+/// than re-deriving litres/kilograms — `"2L"` is stored as `"2000ml"`.
 ///
 /// Whole numbers print without a trailing `.0`; fractional values keep up to
 /// three significant decimals (trailing zeros trimmed) so `1500.0` → `"1.5kg"`
@@ -496,7 +526,7 @@ fn load_fixture_offers() -> Result<Vec<RawLidlProduct>, IngestError> {
 /// final and mirrors the fixture shape; the host/path and JSON field mapping may
 /// need adjustment once the real feed is confirmed, so the base URL is read from
 /// the environment (`LIDL_FEED_URL`) and can be corrected without a code change.
-async fn live_fetch(_pool: SqlitePool, _fetched_at: String) -> Result<FetchOutcome, IngestError> {
+async fn live_fetch() -> Result<FetchOutcome, IngestError> {
     let url = std::env::var("LIDL_FEED_URL")
         .unwrap_or_else(|_| "https://www.lidl.ie/q/api/search".into());
 
@@ -624,6 +654,22 @@ mod tests {
             result.products[0].url.as_deref(),
             Some("https://www.lidl.ie/p/lidl-9")
         );
+    }
+
+    /// The isolation contract for a *panic* (not just an `Err`): a panic inside
+    /// the swallowed work must be caught by the inner task so the handle the
+    /// caller awaits still resolves to `Ok(())`. Without the inner `tokio::spawn`
+    /// the panic would surface as a `JoinError` and `handle.await` would be `Err`.
+    #[tokio::test]
+    async fn spawn_swallowing_swallows_a_panic() {
+        let handle = spawn_swallowing(async {
+            panic!("boom: simulated ingest panic");
+        });
+        // The outer handle resolves Ok despite the inner panic — the panic was
+        // contained and logged, never propagated to the awaiting caller.
+        handle
+            .await
+            .expect("panic must be swallowed: handle resolves to Ok(())");
     }
 
     #[test]
