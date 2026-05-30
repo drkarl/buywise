@@ -144,7 +144,12 @@ fn print_plan(title: &str, plan: Option<&StorePlan>) {
             truncate(&line.display_text, 28),
             line.retailer.as_db_str(),
             euros(line.unit_price_cents),
-            // count is recoverable from line_total / unit_price; print the line total.
+            // `PlanLine` does not carry the unit count: the count lives on the
+            // input `BasketItem` (reachable via `item_index`), which `print_plan`
+            // intentionally does not receive. Since `line_total_cents =
+            // unit_price_cents × count` by construction (optimiser.rs), the exact
+            // integer division recovers it; `.max(1)` only guards a zero-priced
+            // line from a divide-by-zero and never changes a real result.
             line.line_total_cents / line.unit_price_cents.max(1),
             euros(line.line_total_cents),
             loyalty,
