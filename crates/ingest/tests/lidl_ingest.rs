@@ -437,3 +437,34 @@ async fn live_fetch_shape_mismatch_marks_run_failed_without_panic() {
         0
     );
 }
+
+/// Live mode with `LIDL_FEED_URL` unset must **fail fast**: there is no verified
+/// default Lidl.ie endpoint (design §16), so `ingest` returns `MissingFeedUrl`
+/// *before* opening a `source_runs` row — a misconfiguration must not record a
+/// `failed` run on every invocation against a known-bad default URL.
+// See `spawn_ingest_swallows_failure` for why holding the lock across `.await`
+// is sound here.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn live_mode_without_feed_url_fails_fast_without_recording_a_run() {
+    let pool = migrated_pool().await;
+
+    let guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("BUYWISE_NO_NETWORK");
+    std::env::remove_var("LIDL_FEED_URL");
+    let result = lidl::ingest(&pool).await;
+    drop(guard);
+
+    match result {
+        Err(IngestError::MissingFeedUrl) => {}
+        other => panic!("expected IngestError::MissingFeedUrl, got {other:?}"),
+    }
+
+    // No source_run row was opened — the config error short-circuits before any
+    // run is recorded, so health metrics stay clean for a deployment gap.
+    assert_eq!(
+        scalar_i64(&pool, "SELECT COUNT(*) FROM source_runs").await,
+        0,
+        "a missing-config failure must not record a source_run",
+    );
+}

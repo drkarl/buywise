@@ -409,7 +409,13 @@ pub async fn ingest(pool: &SqlitePool) -> Result<RunSummary, IngestError> {
         })
         .await
     } else {
-        run_ingest(pool, &fetched_at, live_fetch).await
+        // Live mode requires an explicitly configured feed URL. There is no
+        // verified default Lidl.ie endpoint (design §16), so resolve it *before*
+        // opening a source_run: an unset value fails fast as MissingFeedUrl rather
+        // than recording a `failed` run against a known-bad default URL on every
+        // invocation.
+        let url = std::env::var("LIDL_FEED_URL").map_err(|_| IngestError::MissingFeedUrl)?;
+        run_ingest(pool, &fetched_at, move || live_fetch(url)).await
     }
 }
 
@@ -518,18 +524,16 @@ fn load_fixture_offers() -> Result<Vec<RawLidlProduct>, IngestError> {
     Ok(products)
 }
 
-/// Live Lidl.ie fetch.
+/// Live Lidl.ie fetch against the caller-resolved `url`.
 ///
 /// NOTE: Lidl.ie's exact endpoint/response shape — and indeed whether a stable
-/// direct feed exists at all — is an open question (design §16). The control flow
-/// here (build a timed client, fetch, deserialise into [`RawLidlProduct`]) is
-/// final and mirrors the fixture shape; the host/path and JSON field mapping may
-/// need adjustment once the real feed is confirmed, so the base URL is read from
-/// the environment (`LIDL_FEED_URL`) and can be corrected without a code change.
-async fn live_fetch() -> Result<FetchOutcome, IngestError> {
-    let url = std::env::var("LIDL_FEED_URL")
-        .unwrap_or_else(|_| "https://www.lidl.ie/q/api/search".into());
-
+/// direct feed exists at all — is an open question (design §16). There is **no
+/// verified default**, so the URL is resolved by [`ingest`] from the *required*
+/// `LIDL_FEED_URL` env var and passed in here; this function never falls back to
+/// a hard-coded host. The control flow (build a timed client, fetch, deserialise
+/// into [`RawLidlProduct`]) is final and mirrors the fixture shape; only the JSON
+/// field mapping may need adjustment once the real feed is confirmed.
+async fn live_fetch(url: String) -> Result<FetchOutcome, IngestError> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;

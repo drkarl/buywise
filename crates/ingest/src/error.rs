@@ -40,6 +40,14 @@ pub enum IngestError {
     #[error("BASKETWATCH_API_KEY is not set (required for live ingest)")]
     MissingApiKey,
 
+    /// Live Lidl mode was requested but `LIDL_FEED_URL` is unset. There is no
+    /// verified default Lidl.ie feed (design §16 open question), so the endpoint
+    /// must be configured explicitly. This is raised *before* a `source_runs` row
+    /// is opened, so a misconfigured deployment fails fast rather than recording a
+    /// `failed` run against a known-bad default URL on every invocation.
+    #[error("LIDL_FEED_URL is not set (required for live Lidl ingest)")]
+    MissingFeedUrl,
+
     /// A source payload was syntactically valid but could not be interpreted as
     /// the expected product listing (e.g. the Lidl.ie page/feed structure
     /// changed, or a required field is absent). Distinct from [`Json`](Self::Json)
