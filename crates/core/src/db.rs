@@ -708,10 +708,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_creates_all_nine_tables() {
+    async fn migration_creates_all_application_tables() {
         let pool = fresh_pool().await;
 
         let expected = [
+            // Phase 0 (001)
             "categories",
             "canonical_items",
             "item_aliases",
@@ -721,6 +722,19 @@ mod tests {
             "product_offers",
             "product_matches",
             "api_usage_events",
+            // Phase 1 (003)
+            "households",
+            "users",
+            "household_members",
+            "sessions",
+            "shopping_lists",
+            "list_entries",
+            "list_entry_events",
+            "mutations",
+            "store_category_orders",
+            "recommendation_runs",
+            "savings_events",
+            "match_feedback",
         ];
 
         for name in expected {
@@ -728,7 +742,8 @@ mod tests {
             assert!(sql.is_some(), "table `{name}` should exist after migration");
         }
 
-        // Exactly the nine application tables (excluding sqlx bookkeeping).
+        // Exactly the 9 Phase-0 + 12 Phase-1 application tables (excluding sqlx
+        // bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -737,7 +752,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count tables");
-        assert_eq!(count, 9, "exactly nine Phase-0 tables expected");
+        assert_eq!(
+            count,
+            expected.len() as i64,
+            "exactly the listed application tables expected"
+        );
     }
 
     #[tokio::test]
@@ -967,7 +986,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count tables");
-        assert_eq!(count, 9, "nine tables in the file-backed database");
+        assert_eq!(
+            count, 21,
+            "9 Phase-0 + 12 Phase-1 tables in the file-backed database"
+        );
 
         pool.close().await;
 
