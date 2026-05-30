@@ -237,9 +237,12 @@ def resolve_spec():
             cheapest = min(p[0] for p in clean_prices.values())
             # Price the baseline above the cheapest so Tesco never wins on price.
             baseline_price = cheapest + 60
-            # Reuse a brand already used for this item if any, else Tesco own-label.
-            any_brand = next((p[3] for p in clean_prices.values() if p[3]), BASELINE_BRAND)
-            clean_prices[BASELINE_RETAILER] = (baseline_price, None, None, any_brand)
+            # A synthesised baseline product is Tesco's own product, so it must
+            # carry Tesco's OWN brand — never a competitor's. Reusing a sibling
+            # retailer's brand here produced impossible committed rows (a Tesco
+            # product named/branded "Aldi Plain Flour", "SuperValu Brown Onions",
+            # etc.). Tesco own-label is always brand-valid.
+            clean_prices[BASELINE_RETAILER] = (baseline_price, None, None, BASELINE_BRAND)
 
         resolved.append((item, size, name_tail, clean_prices))
     return resolved
