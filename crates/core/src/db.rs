@@ -7,7 +7,10 @@
 
 use std::str::FromStr;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use chrono::{SecondsFormat, Utc};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
+
+use crate::domain::{ProductOffer, RetailerProduct, Source};
 
 /// Errors produced while connecting to, migrating, or validating the database.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +105,252 @@ fn map_json1_error(err: sqlx::Error) -> DbError {
         }
     }
     DbError::Sqlx(err)
+}
+
+// ---------------------------------------------------------------------------
+// Ingest helpers (P0-T8 / P0-T9)
+// ---------------------------------------------------------------------------
+//
+// These back the BasketWatch and Lidl adapters. The split between
+// `&SqlitePool` and `&mut SqliteConnection` signatures is deliberate and
+// load-bearing:
+//
+//   * Pool-taking helpers run in autocommit and are used OUTSIDE the success
+//     transaction — committing the `running` row before any network I/O, and
+//     marking a run failed in its own short transaction.
+//   * Connection-taking helpers MUST run on the single connection that holds the
+//     adapter's manual `BEGIN IMMEDIATE`, so the run-number allocation, product
+//     upserts, and offer inserts are one atomic unit. Taking `&mut
+//     SqliteConnection` (not `&SqlitePool`) makes it impossible to accidentally
+//     run them in autocommit and break that atomicity.
+
+/// Current UTC timestamp as an RFC 3339 / ISO 8601 string with a `Z` suffix
+/// (e.g. `2026-05-30T12:34:56.789Z`).
+///
+/// Millisecond precision is used rather than seconds so that two writes in quick
+/// succession (e.g. back-to-back ingest runs) are still distinguishable by
+/// `last_seen_at`. Adapters that need fully deterministic timestamps (tests)
+/// inject their own value instead of calling this.
+pub fn now_iso() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Insert a `source_runs` row with `status = 'running'` and return its id.
+///
+/// Runs in autocommit on the pool: the row is durably committed before the
+/// caller starts any network fetch, so a crash mid-fetch still leaves an
+/// auditable `running` record (later reconciled to `failed`). Never call this
+/// inside the success transaction.
+pub async fn insert_running_source_run(
+    pool: &SqlitePool,
+    source: Source,
+    started_at: &str,
+) -> Result<String, DbError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO source_runs (id, source, started_at, status) \
+         VALUES (?1, ?2, ?3, 'running')",
+    )
+    .bind(&id)
+    .bind(source)
+    .bind(started_at)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// The highest `successful_run_number` recorded for `source`, or `None` if no
+/// run has ever succeeded.
+///
+/// Takes `&mut SqliteConnection` so it reads the value under the same
+/// `BEGIN IMMEDIATE` lock that the subsequent `UPDATE` writes it back with — no
+/// other writer can allocate the same number concurrently.
+pub async fn max_successful_run_number(
+    conn: &mut SqliteConnection,
+    source: Source,
+) -> Result<Option<i64>, DbError> {
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(successful_run_number) FROM source_runs WHERE source = ?1")
+            .bind(source)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(max)
+}
+
+/// Upsert a retailer product, refreshing only `last_seen_at` on conflict.
+///
+/// The conflict target mirrors the partial unique index defined in
+/// `migrations/001_phase0_schema.sql` exactly. **`INSERT OR REPLACE` is
+/// deliberately not used**: SQLite's REPLACE is a DELETE + INSERT, which would
+/// mint a new rowid and cascade-break any `product_offers.retailer_product_id`
+/// foreign keys pointing at the old row. `ON CONFLICT … DO UPDATE` preserves the
+/// stable primary key.
+pub async fn upsert_retailer_product(
+    conn: &mut SqliteConnection,
+    p: &RetailerProduct,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO retailer_products \
+         (id, source, retailer, external_id, url, name, brand, category, \
+          pack_size_text, size_value, size_unit, pack_count, \
+          first_seen_at, last_seen_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         ON CONFLICT(source, retailer, external_id) \
+             WHERE source != 'manual' AND external_id IS NOT NULL \
+         DO UPDATE SET last_seen_at = excluded.last_seen_at",
+    )
+    .bind(&p.id)
+    .bind(p.source)
+    .bind(p.retailer)
+    .bind(&p.external_id)
+    .bind(&p.url)
+    .bind(&p.name)
+    .bind(&p.brand)
+    .bind(&p.category)
+    .bind(&p.pack_size_text)
+    .bind(p.size_value)
+    .bind(&p.size_unit)
+    .bind(p.pack_count)
+    .bind(&p.first_seen_at)
+    .bind(&p.last_seen_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Insert one `product_offers` row. The table is append-only, so this is always
+/// an `INSERT` (never an upsert) and must run inside the success transaction.
+pub async fn insert_product_offer(
+    conn: &mut SqliteConnection,
+    o: &ProductOffer,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO product_offers \
+         (id, retailer_product_id, price_cents, unit_price_eur_micros, unit_price_basis, \
+          previous_price_cents, loyalty_price_cents, loyalty_scheme, offer_text, \
+          offer_valid_until, source_snapshot_date, fetched_at, cache_expires_at, \
+          last_successful_source_run_id, source_successful_run_number_at_fetch, \
+          source_confidence_at_ingest) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )
+    .bind(&o.id)
+    .bind(&o.retailer_product_id)
+    .bind(o.price_cents)
+    .bind(o.unit_price_eur_micros)
+    .bind(o.unit_price_basis)
+    .bind(o.previous_price_cents)
+    .bind(o.loyalty_price_cents)
+    .bind(&o.loyalty_scheme)
+    .bind(&o.offer_text)
+    .bind(&o.offer_valid_until)
+    .bind(&o.source_snapshot_date)
+    .bind(&o.fetched_at)
+    .bind(&o.cache_expires_at)
+    .bind(&o.last_successful_source_run_id)
+    .bind(o.source_successful_run_number_at_fetch)
+    .bind(o.source_confidence_at_ingest)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Mark a `running` run as `success`, stamping its allocated run number, finish
+/// time, and counts. Runs on the success transaction's connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn finalise_successful_run(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    run_number: i64,
+    finished_at: &str,
+    requests_made: i64,
+    items_fetched: i64,
+    items_normalised: i64,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE source_runs \
+         SET status = 'success', successful_run_number = ?2, finished_at = ?3, \
+             requests_made = ?4, items_fetched = ?5, items_normalised = ?6 \
+         WHERE id = ?1",
+    )
+    .bind(run_id)
+    .bind(run_number)
+    .bind(finished_at)
+    .bind(requests_made)
+    .bind(items_fetched)
+    .bind(items_normalised)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Mark a run `failed` with an error message, in its own short autocommit
+/// transaction on the pool.
+///
+/// Used after the write transaction has already been rolled back (or before one
+/// was ever opened), so it never competes with the success path for the same
+/// connection. `successful_run_number` is left NULL.
+pub async fn mark_source_run_failed(
+    pool: &SqlitePool,
+    run_id: &str,
+    error_message: &str,
+    finished_at: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE source_runs \
+         SET status = 'failed', error_message = ?2, finished_at = ?3 \
+         WHERE id = ?1",
+    )
+    .bind(run_id)
+    .bind(error_message)
+    .bind(finished_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Total requests recorded against `source` for the given `month_year` (format
+/// `YYYY-MM`). Drives the quota guardrails (warn / skip-non-essential /
+/// hard-stop).
+pub async fn current_month_request_count(
+    pool: &SqlitePool,
+    source: Source,
+    month_year: &str,
+) -> Result<i64, DbError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(requests_count), 0) FROM api_usage_events \
+         WHERE source = ?1 AND month_year = ?2",
+    )
+    .bind(source.as_db_str())
+    .bind(month_year)
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
+}
+
+/// Record a batch of API requests against the monthly quota.
+pub async fn insert_api_usage_event(
+    pool: &SqlitePool,
+    source: Source,
+    endpoint: &str,
+    requests_count: i64,
+    month_year: &str,
+    created_at: &str,
+) -> Result<(), DbError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO api_usage_events \
+         (id, source, endpoint, requests_count, month_year, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(&id)
+    .bind(source.as_db_str())
+    .bind(endpoint)
+    .bind(requests_count)
+    .bind(month_year)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
