@@ -6,9 +6,12 @@
 //! Phase-1 `list_entries` CHECK constraint and by JSON columns generally).
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
+};
 
 use crate::domain::{ProductOffer, RetailerProduct, Source};
 
@@ -46,22 +49,34 @@ fn is_private_memory_url(database_url: &str) -> bool {
 
 /// Open a pooled connection to `database_url`.
 ///
-/// For file-backed URLs the database is created if missing and the pool may hold
-/// multiple connections. `PRAGMA foreign_keys = ON` is applied to every
-/// connection in the pool.
+/// Every connection gets, per the stack decisions in `docs/design.md` §3 and the
+/// pool configuration in `docs/implementation-plan.md`:
 ///
-/// Private in-memory URLs (e.g. `sqlite::memory:`) are capped at a single
-/// connection: a wider pool would give each connection its own empty database,
-/// making a migration run on one connection invisible to the next checkout.
+/// * `PRAGMA foreign_keys = ON`,
+/// * `PRAGMA journal_mode = WAL` — concurrent readers alongside one writer
+///   (a no-op for in-memory databases, which ignore WAL), and
+/// * `PRAGMA busy_timeout = 5000` — wait up to 5 s for a lock instead of failing
+///   immediately with `SQLITE_BUSY`. This matters now that the ingest adapters
+///   take a manual `BEGIN IMMEDIATE` write lock: a `mark_source_run_failed`
+///   short transaction (or a concurrent Lidl run) that briefly contends with a
+///   held write lock waits rather than erroring spuriously.
+///
+/// File-backed URLs use a pool of up to 8 connections. Private in-memory URLs
+/// (e.g. `sqlite::memory:`) are capped at a single connection: a wider pool
+/// would give each connection its own empty database, making a migration run on
+/// one connection invisible to the next checkout.
 pub async fn connect(database_url: &str) -> Result<SqlitePool, DbError> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
 
-    let mut pool_options = SqlitePoolOptions::new();
-    if is_private_memory_url(database_url) {
-        pool_options = pool_options.max_connections(1);
-    }
+    let pool_options = if is_private_memory_url(database_url) {
+        SqlitePoolOptions::new().max_connections(1)
+    } else {
+        SqlitePoolOptions::new().max_connections(8)
+    };
 
     let pool = pool_options.connect_with(options).await?;
     Ok(pool)
@@ -320,7 +335,7 @@ pub async fn current_month_request_count(
         "SELECT COALESCE(SUM(requests_count), 0) FROM api_usage_events \
          WHERE source = ?1 AND month_year = ?2",
     )
-    .bind(source.as_db_str())
+    .bind(source)
     .bind(month_year)
     .fetch_one(pool)
     .await?;
@@ -343,7 +358,7 @@ pub async fn insert_api_usage_event(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(&id)
-    .bind(source.as_db_str())
+    .bind(source)
     .bind(endpoint)
     .bind(requests_count)
     .bind(month_year)
@@ -645,5 +660,70 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The monthly quota counter sums only the requested source + month, which
+    /// is what drives the BasketWatch guardrails.
+    #[tokio::test]
+    async fn api_usage_count_sums_current_month_only() {
+        let pool = fresh_pool().await;
+
+        // Empty to start.
+        assert_eq!(
+            current_month_request_count(&pool, Source::BasketWatch, "2026-05")
+                .await
+                .expect("count"),
+            0
+        );
+
+        insert_api_usage_event(
+            &pool,
+            Source::BasketWatch,
+            "products",
+            40,
+            "2026-05",
+            "2026-05-30T00:00:00.000Z",
+        )
+        .await
+        .expect("insert event 1");
+        insert_api_usage_event(
+            &pool,
+            Source::BasketWatch,
+            "products",
+            5,
+            "2026-05",
+            "2026-05-30T01:00:00.000Z",
+        )
+        .await
+        .expect("insert event 2");
+        // A different month and a different source must not be counted.
+        insert_api_usage_event(
+            &pool,
+            Source::BasketWatch,
+            "products",
+            99,
+            "2026-04",
+            "2026-04-30T00:00:00.000Z",
+        )
+        .await
+        .expect("insert other month");
+        insert_api_usage_event(
+            &pool,
+            Source::LidlDirect,
+            "products",
+            7,
+            "2026-05",
+            "2026-05-30T02:00:00.000Z",
+        )
+        .await
+        .expect("insert other source");
+
+        assert_eq!(
+            current_month_request_count(&pool, Source::BasketWatch, "2026-05")
+                .await
+                .expect("count"),
+            45,
+            "only current-month BasketWatch requests are summed"
+        );
     }
 }

@@ -478,30 +478,44 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
     let month = month_of(&fetched_at);
 
     let used = db::current_month_request_count(&pool, Source::BasketWatch, &month).await?;
-    if used >= QUOTA_HARD_STOP {
-        return Err(IngestError::QuotaHardStop { used });
+    let mut skip_non_essential = false;
+    match quota_action(used) {
+        QuotaAction::HardStop => return Err(IngestError::QuotaHardStop { used }),
+        QuotaAction::SkipNonEssential => {
+            skip_non_essential = true;
+            tracing::warn!(
+                used,
+                "above skip-non-essential threshold: only essential refreshes"
+            );
+        }
+        QuotaAction::Warn => {
+            tracing::warn!(
+                used,
+                limit = QUOTA_HARD_STOP,
+                "BasketWatch monthly request budget high"
+            );
+        }
+        QuotaAction::Proceed => {}
     }
-    if used >= QUOTA_WARN {
-        tracing::warn!(
-            used,
-            limit = QUOTA_HARD_STOP,
-            "BasketWatch monthly request budget high"
-        );
-    }
-    let skip_non_essential = used >= QUOTA_SKIP_NON_ESSENTIAL;
-    if skip_non_essential {
-        tracing::warn!(
-            used,
-            "above skip-non-essential threshold: only essential refreshes"
-        );
-    }
+    // TODO(P0-T8 follow-up): once offers carry per-item currency (cache_expires_at
+    // freshness), `skip_non_essential` should drop already-current items from the
+    // fetch set per design §12. Phase 0 has no per-item currency yet, so the flag
+    // currently only annotates the run.
+    let _ = skip_non_essential;
 
     let host = std::env::var("BASKETWATCH_API_HOST")
         .unwrap_or_else(|_| "basketwatch.p.rapidapi.com".into());
-    let client = reqwest::Client::new();
+    // A per-request timeout bounds a stalled `send()`; otherwise a hung response
+    // would keep the `running` row open indefinitely.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
     let mut products = Vec::new();
     let mut requests_made = 0i64;
+    // Capture the first error rather than `?`-returning it, so we still record the
+    // requests already spent against the monthly quota before propagating.
+    let mut fetch_error: Option<IngestError> = None;
     for retailer in RETAILERS {
         // 40 RPM self-cap: space requests by RATE_LIMIT_INTERVAL (skip the wait
         // before the first request).
@@ -510,32 +524,90 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
         }
 
         let url = format!("https://{host}/products?retailer={}", retailer.as_db_str());
-        let response = client
+        let response = match client
             .get(&url)
             .header("X-RapidAPI-Key", &api_key)
             .header("X-RapidAPI-Host", &host)
             .send()
-            .await?
-            .error_for_status()?;
-        let batch: Vec<RawBasketWatchProduct> = response.json().await?;
-        products.extend(batch);
-        requests_made += 1;
+            .await
+        {
+            // A response (even a 4xx/5xx) means the request reached BasketWatch
+            // and consumed quota, so count it before inspecting the status.
+            Ok(response) => {
+                requests_made += 1;
+                response
+            }
+            // No response received ⇒ no quota consumed; do not count it.
+            Err(err) => {
+                fetch_error = Some(err.into());
+                break;
+            }
+        };
+
+        match response.error_for_status() {
+            Ok(ok) => match ok.json::<Vec<RawBasketWatchProduct>>().await {
+                Ok(batch) => products.extend(batch),
+                Err(err) => {
+                    fetch_error = Some(err.into());
+                    break;
+                }
+            },
+            Err(err) => {
+                fetch_error = Some(err.into());
+                break;
+            }
+        }
     }
 
-    db::insert_api_usage_event(
-        &pool,
-        Source::BasketWatch,
-        "products",
-        requests_made,
-        &month,
-        &fetched_at,
-    )
-    .await?;
+    // Record whatever quota was actually consumed, on both the success and the
+    // partial-failure paths.
+    if requests_made > 0 {
+        db::insert_api_usage_event(
+            &pool,
+            Source::BasketWatch,
+            "products",
+            requests_made,
+            &month,
+            &fetched_at,
+        )
+        .await?;
+    }
+
+    if let Some(err) = fetch_error {
+        return Err(err);
+    }
 
     Ok(FetchOutcome {
         products,
         requests_made,
     })
+}
+
+/// Which guardrail applies at a given month-to-date request count (design §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaAction {
+    /// Below all thresholds — fetch normally.
+    Proceed,
+    /// At/above the warn threshold — fetch, but log a budget warning.
+    Warn,
+    /// At/above the skip threshold — fetch only essential (non-current) items.
+    SkipNonEssential,
+    /// At/above the hard stop — make no external calls.
+    HardStop,
+}
+
+/// Classify a month-to-date request count against the quota thresholds. Pure, so
+/// the threshold boundaries are unit-tested without touching the network.
+pub fn quota_action(used: i64) -> QuotaAction {
+    if used >= QUOTA_HARD_STOP {
+        QuotaAction::HardStop
+    } else if used >= QUOTA_SKIP_NON_ESSENTIAL {
+        QuotaAction::SkipNonEssential
+    } else if used >= QUOTA_WARN {
+        QuotaAction::Warn
+    } else {
+        QuotaAction::Proceed
+    }
 }
 
 #[cfg(test)]
@@ -664,5 +736,26 @@ mod tests {
     fn month_of_extracts_year_month() {
         assert_eq!(month_of("2026-05-30T12:00:00.000Z"), "2026-05");
         assert_eq!(month_of("short"), "short");
+    }
+
+    #[test]
+    fn quota_action_respects_threshold_boundaries() {
+        assert_eq!(quota_action(0), QuotaAction::Proceed);
+        assert_eq!(quota_action(QUOTA_WARN - 1), QuotaAction::Proceed);
+        assert_eq!(quota_action(QUOTA_WARN), QuotaAction::Warn);
+        assert_eq!(
+            quota_action(QUOTA_SKIP_NON_ESSENTIAL - 1),
+            QuotaAction::Warn
+        );
+        assert_eq!(
+            quota_action(QUOTA_SKIP_NON_ESSENTIAL),
+            QuotaAction::SkipNonEssential
+        );
+        assert_eq!(
+            quota_action(QUOTA_HARD_STOP - 1),
+            QuotaAction::SkipNonEssential
+        );
+        assert_eq!(quota_action(QUOTA_HARD_STOP), QuotaAction::HardStop);
+        assert_eq!(quota_action(10_000), QuotaAction::HardStop);
     }
 }
