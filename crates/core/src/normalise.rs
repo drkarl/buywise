@@ -585,6 +585,60 @@ fn scan_embedded_size(s: &str) -> Option<NormalisedSize> {
     None
 }
 
+/// Scan `text` for an explicit `<number> sheet(s)` token and return the sheet
+/// count, e.g. "200 sheets" → `Some(200)`, "kitchen roll 200sheet" → `Some(200)`.
+/// The space between number and unit is optional and matching is
+/// case-insensitive. Only integer counts qualify ("2.5 sheets" → `None`); a
+/// roll/pack count such as "6 rolls" is ignored (`None`).
+///
+/// Used by [`unit_price_for_product`] to anchor the `PerSheet` basis to a real
+/// sheet count rather than a roll count that `parse_pack_size` might pick first.
+fn explicit_sheet_count(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Start a number only at a word boundary (mirrors `scan_embedded_size`).
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+
+        // Consume the number (digits and '.').
+        let num_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        let token = &lower[num_start..i];
+
+        // Skip a single optional space between number and unit.
+        let mut j = i;
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+
+        // Consume the trailing alphabetic unit token.
+        let unit_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        let unit = &lower[unit_start..j];
+
+        if matches!(unit, "sheet" | "sheets") {
+            // Sheet counts are whole numbers; reject fractional values.
+            if let Ok(n) = token.parse::<u32>() {
+                return Some(n);
+            }
+        }
+        // Not a sheet token; keep scanning from where the unit ended.
+    }
+    None
+}
+
 /// Whether a trailing token denotes a discrete count (or is empty, meaning a
 /// bare number like "12"). Recognises common pluralised pack words.
 fn is_count_unit(unit: &str) -> bool {
@@ -644,6 +698,13 @@ fn is_count_unit(unit: &str) -> bool {
 /// That step is exact for realistic prices (`cents × 1e10` stays integer-exact
 /// in `f64` below ~€9k). The worked example €2.99 / 2L yields exactly
 /// `1_495_000`.
+///
+/// This is a low-level primitive: it trusts the `(size, basis)` it is given and
+/// performs no semantic reconciliation. In particular, for `PerSheet` the
+/// `Count` MUST be a sheet count, not a roll/pack count — callers are
+/// responsible for supplying the right one. [`unit_price_for_product`] enforces
+/// this, using an explicit sheet count when available and otherwise falling
+/// back to `PerRoll` with the roll/pack count.
 pub fn compute_unit_price_micros(
     price_cents: i64,
     size: &NormalisedSize,
@@ -731,9 +792,15 @@ pub fn infer_basis(product_name: &str) -> UnitPriceBasis {
     // "washing-up" yields the tokens ["washing", "up"], not a "wash" match.
     let has_word = |kw: &str| t.split(|c: char| !c.is_alphanumeric()).any(|w| w == kw);
 
-    // Toilet/kitchen roll → €/sheet (€/roll is the fallback handled elsewhere).
+    // Toilet/kitchen roll → €/sheet only when a sheet count is actually present
+    // in the text (design §9: "€/sheet, or €/roll as fallback"). Without a sheet
+    // keyword the count refers to rolls, so fall back to PerRoll; the divisor is
+    // reconciled in `unit_price_for_product`.
     if t.contains("toilet roll") || t.contains("kitchen roll") {
-        return UnitPriceBasis::PerSheet;
+        if t.contains("sheet") {
+            return UnitPriceBasis::PerSheet;
+        }
+        return UnitPriceBasis::PerRoll;
     }
     // "napp" covers "nappy"/"nappies"; check the token prefix explicitly.
     if t.split(|c: char| !c.is_alphanumeric())
@@ -856,10 +923,37 @@ pub fn unit_price_for_product(
     product_name: &str,
     pack_size_text: Option<&str>,
 ) -> (Option<Micros>, UnitPriceBasis) {
-    let basis = infer_basis(product_name);
+    // Infer the basis from the name *and* the pack-size text combined, so a
+    // sheet count living only in the pack-size text (e.g. name "Kitchen Roll",
+    // pack size "200 sheets") is still seen by the paper-goods classifier.
+    let combined = match pack_size_text {
+        Some(text) => format!("{product_name} {text}"),
+        None => product_name.to_string(),
+    };
+    let basis = infer_basis(&combined);
 
-    // Prefer an explicit pack-size string; otherwise scan it out of the name.
-    let micros = parse_pack_size(pack_size_text.unwrap_or(product_name))
+    // Pack size is taken from the explicit text when given, else scanned out of
+    // the name (the Lidl feed embeds the size in the name).
+    let size_text = pack_size_text.unwrap_or(product_name);
+
+    // Paper-goods reconciliation: a `PerSheet` basis must divide by a real sheet
+    // count. If one is present, use it (overriding any roll/pack count that
+    // `parse_pack_size` would pick first). Otherwise fall back to `PerRoll` and
+    // divide by the parsed roll/pack count.
+    if basis == UnitPriceBasis::PerSheet {
+        if let Some(sheets) = explicit_sheet_count(&combined) {
+            let size = NormalisedSize::Count { each: sheets };
+            let micros = compute_unit_price_micros(price_cents, &size, UnitPriceBasis::PerSheet);
+            return (micros, UnitPriceBasis::PerSheet);
+        }
+        // No explicit sheet count: treat the parsed count as a roll/pack count.
+        let micros = parse_pack_size(size_text).and_then(|size| {
+            compute_unit_price_micros(price_cents, &size, UnitPriceBasis::PerRoll)
+        });
+        return (micros, UnitPriceBasis::PerRoll);
+    }
+
+    let micros = parse_pack_size(size_text)
         .and_then(|size| compute_unit_price_micros(price_cents, &size, basis));
 
     (micros, basis)
@@ -1754,8 +1848,14 @@ mod unit_price_tests {
         assert_eq!(infer_basis("laundry detergent"), UnitPriceBasis::PerWash);
         assert_eq!(infer_basis("coffee pods"), UnitPriceBasis::PerPod);
         assert_eq!(infer_basis("coffee capsules"), UnitPriceBasis::PerPod);
-        assert_eq!(infer_basis("toilet roll 9 pack"), UnitPriceBasis::PerSheet);
-        assert_eq!(infer_basis("kitchen roll"), UnitPriceBasis::PerSheet);
+        // Paper goods: PerSheet only with a real sheet count, else PerRoll.
+        assert_eq!(infer_basis("toilet roll 9 pack"), UnitPriceBasis::PerRoll);
+        assert_eq!(infer_basis("kitchen roll"), UnitPriceBasis::PerRoll);
+        assert_eq!(
+            infer_basis("toilet roll 200 sheets"),
+            UnitPriceBasis::PerSheet
+        );
+        assert_eq!(infer_basis("kitchen roll 6 rolls"), UnitPriceBasis::PerRoll);
         assert_eq!(infer_basis("tin of beans"), UnitPriceBasis::PerEach);
     }
 
@@ -1813,5 +1913,59 @@ mod unit_price_tests {
         let (micros, basis) = unit_price_for_product(299, "Semi Skimmed Milk", Some("2L"));
         assert_eq!(basis, UnitPriceBasis::PerL);
         assert_eq!(micros, Some(1_495_000));
+    }
+
+    // ---- paper goods: PerSheet only with a real sheet count, else PerRoll ----
+
+    #[test]
+    fn unit_price_for_product_rolls_fall_back_to_per_roll() {
+        // "6 rolls" is a roll count, not a sheet count → PerRoll, divide by 6.
+        // €6.00 × 10_000 / 6 = 1_000_000 micros.
+        let (micros, basis) = unit_price_for_product(600, "Kitchen Roll 6 rolls", None);
+        assert_eq!(basis, UnitPriceBasis::PerRoll);
+        assert_eq!(micros, Some(1_000_000));
+    }
+
+    #[test]
+    fn unit_price_for_product_sheets_use_per_sheet() {
+        // An explicit sheet count → PerSheet, divide by 200.
+        // €4.00 × 10_000 / 200 = 20_000 micros.
+        let (micros, basis) = unit_price_for_product(400, "Kitchen Roll 200 sheets", None);
+        assert_eq!(basis, UnitPriceBasis::PerSheet);
+        assert_eq!(micros, Some(20_000));
+    }
+
+    #[test]
+    fn unit_price_for_product_sheet_count_beats_roll_count() {
+        // Both counts present: PerSheet must divide by the SHEET count (200),
+        // not the roll count (2) that parse_pack_size would pick first.
+        // €5.00 × 10_000 / 200 = 25_000 micros.
+        let (micros, basis) = unit_price_for_product(500, "Kitchen Roll 2 rolls 200 sheets", None);
+        assert_eq!(basis, UnitPriceBasis::PerSheet);
+        assert_eq!(micros, Some(25_000));
+    }
+
+    #[test]
+    fn unit_price_for_product_paper_goods_no_count() {
+        // Paper-goods name with no parseable count → (None, PerRoll).
+        let (micros, basis) = unit_price_for_product(199, "Kitchen Roll", None);
+        assert_eq!(micros, None);
+        assert_eq!(basis, UnitPriceBasis::PerRoll);
+    }
+
+    #[test]
+    fn explicit_sheet_count_extracts_sheets_only() {
+        assert_eq!(explicit_sheet_count("200 sheets"), Some(200));
+        assert_eq!(explicit_sheet_count("200sheet"), Some(200));
+        assert_eq!(explicit_sheet_count("1 sheet"), Some(1));
+        // A roll/pack count is not a sheet count.
+        assert_eq!(explicit_sheet_count("6 rolls"), None);
+        assert_eq!(explicit_sheet_count("9 pack"), None);
+        // When both are present, only the sheet count is returned.
+        assert_eq!(explicit_sheet_count("2 rolls 200 sheets"), Some(200));
+        // Fractional sheet counts are rejected.
+        assert_eq!(explicit_sheet_count("2.5 sheets"), None);
+        // Nothing relevant.
+        assert_eq!(explicit_sheet_count("kitchen roll"), None);
     }
 }
