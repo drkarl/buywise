@@ -30,12 +30,13 @@ async fn seed_row_counts_match_acceptance_criteria() {
     let pool = seeded_pool().await;
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM categories").await, 11);
+    // 225 ported Shoppy items + nappies_size_4 / nappies_size_5 (P0-T11).
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM canonical_items").await,
-        225
+        227
     );
     assert!(
-        count(&pool, "SELECT COUNT(*) FROM item_aliases").await >= 452,
+        count(&pool, "SELECT COUNT(*) FROM item_aliases").await >= 454,
         "expected at least two aliases per item"
     );
 }
