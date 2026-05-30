@@ -2735,6 +2735,34 @@
         "tampones"
       ],
       "provenance": "shoppy_seed"
+    },
+    {
+      "slug": "nappies_size_4",
+      "name_en": "Nappies Size 4",
+      "name_es": "Pañales Talla 4",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "nappies size 4",
+        "size 4 nappies",
+        "panales talla 4",
+        "panales numero 4"
+      ],
+      "provenance": "buywise_p0t11"
+    },
+    {
+      "slug": "nappies_size_5",
+      "name_en": "Nappies Size 5",
+      "name_es": "Pañales Talla 5",
+      "category": "baby",
+      "default_constraint_policy": "any",
+      "variants": [
+        "nappies size 5",
+        "size 5 nappies",
+        "panales talla 5",
+        "panales numero 5"
+      ],
+      "provenance": "buywise_p0t11"
     }
   ]
 }
