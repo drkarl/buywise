@@ -1,13 +1,23 @@
 -- ============================================================================
 -- Migration 003: Phase 1 schema (households, lists, entries, sync, learning)
 -- ============================================================================
--- Source of truth: docs/design.md §7, docs/implementation-plan.md (P1-T1).
+-- Source of truth: docs/implementation-plan.md (P1-T1) and docs/design.md §7.
+-- The column layout below follows the canonical schema in the implementation
+-- plan verbatim; the Rust enums that back the TEXT columns live in
+-- crates/core/src/domain.rs (ResolutionStatus, ItemStatus, Retailer, ...).
+--
 -- Phase 1 introduces multi-user households, editable shopping lists, the
--- resolution lifecycle for list entries, an offline-sync mutation log, and the
--- recommendation/savings/feedback tables that capture learning signal.
--- Money is stored as INTEGER micros (1 EUR = 1_000_000) — never floats.
--- Timestamps are TEXT (ISO-8601 UTC, e.g. 2025-01-15T12:00:00Z).
--- Primary keys are TEXT (UUID or content hash strings).
+-- resolution lifecycle for list entries, an offline-sync mutation log with a
+-- per-list revision counter, and the recommendation/savings/feedback tables
+-- that capture learning signal.
+--
+-- Conventions (match 001_phase0_schema.sql):
+--   * Primary keys are TEXT (UUID or content-hash strings).
+--   * Timestamps are TEXT (ISO-8601 UTC, e.g. 2025-01-15T12:00:00Z).
+--   * Money is INTEGER cents (recommendation/savings tables) — never floats.
+--   * Enum-like columns carry an explicit CHECK(... IN (...)) whose value set
+--     mirrors the corresponding domain.rs enum's `as_db_str` output.
+--   * api_usage_events is defined in 001 (Phase 0); it is NOT redefined here.
 -- ============================================================================
 
 PRAGMA foreign_keys = ON;
@@ -19,219 +29,213 @@ CREATE TABLE households (
     created_at  TEXT NOT NULL
 );
 
--- Individual people who can authenticate. A user may belong to many
--- households via household_members.
+-- Individual people who can authenticate. A user may belong to many households
+-- via household_members. password_hash stores the argon2id hash; it is part of
+-- the initial table because SQLite cannot add a NOT NULL column via ALTER once
+-- rows exist (the MVP is password login — see P1-T2).
 CREATE TABLE users (
     id            TEXT PRIMARY KEY,
-    email         TEXT NOT NULL,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
     display_name  TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
 
--- Email is the login identity; enforce one account per address.
-CREATE UNIQUE INDEX uq_users_email ON users(email);
-
--- Membership join table mapping users to households with a role.
+-- Membership join table mapping users to households. Composite PK: a user
+-- appears at most once per household.
 CREATE TABLE household_members (
-    id            TEXT PRIMARY KEY,
-    household_id  TEXT NOT NULL,
-    user_id       TEXT NOT NULL,
-    role          TEXT NOT NULL,
-    created_at    TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    CHECK (role IN ('owner', 'member'))
+    household_id TEXT NOT NULL REFERENCES households(id),
+    user_id      TEXT NOT NULL REFERENCES users(id),
+    role         TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner', 'member')),
+    joined_at    TEXT NOT NULL,
+    PRIMARY KEY (household_id, user_id)
 );
 
--- A user appears at most once per household.
-CREATE UNIQUE INDEX uq_household_members_household_user
-    ON household_members(household_id, user_id);
-
--- Authenticated sessions. token_hash is the SHA-256 of the opaque bearer
--- token (the raw token is never stored); csrf_token guards mutating requests.
+-- Authenticated sessions. token_hash is the SHA-256 of the opaque bearer token
+-- (the raw token is never stored); csrf_token guards mutating requests.
 CREATE TABLE sessions (
-    id          TEXT PRIMARY KEY,
-    user_id     TEXT NOT NULL,
-    token_hash  TEXT NOT NULL,
+    id          TEXT PRIMARY KEY,   -- opaque random token used as the cookie value
+    user_id     TEXT NOT NULL REFERENCES users(id),
+    token_hash  TEXT NOT NULL UNIQUE,   -- SHA-256 of the session token
     csrf_token  TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    expires_at  TEXT NOT NULL
 );
 
--- Look up a session by the hash of the presented token.
-CREATE UNIQUE INDEX uq_sessions_token_hash ON sessions(token_hash);
-CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_sessions_token_hash ON sessions(token_hash);
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
 
--- A shopping list belongs to a household.
+-- A shopping list belongs to a household. current_revision is the per-list
+-- counter the offline-sync protocol increments on every accepted mutation;
+-- clients send their base_revision and the server detects staleness against it.
 CREATE TABLE shopping_lists (
-    id            TEXT PRIMARY KEY,
-    household_id  TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id)
+    id                TEXT PRIMARY KEY,
+    household_id      TEXT NOT NULL REFERENCES households(id),
+    name              TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
+    current_revision  INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    archived_at       TEXT
 );
 
 CREATE INDEX idx_shopping_lists_household ON shopping_lists(household_id);
 
--- A line on a shopping list. Entries move through a resolution lifecycle:
---   unresolved  -> raw text, not yet matched to a canonical item
---   ambiguous   -> multiple candidate matches recorded for the user to pick
---   resolved    -> bound to exactly one canonical_item_id
--- The six CHECK implications below encode that lifecycle's invariants. They
--- MUST live inline in CREATE TABLE: SQLite cannot add CHECKs via ALTER TABLE.
---
--- NOTE on column naming: the issue body overloads `status` for both the
--- resolution enum (the six CHECKs) and the dedup index predicate's 'active'
--- value. Those are distinct concerns and cannot share one column, so the
--- resolution enum keeps `status` (as the six CHECKs require) and the soft-delete
--- lifecycle flag is `entry_status` ('active' | 'removed'); the partial unique
--- index predicate therefore reads `entry_status = 'active'`.
+-- A line on a shopping list. Two orthogonal state columns:
+--   * resolution_status (unresolved | resolved | ambiguous) — the matching
+--     lifecycle, governed by the six CHECK implications below.
+--   * status (active | bought | skipped | deleted) — the item lifecycle, used by
+--     the dedup index predicate (WHERE status = 'active').
+-- These map to domain.rs ResolutionStatus and ItemStatus respectively. The six
+-- resolution CHECKs MUST live inline: SQLite cannot add CHECKs via ALTER TABLE.
 CREATE TABLE list_entries (
-    id                          TEXT PRIMARY KEY,
-    list_id                     TEXT NOT NULL,
+    id                          TEXT PRIMARY KEY,   -- client-generated UUID v4
+    list_id                     TEXT NOT NULL REFERENCES shopping_lists(id),
+    canonical_item_id           TEXT REFERENCES canonical_items(id),  -- NULL until resolved
+    resolution_status           TEXT NOT NULL DEFAULT 'unresolved'
+        CHECK(resolution_status IN ('unresolved', 'resolved', 'ambiguous')),
+    -- resolved => a canonical item is bound
+    CHECK(resolution_status != 'resolved' OR canonical_item_id IS NOT NULL),
+    -- canonical_item_id bound => status is resolved
+    CHECK(canonical_item_id IS NULL OR resolution_status = 'resolved'),
+    -- unresolved => no candidate list recorded
+    CHECK(resolution_status != 'unresolved' OR resolution_candidates_json IS NULL),
+    -- ambiguous => a candidate list is recorded (well-formed JSON)
+    CHECK(resolution_status != 'ambiguous'
+          OR (resolution_candidates_json IS NOT NULL
+              AND json_valid(resolution_candidates_json))),
+    -- ambiguous => the candidate list is a non-empty array
+    CHECK(resolution_status != 'ambiguous'
+          OR json_array_length(resolution_candidates_json) > 0),
+    -- resolved => candidate list is cleared
+    CHECK(resolution_status != 'resolved' OR resolution_candidates_json IS NULL),
+    resolution_candidates_json  TEXT,               -- JSON array of canonical_item_ids; ambiguous only
     raw_text                    TEXT NOT NULL,
-    status                      TEXT NOT NULL,
-    canonical_item_id           TEXT,
-    resolution_candidates_json  TEXT,
+    display_name                TEXT NOT NULL,
+    added_by                    TEXT NOT NULL REFERENCES users(id),
     quantity                    INTEGER NOT NULL DEFAULT 1,
+    status                      TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'bought', 'skipped', 'deleted')),
+    bought_by                   TEXT REFERENCES users(id),
+    bought_at                   TEXT,
+    -- sentinel 'unresolved:<entry_id>' when canonical_item_id IS NULL;
+    -- sentinel 'default' when resolved with an empty constraint set;
+    -- otherwise SHA-256 hex of the sorted-key JSON of the resolved constraints.
     effective_constraint_hash   TEXT NOT NULL,
-    entry_status                TEXT NOT NULL DEFAULT 'active'
-                                CHECK (entry_status IN ('active', 'removed')),
+    last_updated_revision       INTEGER NOT NULL DEFAULT 0,
     created_at                  TEXT NOT NULL,
-    updated_at                  TEXT NOT NULL,
-    FOREIGN KEY (list_id) REFERENCES shopping_lists(id),
-    FOREIGN KEY (canonical_item_id) REFERENCES canonical_items(id),
-    -- (1) resolution-status enum
-    CHECK (status IN ('unresolved', 'ambiguous', 'resolved')),
-    -- (2) resolved => a canonical item is bound
-    CHECK (status != 'resolved' OR canonical_item_id IS NOT NULL),
-    -- (3) a bound canonical item => status is resolved
-    CHECK (canonical_item_id IS NULL OR status = 'resolved'),
-    -- (4) unresolved => no candidate list recorded
-    CHECK (status != 'unresolved' OR resolution_candidates_json IS NULL),
-    -- (5) ambiguous => a non-empty, well-formed JSON candidate array is recorded.
-    -- json_valid() is folded in first so json_array_length() never sees malformed
-    -- JSON (which would raise an opaque parse error rather than a clean CHECK
-    -- violation).
-    CHECK (status != 'ambiguous' OR (
-        resolution_candidates_json IS NOT NULL
-        AND json_valid(resolution_candidates_json)
-        AND json_array_length(resolution_candidates_json) > 0
-    )),
-    -- (6) resolved => candidate list is cleared
-    CHECK (status != 'resolved' OR resolution_candidates_json IS NULL)
+    updated_at                  TEXT NOT NULL
 );
 
 CREATE INDEX idx_list_entries_list ON list_entries(list_id);
 
 -- One active line per (list, canonical item, constraint hash). The predicate
--- scopes the constraint to active, resolved entries so historical/soft-deleted
--- rows and still-unresolved entries do not collide.
+-- scopes the constraint to active, resolved entries so bought/skipped/deleted
+-- rows and still-unresolved entries (canonical_item_id IS NULL) do not collide.
 CREATE UNIQUE INDEX uq_list_entries_active_dedup
     ON list_entries(list_id, canonical_item_id, effective_constraint_hash)
-    WHERE entry_status = 'active' AND canonical_item_id IS NOT NULL;
+    WHERE status = 'active' AND canonical_item_id IS NOT NULL;
 
 -- Append-only audit trail of changes to a list entry.
 CREATE TABLE list_entry_events (
-    id             TEXT PRIMARY KEY,
-    list_entry_id  TEXT NOT NULL,
-    event_type     TEXT NOT NULL,
-    payload_json   TEXT,
-    created_at     TEXT NOT NULL,
-    FOREIGN KEY (list_entry_id) REFERENCES list_entries(id),
-    CHECK (event_type IN (
-        'created', 'resolved', 'reresolved', 'edited', 'removed'
-    ))
+    id          TEXT PRIMARY KEY,
+    entry_id    TEXT NOT NULL REFERENCES list_entries(id),
+    user_id     TEXT NOT NULL REFERENCES users(id),
+    event_type  TEXT NOT NULL,
+    payload     TEXT,    -- JSON
+    created_at  TEXT NOT NULL
 );
 
-CREATE INDEX idx_list_entry_events_entry ON list_entry_events(list_entry_id);
+CREATE INDEX idx_list_entry_events_entry ON list_entry_events(entry_id);
 
 -- Offline-sync mutation log. Each client-originated mutation carries a stable
--- client_mutation_id so replays are idempotent on the server.
+-- client_mutation_id (idempotency key) and is ordered per list by
+-- server_revision. response_json is stored so a duplicate client_mutation_id
+-- replay can return the original response without re-applying.
 CREATE TABLE mutations (
-    id                  TEXT PRIMARY KEY,
-    client_mutation_id  TEXT NOT NULL,
-    household_id        TEXT NOT NULL,
-    user_id             TEXT NOT NULL,
-    mutation_type       TEXT NOT NULL,
-    payload_json        TEXT NOT NULL,
-    applied_at          TEXT NOT NULL,
-    created_at          TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    id                  TEXT PRIMARY KEY,        -- server-assigned UUID
+    client_mutation_id  TEXT NOT NULL UNIQUE,    -- client UUID; idempotency key
+    device_id           TEXT NOT NULL,
+    user_id             TEXT NOT NULL REFERENCES users(id),
+    list_id             TEXT NOT NULL REFERENCES shopping_lists(id),
+    entity_type         TEXT NOT NULL,
+    entity_id           TEXT NOT NULL,
+    operation_type      TEXT NOT NULL
+        CHECK(operation_type IN ('add_item', 'mark_bought', 'mark_skipped',
+                                 'delete_item', 'rename_item', 'resolve_alias',
+                                 'reject_match', 'set_constraint')),
+    payload             TEXT NOT NULL,           -- JSON
+    base_revision       INTEGER NOT NULL,
+    created_at_client   TEXT NOT NULL,
+    received_at_server  TEXT NOT NULL,
+    server_revision     INTEGER,                 -- NULL until accepted
+    status              TEXT NOT NULL DEFAULT 'accepted'
+        CHECK(status IN ('accepted', 'rejected', 'merged')),
+    response_json       TEXT                     -- stored response for idempotent replay
 );
 
--- Idempotency key: a replayed client mutation must not be applied twice.
-CREATE UNIQUE INDEX uq_mutations_client_mutation_id
-    ON mutations(client_mutation_id);
-CREATE INDEX idx_mutations_household ON mutations(household_id);
+-- Per-list ordering of accepted mutations (also drives stale-revision detection).
+CREATE INDEX idx_mutations_list_server_revision
+    ON mutations(list_id, server_revision);
 
--- Per-household, per-retailer aisle ordering of categories. Drives the
--- in-store walking order of a generated shopping route.
+-- Per-household, per-store aisle ordering of categories. Drives the in-store
+-- walking order of a generated shopping route. `store` mirrors domain.rs
+-- Retailer::as_db_str.
 CREATE TABLE store_category_orders (
     id            TEXT PRIMARY KEY,
-    household_id  TEXT NOT NULL,
-    retailer      TEXT NOT NULL,
-    category_id   TEXT NOT NULL,
-    sort_order    INTEGER NOT NULL,
-    created_at    TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (category_id) REFERENCES categories(id),
-    -- Must stay in sync with the canonical Retailer enum
-    -- (crates/core/src/domain.rs, Retailer::as_db_str) and the identical CHECK on
-    -- retailer_products in 001_phase0_schema.sql. The 004 seed inserts these exact
-    -- five strings.
-    CHECK (retailer IN ('tesco', 'dunnes', 'supervalu', 'lidl', 'aldi'))
+    household_id  TEXT NOT NULL REFERENCES households(id),
+    store         TEXT NOT NULL CHECK(store IN ('tesco', 'dunnes', 'supervalu', 'aldi', 'lidl')),
+    category_id   TEXT NOT NULL REFERENCES categories(id),
+    display_order INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE(household_id, store, category_id)
 );
 
--- One ordering row per (household, retailer, category).
-CREATE UNIQUE INDEX uq_store_category_orders_household_retailer_category
-    ON store_category_orders(household_id, retailer, category_id);
-
--- A single execution of the recommendation engine for a list.
+-- A single execution of the recommendation engine for a list. plans_json holds
+-- all four plans; thresholds are in cents.
 CREATE TABLE recommendation_runs (
-    id                    TEXT PRIMARY KEY,
-    household_id          TEXT NOT NULL,
-    list_id               TEXT NOT NULL,
-    strategy              TEXT NOT NULL,
-    total_cost_micros     INTEGER NOT NULL,
-    estimated_savings_micros INTEGER NOT NULL DEFAULT 0,
-    result_json           TEXT NOT NULL,
-    created_at            TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (list_id) REFERENCES shopping_lists(id),
-    CHECK (strategy IN ('cheapest_single_store', 'best_two_store', 'cheapest_overall'))
+    id                       TEXT PRIMARY KEY,
+    list_id                  TEXT NOT NULL REFERENCES shopping_lists(id),
+    household_id             TEXT NOT NULL REFERENCES households(id),
+    run_at                   TEXT NOT NULL,
+    offer_snapshot_date      TEXT,
+    plans_json               TEXT NOT NULL,
+    recommended_plan         TEXT NOT NULL,
+    convenience_threshold_2  INTEGER NOT NULL,    -- cents
+    convenience_threshold_3  INTEGER NOT NULL     -- cents
 );
 
 CREATE INDEX idx_recommendation_runs_list ON recommendation_runs(list_id);
 
--- Realised savings attributed to a recommendation run.
+-- Realised savings attributed to a recommendation run. All money in cents.
 CREATE TABLE savings_events (
-    id                     TEXT PRIMARY KEY,
-    household_id           TEXT NOT NULL,
-    recommendation_run_id  TEXT NOT NULL,
-    savings_micros         INTEGER NOT NULL,
-    created_at             TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (recommendation_run_id) REFERENCES recommendation_runs(id)
+    id                             TEXT PRIMARY KEY,
+    list_id                        TEXT NOT NULL REFERENCES shopping_lists(id),
+    recommendation_run_id          TEXT REFERENCES recommendation_runs(id),
+    baseline_cost_cents            INTEGER NOT NULL,
+    recommended_cost_cents         INTEGER NOT NULL,
+    theoretical_minimum_cost_cents INTEGER NOT NULL,
+    chosen_basket_cost_cents       INTEGER,    -- manual entry after the shop
+    chosen_plan                    TEXT,
+    chosen_stores                  TEXT,       -- JSON array
+    gross_saving_cents             INTEGER NOT NULL,
+    accepted_savings_cents         INTEGER,
+    rejected_savings_cents         INTEGER,
+    travel_cost_cents              INTEGER,
+    subscription_cost_alloc_cents  INTEGER,
+    net_saving_cents               INTEGER,
+    created_at                     TEXT NOT NULL
 );
 
-CREATE INDEX idx_savings_events_household ON savings_events(household_id);
+CREATE INDEX idx_savings_events_list ON savings_events(list_id);
 
 -- User feedback on a proposed canonical-item match, used to improve resolution.
+-- References product_matches(id) from the Phase 0 schema (001).
 CREATE TABLE match_feedback (
-    id                 TEXT PRIMARY KEY,
-    household_id       TEXT NOT NULL,
-    list_entry_id      TEXT NOT NULL,
-    canonical_item_id  TEXT NOT NULL,
-    verdict            TEXT NOT NULL,
-    created_at         TEXT NOT NULL,
-    FOREIGN KEY (household_id) REFERENCES households(id),
-    FOREIGN KEY (list_entry_id) REFERENCES list_entries(id),
-    FOREIGN KEY (canonical_item_id) REFERENCES canonical_items(id),
-    CHECK (verdict IN ('accepted', 'rejected'))
+    id                TEXT PRIMARY KEY,
+    product_match_id  TEXT NOT NULL REFERENCES product_matches(id),
+    user_id           TEXT NOT NULL REFERENCES users(id),
+    action            TEXT NOT NULL CHECK(action IN ('accept', 'reject', 'prefer')),
+    created_at        TEXT NOT NULL
 );
 
-CREATE INDEX idx_match_feedback_entry ON match_feedback(list_entry_id);
+CREATE INDEX idx_match_feedback_product_match ON match_feedback(product_match_id);
