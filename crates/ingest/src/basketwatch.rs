@@ -431,9 +431,11 @@ pub async fn ingest(pool: &SqlitePool) -> Result<RunSummary, IngestError> {
         })
         .await
     } else {
-        let pool = pool.clone();
+        // One clone for the closure; the borrow passed to `run_ingest` reuses the
+        // caller's reference.
+        let fetch_pool = pool.clone();
         let clock = fetched_at.clone();
-        run_ingest(&pool.clone(), &fetched_at, move || live_fetch(pool, clock)).await
+        run_ingest(pool, &fetched_at, move || live_fetch(fetch_pool, clock)).await
     }
 }
 
@@ -449,12 +451,11 @@ fn month_of(timestamp: &str) -> String {
 
 /// Read and parse the no-network fixture (`fixtures/offers.json`).
 ///
-/// The path is resolved relative to the crate's `CARGO_MANIFEST_DIR` (so it
-/// works for both library and integration tests regardless of the process CWD),
-/// and can be overridden with `BUYWISE_OFFERS_FIXTURE` for flexibility.
+/// The path is resolved relative to the crate's `CARGO_MANIFEST_DIR` so it works
+/// regardless of the process CWD (dry-run is a dev/CI affordance, and this is the
+/// only place the file is loaded by the adapter).
 fn load_fixture_offers() -> Result<Vec<RawBasketWatchProduct>, IngestError> {
-    let path = std::env::var("BUYWISE_OFFERS_FIXTURE")
-        .unwrap_or_else(|_| format!("{}/../../fixtures/offers.json", env!("CARGO_MANIFEST_DIR")));
+    let path = format!("{}/../../fixtures/offers.json", env!("CARGO_MANIFEST_DIR"));
     let bytes = std::fs::read(&path).map_err(|source| IngestError::Fixture {
         path: path.clone(),
         source,
