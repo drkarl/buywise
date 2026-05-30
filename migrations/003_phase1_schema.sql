@@ -97,7 +97,8 @@ CREATE TABLE list_entries (
     resolution_candidates_json  TEXT,
     quantity                    INTEGER NOT NULL DEFAULT 1,
     effective_constraint_hash   TEXT NOT NULL,
-    entry_status                TEXT NOT NULL DEFAULT 'active',
+    entry_status                TEXT NOT NULL DEFAULT 'active'
+                                CHECK (entry_status IN ('active', 'removed')),
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
     FOREIGN KEY (list_id) REFERENCES shopping_lists(id),
