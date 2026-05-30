@@ -83,12 +83,11 @@ async fn all_migrations_apply_and_seed_55_store_category_orders() {
     assert_eq!(count, 55, "expected 5 stores x 11 categories = 55 rows");
 
     // The default household must match the Phase 0 canonical-items household.
-    let household: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM households WHERE id = ?")
-            .bind(HOUSEHOLD)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let household: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM households WHERE id = ?")
+        .bind(HOUSEHOLD)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(household, 1);
 }
 
@@ -127,8 +126,15 @@ async fn list_entries_resolution_checks_reject_invalid_states() {
     seed_list_prereqs(&pool).await;
 
     // (0) resolution_status enum: an unknown value is rejected.
-    assert_entry_insert_fails(&pool, "e0", "bogus", None, None, "resolution_status not in enum")
-        .await;
+    assert_entry_insert_fails(
+        &pool,
+        "e0",
+        "bogus",
+        None,
+        None,
+        "resolution_status not in enum",
+    )
+    .await;
 
     // (1) resolved => canonical_item_id IS NOT NULL.
     assert_entry_insert_fails(

@@ -87,27 +87,17 @@ CREATE INDEX idx_shopping_lists_household ON shopping_lists(household_id);
 --     the dedup index predicate (WHERE status = 'active').
 -- These map to domain.rs ResolutionStatus and ItemStatus respectively. The six
 -- resolution CHECKs MUST live inline: SQLite cannot add CHECKs via ALTER TABLE.
+-- NOTE: SQLite requires every column definition to precede the table-level
+-- constraints, so the six resolution CHECKs are grouped at the end rather than
+-- interleaved with the columns (as the plan lists them illustratively). They are
+-- still inline in CREATE TABLE, which is what matters — SQLite cannot add CHECKs
+-- via ALTER TABLE.
 CREATE TABLE list_entries (
     id                          TEXT PRIMARY KEY,   -- client-generated UUID v4
     list_id                     TEXT NOT NULL REFERENCES shopping_lists(id),
     canonical_item_id           TEXT REFERENCES canonical_items(id),  -- NULL until resolved
     resolution_status           TEXT NOT NULL DEFAULT 'unresolved'
         CHECK(resolution_status IN ('unresolved', 'resolved', 'ambiguous')),
-    -- resolved => a canonical item is bound
-    CHECK(resolution_status != 'resolved' OR canonical_item_id IS NOT NULL),
-    -- canonical_item_id bound => status is resolved
-    CHECK(canonical_item_id IS NULL OR resolution_status = 'resolved'),
-    -- unresolved => no candidate list recorded
-    CHECK(resolution_status != 'unresolved' OR resolution_candidates_json IS NULL),
-    -- ambiguous => a candidate list is recorded (well-formed JSON)
-    CHECK(resolution_status != 'ambiguous'
-          OR (resolution_candidates_json IS NOT NULL
-              AND json_valid(resolution_candidates_json))),
-    -- ambiguous => the candidate list is a non-empty array
-    CHECK(resolution_status != 'ambiguous'
-          OR json_array_length(resolution_candidates_json) > 0),
-    -- resolved => candidate list is cleared
-    CHECK(resolution_status != 'resolved' OR resolution_candidates_json IS NULL),
     resolution_candidates_json  TEXT,               -- JSON array of canonical_item_ids; ambiguous only
     raw_text                    TEXT NOT NULL,
     display_name                TEXT NOT NULL,
@@ -123,7 +113,22 @@ CREATE TABLE list_entries (
     effective_constraint_hash   TEXT NOT NULL,
     last_updated_revision       INTEGER NOT NULL DEFAULT 0,
     created_at                  TEXT NOT NULL,
-    updated_at                  TEXT NOT NULL
+    updated_at                  TEXT NOT NULL,
+    -- resolved => a canonical item is bound
+    CHECK(resolution_status != 'resolved' OR canonical_item_id IS NOT NULL),
+    -- canonical_item_id bound => status is resolved
+    CHECK(canonical_item_id IS NULL OR resolution_status = 'resolved'),
+    -- unresolved => no candidate list recorded
+    CHECK(resolution_status != 'unresolved' OR resolution_candidates_json IS NULL),
+    -- ambiguous => a candidate list is recorded (well-formed JSON)
+    CHECK(resolution_status != 'ambiguous'
+          OR (resolution_candidates_json IS NOT NULL
+              AND json_valid(resolution_candidates_json))),
+    -- ambiguous => the candidate list is a non-empty array
+    CHECK(resolution_status != 'ambiguous'
+          OR json_array_length(resolution_candidates_json) > 0),
+    -- resolved => candidate list is cleared
+    CHECK(resolution_status != 'resolved' OR resolution_candidates_json IS NULL)
 );
 
 CREATE INDEX idx_list_entries_list ON list_entries(list_id);
