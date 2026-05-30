@@ -50,3 +50,5 @@ argon2 = "0.5"
 # `SaltString::generate` expects a rand_core 0.6 RNG. Bumping to rand 0.9 would
 # pull a second rand_core (0.9) and break the api crate's password hashing.
 rand = "0.8"
+# Test-only: temp dirs/files for CLI integration tests.
+tempfile = "3"
