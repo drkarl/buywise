@@ -75,13 +75,22 @@ enum Command {
         db: String,
         /// Household UUID the matches belong to (Phase 0:
         /// 00000000-0000-0000-0000-000000000001).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_household_id)]
         household_id: String,
     },
 
     /// Regenerate fixtures/canonical_items.json and migrations/002_seed.sql from
     /// fixtures/dictionary.json.
     GenerateFixtures,
+}
+
+/// Validate `--household-id` parses as a UUID at parse time, so a malformed id
+/// fails before any database work. The canonical hyphenated form is returned so
+/// downstream string comparisons (against seeded ids) are stable.
+fn parse_household_id(s: &str) -> Result<String, String> {
+    uuid::Uuid::parse_str(s)
+        .map(|u| u.hyphenated().to_string())
+        .map_err(|e| format!("invalid household id {s:?}: {e}"))
 }
 
 fn main() -> Result<()> {
