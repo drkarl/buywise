@@ -898,11 +898,41 @@ fn best_two_store_is_none_when_one_store_dominates_a_multi_retailer_basket() {
 // Fixture schema guard
 // ---------------------------------------------------------------------------
 
+/// Every key permitted inside an `item_constraints` fixture object — exactly the
+/// columns of the `item_constraints` table / fields of [`ItemConstraints`]. This
+/// is the contract the fixture is checked against: any other key (e.g. the
+/// removed `constraint_policy`) is drift and must fail the guard test.
+const ITEM_CONSTRAINTS_FIELDS: &[&str] = &[
+    "id",
+    "canonical_item_id",
+    "brand",
+    "allowed_brands",
+    "excluded_brands",
+    "preferred_size_value",
+    "preferred_size_basis",
+    "min_size_value",
+    "min_size_basis",
+    "max_size_value",
+    "max_size_basis",
+    "pack_count",
+    "form_factor",
+    "dietary_flags",
+    "substitution_policy",
+    "updated_at",
+];
+
 #[test]
 fn item_constraints_fixture_parses_into_struct() {
-    // Guard against schema drift: fixtures/item_constraints.json must deserialize
-    // field-for-field into Vec<ItemConstraints>. A bogus extra field (e.g. the
-    // removed constraint_policy) or a missing required field would fail here.
+    // Guard against schema drift in fixtures/item_constraints.json. Two checks,
+    // because `serde` ignores unknown fields by default and `ItemConstraints`
+    // deliberately does NOT set `deny_unknown_fields` (it is JSON-round-tripped
+    // and a future P1 path may read it from tolerant DB JSON columns):
+    //   1. Deserialising into `Vec<ItemConstraints>` proves every required field
+    //      is present and correctly typed.
+    //   2. Comparing each object's raw key set against ITEM_CONSTRAINTS_FIELDS
+    //      proves there are NO extra keys — this is what catches a re-introduced
+    //      `constraint_policy` (or any other bogus field) that step 1 would
+    //      silently swallow.
     #[derive(serde::Deserialize)]
     struct Fixture {
         item_constraints: Vec<ItemConstraints>,
@@ -912,6 +942,28 @@ fn item_constraints_fixture_parses_into_struct() {
         "/../../fixtures/item_constraints.json"
     );
     let bytes = std::fs::read(path).expect("read fixtures/item_constraints.json");
+
+    // Check 2: no unexpected keys in any constraint object.
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse fixtures/item_constraints.json as JSON");
+    let raw_entries = raw["item_constraints"]
+        .as_array()
+        .expect("item_constraints must be a JSON array");
+    for (i, entry) in raw_entries.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .unwrap_or_else(|| panic!("item_constraints[{i}] must be a JSON object"));
+        for key in obj.keys() {
+            assert!(
+                ITEM_CONSTRAINTS_FIELDS.contains(&key.as_str()),
+                "item_constraints[{i}] has unexpected field {key:?}; \
+                 allowed fields are {ITEM_CONSTRAINTS_FIELDS:?} \
+                 (did a removed field like constraint_policy come back?)"
+            );
+        }
+    }
+
+    // Check 1: required fields present and well-typed.
     let fixture: Fixture =
         serde_json::from_slice(&bytes).expect("parse fixtures/item_constraints.json");
     assert_eq!(fixture.item_constraints.len(), 2);
