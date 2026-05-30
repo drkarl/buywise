@@ -15,8 +15,8 @@
 
 use anyhow::{bail, Context, Result};
 use buywise_core::db;
-use buywise_core::{MatchStatus, RetailerProduct};
-use sqlx::sqlite::SqlitePool;
+use buywise_core::MatchStatus;
+use sqlx::sqlite::SqliteConnection;
 
 /// One parsed CSV row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,11 +48,18 @@ async fn run_async(csv_path: &str, db_path: &str, household_id: &str) -> Result<
         .context("running migrations")?;
 
     let now = db::now_iso();
+    // Wrap the whole batch in one transaction so a mid-file failure (e.g. an
+    // unknown retailer_product_id on row N) rolls back every prior upsert and
+    // never leaves the table half-populated.
+    let mut tx = pool.begin().await.context("beginning transaction")?;
     let mut upserted = 0usize;
     for m in &matches {
-        upsert_match(&pool, household_id, m, &now).await?;
+        // `&mut tx` auto-derefs the transaction to its underlying connection so
+        // each row's FK-guard read and the upsert write share one atomic unit.
+        upsert_match(&mut tx, household_id, m, &now).await?;
         upserted += 1;
     }
+    tx.commit().await.context("committing transaction")?;
 
     println!("seeded {upserted} product_matches into {db_path} (idempotent upsert)");
     Ok(())
@@ -125,20 +132,27 @@ pub fn parse_matches_csv(body: &str) -> Result<Vec<CsvMatch>> {
     Ok(out)
 }
 
-/// Upsert a single match row. The `id` is a fresh UUID on first insert and
-/// preserved on conflict (see the module doc on why REPLACE is wrong). On
-/// conflict only the mutable columns are updated.
+/// Upsert a single match row within an open transaction. The `id` is a fresh
+/// UUID on first insert and preserved on conflict (see the module doc on why
+/// REPLACE is wrong). On conflict only the mutable columns are updated.
+///
+/// Takes `&mut SqliteConnection` (the transaction auto-derefs to it) so the
+/// FK-guard reads and the upsert write all run inside the caller's transaction;
+/// a `bail!` here propagates and rolls the whole batch back.
 async fn upsert_match(
-    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
     household_id: &str,
     m: &CsvMatch,
     now: &str,
 ) -> Result<()> {
     // Guard the FKs with a clear message: the schema FKs would otherwise surface
     // a generic constraint error.
-    let product: Option<RetailerProduct> =
-        db::retailer_product_by_id(pool, &m.retailer_product_id).await?;
-    if product.is_none() {
+    let known_product: Option<String> =
+        sqlx::query_scalar("SELECT id FROM retailer_products WHERE id = ?1")
+            .bind(&m.retailer_product_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if known_product.is_none() {
         bail!(
             "retailer_product_id {:?} not found — run ingest-basketwatch first",
             m.retailer_product_id
@@ -147,7 +161,7 @@ async fn upsert_match(
     let known_item: Option<String> =
         sqlx::query_scalar("SELECT id FROM canonical_items WHERE id = ?1")
             .bind(&m.canonical_item_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     if known_item.is_none() {
         bail!(
@@ -174,8 +188,93 @@ async fn upsert_match(
     .bind(&m.status)
     .bind(&m.matched_by)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .context("upserting product_matches row")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUSEHOLD: &str = "00000000-0000-0000-0000-000000000001";
+
+    fn good_row() -> &'static str {
+        "canonical_item_id,retailer_product_id,status,matched_by\nitem1,prod1,accepted,system\n"
+    }
+
+    #[test]
+    fn parses_valid_rows_skipping_comments_and_blanks() {
+        let body = "# a comment\n\ncanonical_item_id,retailer_product_id,status,matched_by\n\
+                    item1,prod1,accepted,system\n# trailing comment\nitem2,prod2,pending,llm\n";
+        let rows = parse_matches_csv(body).expect("parse");
+        assert_eq!(
+            rows,
+            vec![
+                CsvMatch {
+                    canonical_item_id: "item1".to_string(),
+                    retailer_product_id: "prod1".to_string(),
+                    status: "accepted".to_string(),
+                    matched_by: "system".to_string(),
+                },
+                CsvMatch {
+                    canonical_item_id: "item2".to_string(),
+                    retailer_product_id: "prod2".to_string(),
+                    status: "pending".to_string(),
+                    matched_by: "llm".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_wrong_header() {
+        let err = parse_matches_csv("").expect_err("empty");
+        assert!(err.to_string().contains("no header"), "got: {err}");
+
+        let body = "a,b,c,d\nitem1,prod1,accepted,system\n";
+        let err = parse_matches_csv(body).expect_err("bad header");
+        assert!(
+            err.to_string().contains("unexpected CSV header"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_arity() {
+        let body =
+            "canonical_item_id,retailer_product_id,status,matched_by\nitem1,prod1,accepted\n";
+        let err = parse_matches_csv(body).expect_err("too few columns");
+        assert!(err.to_string().contains("expected 4"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_status_enum() {
+        let body = good_row().replace("accepted", "approved");
+        let err = parse_matches_csv(&body).expect_err("bad status");
+        assert!(err.to_string().contains("invalid status"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_matched_by_enum() {
+        let body = good_row().replace("system", "robot");
+        let err = parse_matches_csv(&body).expect_err("bad matched_by");
+        assert!(err.to_string().contains("invalid matched_by"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_id_field() {
+        let body =
+            "canonical_item_id,retailer_product_id,status,matched_by\n,prod1,accepted,system\n";
+        let err = parse_matches_csv(body).expect_err("empty id");
+        assert!(err.to_string().contains("empty id"), "got: {err}");
+    }
+
+    // Keep the household constant referenced so it documents the Phase-0 id even
+    // though the pure parser tests don't touch the DB.
+    #[test]
+    fn household_constant_is_the_phase0_dev_id() {
+        assert_eq!(HOUSEHOLD, "00000000-0000-0000-0000-000000000001");
+    }
 }
