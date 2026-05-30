@@ -570,6 +570,12 @@ pub async fn latest_offer_for_product(
 /// lock). The optimiser reads it once, off the write path, to compute freshness
 /// confidence: `missed_cycles = current_run_number − run_number_at_fetch`.
 /// A `None` here ultimately yields [`FreshnessConfidence::Unknown`].
+///
+/// This helper exists for the **caller** that builds `OptimiserInput`: it reads
+/// the current run number once and stores it on `OptimiserInput::current_source_run_number`.
+/// `optimise` itself takes the run number from that field, not from this helper —
+/// so this is not dead code, it is the seam the caller uses before invoking the
+/// optimiser.
 pub async fn current_source_run_number(
     pool: &SqlitePool,
     source: Source,
