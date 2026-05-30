@@ -211,6 +211,83 @@ async fn optimise_fixture_mode_monthly_saving_meets_phase0_gate() {
     );
 }
 
+/// Guards the catalogue/match household-split fix: a fixture pool built for a
+/// **non-default** `--household-id` must stamp the catalogue (canonical_items +
+/// item_aliases) AND the matches with that *same* requested id. Resolution and
+/// pricing both filter by household, so if the catalogue lived under a different
+/// id the basket would silently price to nothing. We assert both the row-level
+/// invariant and the end-to-end pricing path.
+#[tokio::test]
+async fn fixture_pool_uses_requested_household_end_to_end() {
+    const CUSTOM_HOUSEHOLD: &str = "11111111-1111-1111-1111-111111111111";
+
+    let root = workspace_root();
+    let pool = build_fixture_pool(&root, CUSTOM_HOUSEHOLD)
+        .await
+        .expect("build fixture pool for custom household");
+
+    // Row-level: every catalogue + match row carries the requested id, and none
+    // carries a different (e.g. fixture-embedded) household id.
+    for table in ["canonical_items", "item_aliases", "product_matches"] {
+        let under_requested: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE household_id = ?1"
+        ))
+        .bind(CUSTOM_HOUSEHOLD)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("count {table} (requested): {e}"));
+        let under_other: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE household_id <> ?1"
+        ))
+        .bind(CUSTOM_HOUSEHOLD)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("count {table} (other): {e}"));
+        assert!(
+            under_requested > 0,
+            "{table} has no rows under the requested household"
+        );
+        assert_eq!(
+            under_other, 0,
+            "{table} has {under_other} rows under a non-requested household (catalogue/match split)"
+        );
+    }
+
+    // End-to-end: a basket resolved and priced under the custom household must
+    // still produce a complete, priced plan. Before the fix the catalogue was
+    // under a different id, so resolution found nothing and nothing priced.
+    let lines = resolve_lines(&pool, CUSTOM_HOUSEHOLD, &["Whole Milk".to_string()])
+        .await
+        .expect("resolve lines under custom household");
+    assert!(
+        lines
+            .iter()
+            .any(|l| matches!(l.outcome, ResolutionOutcome::SingleMatch { .. })),
+        "milk must resolve under the custom household"
+    );
+
+    let input = build_optimiser_input(&pool, CUSTOM_HOUSEHOLD, &lines, None)
+        .await
+        .expect("build optimiser input under custom household");
+    let out = optimise(&pool, &input)
+        .await
+        .expect("optimise under custom household");
+
+    let best_single = out
+        .best_single
+        .as_ref()
+        .expect("a best single plan under the custom household");
+    assert!(
+        best_single.total_cents > 0,
+        "custom-household basket priced to €0 — catalogue/match household split regressed"
+    );
+    assert_eq!(
+        best_single.missing_count, 0,
+        "milk should price under the custom household; no_valid_offer: {:?}",
+        out.no_valid_offer_items
+    );
+}
+
 /// Build a small tokio runtime for the async DB-assertion helpers. The command
 /// entry points (`ingest::run`, `seed_matches::run`) build their own runtime, so
 /// these tests are plain `#[test]`s and only spin a runtime up for assertions.

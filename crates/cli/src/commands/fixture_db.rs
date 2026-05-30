@@ -34,6 +34,11 @@ const FIXTURE_RUN_NUMBER: i64 = 1;
 /// Minimal mirror of `fixtures/canonical_items.json` for seeding.
 #[derive(Debug, Deserialize)]
 struct CanonicalItemsFixture {
+    /// The household id embedded in the fixture. Intentionally **not** used to
+    /// stamp rows: fixture mode seeds the catalogue under the *requested*
+    /// household id instead (see [`seed_categories_and_items`]). Kept so the
+    /// field is accepted (and documented) when the JSON is deserialised.
+    #[allow(dead_code)]
     household_id: String,
     created_at: String,
     canonical_items: Vec<FixtureItem>,
@@ -71,7 +76,7 @@ pub async fn build_fixture_pool(root: &Path, household_id: &str) -> Result<Sqlit
         .context("connecting in-memory fixture database")?;
 
     apply_schema_001(&pool, root).await?;
-    seed_categories_and_items(&pool, root).await?;
+    seed_categories_and_items(&pool, root, household_id).await?;
     seed_item_constraints(&pool, root).await?;
     seed_offers(&pool, root).await?;
     seed_matches(&pool, root, household_id).await?;
@@ -98,7 +103,19 @@ async fn apply_schema_001(pool: &SqlitePool, root: &Path) -> Result<()> {
 
 /// Seed `categories`, `canonical_items`, and `item_aliases` from
 /// `fixtures/canonical_items.json` and the category list in `dictionary.json`.
-async fn seed_categories_and_items(pool: &SqlitePool, root: &Path) -> Result<()> {
+///
+/// Catalogue rows are stamped with the **requested** `household_id`, *not* the
+/// id embedded in `canonical_items.json`. Resolution (`matching.rs`) and pricing
+/// (`product_matches`, seeded by [`seed_matches`]) both filter by the requested
+/// household, so stamping the catalogue with a different id would split the
+/// fixture DB across two households and silently return empty results for any
+/// non-default `--household-id`. The canonical item *ids* are kept verbatim so
+/// `product_matches.csv` still references them by their literal id.
+async fn seed_categories_and_items(
+    pool: &SqlitePool,
+    root: &Path,
+    household_id: &str,
+) -> Result<()> {
     // Categories live in dictionary.json (canonical_items.json carries only the
     // category_id reference). Seed them first to satisfy the FK.
     let dict_path = root.join("fixtures").join("dictionary.json");
@@ -131,7 +148,7 @@ async fn seed_categories_and_items(pool: &SqlitePool, root: &Path) -> Result<()>
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&item.id)
-        .bind(&fixture.household_id)
+        .bind(household_id)
         .bind(&item.name_en)
         .bind(&item.name_es)
         .bind(&item.category_id)
@@ -148,7 +165,7 @@ async fn seed_categories_and_items(pool: &SqlitePool, root: &Path) -> Result<()>
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(&alias.id)
-            .bind(&fixture.household_id)
+            .bind(household_id)
             .bind(&item.id)
             .bind(&alias.alias)
             .bind(&alias.language)
