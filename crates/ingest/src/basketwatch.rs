@@ -133,7 +133,11 @@ impl OfferDraft {
     /// Promote a draft into a full [`ProductOffer`], stamping the now-known run
     /// id and number. The offer's own primary key is a fresh UUID — offers are
     /// append-only point-in-time snapshots, so each fetch inserts a new row.
-    fn into_offer(self, run_id: &str, run_number: i64) -> ProductOffer {
+    ///
+    /// `pub` so out-of-crate callers that seed fixtures from the same draft type
+    /// (the CLI's fixture-mode database builder) can stamp drafts without
+    /// re-implementing the field mapping.
+    pub fn into_offer(self, run_id: &str, run_number: i64) -> ProductOffer {
         ProductOffer {
             id: uuid::Uuid::new_v4().to_string(),
             retailer_product_id: self.retailer_product_id,

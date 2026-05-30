@@ -25,6 +25,27 @@ fn fixture_products() -> Vec<RawBasketWatchProduct> {
     serde_json::from_slice(&bytes).expect("parse fixtures/offers.json")
 }
 
+/// Counts derived from the committed fixture, so these tests track
+/// `fixtures/offers.json` as it grows (P0-T11 expanded it) instead of pinning a
+/// brittle magic number. `total` records, `skipped` (blank/missing external_id),
+/// and `normalised = total - skipped` priceable records.
+fn fixture_counts() -> (i64, usize, i64) {
+    let products = fixture_products();
+    let total = products.len() as i64;
+    let skipped = products
+        .iter()
+        .filter(|p| {
+            p.external_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        })
+        .count();
+    let normalised = total - skipped as i64;
+    (total, skipped, normalised)
+}
+
 /// Run the adapter once with the fixture data at the given timestamp.
 async fn ingest_fixture(pool: &SqlitePool, fetched_at: &str) -> RunSummary {
     basketwatch::run_ingest(pool, fetched_at, || async {
@@ -49,10 +70,13 @@ async fn no_network_run_writes_source_run_and_offers() {
     let pool = migrated_pool().await;
     let summary = ingest_fixture(&pool, "2026-05-30T10:00:00.000Z").await;
 
-    // 9 records in the fixture; one has a null external_id and is skipped.
-    assert_eq!(summary.items_fetched, 9);
-    assert_eq!(summary.items_normalised, 8);
-    assert_eq!(summary.skipped, 1);
+    // Counts are derived from the fixture (which has at least one null
+    // external_id record that must be skipped).
+    let (total, skipped, normalised) = fixture_counts();
+    assert!(skipped >= 1, "fixture must include a skip-path record");
+    assert_eq!(summary.items_fetched, total);
+    assert_eq!(summary.items_normalised, normalised);
+    assert_eq!(summary.skipped, skipped);
     assert_eq!(summary.run_number, 1, "first successful run is number 1");
 
     // The run row is recorded as a success with run number 1.
@@ -65,11 +89,11 @@ async fn no_network_run_writes_source_run_and_offers() {
 
     assert_eq!(
         scalar_i64(&pool, "SELECT COUNT(*) FROM retailer_products").await,
-        8
+        normalised
     );
     assert_eq!(
         scalar_i64(&pool, "SELECT COUNT(*) FROM product_offers").await,
-        8
+        normalised
     );
 
     // Every offer carries the run's number as its denormalised fetch-time copy.
@@ -145,15 +169,16 @@ async fn second_run_dedups_products_and_advances_last_seen() {
     ingest_fixture(&pool, "2026-05-30T10:00:00.000Z").await;
     let second = ingest_fixture(&pool, "2026-05-30T11:00:00.000Z").await;
 
+    let (_total, _skipped, normalised) = fixture_counts();
     // Upsert (not REPLACE): product count is unchanged on re-ingest…
     assert_eq!(
         scalar_i64(&pool, "SELECT COUNT(*) FROM retailer_products").await,
-        8
+        normalised
     );
     // …while the append-only offers table doubles.
     assert_eq!(
         scalar_i64(&pool, "SELECT COUNT(*) FROM product_offers").await,
-        16
+        normalised * 2
     );
     assert_eq!(second.run_number, 2, "second successful run is number 2");
 
@@ -268,8 +293,9 @@ async fn ingest_entry_point_reads_fixture_under_no_network() {
     let summary = basketwatch::ingest(&pool).await.expect("no-network ingest");
     std::env::remove_var("BUYWISE_NO_NETWORK");
 
-    assert_eq!(summary.items_normalised, 8);
-    assert_eq!(summary.skipped, 1);
+    let (_total, skipped, normalised) = fixture_counts();
+    assert_eq!(summary.items_normalised, normalised);
+    assert_eq!(summary.skipped, skipped);
     assert_eq!(
         summary.requests_made, 0,
         "no live requests in no-network mode"
@@ -278,7 +304,7 @@ async fn ingest_entry_point_reads_fixture_under_no_network() {
 
     assert_eq!(
         scalar_i64(&pool, "SELECT COUNT(*) FROM retailer_products").await,
-        8
+        normalised
     );
     assert_eq!(
         scalar_i64(
