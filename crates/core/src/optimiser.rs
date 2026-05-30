@@ -472,7 +472,10 @@ pub fn optimise_core(
     let best_single = pick_best_plan(single_plans);
 
     // ---- Two-store plans: every unordered pair, each item taken at whichever of
-    // the two stores is cheaper. Ranked by the same fulfilment rule.
+    // the two stores is cheaper. Ranked by the same fulfilment rule, but only
+    // genuine two-retailer splits are eligible for `best_two_store` (see
+    // `pick_best_two_store_plan`): a pair that degenerates to one store is not a
+    // two-store plan.
     let mut two_store_plans: Vec<StorePlan> = Vec::new();
     for i in 0..all_retailers.len() {
         for j in (i + 1)..all_retailers.len() {
@@ -486,7 +489,7 @@ pub fn optimise_core(
             ));
         }
     }
-    let best_two_store = pick_best_plan(two_store_plans);
+    let best_two_store = pick_best_two_store_plan(two_store_plans);
 
     // ---- Theoretical minimum: each item at its globally cheapest retailer.
     let theoretical_minimum = build_theoretical_minimum(
@@ -580,9 +583,10 @@ fn build_single_store_plan(
 
 /// Build the two-store plan for `(a, b)`: each item is taken at whichever of the
 /// two stores offers the lower effective price; items neither store stocks are
-/// missing. The reported `stores` are exactly the retailers actually used (so a
-/// pair that degenerates to one store is not falsely labelled two-store — though
-/// such a plan is naturally dominated by the single-store plan in ranking).
+/// missing. The reported `stores` are exactly the retailers actually used, so a
+/// pair where one store wins every item degenerates to a one-store `stores`
+/// vector. Such degenerate plans are filtered out by [`pick_best_two_store_plan`]
+/// before `best_two_store` is chosen, guaranteeing it always spans two stores.
 fn build_two_store_plan(
     input: &OptimiserInput,
     best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
@@ -674,6 +678,26 @@ fn pick_best_plan(plans: Vec<StorePlan>) -> Option<StorePlan> {
     plans
         .into_iter()
         .filter(|p| !p.lines.is_empty())
+        .min_by(|a, b| {
+            a.missing_count
+                .cmp(&b.missing_count)
+                .then(a.total_cents.cmp(&b.total_cents))
+        })
+}
+
+/// Pick the best *genuine* two-store plan: like [`pick_best_plan`], but only
+/// plans that span exactly two distinct stores are eligible.
+///
+/// A candidate pair where one retailer wins (or solely stocks) every priced item
+/// reports `stores.len() == 1`; such a plan is a single-store plan in disguise
+/// and must not be returned as `best_two_store` (the acceptance criterion requires
+/// `best_two_store.stores` to hold exactly two retailers). When no pair yields a
+/// genuine split — e.g. one store dominates the basket, or there is a single
+/// priceable item — this returns `None` and `best_two_store` is absent.
+fn pick_best_two_store_plan(plans: Vec<StorePlan>) -> Option<StorePlan> {
+    plans
+        .into_iter()
+        .filter(|p| p.stores.len() == 2)
         .min_by(|a, b| {
             a.missing_count
                 .cmp(&b.missing_count)
