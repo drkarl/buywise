@@ -162,6 +162,47 @@ async fn list_entries_check_constraints_reject_invalid_states() {
 }
 
 #[tokio::test]
+async fn list_entries_entry_status_check_rejects_unknown_values() {
+    let pool = migrated_pool().await;
+    seed_list_prereqs(&pool).await;
+
+    // entry_status is the soft-delete lifecycle flag: only 'active' | 'removed'.
+    // An out-of-enum value (here the resolution-status word 'deleted', a likely
+    // mix-up) must be rejected by the column CHECK.
+    let bad = sqlx::query(
+        "INSERT INTO list_entries
+            (id, list_id, raw_text, status, canonical_item_id,
+             resolution_candidates_json, effective_constraint_hash,
+             entry_status, created_at, updated_at)
+         VALUES ('e', 'list-1', 'milk', 'unresolved', NULL, NULL, 'h',
+                 'deleted', 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        bad.is_err(),
+        "entry_status outside ('active','removed') must fail"
+    );
+
+    // Both valid values are accepted.
+    for status in ["active", "removed"] {
+        sqlx::query(
+            "INSERT INTO list_entries
+                (id, list_id, raw_text, status, canonical_item_id,
+                 resolution_candidates_json, effective_constraint_hash,
+                 entry_status, created_at, updated_at)
+             VALUES (?, 'list-1', 'milk', 'unresolved', NULL, NULL, ?, ?, 't', 't')",
+        )
+        .bind(format!("e-{status}"))
+        .bind(format!("h-{status}"))
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("entry_status '{status}' should be accepted: {e}"));
+    }
+}
+
+#[tokio::test]
 async fn list_entries_accepts_each_valid_state() {
     let pool = migrated_pool().await;
     seed_list_prereqs(&pool).await;
