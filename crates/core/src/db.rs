@@ -488,6 +488,100 @@ pub async fn refund_request_slot(pool: &SqlitePool, event_id: &str) -> Result<()
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Optimiser read helpers (P0-T10)
+// ---------------------------------------------------------------------------
+//
+// These are plain autocommit reads on the pool: the optimiser is a read-only
+// consumer that never holds a write lock. They fetch exactly the rows the
+// optimiser needs — accepted/suggested matches for an item, the latest offer
+// per retailer product, the retailer-product rows, and the current run number
+// per source — and hand them to the pure optimiser core in `optimiser.rs`.
+//
+// Keeping the I/O here (and the algorithm pure over in-memory rows) means the
+// optimiser logic is unit-testable without a database, while these helpers stay
+// thin enough to be exercised by a handful of integration tests.
+
+/// Fetch the `product_matches` rows for one canonical item in one household that
+/// are eligible to be priced.
+///
+/// Only `accepted` and `suggested` matches qualify (per design §8 / the issue):
+/// `rejected` and `pending` are excluded in SQL so the optimiser never sees
+/// them. Price is the primary ranking criterion downstream; `accepted` status is
+/// only ever a tie-breaker, so both statuses are returned here and the
+/// distinction is preserved on [`ProductMatch::status`].
+pub async fn accepted_or_suggested_matches(
+    pool: &SqlitePool,
+    household_id: &str,
+    canonical_item_id: &str,
+) -> Result<Vec<crate::domain::ProductMatch>, DbError> {
+    let rows = sqlx::query_as::<_, crate::domain::ProductMatch>(
+        "SELECT * FROM product_matches \
+         WHERE household_id = ?1 AND canonical_item_id = ?2 \
+           AND status IN ('accepted', 'suggested')",
+    )
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch a single `retailer_products` row by primary key, or `None` if it does
+/// not exist.
+pub async fn retailer_product_by_id(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<RetailerProduct>, DbError> {
+    let row = sqlx::query_as::<_, RetailerProduct>("SELECT * FROM retailer_products WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Fetch the latest `product_offers` row for one retailer product, or `None` if
+/// the product has never been priced.
+///
+/// "Latest" is `ORDER BY fetched_at DESC LIMIT 1`, matching the
+/// `idx_product_offers_product_fetched` index on `(retailer_product_id,
+/// fetched_at DESC)`. `product_offers` is append-only, so this is the current
+/// price snapshot.
+pub async fn latest_offer_for_product(
+    pool: &SqlitePool,
+    retailer_product_id: &str,
+) -> Result<Option<ProductOffer>, DbError> {
+    let row = sqlx::query_as::<_, ProductOffer>(
+        "SELECT * FROM product_offers \
+         WHERE retailer_product_id = ?1 \
+         ORDER BY fetched_at DESC LIMIT 1",
+    )
+    .bind(retailer_product_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// The highest `successful_run_number` recorded for `source` on the pool, or
+/// `None` if no run has ever succeeded.
+///
+/// This is the pool/autocommit counterpart to [`max_successful_run_number`]
+/// (which takes a `&mut SqliteConnection` so it can read under an ingest write
+/// lock). The optimiser reads it once, off the write path, to compute freshness
+/// confidence: `missed_cycles = current_run_number − run_number_at_fetch`.
+/// A `None` here ultimately yields [`FreshnessConfidence::Unknown`].
+pub async fn current_source_run_number(
+    pool: &SqlitePool,
+    source: Source,
+) -> Result<Option<i64>, DbError> {
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(successful_run_number) FROM source_runs WHERE source = ?1")
+            .bind(source)
+            .fetch_one(pool)
+            .await?;
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
