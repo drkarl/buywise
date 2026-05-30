@@ -619,7 +619,8 @@ fn brand_constraint_eliminating_all_is_no_valid_offer_not_unresolved() {
 
 #[test]
 fn size_band_accepts_within_20_percent_and_rejects_outside() {
-    // Preferred 500ml. 600ml is within +20%; 700ml is +40% (rejected).
+    // Preferred 500ml. 600ml is exactly +20% (500 × 1.20), the INCLUSIVE upper
+    // edge of the band, so it must pass; 700ml is +40% (rejected).
     let within = branded_product("p1", Retailer::Tesco, "Fairy", 600.0, "ml");
     let outside = branded_product("p2", Retailer::Tesco, "Fairy", 700.0, "ml");
     assert!(super::size_within_band(
@@ -891,6 +892,47 @@ fn best_two_store_is_none_when_one_store_dominates_a_multi_retailer_basket() {
     // The recommendation falls back to the single store.
     let rec = out.recommended.expect("recommendation");
     assert_eq!(rec.kind, RecommendedKind::SingleStore);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture schema guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn item_constraints_fixture_parses_into_struct() {
+    // Guard against schema drift: fixtures/item_constraints.json must deserialize
+    // field-for-field into Vec<ItemConstraints>. A bogus extra field (e.g. the
+    // removed constraint_policy) or a missing required field would fail here.
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        item_constraints: Vec<ItemConstraints>,
+    }
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/item_constraints.json"
+    );
+    let bytes = std::fs::read(path).expect("read fixtures/item_constraints.json");
+    let fixture: Fixture =
+        serde_json::from_slice(&bytes).expect("parse fixtures/item_constraints.json");
+    assert_eq!(fixture.item_constraints.len(), 2);
+
+    // The Fairy brand example (washing-up liquid → canonical 'dish soap').
+    let fairy = &fixture.item_constraints[0];
+    assert_eq!(fairy.brand.as_deref(), Some("Fairy"));
+    assert_eq!(
+        fairy.canonical_item_id, "15a8975bca6f4dd1605c2bf19c1ca5f60894c3ff117bc18d0e75a1e8974cfe4c",
+        "must reference the real hashed 'dish soap' canonical id"
+    );
+    assert_eq!(fairy.preferred_size_value, Some(500.0));
+    assert_eq!(fairy.preferred_size_basis, Some(SizeBasis::Millilitres));
+
+    // The whole-milk size example references the real hashed canonical id.
+    let milk = &fixture.item_constraints[1];
+    assert_eq!(
+        milk.canonical_item_id, "dc26ae0a7a60eec7c71f24059c6fbca2542374bf5a49366ff206bb7419fc1559",
+        "must reference the real hashed 'whole milk' canonical id"
+    );
+    assert!(milk.brand.is_none());
 }
 
 // ---------------------------------------------------------------------------
