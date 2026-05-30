@@ -1,0 +1,900 @@
+//! Basket optimiser: cheapest single-store and two-store shopping plans.
+//!
+//! Given a basket of [`BasketItem`]s (each already resolved to a canonical item
+//! and carrying its constraints) the optimiser produces four plans
+//! (`docs/design.md` §10):
+//!
+//! 1. [`OptimiserOutput::best_single`] — the cheapest *complete-as-possible*
+//!    basket at a single retailer.
+//! 2. [`OptimiserOutput::best_two_store`] — the cheapest split across exactly
+//!    two retailers.
+//! 3. [`OptimiserOutput::theoretical_minimum`] — every item at its globally
+//!    cheapest retailer, ignoring store count (a benchmark, never a routed plan).
+//! 4. [`OptimiserOutput::recommended`] — the practical recommendation, which
+//!    applies a convenience threshold to decide whether a two-store split is
+//!    worth the extra trip.
+//!
+//! # The fulfilment rule (why missing-count beats cost)
+//!
+//! Plans are ranked by `(missing_count ASC, total_cost ASC)`: **fewer missing
+//! items always beats a lower price.** A plan that prices every item, even if it
+//! is more expensive, is preferred over a cheaper plan that simply omits the
+//! items it cannot source. A household would rather pay a little more and get
+//! everything than save money and arrive home missing things. This ordering is
+//! applied uniformly — single-store selection, two-store pairing, and the final
+//! recommendation — so cost can never override completeness anywhere.
+//!
+//! # Pre-step (caller responsibility)
+//!
+//! The caller builds [`OptimiserInput`] *before* the optimiser runs:
+//! parse count/size from raw text, load each canonical item's
+//! `default_constraint_policy`, load its `item_constraints` row, and merge any
+//! requested size from the parsed input into that constraints object (so
+//! `"Fairy 500ml"` keeps both `brand='Fairy'` and a preferred size). The
+//! optimiser receives the result and does not touch raw text again.
+//!
+//! # Money
+//!
+//! All money is integer [`Cents`] (`crate::domain`). Nothing here uses `f64` for
+//! a price. Size comparison (the ±20% band) is the only place `f64` appears, and
+//! only for the dimensionless size values that already live as `REAL` columns.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+
+use crate::db::{self, DbError};
+use crate::domain::{
+    Cents, ConstraintPolicy, FreshnessConfidence, ItemConstraints, MatchStatus, ProductMatch,
+    ProductOffer, Retailer, RetailerProduct, SizeBasis,
+};
+use crate::normalise::normalize;
+use sqlx::sqlite::SqlitePool;
+
+/// Default second-store convenience threshold: a two-store split must save more
+/// than this over the best single store to be recommended (design §10: €10–€15).
+///
+/// The issue's acceptance criterion pins the lower bound: a saving of *less than*
+/// €10 must leave `clears_convenience_threshold = false`, so the default is
+/// exactly €10 = 1000 cents. Callers may override it per run.
+pub const DEFAULT_THRESHOLD_2_CENTS: Cents = 1000;
+
+/// Tolerance band for size matching: a product's size must be within ±20% of the
+/// constrained size (and on the same [`SizeBasis`]) to qualify. Phase-0 scope
+/// (the issue): size and brand are the only enforced constraints.
+const SIZE_TOLERANCE: f64 = 0.20;
+
+/// Inclusive lower bound (cents) of the Dunnes voucher window: a Dunnes basket in
+/// `[DUNNES_VOUCHER_LOW, DUNNES_VOUCHER_HIGH]` is flagged as near the €50
+/// spend-and-save threshold (design §10). €45.00.
+const DUNNES_VOUCHER_LOW: Cents = 4500;
+/// Inclusive upper bound (cents) of the Dunnes voucher window. €50.00.
+const DUNNES_VOUCHER_HIGH: Cents = 5000;
+
+// ---------------------------------------------------------------------------
+// Input types (caller-constructed)
+// ---------------------------------------------------------------------------
+
+/// One line of a basket, resolved and ready to price.
+///
+/// The caller is responsible for the pre-step: `canonical_item_id` is `None`
+/// only when resolution failed (the item is then *unresolved* and excluded from
+/// every total); `constraints` already has any requested size merged in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BasketItem {
+    /// The original display text for this line (surfaced back in the output so
+    /// the household recognises the item).
+    pub display_text: String,
+    /// Resolved canonical item id, or `None` when the line could not be
+    /// resolved. `None` ⇒ the item goes to [`OptimiserOutput::unresolved_items`].
+    pub canonical_item_id: Option<String>,
+    /// How many packs to buy. `line_total = selected_price × count`.
+    pub count: u32,
+    /// Constraint strictness for this item (from the canonical item's
+    /// `default_constraint_policy`).
+    pub constraint_policy: ConstraintPolicy,
+    /// The merged constraints object (brand, preferred size, …) or `None` when
+    /// the item has no `item_constraints` row.
+    pub constraints: Option<ItemConstraints>,
+}
+
+/// Everything the optimiser needs for one run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptimiserInput {
+    /// The household whose matches and constraints are in play.
+    pub household_id: String,
+    /// The current run number for freshness comparison. `None` (no successful
+    /// run yet) makes every freshness confidence [`FreshnessConfidence::Unknown`].
+    pub current_source_run_number: Option<i64>,
+    /// Second-store convenience threshold in cents (see
+    /// [`DEFAULT_THRESHOLD_2_CENTS`]).
+    pub threshold_2_cents: Cents,
+    /// The basket lines.
+    pub items: Vec<BasketItem>,
+}
+
+impl OptimiserInput {
+    /// Construct an input with the default convenience threshold
+    /// ([`DEFAULT_THRESHOLD_2_CENTS`]).
+    pub fn new(
+        household_id: impl Into<String>,
+        current_source_run_number: Option<i64>,
+        items: Vec<BasketItem>,
+    ) -> Self {
+        Self {
+            household_id: household_id.into(),
+            current_source_run_number,
+            threshold_2_cents: DEFAULT_THRESHOLD_2_CENTS,
+            items,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate data (the pure core's input)
+// ---------------------------------------------------------------------------
+
+/// A priced, constraint-passing option for one basket item at one retailer.
+///
+/// Produced by `db.rs` reads (or hand-built in tests) and consumed by the pure
+/// [`optimise_core`]. One basket item can have several candidates across (and
+/// even within) retailers; the optimiser picks the cheapest per (item, retailer).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    /// Index of the basket item this candidate prices (into `OptimiserInput::items`).
+    pub item_index: usize,
+    /// The retailer this option is sold at.
+    pub retailer: Retailer,
+    /// The matched retailer product.
+    pub product: RetailerProduct,
+    /// The latest offer for that product.
+    pub offer: ProductOffer,
+    /// Whether the underlying match was `accepted` (vs `suggested`). Used only as
+    /// a tie-breaker when prices are equal.
+    pub accepted: bool,
+}
+
+impl Candidate {
+    /// The effective per-unit price: the loyalty price when present, else the
+    /// shelf price. Loyalty schemes (Clubcard, Real Rewards) are assumed active
+    /// (design §10) so their price is the price the household actually pays.
+    pub fn effective_unit_price(&self) -> Cents {
+        self.offer
+            .loyalty_price_cents
+            .unwrap_or(self.offer.price_cents)
+    }
+
+    /// Whether a loyalty price was applied (the loyalty price was present and so
+    /// became the effective price). Surfaced on the plan line for transparency.
+    pub fn loyalty_applied(&self) -> bool {
+        self.offer.loyalty_price_cents.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
+
+/// One priced line of a [`StorePlan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanLine {
+    /// Index of the basket item (into `OptimiserInput::items`).
+    pub item_index: usize,
+    /// The item's display text (copied for convenience).
+    pub display_text: String,
+    /// The retailer this line is fulfilled at.
+    pub retailer: Retailer,
+    /// The chosen retailer product id.
+    pub retailer_product_id: String,
+    /// The chosen offer id.
+    pub offer_id: String,
+    /// The effective per-unit price actually charged (loyalty when applicable).
+    pub unit_price_cents: Cents,
+    /// `unit_price_cents × count`.
+    pub line_total_cents: Cents,
+    /// Whether a loyalty price was applied on this line.
+    pub loyalty_applied: bool,
+    /// Freshness confidence for the underlying offer.
+    pub freshness_confidence: FreshnessConfidence,
+}
+
+/// A concrete shopping plan over one or more stores.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorePlan {
+    /// The distinct retailers in this plan, in fulfilment order. Exactly one for
+    /// [`OptimiserOutput::best_single`], exactly two for
+    /// [`OptimiserOutput::best_two_store`].
+    pub stores: Vec<Retailer>,
+    /// Priced lines, one per item that could be fulfilled by this plan.
+    pub lines: Vec<PlanLine>,
+    /// Sum of `line_total_cents` across `lines`. Excludes missing items.
+    pub total_cents: Cents,
+    /// How many basket items this plan could *not* fulfil. The primary ranking
+    /// key (see the module-level fulfilment rule).
+    pub missing_count: usize,
+    /// A Dunnes spend-and-save prompt, set when a Dunnes line of this plan puts
+    /// the Dunnes spend in the €45–€50 voucher window.
+    pub dunnes_voucher_offer_text: Option<String>,
+}
+
+/// Which plan the recommendation chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendedKind {
+    /// The best single-store plan was recommended.
+    SingleStore,
+    /// The best two-store split was recommended.
+    TwoStore,
+}
+
+/// The practical recommendation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Recommendation {
+    /// Which plan kind was chosen.
+    pub kind: RecommendedKind,
+    /// The chosen plan.
+    pub plan: StorePlan,
+    /// Whether the two-store saving cleared the convenience threshold. `false`
+    /// when the saving was too small (or completeness, not cost, drove the
+    /// choice — a less-complete cheaper split never wins).
+    pub clears_convenience_threshold: bool,
+    /// Saving of the two-store split over the best single store, in cents. May be
+    /// negative or zero (then the single store is recommended). Only meaningful
+    /// when both plans are equally complete.
+    pub two_store_saving_cents: Cents,
+}
+
+/// An item that could not be resolved to a canonical item (no `canonical_item_id`).
+/// Excluded from every total; surfaced so the household can clarify it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedItem {
+    /// Index into `OptimiserInput::items`.
+    pub item_index: usize,
+    /// The original display text.
+    pub display_text: String,
+}
+
+/// Why an otherwise-resolved item produced no priceable offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoOfferReason {
+    /// The item resolved but has no `accepted`/`suggested` matches with offers.
+    NoMatches,
+    /// Every candidate was filtered out by the item's constraints.
+    ConstraintsEliminatedAll,
+    /// `policy = 'brand'` but no brand is configured. A configuration error: we
+    /// never silently fall back to `any`, so the item is rejected with a warning.
+    BrandPolicyMissingBrand,
+}
+
+/// An item that resolved but yielded no valid offer. Carries a structured reason
+/// (including the brand-config-error case) so the caller can warn appropriately.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoValidOfferItem {
+    /// Index into `OptimiserInput::items`.
+    pub item_index: usize,
+    /// The original display text.
+    pub display_text: String,
+    /// Structured reason for the warning.
+    pub reason: NoOfferReason,
+}
+
+/// The full optimiser result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptimiserOutput {
+    /// Cheapest plan at a single retailer (exactly one store), or `None` if no
+    /// item could be priced anywhere.
+    pub best_single: Option<StorePlan>,
+    /// Cheapest plan across exactly two retailers, or `None` if fewer than two
+    /// retailers can contribute (then `best_single` is the only multi-store plan).
+    pub best_two_store: Option<StorePlan>,
+    /// Every item at its globally cheapest retailer (benchmark only), or `None`
+    /// if nothing could be priced.
+    pub theoretical_minimum: Option<StorePlan>,
+    /// The practical recommendation, or `None` if no plan exists.
+    pub recommended: Option<Recommendation>,
+    /// Items with no `canonical_item_id`, excluded from all totals.
+    pub unresolved_items: Vec<UnresolvedItem>,
+    /// Resolved items that nonetheless produced no valid offer.
+    pub no_valid_offer_items: Vec<NoValidOfferItem>,
+}
+
+// ---------------------------------------------------------------------------
+// Constraint filtering
+// ---------------------------------------------------------------------------
+
+/// Outcome of applying an item's constraints to one candidate product.
+enum ConstraintCheck {
+    /// The product passes; it may be priced.
+    Pass,
+    /// The product fails a constraint (brand mismatch, size out of band); skip it.
+    Reject,
+    /// The item's *configuration* is invalid (policy=brand with no brand). The
+    /// whole item is rejected to `no_valid_offer_items`, never silently relaxed.
+    ConfigError,
+}
+
+/// Apply Phase-0 constraints (brand + size ±20%) to a single product.
+///
+/// Phase-0 scope (the issue): only `brand` and `preferred_size` are enforced.
+/// `allowed_brands`, `form_factor`, and `dietary_flags` are stored but not
+/// enforced (Backlog-T1). The brand check runs only under `policy = 'brand'`;
+/// other policies do not gate on brand in Phase 0.
+fn check_constraints(
+    policy: ConstraintPolicy,
+    constraints: Option<&ItemConstraints>,
+    product: &RetailerProduct,
+) -> ConstraintCheck {
+    // Brand enforcement: only under the `brand` policy.
+    if policy == ConstraintPolicy::Brand {
+        let Some(c) = constraints else {
+            // policy=brand but no constraints row at all ⇒ no brand to match.
+            return ConstraintCheck::ConfigError;
+        };
+        let Some(wanted_brand) = c.brand.as_deref() else {
+            // policy=brand but brand IS NULL ⇒ configuration error. Never fall
+            // back to `any`: a brand-locked item with no brand is a data bug, not
+            // a licence to buy any brand.
+            return ConstraintCheck::ConfigError;
+        };
+        match product.brand.as_deref() {
+            Some(b) if normalize(b) == normalize(wanted_brand) => {}
+            // Brand missing on the product, or a different brand: reject.
+            _ => return ConstraintCheck::Reject,
+        }
+    }
+
+    // Size band: enforced whenever a preferred size is set, regardless of policy.
+    if let Some(c) = constraints {
+        if let (Some(pref_value), Some(pref_basis)) =
+            (c.preferred_size_value, c.preferred_size_basis)
+        {
+            if !size_within_band(product, pref_value, pref_basis) {
+                return ConstraintCheck::Reject;
+            }
+        }
+    }
+
+    ConstraintCheck::Pass
+}
+
+/// Whether `product`'s size is within ±[`SIZE_TOLERANCE`] of `pref_value` on the
+/// same [`SizeBasis`].
+///
+/// A product with no size, or a size on a different basis, fails: we cannot
+/// honour a size constraint we cannot compare. The product's `size_unit` is the
+/// SI unit string (`"g"`, `"ml"`, `"each"`) written at ingest, parsed back into a
+/// [`SizeBasis`]; an unparseable/absent unit fails closed.
+fn size_within_band(product: &RetailerProduct, pref_value: f64, pref_basis: SizeBasis) -> bool {
+    let Some(value) = product.size_value else {
+        return false;
+    };
+    let Some(unit) = product.size_unit.as_deref() else {
+        return false;
+    };
+    let Ok(basis) = SizeBasis::from_db_str(unit) else {
+        return false;
+    };
+    if basis != pref_basis {
+        return false;
+    }
+    let low = pref_value * (1.0 - SIZE_TOLERANCE);
+    let high = pref_value * (1.0 + SIZE_TOLERANCE);
+    value >= low && value <= high
+}
+
+// ---------------------------------------------------------------------------
+// Pure optimiser core
+// ---------------------------------------------------------------------------
+
+/// The three computed plans before the recommendation is layered on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorePlans {
+    /// Best single-store plan, or `None` if nothing could be priced.
+    pub best_single: Option<StorePlan>,
+    /// Best two-store plan, or `None`.
+    pub best_two_store: Option<StorePlan>,
+    /// Theoretical minimum, or `None`.
+    pub theoretical_minimum: Option<StorePlan>,
+}
+
+/// Run the optimiser over already-fetched, constraint-passing candidate data.
+///
+/// This is the pure, database-free core. [`optimise`] is the thin wrapper that
+/// fetches candidates from the pool and calls this (via [`build_output`]).
+///
+/// `candidates` are the constraint-*passing* options for the resolved items.
+/// Constraint filtering and the unresolved/no-offer classification happen in
+/// [`classify_items`]; this core assumes every candidate it receives is valid.
+pub fn optimise_core(input: &OptimiserInput, candidates: &[Candidate]) -> CorePlans {
+    // Group candidates by item, keeping the cheapest per (item, retailer).
+    // Map: item_index -> retailer -> best candidate.
+    let mut best_per_item_retailer: BTreeMap<usize, HashMap<Retailer, Candidate>> = BTreeMap::new();
+    for cand in candidates {
+        let by_retailer = best_per_item_retailer.entry(cand.item_index).or_default();
+        match by_retailer.get(&cand.retailer) {
+            Some(existing) if !is_cheaper(cand, existing) => {}
+            _ => {
+                by_retailer.insert(cand.retailer, cand.clone());
+            }
+        }
+    }
+
+    // The set of items that have at least one candidate somewhere. Items the
+    // caller flagged as unresolved/no-offer never appear here.
+    let priced_items: Vec<usize> = best_per_item_retailer.keys().copied().collect();
+
+    // The retailers that appear anywhere, in a stable order.
+    let mut all_retailers: Vec<Retailer> = best_per_item_retailer
+        .values()
+        .flat_map(|m| m.keys().copied())
+        .collect();
+    all_retailers.sort_by_key(|r| r.as_db_str());
+    all_retailers.dedup();
+
+    // ---- Single-store plans: one per retailer, ranked by the fulfilment rule.
+    let single_plans: Vec<StorePlan> = all_retailers
+        .iter()
+        .map(|&r| build_single_store_plan(input, &best_per_item_retailer, &priced_items, r))
+        .collect();
+    let best_single = pick_best_plan(single_plans);
+
+    // ---- Two-store plans: every unordered pair, each item taken at whichever of
+    // the two stores is cheaper. Ranked by the same fulfilment rule.
+    let mut two_store_plans: Vec<StorePlan> = Vec::new();
+    for i in 0..all_retailers.len() {
+        for j in (i + 1)..all_retailers.len() {
+            two_store_plans.push(build_two_store_plan(
+                input,
+                &best_per_item_retailer,
+                &priced_items,
+                all_retailers[i],
+                all_retailers[j],
+            ));
+        }
+    }
+    let best_two_store = pick_best_plan(two_store_plans);
+
+    // ---- Theoretical minimum: each item at its globally cheapest retailer.
+    let theoretical_minimum =
+        build_theoretical_minimum(input, &best_per_item_retailer, &priced_items);
+
+    CorePlans {
+        best_single,
+        best_two_store,
+        theoretical_minimum,
+    }
+}
+
+/// Whether candidate `a` is strictly preferable to `b` for the same item, using
+/// price as the primary key and `accepted` status as the only tie-breaker.
+fn is_cheaper(a: &Candidate, b: &Candidate) -> bool {
+    let (pa, pb) = (a.effective_unit_price(), b.effective_unit_price());
+    if pa != pb {
+        return pa < pb;
+    }
+    // Equal price: prefer an accepted match over a merely suggested one.
+    a.accepted && !b.accepted
+}
+
+/// Build a [`PlanLine`] for one candidate under the given basket item.
+fn plan_line(input: &OptimiserInput, cand: &Candidate) -> PlanLine {
+    let item = &input.items[cand.item_index];
+    let unit_price = cand.effective_unit_price();
+    let line_total = unit_price * i64::from(item.count);
+    PlanLine {
+        item_index: cand.item_index,
+        display_text: item.display_text.clone(),
+        retailer: cand.retailer,
+        retailer_product_id: cand.product.id.clone(),
+        offer_id: cand.offer.id.clone(),
+        unit_price_cents: unit_price,
+        line_total_cents: line_total,
+        loyalty_applied: cand.loyalty_applied(),
+        freshness_confidence: freshness_confidence(
+            input.current_source_run_number,
+            cand.offer.source_successful_run_number_at_fetch,
+        ),
+    }
+}
+
+/// Assemble a [`StorePlan`] from chosen lines and the set of stores it spans.
+/// Computes `total_cents`, `missing_count`, and the Dunnes voucher flag.
+fn assemble_plan(lines: Vec<PlanLine>, stores: Vec<Retailer>, total_items: usize) -> StorePlan {
+    let total_cents: Cents = lines.iter().map(|l| l.line_total_cents).sum();
+    let missing_count = total_items - lines.len();
+    let dunnes_voucher_offer_text = dunnes_voucher_text(&lines);
+    StorePlan {
+        stores,
+        lines,
+        total_cents,
+        missing_count,
+        dunnes_voucher_offer_text,
+    }
+}
+
+/// Build the single-store plan for `retailer`: take every item that `retailer`
+/// can fulfil, skip the rest (they count as missing).
+fn build_single_store_plan(
+    input: &OptimiserInput,
+    best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
+    priced_items: &[usize],
+    retailer: Retailer,
+) -> StorePlan {
+    let mut lines = Vec::new();
+    for &item_index in priced_items {
+        if let Some(cand) = best.get(&item_index).and_then(|m| m.get(&retailer)) {
+            lines.push(plan_line(input, cand));
+        }
+    }
+    assemble_plan(lines, vec![retailer], priced_items.len())
+}
+
+/// Build the two-store plan for `(a, b)`: each item is taken at whichever of the
+/// two stores offers the lower effective price; items neither store stocks are
+/// missing. The reported `stores` are exactly the retailers actually used (so a
+/// pair that degenerates to one store is not falsely labelled two-store — though
+/// such a plan is naturally dominated by the single-store plan in ranking).
+fn build_two_store_plan(
+    input: &OptimiserInput,
+    best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
+    priced_items: &[usize],
+    a: Retailer,
+    b: Retailer,
+) -> StorePlan {
+    let mut lines = Vec::new();
+    let mut used_a = false;
+    let mut used_b = false;
+    for &item_index in priced_items {
+        let by_retailer = match best.get(&item_index) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ca = by_retailer.get(&a);
+        let cb = by_retailer.get(&b);
+        let chosen = match (ca, cb) {
+            (Some(ca), Some(cb)) => {
+                if is_cheaper(cb, ca) {
+                    cb
+                } else {
+                    ca
+                }
+            }
+            (Some(ca), None) => ca,
+            (None, Some(cb)) => cb,
+            (None, None) => continue,
+        };
+        if chosen.retailer == a {
+            used_a = true;
+        } else {
+            used_b = true;
+        }
+        lines.push(plan_line(input, chosen));
+    }
+
+    let mut stores = Vec::new();
+    if used_a {
+        stores.push(a);
+    }
+    if used_b {
+        stores.push(b);
+    }
+    assemble_plan(lines, stores, priced_items.len())
+}
+
+/// Build the theoretical minimum: each item at its globally cheapest retailer,
+/// regardless of how many distinct stores that implies.
+fn build_theoretical_minimum(
+    input: &OptimiserInput,
+    best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
+    priced_items: &[usize],
+) -> Option<StorePlan> {
+    let mut lines = Vec::new();
+    let mut stores: Vec<Retailer> = Vec::new();
+    for &item_index in priced_items {
+        let by_retailer = match best.get(&item_index) {
+            Some(m) => m,
+            None => continue,
+        };
+        // The globally cheapest candidate for this item.
+        let cheapest = by_retailer
+            .values()
+            .reduce(|acc, c| if is_cheaper(c, acc) { c } else { acc })?;
+        if !stores.contains(&cheapest.retailer) {
+            stores.push(cheapest.retailer);
+        }
+        lines.push(plan_line(input, cheapest));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    stores.sort_by_key(|r| r.as_db_str());
+    Some(assemble_plan(lines, stores, priced_items.len()))
+}
+
+/// Pick the best plan by the fulfilment rule `(missing_count ASC, total_cost
+/// ASC)`. Returns `None` if the candidate list is empty or every plan priced
+/// nothing (an all-missing plan is never a usable result).
+fn pick_best_plan(plans: Vec<StorePlan>) -> Option<StorePlan> {
+    plans
+        .into_iter()
+        .filter(|p| !p.lines.is_empty())
+        .min_by(|a, b| {
+            a.missing_count
+                .cmp(&b.missing_count)
+                .then(a.total_cents.cmp(&b.total_cents))
+        })
+}
+
+/// Compute freshness confidence from the current run number and the run number
+/// recorded on the offer at fetch time.
+///
+/// `missed_cycles = current − at_fetch`; `0 ⇒ High`, `1 ⇒ Low`, `≥2 ⇒ Unknown`.
+/// If *either* number is `NULL` we cannot compute a delta, so the result is
+/// [`FreshnessConfidence::Unknown`] — we never guess freshness from a missing
+/// run number. A negative delta (a fetch stamped ahead of the current number,
+/// which should not happen) also collapses to `Unknown` rather than pretending
+/// to be fresh.
+fn freshness_confidence(current: Option<i64>, at_fetch: Option<i64>) -> FreshnessConfidence {
+    match (current, at_fetch) {
+        (Some(current), Some(at_fetch)) => match current - at_fetch {
+            0 => FreshnessConfidence::High,
+            1 => FreshnessConfidence::Low,
+            _ => FreshnessConfidence::Unknown,
+        },
+        _ => FreshnessConfidence::Unknown,
+    }
+}
+
+/// Build the Dunnes spend-and-save prompt for a plan's lines, if applicable.
+///
+/// Sums the Dunnes lines; if the Dunnes spend falls in
+/// `[DUNNES_VOUCHER_LOW, DUNNES_VOUCHER_HIGH]` (€45–€50 inclusive) returns the
+/// prompt "add €X.XX more to potentially trigger the €50 voucher", where
+/// `X = €50 − dunnes_spend`. At exactly €50 the "add €0.00" prompt still fires
+/// (the upper bound is inclusive): the household is on the threshold.
+///
+/// This is modelled as a *future-shop* incentive (design §10) — it is never
+/// subtracted from the current total, only flagged.
+fn dunnes_voucher_text(lines: &[PlanLine]) -> Option<String> {
+    let dunnes_spend: Cents = lines
+        .iter()
+        .filter(|l| l.retailer == Retailer::Dunnes)
+        .map(|l| l.line_total_cents)
+        .sum();
+    if (DUNNES_VOUCHER_LOW..=DUNNES_VOUCHER_HIGH).contains(&dunnes_spend) {
+        let shortfall = DUNNES_VOUCHER_HIGH - dunnes_spend;
+        Some(format!(
+            "add €{}.{:02} more to potentially trigger the €50 voucher",
+            shortfall / 100,
+            shortfall % 100
+        ))
+    } else {
+        None
+    }
+}
+
+/// Apply the convenience threshold to choose between the best single store and
+/// the best two-store split.
+///
+/// Completeness comes first: a two-store split is only ever preferred when it is
+/// *at least as complete* as the single store (`missing_count` no greater). Only
+/// then does cost matter, and only if the saving strictly exceeds
+/// `threshold_2_cents`. Otherwise the single store is recommended. This is the
+/// fulfilment rule again: cost can never override missing-item count.
+fn recommend(
+    best_single: Option<StorePlan>,
+    best_two_store: Option<StorePlan>,
+    threshold_2_cents: Cents,
+) -> Option<Recommendation> {
+    match (best_single, best_two_store) {
+        (Some(single), Some(two)) => {
+            let saving = single.total_cents - two.total_cents;
+            // A more-complete split (fewer missing) is preferred regardless of
+            // cost; an equally complete split must beat the threshold; a
+            // less-complete split never wins.
+            let split_more_complete = two.missing_count < single.missing_count;
+            let split_equal_complete = two.missing_count == single.missing_count;
+            let clears_threshold = saving > threshold_2_cents;
+
+            if split_more_complete || (split_equal_complete && clears_threshold) {
+                Some(Recommendation {
+                    kind: RecommendedKind::TwoStore,
+                    plan: two,
+                    clears_convenience_threshold: split_equal_complete && clears_threshold,
+                    two_store_saving_cents: saving,
+                })
+            } else {
+                Some(Recommendation {
+                    kind: RecommendedKind::SingleStore,
+                    plan: single,
+                    clears_convenience_threshold: false,
+                    two_store_saving_cents: saving,
+                })
+            }
+        }
+        (Some(single), None) => Some(Recommendation {
+            kind: RecommendedKind::SingleStore,
+            // No two-store option: saving is undefined; report 0.
+            two_store_saving_cents: 0,
+            plan: single,
+            clears_convenience_threshold: false,
+        }),
+        (None, Some(two)) => Some(Recommendation {
+            kind: RecommendedKind::TwoStore,
+            two_store_saving_cents: 0,
+            plan: two,
+            clears_convenience_threshold: false,
+        }),
+        (None, None) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item classification (resolved / unresolved / no-offer)
+// ---------------------------------------------------------------------------
+
+/// Per-item classification result, separating items that can be priced from
+/// those surfaced as unresolved or no-offer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Classification {
+    /// Items with no `canonical_item_id`.
+    pub unresolved: Vec<UnresolvedItem>,
+    /// Resolved items that produced no valid offer.
+    pub no_valid_offer: Vec<NoValidOfferItem>,
+}
+
+/// Classify each basket item against its raw matches/offers, applying the
+/// constraint filter, and emit the constraint-passing [`Candidate`]s plus the
+/// unresolved / no-offer classification.
+///
+/// `priced_inputs` supplies, per item index, the `(match, product, offer)`
+/// triples already fetched from the DB (or hand-built in tests). The brand-config
+/// error short-circuits an item to `no_valid_offer` regardless of its candidates.
+fn classify_items(
+    input: &OptimiserInput,
+    priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
+) -> (Vec<Candidate>, Classification) {
+    let mut candidates = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut no_valid_offer = Vec::new();
+
+    for (item_index, item) in input.items.iter().enumerate() {
+        // 1a. Unresolved: no canonical item id.
+        if item.canonical_item_id.is_none() {
+            unresolved.push(UnresolvedItem {
+                item_index,
+                display_text: item.display_text.clone(),
+            });
+            continue;
+        }
+
+        // 1b. No matches / offers at all.
+        let Some(rows) = priced_inputs.get(&item_index).filter(|r| !r.is_empty()) else {
+            no_valid_offer.push(NoValidOfferItem {
+                item_index,
+                display_text: item.display_text.clone(),
+                reason: NoOfferReason::NoMatches,
+            });
+            continue;
+        };
+
+        // 1c. Constraint filter. A config error rejects the whole item.
+        let mut item_candidates = Vec::new();
+        let mut config_error = false;
+        for (m, product, offer) in rows {
+            match check_constraints(item.constraint_policy, item.constraints.as_ref(), product) {
+                ConstraintCheck::ConfigError => {
+                    config_error = true;
+                    break;
+                }
+                ConstraintCheck::Reject => {}
+                ConstraintCheck::Pass => {
+                    item_candidates.push(Candidate {
+                        item_index,
+                        retailer: product.retailer,
+                        product: product.clone(),
+                        offer: offer.clone(),
+                        accepted: m.status == MatchStatus::Accepted,
+                    });
+                }
+            }
+        }
+
+        if config_error {
+            no_valid_offer.push(NoValidOfferItem {
+                item_index,
+                display_text: item.display_text.clone(),
+                reason: NoOfferReason::BrandPolicyMissingBrand,
+            });
+            continue;
+        }
+
+        if item_candidates.is_empty() {
+            no_valid_offer.push(NoValidOfferItem {
+                item_index,
+                display_text: item.display_text.clone(),
+                reason: NoOfferReason::ConstraintsEliminatedAll,
+            });
+            continue;
+        }
+
+        candidates.append(&mut item_candidates);
+    }
+
+    (
+        candidates,
+        Classification {
+            unresolved,
+            no_valid_offer,
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Run the optimiser end-to-end against the database.
+///
+/// Fetches, per resolved item: the `accepted`/`suggested` matches, each matched
+/// product's row, and that product's latest offer. Applies the constraint filter
+/// and classification, runs the pure core, and layers the recommendation on top.
+///
+/// Reads run in autocommit on the pool; the optimiser never holds a write lock.
+pub async fn optimise(
+    pool: &SqlitePool,
+    input: &OptimiserInput,
+) -> Result<OptimiserOutput, DbError> {
+    let mut priced_inputs: BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>> =
+        BTreeMap::new();
+
+    for (item_index, item) in input.items.iter().enumerate() {
+        let Some(canonical_item_id) = item.canonical_item_id.as_deref() else {
+            continue; // Unresolved; handled by classify_items.
+        };
+        let matches =
+            db::accepted_or_suggested_matches(pool, &input.household_id, canonical_item_id).await?;
+        let mut rows = Vec::new();
+        for m in matches {
+            let Some(product) = db::retailer_product_by_id(pool, &m.retailer_product_id).await?
+            else {
+                continue;
+            };
+            let Some(offer) = db::latest_offer_for_product(pool, &m.retailer_product_id).await?
+            else {
+                continue;
+            };
+            rows.push((m, product, offer));
+        }
+        priced_inputs.insert(item_index, rows);
+    }
+
+    Ok(build_output(input, &priced_inputs))
+}
+
+/// Build the full [`OptimiserOutput`] from already-fetched per-item rows. Shared
+/// by [`optimise`] and the in-memory tests.
+fn build_output(
+    input: &OptimiserInput,
+    priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
+) -> OptimiserOutput {
+    let (candidates, classification) = classify_items(input, priced_inputs);
+    let core = optimise_core(input, &candidates);
+    let recommended = recommend(
+        core.best_single.clone(),
+        core.best_two_store.clone(),
+        input.threshold_2_cents,
+    );
+    OptimiserOutput {
+        best_single: core.best_single,
+        best_two_store: core.best_two_store,
+        theoretical_minimum: core.theoretical_minimum,
+        recommended,
+        unresolved_items: classification.unresolved,
+        no_valid_offer_items: classification.no_valid_offer,
+    }
+}
+
+#[cfg(test)]
+mod tests;
