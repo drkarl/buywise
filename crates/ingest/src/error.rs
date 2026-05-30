@@ -44,7 +44,7 @@ pub enum IngestError {
     /// the expected product listing (e.g. the Lidl.ie page/feed structure
     /// changed, or a required field is absent). Distinct from [`Json`](Self::Json)
     /// — that is a *syntax* failure; this is a *shape* failure.
-    #[error("failed to parse source payload: {0}")]
+    #[error("unexpected source payload shape: {0}")]
     Parse(String),
 
     /// The monthly request budget hard-stop (4,900) has been reached; no live
