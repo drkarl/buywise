@@ -4,13 +4,15 @@
 //! plus `migrations/002_seed.sql`. Both outputs are byte-stable across runs.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use buywise_core::domain::ConstraintPolicy;
 use sha2::{Digest, Sha256};
 
 use crate::model::{Category, Dictionary, GeneratedAlias, GeneratedFixture, GeneratedItem};
 use crate::normalise::normalise;
+use crate::workspace_root;
 
 /// Fixed dev household UUID (Phase 0 only; Phase 1 creates real households).
 /// Authoritative value lives in `fixtures/dictionary.json`; this constant exists
@@ -45,8 +47,10 @@ fn alias_id(item_id: &str, language: &str, normalised_alias: &str) -> String {
 
 /// Build the in-memory generated fixture from the dictionary document.
 ///
-/// Validates slugs (non-empty, unique) and category references, normalises all
-/// aliases, dual-inserts variants under both languages, and dedupes aliases.
+/// Validates slugs (non-empty, unique), category references, and each item's
+/// `default_constraint_policy` (against [`ConstraintPolicy`]'s DB strings), then
+/// normalises all aliases, dual-inserts variants under both languages, and
+/// dedupes aliases.
 ///
 /// Two layers of alias dedupe/validation, matching the DB's GLOBAL unique index
 /// `uq_item_aliases_household_alias_lang (household_id, lower(alias), language)`:
@@ -94,6 +98,18 @@ pub fn build_fixture(dict: &Dictionary) -> Result<GeneratedFixture> {
                     entry.slug, entry.category
                 )
             })?;
+
+        // Validate default_constraint_policy against the domain enum's DB strings
+        // (any/brand/allowed_set/own_label/exact/ask). An invalid value would
+        // otherwise flow into 002_seed.sql and only fail later as a generic
+        // SQLite CHECK error, so fail fast here naming the slug and bad value.
+        ConstraintPolicy::from_db_str(&entry.default_constraint_policy).with_context(|| {
+            format!(
+                "item {:?} has invalid default_constraint_policy {:?} \
+                 (expected one of any|brand|allowed_set|own_label|exact|ask)",
+                entry.slug, entry.default_constraint_policy
+            )
+        })?;
 
         let id = item_id(&dict.household_id, &entry.slug);
 
@@ -323,15 +339,6 @@ const SEED_SQL_HEADER: &str = "\
 -- provenance lives in fixtures/dictionary.json.
 ";
 
-/// Resolve the workspace root from this crate's manifest dir (../../ from crate).
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
-}
-
 /// Run the generator against the repo's default paths.
 ///
 /// Reads `<root>/fixtures/dictionary.json`; writes
@@ -385,6 +392,7 @@ pub fn load_dictionary(path: &Path) -> Result<Dictionary> {
 mod tests {
     use super::*;
     use crate::model::DictionaryItem;
+    use std::path::PathBuf;
 
     fn root() -> PathBuf {
         workspace_root()
@@ -491,6 +499,69 @@ mod tests {
             sql.contains("'Children''s Cereal'"),
             "expected doubled quote in emitted SQL, got:\n{sql}"
         );
+    }
+
+    #[test]
+    fn rejects_invalid_default_constraint_policy() {
+        // A policy value outside the ConstraintPolicy DB strings must fail fast
+        // with a message naming the slug and the bad value.
+        let dict = Dictionary {
+            note: String::new(),
+            household_id: HOUSEHOLD_ID.to_string(),
+            categories: vec![Category {
+                key: "produce".to_string(),
+                uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                name_en: "Produce".to_string(),
+                name_es: "Frutas".to_string(),
+                icon: "leaf".to_string(),
+                default_order: 1,
+            }],
+            items: vec![DictionaryItem {
+                slug: "apples".to_string(),
+                name_en: "Apples".to_string(),
+                name_es: "Manzanas".to_string(),
+                category: "produce".to_string(),
+                default_constraint_policy: "loosey-goosey".to_string(),
+                variants: vec![],
+                provenance: String::new(),
+            }],
+        };
+        let err = build_fixture(&dict).expect_err("expected invalid-policy error");
+        let msg = err.to_string();
+        assert!(msg.contains("apples"), "got: {msg}");
+        assert!(msg.contains("loosey-goosey"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_all_valid_default_constraint_policies() {
+        // Every ConstraintPolicy DB string must be accepted by the generator.
+        for policy in ["any", "brand", "allowed_set", "own_label", "exact", "ask"] {
+            let dict = Dictionary {
+                note: String::new(),
+                household_id: HOUSEHOLD_ID.to_string(),
+                categories: vec![Category {
+                    key: "produce".to_string(),
+                    uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                    name_en: "Produce".to_string(),
+                    name_es: "Frutas".to_string(),
+                    icon: "leaf".to_string(),
+                    default_order: 1,
+                }],
+                items: vec![DictionaryItem {
+                    slug: "apples".to_string(),
+                    name_en: "Apples".to_string(),
+                    name_es: "Manzanas".to_string(),
+                    category: "produce".to_string(),
+                    default_constraint_policy: policy.to_string(),
+                    variants: vec![],
+                    provenance: String::new(),
+                }],
+            };
+            assert!(
+                build_fixture(&dict).is_ok(),
+                "policy {policy:?} should be accepted"
+            );
+        }
     }
 
     #[test]
