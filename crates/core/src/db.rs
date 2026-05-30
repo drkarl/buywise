@@ -588,6 +588,102 @@ pub async fn current_source_run_number(
     Ok(max)
 }
 
+/// The `default_constraint_policy` of a canonical item, or `None` if the id is
+/// unknown. Drives `BasketItem::constraint_policy` in the CLI optimiser.
+pub async fn canonical_item_policy(
+    pool: &SqlitePool,
+    canonical_item_id: &str,
+) -> Result<Option<crate::domain::ConstraintPolicy>, DbError> {
+    let policy: Option<crate::domain::ConstraintPolicy> =
+        sqlx::query_scalar("SELECT default_constraint_policy FROM canonical_items WHERE id = ?1")
+            .bind(canonical_item_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(policy)
+}
+
+/// Fetch the Phase-0-enforced subset of an item's [`ItemConstraints`], or `None`
+/// if the item has no `item_constraints` row.
+///
+/// Only the columns the optimiser actually enforces in Phase 0 are read —
+/// `brand`, `preferred_size_value`/`preferred_size_basis`, and
+/// `substitution_policy` — plus the row `id`. The JSON TEXT columns
+/// (`allowed_brands`, `excluded_brands`, `dietary_flags`) are deliberately not
+/// decoded: [`ItemConstraints`] does not derive [`sqlx::FromRow`] (it would need
+/// the sqlx `json` feature, not enabled in the workspace), and no Phase-0 read
+/// path enforces them. The unread columns are returned as `None`/defaults, which
+/// is faithful for Phase-0 optimisation (see `optimiser::check_constraints`).
+///
+/// This is the seam the CLI uses to build `BasketItem::constraints` in live
+/// mode; fixture mode loads the same data from `fixtures/item_constraints.json`.
+pub async fn item_constraints_by_canonical_id(
+    pool: &SqlitePool,
+    canonical_item_id: &str,
+) -> Result<Option<crate::domain::ItemConstraints>, DbError> {
+    use crate::domain::SizeBasis;
+
+    // The Phase-0-enforced columns of one item_constraints row, in SELECT order:
+    // (id, brand, preferred_size_value, preferred_size_basis, substitution_policy,
+    // updated_at). A named alias keeps the query_as signature readable.
+    type ConstraintsRow = (
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        String,
+        String,
+    );
+
+    let row: Option<ConstraintsRow> = sqlx::query_as(
+        "SELECT id, brand, preferred_size_value, preferred_size_basis, \
+                substitution_policy, updated_at \
+         FROM item_constraints WHERE canonical_item_id = ?1",
+    )
+    .bind(canonical_item_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((
+        id,
+        brand,
+        preferred_size_value,
+        preferred_size_basis,
+        substitution_policy,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    // Parse the enum TEXT columns; an unparseable value is treated as absent
+    // (size) or falls back to the permissive default (substitution policy),
+    // never aborting the whole optimiser run over one bad fixture row.
+    let preferred_size_basis = preferred_size_basis
+        .as_deref()
+        .and_then(|s| SizeBasis::from_db_str(s).ok());
+    let substitution_policy = crate::domain::SubstitutionPolicy::from_db_str(&substitution_policy)
+        .unwrap_or(crate::domain::SubstitutionPolicy::Any);
+
+    Ok(Some(crate::domain::ItemConstraints {
+        id,
+        canonical_item_id: canonical_item_id.to_string(),
+        brand,
+        allowed_brands: None,
+        excluded_brands: None,
+        preferred_size_value,
+        preferred_size_basis,
+        min_size_value: None,
+        min_size_basis: None,
+        max_size_value: None,
+        max_size_basis: None,
+        pack_count: None,
+        form_factor: None,
+        dietary_flags: None,
+        substitution_policy,
+        updated_at,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
