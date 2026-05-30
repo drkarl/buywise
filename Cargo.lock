@@ -230,15 +230,18 @@ dependencies = [
  "anyhow",
  "buywise-core",
  "buywise-ingest",
+ "chrono",
  "clap",
  "hex",
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
