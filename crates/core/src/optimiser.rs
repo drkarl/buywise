@@ -211,6 +211,20 @@ pub struct StorePlan {
     pub total_cents: Cents,
     /// How many basket items this plan could *not* fulfil. The primary ranking
     /// key (see the module-level fulfilment rule).
+    ///
+    /// This counts **every** unfulfilled resolved basket line, not just the ones
+    /// this plan's store(s) failed to price:
+    /// * items this plan's stores do not stock (plan-specific), plus
+    /// * resolved items that produced no valid offer anywhere — the
+    ///   [`OptimiserOutput::no_valid_offer_items`] (constant across all plans,
+    ///   since they are unfulfillable at every store).
+    ///
+    /// Including the latter keeps the field honest: a plan never reports
+    /// `missing_count == 0` while the basket still has resolved lines nobody can
+    /// fulfil. Because that contribution is constant across plans it does not
+    /// disturb relative ranking. Unresolved lines (no `canonical_item_id`) are
+    /// *not* counted here — they are surfaced separately in
+    /// [`OptimiserOutput::unresolved_items`] and excluded from every total.
     pub missing_count: usize,
     /// A Dunnes spend-and-save prompt, set when a Dunnes line of this plan puts
     /// the Dunnes spend in the €45–€50 voucher window.
@@ -406,7 +420,17 @@ pub struct CorePlans {
 /// `candidates` are the constraint-*passing* options for the resolved items.
 /// Constraint filtering and the unresolved/no-offer classification happen in
 /// [`classify_items`]; this core assumes every candidate it receives is valid.
-pub fn optimise_core(input: &OptimiserInput, candidates: &[Candidate]) -> CorePlans {
+///
+/// `no_offer_count` is the number of resolved items that produced no valid offer
+/// anywhere ([`OptimiserOutput::no_valid_offer_items`]). They are missing at
+/// every store, so this constant is folded into each plan's `missing_count` to
+/// keep the field honest (see [`StorePlan::missing_count`]). Pass `0` when
+/// driving the pure core directly with fully priceable candidates.
+pub fn optimise_core(
+    input: &OptimiserInput,
+    candidates: &[Candidate],
+    no_offer_count: usize,
+) -> CorePlans {
     // Group candidates by item, keeping the cheapest per (item, retailer).
     // Map: item_index -> retailer -> best candidate.
     let mut best_per_item_retailer: BTreeMap<usize, HashMap<Retailer, Candidate>> = BTreeMap::new();
@@ -435,7 +459,15 @@ pub fn optimise_core(input: &OptimiserInput, candidates: &[Candidate]) -> CorePl
     // ---- Single-store plans: one per retailer, ranked by the fulfilment rule.
     let single_plans: Vec<StorePlan> = all_retailers
         .iter()
-        .map(|&r| build_single_store_plan(input, &best_per_item_retailer, &priced_items, r))
+        .map(|&r| {
+            build_single_store_plan(
+                input,
+                &best_per_item_retailer,
+                &priced_items,
+                r,
+                no_offer_count,
+            )
+        })
         .collect();
     let best_single = pick_best_plan(single_plans);
 
@@ -450,14 +482,19 @@ pub fn optimise_core(input: &OptimiserInput, candidates: &[Candidate]) -> CorePl
                 &priced_items,
                 all_retailers[i],
                 all_retailers[j],
+                no_offer_count,
             ));
         }
     }
     let best_two_store = pick_best_plan(two_store_plans);
 
     // ---- Theoretical minimum: each item at its globally cheapest retailer.
-    let theoretical_minimum =
-        build_theoretical_minimum(input, &best_per_item_retailer, &priced_items);
+    let theoretical_minimum = build_theoretical_minimum(
+        input,
+        &best_per_item_retailer,
+        &priced_items,
+        no_offer_count,
+    );
 
     CorePlans {
         best_single,
@@ -500,9 +537,19 @@ fn plan_line(input: &OptimiserInput, cand: &Candidate) -> PlanLine {
 
 /// Assemble a [`StorePlan`] from chosen lines and the set of stores it spans.
 /// Computes `total_cents`, `missing_count`, and the Dunnes voucher flag.
-fn assemble_plan(lines: Vec<PlanLine>, stores: Vec<Retailer>, total_items: usize) -> StorePlan {
+///
+/// `missing_count = (priceable items this plan did not fulfil) + `extra_missing``,
+/// where `extra_missing` is the count of resolved-but-unpriceable items
+/// ([`OptimiserOutput::no_valid_offer_items`]) — missing at every store, so a
+/// constant added to every plan (see [`StorePlan::missing_count`]).
+fn assemble_plan(
+    lines: Vec<PlanLine>,
+    stores: Vec<Retailer>,
+    total_items: usize,
+    extra_missing: usize,
+) -> StorePlan {
     let total_cents: Cents = lines.iter().map(|l| l.line_total_cents).sum();
-    let missing_count = total_items - lines.len();
+    let missing_count = (total_items - lines.len()) + extra_missing;
     let dunnes_voucher_offer_text = dunnes_voucher_text(&lines);
     StorePlan {
         stores,
@@ -520,6 +567,7 @@ fn build_single_store_plan(
     best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
     priced_items: &[usize],
     retailer: Retailer,
+    no_offer_count: usize,
 ) -> StorePlan {
     let mut lines = Vec::new();
     for &item_index in priced_items {
@@ -527,7 +575,7 @@ fn build_single_store_plan(
             lines.push(plan_line(input, cand));
         }
     }
-    assemble_plan(lines, vec![retailer], priced_items.len())
+    assemble_plan(lines, vec![retailer], priced_items.len(), no_offer_count)
 }
 
 /// Build the two-store plan for `(a, b)`: each item is taken at whichever of the
@@ -541,6 +589,7 @@ fn build_two_store_plan(
     priced_items: &[usize],
     a: Retailer,
     b: Retailer,
+    no_offer_count: usize,
 ) -> StorePlan {
     let mut lines = Vec::new();
     let mut used_a = false;
@@ -579,7 +628,7 @@ fn build_two_store_plan(
     if used_b {
         stores.push(b);
     }
-    assemble_plan(lines, stores, priced_items.len())
+    assemble_plan(lines, stores, priced_items.len(), no_offer_count)
 }
 
 /// Build the theoretical minimum: each item at its globally cheapest retailer,
@@ -588,6 +637,7 @@ fn build_theoretical_minimum(
     input: &OptimiserInput,
     best: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
     priced_items: &[usize],
+    no_offer_count: usize,
 ) -> Option<StorePlan> {
     let mut lines = Vec::new();
     let mut stores: Vec<Retailer> = Vec::new();
@@ -609,7 +659,12 @@ fn build_theoretical_minimum(
         return None;
     }
     stores.sort_by_key(|r| r.as_db_str());
-    Some(assemble_plan(lines, stores, priced_items.len()))
+    Some(assemble_plan(
+        lines,
+        stores,
+        priced_items.len(),
+        no_offer_count,
+    ))
 }
 
 /// Pick the best plan by the fulfilment rule `(missing_count ASC, total_cost
@@ -880,7 +935,10 @@ fn build_output(
     priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
 ) -> OptimiserOutput {
     let (candidates, classification) = classify_items(input, priced_inputs);
-    let core = optimise_core(input, &candidates);
+    // Resolved-but-unpriceable items are missing at every store, so they fold into
+    // every plan's missing_count as a constant (see StorePlan::missing_count).
+    let no_offer_count = classification.no_valid_offer.len();
+    let core = optimise_core(input, &candidates, no_offer_count);
     let recommended = recommend(
         core.best_single.clone(),
         core.best_two_store.clone(),
