@@ -4,6 +4,16 @@
 //! `crates/ingest` APIs. Shared plumbing — the basket fixture format, the
 //! resolution + constraint-merge pre-step, and small money/printing helpers —
 //! lives here in [`mod@self`].
+//!
+//! Fixture mode vs live mode: the read-only commands [`validate`] and
+//! [`optimise`] choose their data source from the **presence of `--db`**. With
+//! no `--db`, they run in *fixture mode* — [`fixture_db::build_fixture_pool`]
+//! builds a private in-memory SQLite database, applies only
+//! `migrations/001_phase0_schema.sql`, and seeds it from the committed
+//! `fixtures/` (no file is written). With `--db <path>`, they run in *live mode*
+//! against that SQLite file, which is expected to have been populated by
+//! `ingest-basketwatch` + `seed-matches`. The write commands `ingest-basketwatch`
+//! and `seed-matches` always require a `--db` and never use fixture mode.
 
 pub mod basket;
 pub mod fixture_db;
