@@ -476,8 +476,10 @@ pub async fn reserve_request_slot(
 }
 
 /// Refund a previously reserved request slot by deleting its `api_usage_events`
-/// row. Used when a reserved request never reached the API (no response), so the
-/// monthly count stays accurate.
+/// row. The caller must only refund a request that *provably* never reached the
+/// API (e.g. a pre-send connection failure); an ambiguous failure such as a
+/// timeout may already have been charged by the API and must keep its slot, so
+/// the monthly count never under-counts real usage.
 pub async fn refund_request_slot(pool: &SqlitePool, event_id: &str) -> Result<(), DbError> {
     sqlx::query("DELETE FROM api_usage_events WHERE id = ?1")
         .bind(event_id)
