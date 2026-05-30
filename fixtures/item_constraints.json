@@ -1,12 +1,10 @@
 {
-  "_note": "Item constraint fixtures for the optimiser (P0-T10). Each entry maps to an `item_constraints` row (see crates/core/src/domain.rs::ItemConstraints) for a household canonical item. `allowed_brands`, `excluded_brands` and `dietary_flags` are stored but NOT enforced in Phase 0 (Backlog-T1); only `brand` (under constraint_policy='brand') and `preferred_size_*` (±20% band) are enforced. The Fairy entry is the brand-constrained example required by the issue: with policy='brand' and brand='Fairy', own-label washing-up liquid is excluded and only Fairy products are priced.",
+  "_note": "Item constraint fixtures for the optimiser (P0-T10). Each entry in `item_constraints` maps field-for-field to an `item_constraints` row / the ItemConstraints struct (crates/core/src/domain.rs). The constraint POLICY lives on the canonical item (canonical_items.default_constraint_policy), NOT here, so there is no constraint_policy field. `canonical_item_id` references the real hashed id from fixtures/canonical_items.json: 'dish soap' (washing-up liquid) for the Fairy brand example, and 'whole milk' for the size example. `allowed_brands`, `excluded_brands` and `dietary_flags` are stored but NOT enforced in Phase 0 (Backlog-T1); only `brand` (when the canonical item's policy is 'brand') and `preferred_size_*` (±20% band) are enforced. The Fairy entry is the brand-constrained example required by the issue: with brand='Fairy', own-label washing-up liquid is excluded and only Fairy products are priced.",
   "household_id": "00000000-0000-0000-0000-000000000001",
-  "updated_at": "2026-05-29T00:00:00Z",
   "item_constraints": [
     {
       "id": "ic00000000000000000000000000000000000000000000000000000000000001",
-      "canonical_item_id": "ci-fairy-washing-up-liquid",
-      "constraint_policy": "brand",
+      "canonical_item_id": "15a8975bca6f4dd1605c2bf19c1ca5f60894c3ff117bc18d0e75a1e8974cfe4c",
       "brand": "Fairy",
       "allowed_brands": null,
       "excluded_brands": null,
@@ -19,12 +17,12 @@
       "pack_count": 1,
       "form_factor": "bottle",
       "dietary_flags": null,
-      "substitution_policy": "strict"
+      "substitution_policy": "strict",
+      "updated_at": "2026-05-29T00:00:00Z"
     },
     {
       "id": "ic00000000000000000000000000000000000000000000000000000000000002",
-      "canonical_item_id": "ci-whole-milk",
-      "constraint_policy": "any",
+      "canonical_item_id": "dc26ae0a7a60eec7c71f24059c6fbca2542374bf5a49366ff206bb7419fc1559",
       "brand": null,
       "allowed_brands": null,
       "excluded_brands": null,
@@ -37,7 +35,8 @@
       "pack_count": 1,
       "form_factor": "carton",
       "dietary_flags": null,
-      "substitution_policy": "any"
+      "substitution_policy": "any",
+      "updated_at": "2026-05-29T00:00:00Z"
     }
   ]
 }
