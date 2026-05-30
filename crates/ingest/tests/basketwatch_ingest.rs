@@ -255,3 +255,37 @@ async fn write_error_rolls_back_then_marks_failed() {
     assert_eq!(status, "failed");
     assert_eq!(run_number, None);
 }
+
+/// Covers the public `ingest()` entry point with the real env-selected fetcher
+/// path (not the injected-fetcher seam the other tests use): `BUYWISE_NO_NETWORK=1`
+/// must read `fixtures/offers.json` and write the run + offers, with zero live
+/// requests. No other test reads this env var, so toggling it here is safe.
+#[tokio::test]
+async fn ingest_entry_point_reads_fixture_under_no_network() {
+    let pool = migrated_pool().await;
+
+    std::env::set_var("BUYWISE_NO_NETWORK", "1");
+    let summary = basketwatch::ingest(&pool).await.expect("no-network ingest");
+    std::env::remove_var("BUYWISE_NO_NETWORK");
+
+    assert_eq!(summary.items_normalised, 8);
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(
+        summary.requests_made, 0,
+        "no live requests in no-network mode"
+    );
+    assert_eq!(summary.run_number, 1);
+
+    assert_eq!(
+        scalar_i64(&pool, "SELECT COUNT(*) FROM retailer_products").await,
+        8
+    );
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM source_runs WHERE status = 'success'"
+        )
+        .await,
+        1
+    );
+}

@@ -479,14 +479,17 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
     let month = month_of(&fetched_at);
 
     let used = db::current_month_request_count(&pool, Source::BasketWatch, &month).await?;
-    let mut skip_non_essential = false;
+    // Initial classification (logging + the can't-even-start hard stop). The
+    // weekly BasketWatch batch is a full refresh with no per-item currency in
+    // Phase 0, so every request is essential by construction — there is nothing
+    // to drop at the skip threshold. The threshold is still honoured by the
+    // per-request hard-stop below, which caps how far the batch can run.
     match quota_action(used) {
         QuotaAction::HardStop => return Err(IngestError::QuotaHardStop { used }),
         QuotaAction::SkipNonEssential => {
-            skip_non_essential = true;
             tracing::warn!(
                 used,
-                "above skip-non-essential threshold: only essential refreshes"
+                "above skip-non-essential threshold; Phase-0 batch is essential-only"
             );
         }
         QuotaAction::Warn => {
@@ -498,11 +501,6 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
         }
         QuotaAction::Proceed => {}
     }
-    // TODO(P0-T8 follow-up): once offers carry per-item currency (cache_expires_at
-    // freshness), `skip_non_essential` should drop already-current items from the
-    // fetch set per design §12. Phase 0 has no per-item currency yet, so the flag
-    // currently only annotates the run.
-    let _ = skip_non_essential;
 
     let host = std::env::var("BASKETWATCH_API_HOST")
         .unwrap_or_else(|_| "basketwatch.p.rapidapi.com".into());
@@ -518,6 +516,20 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
     // requests already spent against the monthly quota before propagating.
     let mut fetch_error: Option<IngestError> = None;
     for retailer in RETAILERS {
+        // Re-check the budget before *every* request using the live projected
+        // total (month-to-date + this run's requests). This is what keeps the
+        // batch from crossing the 4900 hard stop mid-run: at 4899 exactly one
+        // request is allowed (reaching 4900), after which we stop making external
+        // calls and proceed with whatever was fetched.
+        if quota_action(used + requests_made) == QuotaAction::HardStop {
+            tracing::warn!(
+                used,
+                requests_made,
+                "BasketWatch hard stop reached mid-batch; stopping external calls"
+            );
+            break;
+        }
+
         // 40 RPM self-cap: space requests by RATE_LIMIT_INTERVAL (skip the wait
         // before the first request).
         if requests_made > 0 {
