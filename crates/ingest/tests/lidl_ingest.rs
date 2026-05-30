@@ -12,6 +12,8 @@ use buywise_core::db;
 use buywise_ingest::error::IngestError;
 use buywise_ingest::lidl::{self, FetchOutcome, RawLidlProduct, RunSummary};
 use sqlx::sqlite::SqlitePool;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// Serialises the two tests that mutate process-global ingest env vars
 /// (`BUYWISE_NO_NETWORK` / `LIDL_FEED_URL`); cargo runs tests in a binary
@@ -361,5 +363,77 @@ async fn ingest_entry_point_reads_fixture_under_no_network() {
         )
         .await,
         1
+    );
+}
+
+/// Spawn a one-shot HTTP/1.1 server that replies to the first connection with a
+/// `200 OK` carrying `body`, then returns its `http://127.0.0.1:<port>/` URL.
+///
+/// Used to drive the *real* `live_fetch` path against a controlled response so
+/// the genuine deserialisation-shape → `IngestError::Parse` conversion runs (the
+/// injected-fetcher seam can't exercise that conversion).
+async fn one_shot_server(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            // Drain the request so the client's write side does not error.
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// Drives the real `live_fetch` against a server that returns a syntactically
+/// valid 2xx JSON body of the *wrong shape* (an object, not a product array).
+/// The genuine `response.json::<Vec<_>>()` failure must be converted to
+/// `IngestError::Parse` and recorded as a `failed` source_run — no panic. This
+/// covers the real conversion the injected-`Parse` test cannot reach.
+// See `spawn_ingest_swallows_failure` for why holding the lock across `.await`
+// is sound here.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn live_fetch_shape_mismatch_marks_run_failed_without_panic() {
+    let pool = migrated_pool().await;
+    // A 2xx body that parses as JSON but not as `Vec<RawLidlProduct>`.
+    let url = one_shot_server("{\"error\":\"unexpected\"}").await;
+
+    let guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("BUYWISE_NO_NETWORK");
+    std::env::set_var("LIDL_FEED_URL", &url);
+    let result = lidl::ingest(&pool).await;
+    std::env::remove_var("LIDL_FEED_URL");
+    drop(guard);
+
+    match result {
+        Err(IngestError::Parse(_)) => {}
+        other => panic!("expected IngestError::Parse from a shape mismatch, got {other:?}"),
+    }
+
+    // The run was recorded as failed, with nothing written to the product tables.
+    let (status, run_number): (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, successful_run_number FROM source_runs WHERE source = 'lidl_direct'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("run row");
+    assert_eq!(status, "failed");
+    assert_eq!(run_number, None, "failed run has no run number");
+    assert_eq!(
+        scalar_i64(&pool, "SELECT COUNT(*) FROM retailer_products").await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(&pool, "SELECT COUNT(*) FROM product_offers").await,
+        0
     );
 }
