@@ -28,12 +28,12 @@ pub enum IngestError {
     },
 
     /// A database operation failed (via a core db helper).
-    #[error("database error: {0}")]
+    #[error("db helper error: {0}")]
     Db(#[from] buywise_core::db::DbError),
 
     /// A raw sqlx operation failed (e.g. the manual `BEGIN IMMEDIATE` /
     /// `COMMIT` / `ROLLBACK` statements the adapter issues directly).
-    #[error("database error: {0}")]
+    #[error("transaction control error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
     /// Live mode was requested but `BASKETWATCH_API_KEY` is unset.
