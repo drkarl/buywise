@@ -18,6 +18,12 @@ core BuyWise logic end-to-end (resolution → matching → unit-price normalisat
 
 **€77.96 / month ≥ €50 → Phase 0 gate PASSED.** Proceed to Phase 1.
 
+> **These figures are illustrative, not a real-data gate result.** They are
+> computed from the hand-authored prices in `fixtures/offers.json` (see
+> [Caveat on the prices](#caveat-on-the-prices)); €77.96 demonstrates the
+> pipeline clearing the €50 gate on representative data. The real-price gate is
+> re-run in live mode before Phase 1 ships.
+
 The achievable saving is the gate metric: the most a household saves by buying
 each item at its globally cheapest store versus shopping at the single best
 store. The *recommended* plan applies the second-store convenience threshold
