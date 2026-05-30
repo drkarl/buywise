@@ -688,6 +688,41 @@ fn item_with_no_matches_is_no_valid_offer() {
     assert_eq!(out.no_valid_offer_items[0].reason, NoOfferReason::NoMatches);
 }
 
+#[test]
+fn missing_count_includes_resolved_but_unpriceable_items() {
+    // Two resolved items. Item 0 is priced at Tesco; item 1 resolves but has no
+    // matches anywhere (→ no_valid_offer_items). The plan must report
+    // missing_count == 1 (the unpriceable line is missing at every store), never
+    // 0, so the field stays honest about basket completeness.
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("rice", "ci-rice", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m", "ci-milk", "p", MatchStatus::Accepted),
+            product("p", Retailer::Tesco),
+            offer("o", "p", 200, Some(5)),
+        )],
+    );
+    // No entry for index 1 → resolved item with no offer → NoMatches.
+
+    let out = run(&input, priced);
+    assert_eq!(out.no_valid_offer_items.len(), 1);
+    let single = out.best_single.expect("milk is priceable");
+    assert_eq!(single.lines.len(), 1, "only milk is priced");
+    assert_eq!(single.total_cents, 200);
+    assert_eq!(
+        single.missing_count, 1,
+        "the resolved-but-unpriceable rice counts as missing in the plan"
+    );
+    // Theoretical minimum carries the same honest missing_count.
+    assert_eq!(out.theoretical_minimum.expect("theo").missing_count, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Fulfilment rule: missing-count beats cost
 // ---------------------------------------------------------------------------
@@ -788,7 +823,7 @@ fn optimise_core_pure_entry_point_returns_three_plans() {
             accepted: true,
         },
     ];
-    let core = optimise_core(&input, &candidates);
+    let core = optimise_core(&input, &candidates, 0);
     assert_eq!(core.best_single.expect("single").total_cents, 100);
     // A single item cannot fill a genuine two-store plan; the best "pair" plan
     // still prices the one item at its cheaper store.
