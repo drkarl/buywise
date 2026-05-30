@@ -16,13 +16,19 @@ core BuyWise logic end-to-end (resolution → matching → unit-price normalisat
 | **Estimated monthly saving** (×52/12) | **€77.96 / month** |
 | Recommended plan | Two-store (Aldi + Tesco), €95.28 (saves €10.52/wk, clears threshold) |
 
-**€77.96 / month ≥ €50 → Phase 0 gate PASSED.** Proceed to Phase 1.
+**€77.96 / month ≥ €50 on fixture data → the pipeline clears the €50 threshold
+on representative prices.** This is the **fixture-only (illustrative)** result,
+**not** a live-data gate pass. The real gate runs against live BasketWatch
+prices and is **still pending**: issue #11 defers the live-BasketWatch gate to
+before Phase 1, and it must pass before Phase 1 begins. So this is *not* yet an
+unconditional "proceed to Phase 1".
 
 > **These figures are illustrative, not a real-data gate result.** They are
 > computed from the hand-authored prices in `fixtures/offers.json` (see
 > [Caveat on the prices](#caveat-on-the-prices)); €77.96 demonstrates the
-> pipeline clearing the €50 gate on representative data. The real-price gate is
-> re-run in live mode before Phase 1 ships.
+> pipeline clearing the €50 threshold on representative data only. The live gate
+> (real BasketWatch prices) is the actual Phase-1 prerequisite and has not yet
+> been run.
 
 The achievable saving is the gate metric: the most a household saves by buying
 each item at its globally cheapest store versus shopping at the single best
