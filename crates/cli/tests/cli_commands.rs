@@ -11,6 +11,7 @@
 //!   recommended saving.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use buywise_cli::commands::basket::{build_optimiser_input, resolve_lines};
 use buywise_cli::commands::fixture_db::build_fixture_pool;
@@ -20,6 +21,15 @@ use buywise_core::matching::ResolutionOutcome;
 use buywise_core::optimiser::optimise;
 
 const PHASE0_HOUSEHOLD: &str = "00000000-0000-0000-0000-000000000001";
+
+/// Serialises the tests that drive `ingest::run`, which mutates the
+/// process-global `BUYWISE_NO_NETWORK` env var for the duration of a dry-run.
+/// `ingest::run` now restores the prior value on drop, so no leak survives a
+/// test, but cargo runs tests in a binary concurrently — without this lock two
+/// such runs could still race on the shared variable mid-run. Each test holds
+/// the lock for the whole `ingest::run` call, so neither depends on (nor leaks)
+/// global env state into the other.
+static INGEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Count rows in a table of a freshly opened pool over the given db file.
 async fn count_rows(db_path: &str, table: &str) -> i64 {
@@ -312,7 +322,14 @@ fn ingest_dry_run_completes_without_network_and_writes_rows() {
     let db_path = dir.path().join("dry.db");
     let db = db_path.to_str().unwrap();
 
+    // Serialise the env-mutating window with the other ingest test (see
+    // INGEST_ENV_LOCK). Ignore a poisoned lock: a panic in the other test still
+    // leaves the env restored by the guard, so the lock state is irrelevant.
+    let _env = INGEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // Returns Ok(()) (exit 0) and prints the "dry-run mode" banner to stdout.
+    // `ingest::run` restores BUYWISE_NO_NETWORK to its prior value on return, so
+    // this dry-run does not leak the no-network flag to any later test.
     buywise_cli::commands::ingest::run(db, true).expect("dry-run ingest should succeed");
 
     // The fixture-backed (no-network) run still persists rows.
@@ -327,20 +344,33 @@ fn ingest_dry_run_completes_without_network_and_writes_rows() {
 }
 
 #[test]
-fn ingest_live_then_seed_matches_is_idempotent() {
+fn ingest_then_seed_matches_is_idempotent() {
     // Acceptance criterion: seed-matches upserts rows and is idempotent on a
     // second run (stable row count + values; an updated status in the CSV updates
     // in place rather than duplicating).
+    //
+    // The ingest step populates retailer_products + offers so the match FKs
+    // resolve. We drive the no-network (fixture) ingest path explicitly via
+    // `--dry-run` so the test is self-contained: it requires neither a live
+    // BASKETWATCH_API_KEY nor env state leaked from another test. The seed +
+    // idempotency assertions below are identical regardless of which ingest path
+    // populated the products.
     let root = workspace_root();
     let dir = tempfile::Builder::new()
         .prefix("bw")
         .tempdir()
         .expect("tempdir");
-    let db_path = dir.path().join("live.db");
+    let db_path = dir.path().join("seed.db");
     let db = db_path.to_str().unwrap();
 
-    // Populate retailer_products + offers so the match FKs resolve.
-    buywise_cli::commands::ingest::run(db, false).expect("live ingest should succeed");
+    // Serialise the env-mutating ingest window with the dry-run test (see
+    // INGEST_ENV_LOCK). Hold the lock only for the ingest call; the seed-matches
+    // runs below touch no env vars. Ignore a poisoned lock: the guard restores
+    // the env on a panic, so the lock state is irrelevant.
+    {
+        let _env = INGEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        buywise_cli::commands::ingest::run(db, true).expect("fixture ingest should succeed");
+    }
 
     let csv_src = root.join("fixtures").join("product_matches.csv");
     let csv_path = dir.path().join("matches.csv");
