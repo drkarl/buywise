@@ -573,11 +573,25 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
                 requests_made += 1;
                 response
             }
-            // No response received ⇒ the request never reached the API and
-            // consumed no quota, so refund the slot we reserved.
+            // `send()` failed. Only a clearly pre-send failure — the connection
+            // was never established — proves the request did not reach RapidAPI
+            // and consumed no quota; refund that slot. Any ambiguous failure
+            // (notably a timeout, which can fire *after* the server received and
+            // charged the call) keeps the reservation, the conservative direction
+            // for a quota guardrail.
             Err(err) => {
-                if let Err(refund) = db::refund_request_slot(&pool, &event_id).await {
-                    tracing::error!(error = %refund, "failed to refund reserved request slot");
+                if err.is_connect() {
+                    if let Err(refund) = db::refund_request_slot(&pool, &event_id).await {
+                        tracing::error!(error = %refund, "failed to refund reserved request slot");
+                    }
+                } else {
+                    // Keep the reservation and count it, so the run's
+                    // requests_made stays consistent with the recorded usage.
+                    requests_made += 1;
+                    tracing::warn!(
+                        error = %err,
+                        "ambiguous send failure; keeping reserved quota slot"
+                    );
                 }
                 fetch_error = Some(err.into());
                 break;
