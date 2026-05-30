@@ -15,8 +15,40 @@ use std::path::{Path, PathBuf};
 use buywise_cli::commands::basket::{build_optimiser_input, resolve_lines};
 use buywise_cli::commands::fixture_db::build_fixture_pool;
 use buywise_cli::commands::BasketFixture;
+use buywise_core::db;
 use buywise_core::matching::ResolutionOutcome;
 use buywise_core::optimiser::optimise;
+
+const PHASE0_HOUSEHOLD: &str = "00000000-0000-0000-0000-000000000001";
+
+/// Count rows in a table of a freshly opened pool over the given db file.
+async fn count_rows(db_path: &str, table: &str) -> i64 {
+    let pool = db::connect(&format!("sqlite://{db_path}"))
+        .await
+        .expect("open db");
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows")
+}
+
+/// Fetch (status, matched_by) for one product_matches row by its natural key.
+async fn match_status(db_path: &str, canonical_item_id: &str, retailer_product_id: &str) -> String {
+    let pool = db::connect(&format!("sqlite://{db_path}"))
+        .await
+        .expect("open db");
+    sqlx::query_scalar::<_, String>(
+        "SELECT status FROM product_matches \
+         WHERE household_id = ?1 AND canonical_item_id = ?2 AND retailer_product_id = ?3",
+    )
+    .bind(PHASE0_HOUSEHOLD)
+    .bind(canonical_item_id)
+    .bind(retailer_product_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch status")
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -176,5 +208,110 @@ async fn optimise_fixture_mode_monthly_saving_meets_phase0_gate() {
         single % 100,
         theoretical / 100,
         theoretical % 100,
+    );
+}
+
+/// Build a small tokio runtime for the async DB-assertion helpers. The command
+/// entry points (`ingest::run`, `seed_matches::run`) build their own runtime, so
+/// these tests are plain `#[test]`s and only spin a runtime up for assertions.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Runtime::new()
+        .expect("assertion runtime")
+        .block_on(fut)
+}
+
+#[test]
+fn ingest_dry_run_completes_without_network_and_writes_rows() {
+    // Acceptance criterion: `ingest-basketwatch --db <tmp> --dry-run` completes
+    // (exit 0) without any network calls. Per the command contract (see
+    // crates/cli/src/commands/ingest.rs), `--dry-run` forces the no-network path
+    // so the adapter reads `fixtures/offers.json`, but it STILL writes the
+    // resulting retailer_products + product_offers rows. So a successful dry-run
+    // is observable as Ok(()) plus non-empty data tables.
+    let dir = tempfile::Builder::new()
+        .prefix("bw")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("dry.db");
+    let db = db_path.to_str().unwrap();
+
+    // Returns Ok(()) (exit 0) and prints the "dry-run mode" banner to stdout.
+    buywise_cli::commands::ingest::run(db, true).expect("dry-run ingest should succeed");
+
+    // The fixture-backed (no-network) run still persists rows.
+    assert!(
+        block_on(count_rows(db, "retailer_products")) > 0,
+        "dry-run should write retailer_products from fixtures/offers.json"
+    );
+    assert!(
+        block_on(count_rows(db, "product_offers")) > 0,
+        "dry-run should write product_offers from fixtures/offers.json"
+    );
+}
+
+#[test]
+fn ingest_live_then_seed_matches_is_idempotent() {
+    // Acceptance criterion: seed-matches upserts rows and is idempotent on a
+    // second run (stable row count + values; an updated status in the CSV updates
+    // in place rather than duplicating).
+    let root = workspace_root();
+    let dir = tempfile::Builder::new()
+        .prefix("bw")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("live.db");
+    let db = db_path.to_str().unwrap();
+
+    // Populate retailer_products + offers so the match FKs resolve.
+    buywise_cli::commands::ingest::run(db, false).expect("live ingest should succeed");
+
+    let csv_src = root.join("fixtures").join("product_matches.csv");
+    let csv_path = dir.path().join("matches.csv");
+    std::fs::copy(&csv_src, &csv_path).expect("copy fixture csv");
+    let csv = csv_path.to_str().unwrap();
+
+    // First run: seeds the rows.
+    buywise_cli::commands::seed_matches::run(csv, db, PHASE0_HOUSEHOLD).expect("seed run 1");
+    let count_after_first = block_on(count_rows(db, "product_matches"));
+    assert!(
+        count_after_first > 0,
+        "seed-matches should write rows, got {count_after_first}"
+    );
+
+    // Second run with the identical CSV: idempotent (same count, no duplicates).
+    buywise_cli::commands::seed_matches::run(csv, db, PHASE0_HOUSEHOLD).expect("seed run 2");
+    let count_after_second = block_on(count_rows(db, "product_matches"));
+    assert_eq!(
+        count_after_first, count_after_second,
+        "second seed-matches run must be idempotent (no new rows)"
+    );
+
+    // An updated status in the CSV must update in place, not duplicate the row.
+    let raw = std::fs::read_to_string(&csv_path).expect("read csv");
+    let updated = raw.replacen(",accepted,system", ",rejected,system", 1);
+    assert_ne!(
+        raw, updated,
+        "fixture must contain an 'accepted' row to flip"
+    );
+    std::fs::write(&csv_path, &updated).expect("write updated csv");
+
+    buywise_cli::commands::seed_matches::run(csv, db, PHASE0_HOUSEHOLD).expect("seed run 3");
+    let count_after_update = block_on(count_rows(db, "product_matches"));
+    assert_eq!(
+        count_after_first, count_after_update,
+        "an updated status must update in place, not add a row"
+    );
+
+    // The first data row's status must now reflect the update.
+    let first = updated
+        .lines()
+        .find(|l| l.contains(",rejected,system"))
+        .expect("an updated row");
+    let cols: Vec<&str> = first.split(',').collect();
+    let status = match_status(db, cols[0], cols[1]);
+    assert_eq!(
+        block_on(status),
+        "rejected",
+        "the flipped row's status must be updated in place"
     );
 }
