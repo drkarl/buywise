@@ -110,9 +110,13 @@ CREATE TABLE list_entries (
     CHECK (canonical_item_id IS NULL OR status = 'resolved'),
     -- (4) unresolved => no candidate list recorded
     CHECK (status != 'unresolved' OR resolution_candidates_json IS NULL),
-    -- (5) ambiguous => a non-empty candidate list is recorded
+    -- (5) ambiguous => a non-empty, well-formed JSON candidate array is recorded.
+    -- json_valid() is folded in first so json_array_length() never sees malformed
+    -- JSON (which would raise an opaque parse error rather than a clean CHECK
+    -- violation).
     CHECK (status != 'ambiguous' OR (
         resolution_candidates_json IS NOT NULL
+        AND json_valid(resolution_candidates_json)
         AND json_array_length(resolution_candidates_json) > 0
     )),
     -- (6) resolved => candidate list is cleared
@@ -174,6 +178,10 @@ CREATE TABLE store_category_orders (
     created_at    TEXT NOT NULL,
     FOREIGN KEY (household_id) REFERENCES households(id),
     FOREIGN KEY (category_id) REFERENCES categories(id),
+    -- Must stay in sync with the canonical Retailer enum
+    -- (crates/core/src/domain.rs, Retailer::as_db_str) and the identical CHECK on
+    -- retailer_products in 001_phase0_schema.sql. The 004 seed inserts these exact
+    -- five strings.
     CHECK (retailer IN ('tesco', 'dunnes', 'supervalu', 'lidl', 'aldi'))
 );
 
