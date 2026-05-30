@@ -18,14 +18,20 @@ INSERT INTO households (id, name, created_at) VALUES
     ('00000000-0000-0000-0000-000000000001', 'Default Household', '2025-01-01T00:00:00Z');
 
 -- Default store_category_orders: one row per (retailer, category).
--- 5 retailers x 11 categories (seeded in 002_seed.sql) = 55 rows.
+-- Expects exactly 11 categories from 002_seed.sql -> 5 retailers x 11 = 55 rows.
+-- (crates/core/tests/migrations.rs asserts BOTH categories = 11 AND
+-- store_category_orders = 55, so any drift in the category seed fails the test.)
 --
 -- We INSERT ... SELECT against the live `categories` table rather than hard-code
 -- category ids: the category primary keys are generated UUIDs (see 002_seed.sql),
 -- so cross-joining the retailer list against the seeded categories references
--- the EXACT ids that exist and always yields exactly 5 x 11 = 55 rows. The
--- composite id keeps each row stable and unique; the category `default_order`
--- seeds the per-retailer `sort_order` (households can override later).
+-- the EXACT ids that exist and always yields exactly 5 x 11 = 55 rows.
+--
+-- The id is derived deterministically from the stable (retailer, category_id)
+-- pair as 'sco-' || retailer || '-' || category_id (pure SQLite, no randomness),
+-- mirroring 002_seed.sql's reproducible-id discipline so re-running yields the
+-- same rows. The category `default_order` seeds the per-retailer `sort_order`
+-- (households can override later).
 INSERT INTO store_category_orders (id, household_id, retailer, category_id, sort_order, created_at)
 SELECT
     'sco-' || r.retailer || '-' || c.id            AS id,
