@@ -27,6 +27,7 @@
 use std::time::Duration;
 
 use buywise_core::db;
+use buywise_core::normalise::validate_unit_price;
 use buywise_core::{
     Cents, Micros, ProductOffer, Retailer, RetailerProduct, Source, SourceConfidence,
     UnitPriceBasis,
@@ -225,7 +226,7 @@ pub fn normalise(raw: Vec<RawBasketWatchProduct>, fetched_at: &str) -> Normalise
 
         // Lenient unit-price basis: an unknown string is dropped (logged) rather
         // than failing the whole run.
-        let unit_price_basis = match record.unit_price_basis.as_deref() {
+        let provided_basis = match record.unit_price_basis.as_deref() {
             None => None,
             Some(s) => match UnitPriceBasis::try_from(s) {
                 Ok(b) => Some(b),
@@ -235,6 +236,17 @@ pub fn normalise(raw: Vec<RawBasketWatchProduct>, fetched_at: &str) -> Normalise
                 }
             },
         };
+
+        // Cross-check BasketWatch's unit price against one computed from the pack
+        // size (P0-T7): if the provided value is missing, or diverges by more than
+        // 2%, `validate_unit_price` substitutes the recomputed value — so a bad or
+        // absent API unit price cannot flow straight into `product_offers`.
+        let (unit_price_eur_micros, unit_price_basis) = validate_unit_price(
+            record.price_cents,
+            record.pack_size_text.as_deref(),
+            record.unit_price_eur_micros,
+            provided_basis,
+        );
 
         let id = stable_product_id(Source::BasketWatch, retailer, &external_id);
 
@@ -258,7 +270,7 @@ pub fn normalise(raw: Vec<RawBasketWatchProduct>, fetched_at: &str) -> Normalise
         result.offers.push(OfferDraft {
             retailer_product_id: id,
             price_cents: record.price_cents,
-            unit_price_eur_micros: record.unit_price_eur_micros,
+            unit_price_eur_micros,
             unit_price_basis,
             previous_price_cents: record.previous_price_cents,
             loyalty_price_cents: record.loyalty_price_cents,
@@ -478,28 +490,24 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
     let api_key = std::env::var("BASKETWATCH_API_KEY").map_err(|_| IngestError::MissingApiKey)?;
     let month = month_of(&fetched_at);
 
+    // Informational classification only (the warn / skip log). Enforcement is the
+    // per-request atomic reservation below — a single up-front read would be stale
+    // under concurrency. The Phase-0 weekly batch is a full refresh with no
+    // per-item currency, so every request is essential by construction; there is
+    // nothing to drop at the skip threshold, which is instead honoured by the
+    // hard stop capping how far the batch can run.
     let used = db::current_month_request_count(&pool, Source::BasketWatch, &month).await?;
-    // Initial classification (logging + the can't-even-start hard stop). The
-    // weekly BasketWatch batch is a full refresh with no per-item currency in
-    // Phase 0, so every request is essential by construction — there is nothing
-    // to drop at the skip threshold. The threshold is still honoured by the
-    // per-request hard-stop below, which caps how far the batch can run.
     match quota_action(used) {
-        QuotaAction::HardStop => return Err(IngestError::QuotaHardStop { used }),
-        QuotaAction::SkipNonEssential => {
-            tracing::warn!(
-                used,
-                "above skip-non-essential threshold; Phase-0 batch is essential-only"
-            );
-        }
-        QuotaAction::Warn => {
-            tracing::warn!(
-                used,
-                limit = QUOTA_HARD_STOP,
-                "BasketWatch monthly request budget high"
-            );
-        }
-        QuotaAction::Proceed => {}
+        QuotaAction::SkipNonEssential => tracing::warn!(
+            used,
+            "above skip-non-essential threshold; Phase-0 batch is essential-only"
+        ),
+        QuotaAction::Warn => tracing::warn!(
+            used,
+            limit = QUOTA_HARD_STOP,
+            "BasketWatch monthly request budget high"
+        ),
+        QuotaAction::HardStop | QuotaAction::Proceed => {}
     }
 
     let host = std::env::var("BASKETWATCH_API_HOST")
@@ -512,23 +520,38 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
 
     let mut products = Vec::new();
     let mut requests_made = 0i64;
-    // Capture the first error rather than `?`-returning it, so we still record the
-    // requests already spent against the monthly quota before propagating.
+    // Capture the first error rather than `?`-returning it, so partial progress is
+    // returned cleanly (the reservations already committed stay recorded).
     let mut fetch_error: Option<IngestError> = None;
     for retailer in RETAILERS {
-        // Re-check the budget before *every* request using the live projected
-        // total (month-to-date + this run's requests). This is what keeps the
-        // batch from crossing the 4900 hard stop mid-run: at 4899 exactly one
-        // request is allowed (reaching 4900), after which we stop making external
-        // calls and proceed with whatever was fetched.
-        if quota_action(used + requests_made) == QuotaAction::HardStop {
-            tracing::warn!(
-                used,
-                requests_made,
-                "BasketWatch hard stop reached mid-batch; stopping external calls"
-            );
-            break;
-        }
+        // Atomically reserve a request slot before each call. This re-reads the
+        // live month-to-date count under a write lock and records the request in
+        // one step, so concurrent ingest processes cannot both pass a stale check
+        // and overshoot the 4900 hard stop.
+        let event_id = match db::reserve_request_slot(
+            &pool,
+            Source::BasketWatch,
+            "products",
+            &month,
+            &fetched_at,
+            QUOTA_HARD_STOP,
+        )
+        .await?
+        {
+            db::RequestReservation::Granted { event_id, .. } => event_id,
+            db::RequestReservation::Denied { used } => {
+                if requests_made == 0 {
+                    // Could not even start: surface the hard stop as an error.
+                    return Err(IngestError::QuotaHardStop { used });
+                }
+                tracing::warn!(
+                    used,
+                    requests_made,
+                    "BasketWatch hard stop reached mid-batch; stopping external calls"
+                );
+                break;
+            }
+        };
 
         // 40 RPM self-cap: space requests by RATE_LIMIT_INTERVAL (skip the wait
         // before the first request).
@@ -545,13 +568,17 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
             .await
         {
             // A response (even a 4xx/5xx) means the request reached BasketWatch
-            // and consumed quota, so count it before inspecting the status.
+            // and genuinely consumed quota — keep the reservation.
             Ok(response) => {
                 requests_made += 1;
                 response
             }
-            // No response received ⇒ no quota consumed; do not count it.
+            // No response received ⇒ the request never reached the API and
+            // consumed no quota, so refund the slot we reserved.
             Err(err) => {
+                if let Err(refund) = db::refund_request_slot(&pool, &event_id).await {
+                    tracing::error!(error = %refund, "failed to refund reserved request slot");
+                }
                 fetch_error = Some(err.into());
                 break;
             }
@@ -570,20 +597,6 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
                 break;
             }
         }
-    }
-
-    // Record whatever quota was actually consumed, on both the success and the
-    // partial-failure paths.
-    if requests_made > 0 {
-        db::insert_api_usage_event(
-            &pool,
-            Source::BasketWatch,
-            "products",
-            requests_made,
-            &month,
-            &fetched_at,
-        )
-        .await?;
     }
 
     if let Some(err) = fetch_error {
@@ -712,6 +725,35 @@ mod tests {
         r.brand = Some("Fairy".into());
         let result = normalise(vec![r], "2026-05-30T00:00:00.000Z");
         assert_eq!(result.products[0].brand.as_deref(), Some("Fairy"));
+    }
+
+    #[test]
+    fn normalise_validates_and_recomputes_unit_price() {
+        // €2.50 / 433 ml → €5.77/L. A provided value that is correct is trusted…
+        let mut good = raw(Some("t-1"), "tesco", "Fairy Washing Up Liquid 433ml");
+        good.pack_size_text = Some("433ml".into());
+        good.price_cents = 250;
+        good.unit_price_basis = Some("per_l".into());
+        good.unit_price_eur_micros = Some(5_773_672);
+
+        // …while a value off by 10× (well beyond the 2% tolerance) is recomputed.
+        let mut bad = raw(Some("t-2"), "tesco", "Fairy Washing Up Liquid 433ml");
+        bad.pack_size_text = Some("433ml".into());
+        bad.price_cents = 250;
+        bad.unit_price_basis = Some("per_l".into());
+        bad.unit_price_eur_micros = Some(577_367);
+
+        // …and a missing value is supplemented from the pack size.
+        let mut missing = raw(Some("t-3"), "tesco", "Fairy Washing Up Liquid 433ml");
+        missing.pack_size_text = Some("433ml".into());
+        missing.price_cents = 250;
+        missing.unit_price_basis = Some("per_l".into());
+        missing.unit_price_eur_micros = None;
+
+        let result = normalise(vec![good, bad, missing], "2026-05-30T00:00:00.000Z");
+        assert_eq!(result.offers[0].unit_price_eur_micros, Some(5_773_672));
+        assert_eq!(result.offers[1].unit_price_eur_micros, Some(5_773_672));
+        assert_eq!(result.offers[2].unit_price_eur_micros, Some(5_773_672));
     }
 
     #[test]

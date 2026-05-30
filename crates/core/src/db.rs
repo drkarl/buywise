@@ -368,6 +368,124 @@ pub async fn insert_api_usage_event(
     Ok(())
 }
 
+/// Outcome of attempting to atomically reserve a single request slot against the
+/// monthly budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestReservation {
+    /// A slot was reserved (one `api_usage_events` request recorded). Carries the
+    /// new event's id (so it can be refunded if the request never goes out) and
+    /// the month-to-date total *after* this reservation.
+    Granted {
+        /// Primary key of the recorded `api_usage_events` row.
+        event_id: String,
+        /// Month-to-date request total including this reservation.
+        used_after: i64,
+    },
+    /// The hard stop was already reached; no slot was reserved.
+    Denied {
+        /// Month-to-date request total at the time of denial.
+        used: i64,
+    },
+}
+
+/// Atomically check the monthly budget and reserve one request slot.
+///
+/// The count read and the reservation insert run inside a single
+/// `BEGIN IMMEDIATE` transaction, so the write lock serialises concurrent ingest
+/// processes: two callers cannot both observe the same stale count and each make
+/// a request that, together, overshoot `hard_stop`. The loser of the lock race
+/// waits (`busy_timeout`) and then re-reads the now-incremented count.
+///
+/// Reserving *before* the request is the conservative direction for a guardrail
+/// (it can only stop early, never late). If the request then fails to reach the
+/// API (no response), the caller should [`refund_request_slot`] the returned
+/// `event_id` so the slot is not charged.
+pub async fn reserve_request_slot(
+    pool: &SqlitePool,
+    source: Source,
+    endpoint: &str,
+    month_year: &str,
+    created_at: &str,
+    hard_stop: i64,
+) -> Result<RequestReservation, DbError> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+    // Helper so any error rolls the transaction back before propagating.
+    async fn run(
+        conn: &mut SqliteConnection,
+        source: Source,
+        endpoint: &str,
+        month_year: &str,
+        created_at: &str,
+        hard_stop: i64,
+    ) -> Result<RequestReservation, DbError> {
+        let used: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(requests_count), 0) FROM api_usage_events \
+             WHERE source = ?1 AND month_year = ?2",
+        )
+        .bind(source)
+        .bind(month_year)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if used >= hard_stop {
+            return Ok(RequestReservation::Denied { used });
+        }
+
+        let event_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO api_usage_events \
+             (id, source, endpoint, requests_count, month_year, created_at) \
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+        )
+        .bind(&event_id)
+        .bind(source)
+        .bind(endpoint)
+        .bind(month_year)
+        .bind(created_at)
+        .execute(&mut *conn)
+        .await?;
+
+        Ok(RequestReservation::Granted {
+            event_id,
+            used_after: used + 1,
+        })
+    }
+
+    match run(
+        &mut conn, source, endpoint, month_year, created_at, hard_stop,
+    )
+    .await
+    {
+        Ok(reservation) => {
+            // A denial reserved nothing, so either COMMIT or ROLLBACK is correct;
+            // ROLLBACK keeps the no-op explicit.
+            let finish = match reservation {
+                RequestReservation::Granted { .. } => "COMMIT",
+                RequestReservation::Denied { .. } => "ROLLBACK",
+            };
+            sqlx::query(finish).execute(&mut *conn).await?;
+            Ok(reservation)
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// Refund a previously reserved request slot by deleting its `api_usage_events`
+/// row. Used when a reserved request never reached the API (no response), so the
+/// monthly count stays accurate.
+pub async fn refund_request_slot(pool: &SqlitePool, event_id: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM api_usage_events WHERE id = ?1")
+        .bind(event_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +842,77 @@ mod tests {
                 .expect("count"),
             45,
             "only current-month BasketWatch requests are summed"
+        );
+    }
+
+    /// Reserving a slot records one request and reports the new total; once the
+    /// hard stop is reached, reservations are denied without recording anything;
+    /// a refund removes a previously reserved slot.
+    #[tokio::test]
+    async fn reserve_request_slot_enforces_hard_stop_atomically() {
+        let pool = fresh_pool().await;
+        let reserve = |hard_stop: i64| {
+            let pool = pool.clone();
+            async move {
+                reserve_request_slot(
+                    &pool,
+                    Source::BasketWatch,
+                    "products",
+                    "2026-05",
+                    "2026-05-30T00:00:00.000Z",
+                    hard_stop,
+                )
+                .await
+                .expect("reserve")
+            }
+        };
+
+        // First two reservations are granted and increment the recorded total.
+        let first = reserve(3).await;
+        let second = reserve(3).await;
+        assert!(
+            matches!(first, RequestReservation::Granted { used_after: 1, .. }),
+            "first reservation: {first:?}"
+        );
+        assert!(
+            matches!(second, RequestReservation::Granted { used_after: 2, .. }),
+            "second reservation: {second:?}"
+        );
+        assert_eq!(
+            current_month_request_count(&pool, Source::BasketWatch, "2026-05")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The third reservation reaches the hard stop and is granted (3 == limit
+        // only denies the *next* one); the fourth is denied and records nothing.
+        let third = reserve(3).await;
+        assert!(matches!(
+            third,
+            RequestReservation::Granted { used_after: 3, .. }
+        ));
+        let denied = reserve(3).await;
+        assert_eq!(denied, RequestReservation::Denied { used: 3 });
+        assert_eq!(
+            current_month_request_count(&pool, Source::BasketWatch, "2026-05")
+                .await
+                .unwrap(),
+            3,
+            "a denied reservation must not record a request"
+        );
+
+        // Refunding the first slot decrements the recorded total.
+        let RequestReservation::Granted { event_id, .. } = first else {
+            unreachable!("first was granted");
+        };
+        refund_request_slot(&pool, &event_id).await.expect("refund");
+        assert_eq!(
+            current_month_request_count(&pool, Source::BasketWatch, "2026-05")
+                .await
+                .unwrap(),
+            2,
+            "refund removes exactly the refunded slot"
         );
     }
 }
