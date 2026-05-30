@@ -7,6 +7,17 @@
 //! adapter reads `fixtures/offers.json` instead of making any live RapidAPI
 //! calls — but still writes the `source_runs` + `retailer_products` +
 //! `product_offers` rows to the specified database (issue #11).
+//!
+//! Thread-safety caveat: `--dry-run` mutates a process-global env var because the
+//! BasketWatch adapter selects its fetch strategy from `BUYWISE_NO_NETWORK`
+//! ([`basketwatch::ingest`] takes only a pool, with no `no_network` parameter).
+//! This is safe for the CLI, which runs as a single short-lived process, but it
+//! is **not** safe to call this entry point concurrently from in-process tests
+//! that share the same address space (one test's `--dry-run` would leak into a
+//! parallel non-dry-run call). Such tests should drive [`basketwatch::ingest`]
+//! and set the env var themselves under a serial guard, or run in separate
+//! processes. Threading a `no_network: bool` through the adapter API would remove
+//! the caveat but is out of scope for this CLI change.
 
 use anyhow::{Context, Result};
 use buywise_core::db;
