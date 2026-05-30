@@ -825,10 +825,72 @@ fn optimise_core_pure_entry_point_returns_three_plans() {
     ];
     let core = optimise_core(&input, &candidates, 0);
     assert_eq!(core.best_single.expect("single").total_cents, 100);
-    // A single item cannot fill a genuine two-store plan; the best "pair" plan
-    // still prices the one item at its cheaper store.
-    assert_eq!(core.best_two_store.expect("two").total_cents, 100);
+    // A single item cannot fill a GENUINE two-store plan: every candidate pair
+    // degenerates to one store, so best_two_store is None (the two-store plan
+    // must span exactly two distinct retailers).
+    assert!(
+        core.best_two_store.is_none(),
+        "a single priceable item cannot yield a two-store split"
+    );
     assert_eq!(core.theoretical_minimum.expect("theo").total_cents, 100);
+}
+
+#[test]
+fn best_two_store_is_none_when_one_store_dominates_a_multi_retailer_basket() {
+    // Regression for the degeneracy bug: a >=2-retailer basket where Tesco wins
+    // (or solely stocks) every item. Each candidate pair collapses to a single
+    // store, so there is NO genuine two-store split → best_two_store is None,
+    // never a one-store plan masquerading as two-store. best_single still works.
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("rice", "ci-rice", 1), item("coffee", "ci-coffee", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    // rice: Tesco 100 (cheaper), Aldi 200.
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-rt", "ci-rice", "p-rt", MatchStatus::Accepted),
+                product("p-rt", Retailer::Tesco),
+                offer("o-rt", "p-rt", 100, Some(5)),
+            ),
+            (
+                product_match("m-ra", "ci-rice", "p-ra", MatchStatus::Accepted),
+                product("p-ra", Retailer::Aldi),
+                offer("o-ra", "p-ra", 200, Some(5)),
+            ),
+        ],
+    );
+    // coffee: Tesco 300 (cheaper), Aldi 400. Tesco wins everything.
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-ct", "ci-coffee", "p-ct", MatchStatus::Accepted),
+                product("p-ct", Retailer::Tesco),
+                offer("o-ct", "p-ct", 300, Some(5)),
+            ),
+            (
+                product_match("m-ca", "ci-coffee", "p-ca", MatchStatus::Accepted),
+                product("p-ca", Retailer::Aldi),
+                offer("o-ca", "p-ca", 400, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("single");
+    assert_eq!(single.stores, vec![Retailer::Tesco]);
+    assert_eq!(single.total_cents, 400);
+    assert!(
+        out.best_two_store.is_none(),
+        "no genuine two-store split exists; best_two_store must be None, not a one-store plan"
+    );
+    // The recommendation falls back to the single store.
+    let rec = out.recommended.expect("recommendation");
+    assert_eq!(rec.kind, RecommendedKind::SingleStore);
 }
 
 // ---------------------------------------------------------------------------
