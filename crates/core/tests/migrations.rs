@@ -48,6 +48,17 @@ async fn seed_list_prereqs(pool: &SqlitePool) {
 async fn all_migrations_apply_and_seed_55_store_category_orders() {
     let pool = migrated_pool().await;
 
+    // The 55-row cross join depends on categories having exactly 11 rows; assert
+    // the category count too so a change to the 002 seed fails here, not silently.
+    let categories: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM categories")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        categories, 11,
+        "expected 11 seeded categories from 002_seed.sql"
+    );
+
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM store_category_orders")
         .fetch_one(&pool)
         .await
@@ -128,6 +139,16 @@ async fn list_entries_check_constraints_reject_invalid_states() {
         &pool,
         "('e', 'list-1', 'x', 'ambiguous', NULL, '[]', 'h', 't', 't')",
         "ambiguous with empty candidate array",
+    )
+    .await;
+
+    // (5c) ambiguous candidate list must be well-formed JSON: json_valid() folded
+    // into the CHECK turns malformed JSON into a clean CHECK violation rather than
+    // an opaque json_array_length() parse error.
+    assert_entry_insert_fails(
+        &pool,
+        "('e', 'list-1', 'x', 'ambiguous', NULL, 'not-json', 'h', 't', 't')",
+        "ambiguous with malformed JSON candidates",
     )
     .await;
 
