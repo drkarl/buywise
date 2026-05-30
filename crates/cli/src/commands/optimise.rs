@@ -13,7 +13,7 @@
 //! printing. The printed monthly saving (best single store − theoretical
 //! minimum, annualised to a month) is the Phase-0 gate metric.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use buywise_core::db;
 use buywise_core::optimiser::{optimise, OptimiserOutput, Recommendation, StorePlan};
 use sqlx::sqlite::SqlitePool;
@@ -33,6 +33,18 @@ pub fn run(
     threshold2: Option<i64>,
     threshold3: Option<i64>,
 ) -> Result<()> {
+    // A third-store threshold must be at least the two-store threshold:
+    // switching to a third store should never be *easier* to justify than a
+    // second one, or the two/three-store switch behaves unexpectedly. Validate
+    // up front (both are cents) before any work is done.
+    if let (Some(t2), Some(t3)) = (threshold2, threshold3) {
+        if t3 < t2 {
+            bail!(
+                "--threshold3 ({t3} cents) must be >= --threshold2 ({t2} cents): \
+                 a third store cannot be easier to justify than a second"
+            );
+        }
+    }
     if threshold3.is_some() {
         // Phase 0 produces single- and two-store plans only; a third-store
         // threshold is accepted for forward-compatibility but has no effect.
