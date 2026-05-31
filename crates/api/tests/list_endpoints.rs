@@ -92,7 +92,7 @@ async fn seed_list(pool: &SqlitePool, id: &str, household_id: &str, name: &str) 
     .expect("insert list");
 }
 
-/// Seed one ACTIVE, resolved list entry on a list.
+/// Seed one ACTIVE, unresolved list entry on a list.
 async fn seed_entry(pool: &SqlitePool, id: &str, list_id: &str, added_by: &str, hash: &str) {
     sqlx::query(
         "INSERT INTO list_entries \
@@ -109,6 +109,67 @@ async fn seed_entry(pool: &SqlitePool, id: &str, list_id: &str, added_by: &str, 
     .execute(pool)
     .await
     .expect("insert entry");
+}
+
+/// Seed a category and a canonical item belonging to `household_id`.
+async fn seed_canonical_item(
+    pool: &SqlitePool,
+    category_id: &str,
+    item_id: &str,
+    household_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+         VALUES (?1, 'Dairy', 'Lácteos', 'milk', 1)",
+    )
+    .bind(category_id)
+    .execute(pool)
+    .await
+    .expect("insert category");
+
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES (?1, ?2, 'Milk', 'Leche', ?3, 'any', ?4)",
+    )
+    .bind(item_id)
+    .bind(household_id)
+    .bind(category_id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert canonical item");
+}
+
+/// Seed one ACTIVE, resolved list entry bound to `canonical_item_id` with a
+/// real (non-sentinel) `effective_constraint_hash`. Satisfies the resolution
+/// CHECKs in migrations/003_phase1_schema.sql (resolved => canonical_item_id
+/// NOT NULL and resolution_candidates_json NULL).
+async fn seed_resolved_entry(
+    pool: &SqlitePool,
+    id: &str,
+    list_id: &str,
+    added_by: &str,
+    canonical_item_id: &str,
+    hash: &str,
+) {
+    sqlx::query(
+        "INSERT INTO list_entries \
+             (id, list_id, canonical_item_id, resolution_status, raw_text, display_name, \
+              added_by, quantity, status, effective_constraint_hash, last_updated_revision, \
+              created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'resolved', ?4, ?4, ?5, 1, 'active', ?6, 0, ?7, ?7)",
+    )
+    .bind(id)
+    .bind(list_id)
+    .bind(canonical_item_id)
+    .bind("Milk")
+    .bind(added_by)
+    .bind(hash)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert resolved entry");
 }
 
 /// Log in and return the session + csrf tokens.
@@ -475,6 +536,69 @@ async fn patch_with_invalid_status_is_422() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn patch_with_empty_body_is_422() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // An empty object changes nothing → 422 (no-op body is rejected).
+    let body = serde_json::json!({}).to_string();
+    let resp = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/list/list-a")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .header("X-CSRF-Token", &s.csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn get_list_surfaces_resolved_entry_canonical_id_and_hash() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_canonical_item(&pool, "cat-1", "item-1", "hh-a").await;
+    seed_resolved_entry(
+        &pool,
+        "entry-1",
+        "list-a",
+        "user-a",
+        "item-1",
+        "hash-abc123",
+    )
+    .await;
+
+    let s = login(&pool, "a@example.test").await;
+    let resp = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .uri("/api/list/list-a")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = json(resp).await;
+    let entries = detail["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resolution_status"], "resolved");
+    assert_eq!(entries[0]["canonical_item_id"], "item-1");
+    assert_eq!(entries[0]["effective_constraint_hash"], "hash-abc123");
 }
 
 #[tokio::test]
