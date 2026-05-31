@@ -261,7 +261,7 @@ async fn list_lists(
          WHERE status = 'active' \
            AND household_id IN \
                (SELECT household_id FROM household_members WHERE user_id = ?1) \
-         ORDER BY created_at",
+         ORDER BY created_at, id",
     )
     .bind(&user.user_id)
     .fetch_all(&state.pool)
@@ -350,29 +350,13 @@ async fn load_list(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<ListRow>,
     .await
 }
 
-/// `GET /api/list/:id` — full list state with a top-level `current_revision`
-/// and all ACTIVE entries.
+/// Render a [`ListDetail`] from an already-loaded `shopping_lists` row plus a
+/// single query for its ACTIVE entries.
 ///
-/// 404 if the list does not exist; **403** if it exists but belongs to a
-/// household the caller is not a member of (deliberately distinct from 404).
-async fn get_list(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(id): Path<String>,
-) -> Result<Json<ListDetail>, StatusCode> {
-    let row = load_list(&state.pool, &id)
-        .await
-        .map_err(db_error("get_list.load"))?
-        .ok_or(StatusCode::NOT_FOUND)?;
+/// Shared by [`get_list`] and [`patch_list`] so neither re-runs [`load_list`]
+/// nor a redundant [`is_member`] check after the row is already in hand.
+async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail, sqlx::Error> {
     let (id, household_id, name, status, current_revision, created_at, archived_at) = row;
-
-    // Existing-but-forbidden is 403, NOT 404.
-    if !is_member(&state.pool, &user.user_id, &household_id)
-        .await
-        .map_err(db_error("get_list.is_member"))?
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
 
     let entry_rows = sqlx::query_as::<
         _,
@@ -397,12 +381,11 @@ async fn get_list(
                 effective_constraint_hash, last_updated_revision, created_at, updated_at \
          FROM list_entries \
          WHERE list_id = ?1 AND status = 'active' \
-         ORDER BY created_at",
+         ORDER BY created_at, id",
     )
     .bind(&id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(db_error("get_list.entries"))?;
+    .fetch_all(pool)
+    .await?;
 
     let entries = entry_rows
         .into_iter()
@@ -423,7 +406,7 @@ async fn get_list(
         })
         .collect();
 
-    Ok(Json(ListDetail {
+    Ok(ListDetail {
         id,
         household_id,
         name,
@@ -432,7 +415,36 @@ async fn get_list(
         created_at,
         archived_at,
         entries,
-    }))
+    })
+}
+
+/// `GET /api/list/:id` — full list state with a top-level `current_revision`
+/// and all ACTIVE entries.
+///
+/// 404 if the list does not exist; **403** if it exists but belongs to a
+/// household the caller is not a member of (deliberately distinct from 404).
+async fn get_list(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> Result<Json<ListDetail>, StatusCode> {
+    let row = load_list(&state.pool, &id)
+        .await
+        .map_err(db_error("get_list.load"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Existing-but-forbidden is 403, NOT 404.
+    if !is_member(&state.pool, &user.user_id, &row.1)
+        .await
+        .map_err(db_error("get_list.is_member"))?
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let detail = load_detail(&state.pool, row)
+        .await
+        .map_err(db_error("get_list.entries"))?;
+    Ok(Json(detail))
 }
 
 /// `PATCH /api/list/:id` — rename and/or archive a list.
@@ -442,6 +454,10 @@ async fn get_list(
 /// archiving, `archived_at` is set; reactivating clears it. `current_revision`
 /// is intentionally left untouched (owned by the mutation log, P1-T4). CSRF is
 /// enforced by the extractor (this is a PATCH).
+///
+/// Ordering note: body validation runs **before** the list lookup, so a
+/// malformed body on a missing/forbidden list returns 422 ahead of 404/403.
+/// This is intentional — input is validated at the boundary first.
 async fn patch_list(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -522,7 +538,17 @@ async fn patch_list(
     }
 
     // Re-read so the response reflects the persisted state (including entries).
-    get_list(State(state), user, Path(id)).await
+    // Membership was already verified above, so render directly from the
+    // updated row rather than re-running get_list (which would repeat the
+    // load_list + is_member queries).
+    let updated = load_list(&state.pool, &id)
+        .await
+        .map_err(db_error("patch_list.reload"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let detail = load_detail(&state.pool, updated)
+        .await
+        .map_err(db_error("patch_list.entries"))?;
+    Ok(Json(detail))
 }
 
 /// `GET /api/items` — the full canonical catalogue for the caller's
@@ -543,46 +569,160 @@ async fn list_items(
     .await
     .map_err(db_error("list_items.items"))?;
 
-    let mut items = Vec::with_capacity(item_rows.len());
-    for (id, household_id, name_en, name_es, category_id, default_constraint_policy) in item_rows {
-        let aliases = sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT id, alias, language, source FROM item_aliases \
-             WHERE canonical_item_id = ?1 ORDER BY alias",
-        )
-        .bind(&id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(db_error("list_items.aliases"))?
-        .into_iter()
-        .map(|(id, alias, language, source)| AliasView {
-            id,
-            alias,
-            language,
-            source,
-        })
-        .collect();
-
-        let constraints = load_constraints(&state.pool, &id)
-            .await
-            .map_err(db_error("list_items.constraints"))?;
-
-        items.push(ItemView {
-            id,
-            household_id,
-            name_en,
-            name_es,
-            category_id,
-            default_constraint_policy,
-            aliases,
-            constraints,
-        });
+    if item_rows.is_empty() {
+        return Ok(Json(Vec::new()));
     }
+
+    // Batch all aliases and constraints for the scoped item set in a small,
+    // constant number of queries (no per-item N+1). Both helpers chunk their
+    // `IN (...)` lists to stay under SQLite's bound-parameter limit.
+    let item_ids: Vec<String> = item_rows.iter().map(|r| r.0.clone()).collect();
+
+    let mut aliases_by_item = load_aliases_for_items(&state.pool, &user.user_id, &item_ids)
+        .await
+        .map_err(db_error("list_items.aliases"))?;
+    let mut constraints_by_item = load_constraints_for_items(&state.pool, &item_ids)
+        .await
+        .map_err(db_error("list_items.constraints"))?;
+
+    let items = item_rows
+        .into_iter()
+        .map(
+            |(id, household_id, name_en, name_es, category_id, default_constraint_policy)| {
+                let aliases = aliases_by_item.remove(&id).unwrap_or_default();
+                let constraints = constraints_by_item.remove(&id);
+                ItemView {
+                    id,
+                    household_id,
+                    name_en,
+                    name_es,
+                    category_id,
+                    default_constraint_policy,
+                    aliases,
+                    constraints,
+                }
+            },
+        )
+        .collect();
 
     Ok(Json(items))
 }
 
-/// The columns of an `item_constraints` row, in [`ConstraintsView`] order.
-type ConstraintsRow = (
+/// Max bound parameters per chunked `IN (...)` query. SQLite's compile-time
+/// limit is 999 (pre-3.32) / 32766 (3.32+); 900 is comfortably below either and
+/// leaves headroom for the per-chunk household-scope parameter.
+const IN_CHUNK_SIZE: usize = 900;
+
+/// Build all aliases for the given canonical item ids, grouped by
+/// `canonical_item_id`.
+///
+/// Defense in depth: aliases are additionally constrained to the caller's
+/// household set (`item_aliases.household_id`) so a mis-pointed alias from
+/// another household cannot leak through the `canonical_item_id` join.
+async fn load_aliases_for_items(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    item_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<AliasView>>, sqlx::Error> {
+    let mut grouped: std::collections::HashMap<String, Vec<AliasView>> =
+        std::collections::HashMap::new();
+
+    for chunk in item_ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT canonical_item_id, id, alias, language, source FROM item_aliases \
+             WHERE canonical_item_id IN ({placeholders}) \
+               AND household_id IN \
+                   (SELECT household_id FROM household_members WHERE user_id = ?) \
+             ORDER BY alias"
+        );
+        let mut query = sqlx::query_as::<_, (String, String, String, String, String)>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        query = query.bind(user_id);
+
+        for (canonical_item_id, id, alias, language, source) in query.fetch_all(pool).await? {
+            grouped
+                .entry(canonical_item_id)
+                .or_default()
+                .push(AliasView {
+                    id,
+                    alias,
+                    language,
+                    source,
+                });
+        }
+    }
+
+    Ok(grouped)
+}
+
+/// Build the (at most one) constraints row for each canonical item id, keyed by
+/// `canonical_item_id`.
+async fn load_constraints_for_items(
+    pool: &sqlx::SqlitePool,
+    item_ids: &[String],
+) -> Result<std::collections::HashMap<String, ConstraintsView>, sqlx::Error> {
+    let mut by_item: std::collections::HashMap<String, ConstraintsView> =
+        std::collections::HashMap::new();
+
+    for chunk in item_ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT canonical_item_id, brand, allowed_brands, excluded_brands, \
+                    preferred_size_value, preferred_size_basis, min_size_value, min_size_basis, \
+                    max_size_value, max_size_basis, pack_count, form_factor, dietary_flags, \
+                    substitution_policy \
+             FROM item_constraints WHERE canonical_item_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, KeyedConstraintsRow>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+
+        for r in query.fetch_all(pool).await? {
+            by_item.insert(
+                r.0,
+                ConstraintsView {
+                    brand: r.1,
+                    allowed_brands: r.2,
+                    excluded_brands: r.3,
+                    preferred_size_value: r.4,
+                    preferred_size_basis: r.5,
+                    min_size_value: r.6,
+                    min_size_basis: r.7,
+                    max_size_value: r.8,
+                    max_size_basis: r.9,
+                    pack_count: r.10,
+                    form_factor: r.11,
+                    dietary_flags: r.12,
+                    substitution_policy: r.13,
+                },
+            );
+        }
+    }
+
+    Ok(by_item)
+}
+
+/// Build `n` comma-separated `?` placeholders for an `IN (...)` clause.
+fn sql_placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n.saturating_mul(2));
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
+}
+
+/// An `item_constraints` row keyed by its `canonical_item_id` (first column),
+/// followed by the columns in [`ConstraintsView`] order. Flat (not nested) so
+/// sqlx can decode it via `FromRow`.
+type KeyedConstraintsRow = (
+    String,         // canonical_item_id
     Option<String>, // brand
     Option<String>, // allowed_brands
     Option<String>, // excluded_brands
@@ -597,35 +737,3 @@ type ConstraintsRow = (
     Option<String>, // dietary_flags
     String,         // substitution_policy
 );
-
-/// Load the (at most one) constraints row for a canonical item.
-async fn load_constraints(
-    pool: &sqlx::SqlitePool,
-    canonical_item_id: &str,
-) -> Result<Option<ConstraintsView>, sqlx::Error> {
-    let row = sqlx::query_as::<_, ConstraintsRow>(
-        "SELECT brand, allowed_brands, excluded_brands, preferred_size_value, \
-                preferred_size_basis, min_size_value, min_size_basis, max_size_value, \
-                max_size_basis, pack_count, form_factor, dietary_flags, substitution_policy \
-         FROM item_constraints WHERE canonical_item_id = ?1",
-    )
-    .bind(canonical_item_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|r| ConstraintsView {
-        brand: r.0,
-        allowed_brands: r.1,
-        excluded_brands: r.2,
-        preferred_size_value: r.3,
-        preferred_size_basis: r.4,
-        min_size_value: r.5,
-        min_size_basis: r.6,
-        max_size_value: r.7,
-        max_size_basis: r.8,
-        pack_count: r.9,
-        form_factor: r.10,
-        dietary_flags: r.11,
-        substitution_policy: r.12,
-    }))
-}
