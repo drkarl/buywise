@@ -42,6 +42,9 @@ pub fn hash_token(raw_token: &str) -> String {
 
 /// Constant-time byte comparison, used for the CSRF token check so a timing side
 /// channel cannot reveal how many leading bytes matched.
+///
+/// The early length check leaks only the *length* of the expected token, which
+/// is a fixed 64-char hex string here, so it reveals nothing useful.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -148,7 +151,10 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         let token_hash = hash_token(&raw_token);
         let session = lookup_session(&state.pool, &token_hash)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+                tracing::error!(error = %e, "auth: session lookup failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
         if !session_is_live(&session.expires_at) {

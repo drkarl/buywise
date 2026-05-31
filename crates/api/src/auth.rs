@@ -38,7 +38,9 @@ const SESSION_TTL_HOURS: i64 = 24 * 30;
 /// Verified against when no user matches the supplied email, so the "unknown
 /// user" path does roughly the same work as the "wrong password" path and does
 /// not leak account existence via response timing. Computed lazily (not a `const`)
-/// so it is a genuine, parseable PHC string that actually exercises the KDF.
+/// so it is a genuine, parseable PHC string that actually exercises the KDF;
+/// [`warm_dummy_hash`] forces this one-time cost at startup so even the first
+/// unknown-user login only performs verification work.
 fn dummy_password_hash() -> &'static str {
     use std::sync::OnceLock;
     static DUMMY: OnceLock<String> = OnceLock::new();
@@ -46,6 +48,13 @@ fn dummy_password_hash() -> &'static str {
         hash_password_for_storage("buywise-dummy-password-for-timing")
             .expect("hashing a static dummy password cannot fail")
     })
+}
+
+/// Eagerly compute [`dummy_password_hash`] so the first unknown-user login does
+/// not pay the one-time argon2 cost. Called once when the router is built (see
+/// `crate::app`).
+pub(crate) fn warm_dummy_hash() {
+    let _ = dummy_password_hash();
 }
 
 /// Request body for `POST /api/auth/login`.
@@ -80,8 +89,8 @@ pub fn router() -> Router<AppState> {
 ///
 /// On valid credentials: mints a session, persists `SHA-256(token)` +
 /// `csrf_token`, sets both cookies, and returns the user as JSON (200). On an
-/// unknown email or a bad password: 401 with no cookies (and constant-ish
-/// timing, see [`DUMMY_PASSWORD_HASH`]).
+/// unknown email or a bad password: 401 with no cookies (and approximately
+/// constant timing, see [`dummy_password_hash`]).
 async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
@@ -96,7 +105,10 @@ async fn login(
     .bind(&body.email)
     .fetch_optional(pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        tracing::error!(error = %e, "login: user lookup failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let verified_user = match user {
         Some((id, email, display_name, password_hash)) => {
@@ -123,11 +135,21 @@ async fn login(
     let session_token = random_token();
     let csrf_token = random_token();
     let token_hash = hash_token(&session_token);
-
     let session_id = uuid::Uuid::new_v4().to_string();
-    let now = buywise_core::db::now_iso();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(SESSION_TTL_HOURS))
+
+    // Derive `created_at` and `expires_at` from a single instant so the two
+    // timestamps are coherent.
+    let issued_at = chrono::Utc::now();
+    let created_at = issued_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let expires_at = (issued_at + chrono::Duration::hours(SESSION_TTL_HOURS))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // Build the response cookies *before* writing the session row: if a cookie
+    // value cannot be encoded as a header, fail without leaving an orphaned
+    // session row the client never received a token for.
+    let mut headers = HeaderMap::new();
+    append_cookie(&mut headers, &set_session_cookie(&session_token))?;
+    append_cookie(&mut headers, &set_csrf_cookie(&csrf_token))?;
 
     sqlx::query(
         "INSERT INTO sessions (id, user_id, token_hash, csrf_token, created_at, expires_at) \
@@ -137,15 +159,14 @@ async fn login(
     .bind(&user.id)
     .bind(&token_hash)
     .bind(&csrf_token)
-    .bind(&now)
+    .bind(&created_at)
     .bind(&expires_at)
     .execute(pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut headers = HeaderMap::new();
-    append_cookie(&mut headers, &set_session_cookie(&session_token))?;
-    append_cookie(&mut headers, &set_csrf_cookie(&csrf_token))?;
+    .map_err(|e| {
+        tracing::error!(error = %e, "login: session insert failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok((StatusCode::OK, headers, Json(user)))
 }
@@ -163,7 +184,10 @@ async fn logout(
         .bind(&user.session_id)
         .execute(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "logout: session delete failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut headers = HeaderMap::new();
     append_cookie(&mut headers, &clear_cookie(SESSION_COOKIE, true))?;
@@ -234,8 +258,10 @@ fn append_cookie(headers: &mut HeaderMap, cookie: &str) -> Result<(), StatusCode
 /// Hash a plaintext password with argon2id, producing a PHC string suitable for
 /// storage in `users.password_hash`.
 ///
-/// Exposed for the `buywise-cli set-password` subcommand (P1-T2): the API itself
-/// only ever verifies, never registers.
+/// The API only ever verifies passwords, never registers them; this helper
+/// exists for an out-of-band operator tool that seeds `users.password_hash`
+/// (tracked as a separate follow-up issue), and is used by the integration
+/// tests to seed a user.
 pub fn hash_password_for_storage(password: &str) -> Result<String, argon2::password_hash::Error> {
     use argon2::password_hash::{PasswordHasher, SaltString};
     use rand::rngs::OsRng;

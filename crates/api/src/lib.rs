@@ -26,6 +26,10 @@ pub struct AppState {
 
 /// Build the top-level application router from a ready [`AppState`].
 pub fn app(state: AppState) -> Router {
+    // Warm the lazily-computed dummy password hash so the first unknown-user
+    // login does not pay a one-time argon2 cost (which would briefly reintroduce
+    // an account-existence timing signal).
+    auth::warm_dummy_hash();
     Router::new()
         .nest("/api/auth", auth::router())
         .with_state(state)
