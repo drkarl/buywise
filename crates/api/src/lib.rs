@@ -1,8 +1,9 @@
 //! BuyWise HTTP API library (axum 0.8).
 //!
-//! Phase 1 exposes the authentication routes (P1-T2) under `/api/auth`. The
-//! shared [`AppState`] carries the SQLite pool that handlers and the
-//! [`middleware::AuthenticatedUser`] extractor read from.
+//! Phase 1 exposes the authentication routes (P1-T2) under `/api/auth` and the
+//! list-management routes (P1-T3) under `/api/lists`, `/api/list/:id`, and
+//! `/api/items`. The shared [`AppState`] carries the SQLite pool that handlers
+//! and the [`middleware::AuthenticatedUser`] extractor read from.
 //!
 //! The router is built by [`app`], kept separate from the binary entry point so
 //! integration tests can mount the exact same routes against an in-memory
@@ -12,6 +13,7 @@ use axum::Router;
 use sqlx::SqlitePool;
 
 pub mod auth;
+pub mod lists;
 pub mod middleware;
 
 /// Application state shared across handlers and extractors.
@@ -32,5 +34,9 @@ pub fn app(state: AppState) -> Router {
     auth::warm_dummy_hash();
     Router::new()
         .nest("/api/auth", auth::router())
+        // `lists::router` already carries absolute `/api/...` paths (the list
+        // endpoints span two path shapes — `/api/lists` and `/api/list/:id` —
+        // so they are merged rather than nested under one prefix).
+        .merge(lists::router())
         .with_state(state)
 }
