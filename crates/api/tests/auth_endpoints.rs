@@ -355,3 +355,64 @@ async fn expired_session_is_rejected_with_401() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn unknown_session_cookie_is_rejected_with_401() {
+    let pool = setup_pool().await;
+
+    // A syntactically valid token whose hash matches no stored session.
+    let resp = app(AppState { pool })
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header(header::COOKIE, format!("session={}", "f00d".repeat(16)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn second_logout_after_session_deleted_is_401() {
+    let pool = setup_pool().await;
+
+    let login = app(AppState { pool: pool.clone() })
+        .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
+        .await
+        .unwrap();
+    let session = cookie_from_set_cookie(&login, "session").unwrap();
+    let csrf = cookie_from_set_cookie(&login, "csrf").unwrap();
+
+    // First logout deletes the row and returns 204.
+    let first = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header(header::COOKIE, format!("session={session}"))
+                .header("X-CSRF-Token", &csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    // Second logout with the same (now-deleted) session is rejected at the
+    // extractor with 401, before the DELETE runs — logout is idempotent.
+    let second = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header(header::COOKIE, format!("session={session}"))
+                .header("X-CSRF-Token", &csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+}
