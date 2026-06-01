@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use buywise_api::sse::SseConfig;
 use buywise_api::{app, AppState};
 use buywise_core::db;
 use futures_util::StreamExt;
@@ -163,7 +164,19 @@ async fn seed_list(pool: &SqlitePool, id: &str, household_id: &str, current_revi
 
 /// Insert a fully-accepted `mutations` row with a stored `response_json` so the
 /// backfill path can replay it. The response shape mirrors `MutationResponse`.
+/// `received_at_server` is "now"; use [`seed_mutation_at`] to backdate it.
 async fn seed_mutation(pool: &SqlitePool, list_id: &str, server_revision: i64) {
+    seed_mutation_at(pool, list_id, server_revision, &db::now_iso()).await;
+}
+
+/// Like [`seed_mutation`] but with an explicit `received_at_server` so a test can
+/// place a row inside or outside the time-based retention window.
+async fn seed_mutation_at(
+    pool: &SqlitePool,
+    list_id: &str,
+    server_revision: i64,
+    received_at_server: &str,
+) {
     let entity = serde_json::json!({
         "id": format!("entry-{server_revision}"),
         "list_id": list_id,
@@ -182,13 +195,14 @@ async fn seed_mutation(pool: &SqlitePool, list_id: &str, server_revision: i64) {
               operation_type, payload, base_revision, created_at_client, received_at_server, \
               server_revision, status, response_json) \
          VALUES (?1, ?2, 'device-1', 'user-a', ?3, 'list_entry', ?4, 'add_item', '{}', 0, \
-                 ?5, ?5, ?6, 'accepted', ?7)",
+                 ?5, ?6, ?7, 'accepted', ?8)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(format!("cm-{server_revision}"))
     .bind(list_id)
     .bind(format!("entry-{server_revision}"))
     .bind(db::now_iso())
+    .bind(received_at_server)
     .bind(server_revision)
     .bind(response.to_string())
     .execute(pool)
@@ -198,11 +212,17 @@ async fn seed_mutation(pool: &SqlitePool, list_id: &str, server_revision: i64) {
 
 /// Spawn the real router on an ephemeral TCP port; returns its base URL.
 async fn spawn_server(pool: SqlitePool) -> String {
+    spawn_server_with_config(pool, SseConfig::default()).await
+}
+
+/// Spawn the router with a custom [`SseConfig`] (tiny buffer, fast heartbeat, or
+/// a shrunken retention window) so timing/capacity paths are testable.
+async fn spawn_server_with_config(pool: SqlitePool, config: SseConfig) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let app = app(AppState::new(pool));
+    let app = app(AppState::new(pool).with_sse_config(config));
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
@@ -484,6 +504,150 @@ async fn since_below_retention_floor_yields_full_snapshot() {
     assert_eq!(
         v["current_revision"], 25_000,
         "snapshot has current revision"
+    );
+}
+
+/// A `?since=` below the *time-based* retention floor (older than the window)
+/// yields a `full_snapshot` even though the revision floor alone would allow a
+/// replay. Uses a 1-day retention window and backdates the only mutation by 2
+/// days so it falls outside the window.
+#[tokio::test]
+async fn since_below_time_floor_yields_full_snapshot() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    // Small revision counts so the revision floor (current - 10_000 = 0) never
+    // triggers; only the time floor can force a snapshot here.
+    seed_list(&pool, "list-a", "hh-a", 10).await;
+    let two_days_ago = (chrono::Utc::now() - chrono::Duration::days(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // The only retained mutation is older than the 1-day window, so no row is
+    // replayable and a client reconnecting at since=5 must be re-snapshotted.
+    seed_mutation_at(&pool, "list-a", 10, &two_days_ago).await;
+
+    let config = SseConfig {
+        retention_window: chrono::Duration::days(1),
+        ..SseConfig::default()
+    };
+    let base = spawn_server_with_config(pool.clone(), config).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    let mut r = SseReader::new(client.open_sse("list-a", Some(5)).await);
+    let frame = r.next_frame(SHORT).await.expect("snapshot frame");
+    assert_eq!(
+        frame.event, "full_snapshot",
+        "below the time floor → full_snapshot"
+    );
+    let v: serde_json::Value = serde_json::from_str(&frame.data).expect("snapshot json");
+    assert_eq!(
+        v["current_revision"], 10,
+        "snapshot carries current revision"
+    );
+}
+
+/// A subscriber that falls behind the bounded broadcast buffer self-heals: the
+/// stream emits a fresh `full_snapshot` (rather than silently skipping events).
+/// Forced with a 1-event buffer and a client that does not read while several
+/// mutations are posted, overflowing the broadcast channel into `Lagged`.
+#[tokio::test]
+async fn lagged_subscriber_receives_full_snapshot() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", 0).await;
+
+    // Tiny buffer so a single unread client overflows almost immediately.
+    let config = SseConfig {
+        broadcast_capacity: 1,
+        ..SseConfig::default()
+    };
+    let base = spawn_server_with_config(pool.clone(), config).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    // Open the stream but do NOT read it yet, so the producer task's mpsc fills
+    // (cap 1) and — once the kernel socket / hyper write buffers also fill — it
+    // blocks on `tx.send` and stops draining the broadcast receiver.
+    let mut r = SseReader::new(client.open_sse("list-a", None).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Post far more mutations than any socket buffer can hold while the consumer
+    // is stalled, so the producer blocks on `tx.send`, the 1-event broadcast
+    // buffer overflows, and the next `recv` reports `Lagged`.
+    for i in 1..=400 {
+        let status = client
+            .post_mutation(add_item_envelope(
+                &format!("cm-{i}"),
+                "list-a",
+                &format!("entry-{i}"),
+            ))
+            .await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::CREATED,
+            "mutation {i} accepted"
+        );
+    }
+
+    // Now drain. Within the stream we must encounter a `full_snapshot` produced
+    // by the lag-recovery path (it may be preceded by a couple of buffered
+    // `mutation`/`heartbeat` frames before the lag is observed).
+    let mut saw_snapshot = false;
+    for _ in 0..500 {
+        match r.next_frame(SHORT).await {
+            Some(frame) if frame.event == "full_snapshot" => {
+                let v: serde_json::Value = serde_json::from_str(&frame.data).expect("json");
+                assert_eq!(v["id"], "list-a", "self-heal snapshot is for this list");
+                saw_snapshot = true;
+                break;
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        saw_snapshot,
+        "a lagged subscriber should receive a self-healing full_snapshot"
+    );
+}
+
+/// The stream emits `heartbeat` frames on its configured cadence. Uses a 100ms
+/// interval and asserts at least two heartbeats arrive within ~500ms on an idle
+/// list (no mutations posted, so every frame is a heartbeat).
+#[tokio::test]
+async fn heartbeat_frames_arrive_on_cadence() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", 0).await;
+
+    let config = SseConfig {
+        heartbeat_interval: Duration::from_millis(100),
+        ..SseConfig::default()
+    };
+    let base = spawn_server_with_config(pool.clone(), config).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    let mut r = SseReader::new(client.open_sse("list-a", None).await);
+
+    let mut heartbeats = 0;
+    // Read a few frames; on an idle list they are all heartbeats. Two within the
+    // window proves the cadence fires repeatedly.
+    for _ in 0..4 {
+        match r.next_frame(Duration::from_millis(400)).await {
+            Some(frame) if frame.event == "heartbeat" => {
+                assert_eq!(frame.data, "{}", "heartbeat data is an empty object");
+                heartbeats += 1;
+                if heartbeats >= 2 {
+                    break;
+                }
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        heartbeats >= 2,
+        "expected >=2 heartbeat frames on the 100ms cadence, got {heartbeats}"
     );
 }
 
