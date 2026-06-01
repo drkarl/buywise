@@ -27,7 +27,13 @@
 //!     like the list and mutation routes), subscribes to the broadcast BEFORE any
 //!     backfill query so no live event committed during backfill is missed, then
 //!     streams: optional backfill (or a `full_snapshot`), then live events,
-//!     interleaved with a 30-second heartbeat.
+//!     interleaved with a 30-second heartbeat. Subscribing before backfilling
+//!     opens a small overlap window: a mutation that commits between the
+//!     subscribe and the backfill SELECT is both replayed (it is now in
+//!     `mutations`) and buffered on the live receiver. The live loop therefore
+//!     tracks a high-water mark (the last revision the backfill emitted) and
+//!     suppresses any live `mutation` at or below it, so every revision is
+//!     delivered exactly once.
 //!   * Reconnect: the client sends `?since=<last_revision>`. If that revision is
 //!     still within the mutation-log retention window the server replays
 //!     `mutations WHERE server_revision > since` as `mutation` events. If it is
@@ -46,7 +52,7 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -62,6 +68,14 @@ use crate::AppState;
 /// Retention window for incremental backfill, in revisions. A client whose
 /// `?since=` is more than this many revisions behind the list's current revision
 /// is served a `full_snapshot` instead of a replay (see [`needs_snapshot`]).
+///
+/// The retention floor is intentionally revision-only. The canonical retention
+/// pseudocode in `docs/implementation-plan.md` (the source of truth) is purely
+/// revision-based — `retention_floor = (current_revision - 10_000).max(0)` plus
+/// the oldest-retained check; the "90 days" in the issue prose has no
+/// counterpart there, so it is deliberately not implemented. (A time-based floor
+/// *would* be computable from `mutations.received_at_server`, but the plan does
+/// not call for one, so adding it would diverge from the canonical schema.)
 const RETENTION_FLOOR_REVISIONS: i64 = 10_000;
 
 /// Heartbeat cadence. A named `heartbeat` event every 30 s keeps intermediary
@@ -91,6 +105,17 @@ pub enum SseEvent {
         /// entity. Pre-serialised so the broadcast clone is cheap.
         entity: Value,
     },
+}
+
+impl SseEvent {
+    /// The `server_revision` this event carries, used for high-water-mark dedup.
+    fn server_revision(&self) -> i64 {
+        match self {
+            SseEvent::Mutation {
+                server_revision, ..
+            } => *server_revision,
+        }
+    }
 }
 
 /// Query string for `GET /api/sse/{list_id}`.
@@ -143,6 +168,14 @@ fn needs_snapshot(
     match oldest_retained {
         // The client must already hold everything strictly before the oldest
         // retained mutation; if it is behind that, the replay rows are gone.
+        //
+        // Intentional `oldest - 1` divergence from the plan's literal
+        // `client_revision < oldest_retained`: backfill replays
+        // `server_revision > since`, so a client that already holds `oldest - 1`
+        // can be replayed incrementally from `oldest` onward and needs no
+        // snapshot. The plan's strict `< oldest` would force an unnecessary
+        // snapshot at that exact boundary. Covered by
+        // `client_at_oldest_minus_one_can_replay`.
         Some(oldest) => client_revision < oldest - 1,
         None => false,
     }
@@ -176,30 +209,40 @@ async fn sse_handler(
     // 2. Subscribe to the broadcast BEFORE computing backfill, so a mutation that
     //    commits while we are querying the backlog is buffered for the live phase
     //    rather than lost in the gap between "read backlog" and "start listening".
+    //    The cost is a small overlap (a mutation committed in that window is both
+    //    backfilled and buffered live); the high-water mark below dedups it.
     let sender = sender_for(&state, &list_id);
     let mut live = sender.subscribe();
 
     // 3. Decide the initial payload: a full snapshot if the client is below the
     //    retention floor, otherwise the incremental backfill (empty on a first
-    //    connect with no `?since=`).
-    let current_revision = current_revision(&state.pool, &list_id)
-        .await
-        .map_err(db_error("sse.current_revision"))?;
-
+    //    connect with no `?since=`). `high_water` is the last revision the initial
+    //    phase emits; the live loop suppresses any live `mutation` at or below it
+    //    so an overlap-window mutation is delivered exactly once.
     let mut initial: Vec<SseEvent> = Vec::new();
     let mut snapshot: Option<Event> = None;
+    let mut high_water: i64 = query.since.unwrap_or(0);
 
     if let Some(since) = query.since {
+        // `current_revision` is only needed for the retention-floor decision, so
+        // it is queried here (inside the `?since=` branch) rather than on every
+        // connect — a first connection pays no extra round-trip.
+        let current_revision = current_revision(&state.pool, &list_id)
+            .await
+            .map_err(db_error("sse.current_revision"))?;
         let oldest = oldest_retained_revision(&state.pool, &list_id)
             .await
             .map_err(db_error("sse.oldest_retained"))?;
         if needs_snapshot(since, current_revision, oldest) {
-            let detail = lists_snapshot(&state.pool, &list_id)
+            let detail = lists::list_snapshot(&state.pool, &list_id)
                 .await
                 .map_err(db_error("sse.snapshot"))?
                 // The list existed at the auth check above; a None here would be a
                 // concurrent delete, which we treat as "nothing to send".
                 .ok_or(StatusCode::NOT_FOUND)?;
+            // A full snapshot carries state up to the current revision, so nothing
+            // older than that should be re-sent live.
+            high_water = high_water.max(current_revision);
             snapshot = Some(snapshot_event(&detail).map_err(|e| {
                 tracing::error!(error = %e, list_id, "sse: failed to serialise snapshot");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -208,6 +251,14 @@ async fn sse_handler(
             initial = backfill_since(&state.pool, &list_id, since)
                 .await
                 .map_err(db_error("sse.backfill"))?;
+            // The backfill is ordered ascending, so the last event carries the
+            // highest replayed revision — the high-water mark for live dedup.
+            if let Some(SseEvent::Mutation {
+                server_revision, ..
+            }) = initial.last()
+            {
+                high_water = high_water.max(*server_revision);
+            }
         }
     }
 
@@ -246,16 +297,25 @@ async fn sse_handler(
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(event) => match event_from(&event) {
-                        Ok(e) => {
-                            if tx.send(Ok(e)).await.is_err() {
-                                return;
+                    Ok(event) => {
+                        // Dedup the subscribe→backfill overlap: a mutation that
+                        // committed in that window is already in the backfill (or
+                        // covered by the snapshot), so suppress any live event at
+                        // or below the high-water mark.
+                        if event.server_revision() <= high_water {
+                            continue;
+                        }
+                        match event_from(&event) {
+                            Ok(e) => {
+                                if tx.send(Ok(e)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %err, "sse: failed to serialise live event");
                             }
                         }
-                        Err(err) => {
-                            tracing::error!(error = %err, "sse: failed to serialise live event");
-                        }
-                    },
+                    }
                     // Lagged: this slow client dropped some events. It recovers by
                     // reconnecting with `?since=`; keep streaming the rest.
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -273,7 +333,10 @@ async fn sse_handler(
         }
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+    // No `KeepAlive`: the explicit named `heartbeat` every 30s is the sole
+    // liveness contract (axum's `KeepAlive` would add a second, ~15s comment
+    // cadence and emit frames not in the documented wire format).
+    Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
 /// Build the `mutation` SSE event from a broadcast payload.
@@ -364,11 +427,22 @@ async fn oldest_retained_revision(
 /// Reconstructs each `mutation` event from the stored `response_json` (the exact
 /// bytes `POST /api/mutations` returned), so a backfilled event is identical to
 /// the live one a connected client would have received.
+///
+/// Collects into a `Vec` via `fetch_all` rather than streaming: the result is
+/// hard-bounded by the retention window (a `since` more than `RETENTION_FLOOR`
+/// revisions behind takes the `full_snapshot` path instead, so at most ~10k rows
+/// reach here), and the caller needs the highest replayed revision for the
+/// live-dedup high-water mark, which is read directly off the collected slice.
+/// The bounded allocation makes streaming an unnecessary complication.
 async fn backfill_since(
     pool: &sqlx::SqlitePool,
     list_id: &str,
     since: i64,
 ) -> Result<Vec<SseEvent>, sqlx::Error> {
+    // `server_revision IS NOT NULL` is sufficient to scope this to applied
+    // mutations: only `accepted`/`merged` rows are revision-stamped at finalise
+    // time; a `rejected` row keeps `server_revision` NULL, so no explicit
+    // `status` filter is needed (see `mutations::finalize_mutation_row`).
     let rows = sqlx::query_as::<_, (i64, Option<String>)>(
         "SELECT server_revision, response_json FROM mutations \
          WHERE list_id = ?1 AND server_revision IS NOT NULL AND server_revision > ?2 \
@@ -396,15 +470,6 @@ async fn backfill_since(
         });
     }
     Ok(events)
-}
-
-/// Thin wrapper over [`lists::list_snapshot`] kept local so the snapshot call
-/// site reads symmetrically with the other DB helpers in this module.
-async fn lists_snapshot(
-    pool: &sqlx::SqlitePool,
-    list_id: &str,
-) -> Result<Option<lists::ListDetail>, sqlx::Error> {
-    lists::list_snapshot(pool, list_id).await
 }
 
 /// Map a DB error to a logged 500, matching the rest of the api crate.
