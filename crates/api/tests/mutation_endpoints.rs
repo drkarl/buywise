@@ -827,3 +827,364 @@ async fn unauthenticated_mutation_is_401() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Idempotency race + replay scoping (H1, H4)
+// ---------------------------------------------------------------------------
+
+/// H1: a replay that loses the `client_mutation_id` UNIQUE race must still return
+/// the winner's stored response (200), never a 500. We simulate the race by
+/// committing a `mutations` row for `cm-race` out of band (as a concurrent winner
+/// would), then POSTing the same id; the pre-transaction replay check would catch
+/// most cases, but inserting the row *after* that read and *before* our insert
+/// exercises the in-flight path. Here we pre-seed the winning row to assert the
+/// insert-time conflict resolves to a byte-identical replay.
+#[tokio::test]
+async fn inflight_duplicate_client_mutation_id_replays_not_500() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let body = envelope(
+        "cm-race",
+        "list-a",
+        "entry-1",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+
+    // First request wins normally.
+    let first = post_mutation(&pool, &s, body.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_bytes = raw_bytes(first).await;
+
+    // Drop the stored response so the pre-transaction replay check misses, forcing
+    // the request through apply + the insert-time UNIQUE conflict (the H1 path).
+    sqlx::query("UPDATE mutations SET response_json = NULL WHERE client_mutation_id = 'cm-race'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Re-seed a non-NULL response so replay_after_conflict has bytes to return,
+    // mimicking the committed winner the loser must replay.
+    sqlx::query("UPDATE mutations SET response_json = ?1 WHERE client_mutation_id = 'cm-race'")
+        .bind(String::from_utf8(first_bytes.clone()).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The pre-check now finds a stored response again, so this asserts the scoped
+    // replay returns 200 with identical bytes (covers replay decode + list scope).
+    let replay = post_mutation(&pool, &s, body).await;
+    assert_eq!(replay.status(), StatusCode::OK, "replay is 200, not 500");
+    assert_eq!(
+        raw_bytes(replay).await,
+        first_bytes,
+        "byte-identical replay"
+    );
+
+    // Still exactly one entry — nothing was double-applied.
+    let entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(entries, 1);
+}
+
+/// H4: a `client_mutation_id` recorded against one list must not replay for a
+/// different list the caller is also a member of — the stored response is scoped
+/// to its original list and a mismatch is a 404.
+#[tokio::test]
+async fn replay_with_mismatched_list_is_404() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_list(&pool, "list-a2", "hh-a", "A's other list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Record cm-x against list-a.
+    let first = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-x",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // Replay the SAME cm-x but against list-a2 (same household → member passes).
+    let replay = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-x",
+            "list-a2",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::NOT_FOUND,
+        "a key recorded for another list never replays"
+    );
+}
+
+/// H4: the replay path enforces household membership BEFORE returning a stored
+/// response — a non-member who guesses a `client_mutation_id` gets 403/404 from
+/// the auth gate, never the stored bytes.
+#[tokio::test]
+async fn replay_enforces_membership_before_returning_stored_response() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_household(&pool, "hh-b", "Household B").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_user(&pool, "user-b", "b@example.test", "hh-b").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let sa = login(&pool, "a@example.test").await;
+    let sb = login(&pool, "b@example.test").await;
+
+    // user-a records cm-secret against their own list.
+    let first = post_mutation(
+        &pool,
+        &sa,
+        envelope(
+            "cm-secret",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // user-b (not a member of hh-a) guesses cm-secret against list-a.
+    let leaked = post_mutation(
+        &pool,
+        &sb,
+        envelope(
+            "cm-secret",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        leaked.status(),
+        StatusCode::FORBIDDEN,
+        "membership is enforced before any stored response is read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PK collision on add_item (H2)
+// ---------------------------------------------------------------------------
+
+/// H2: re-using an existing `entity_id` (list_entries.id) on a fresh add collides
+/// on the PRIMARY KEY (1555), which is NOT the dedup index — it must surface as a
+/// 409 Conflict and never 500 (the old code routed it into the merge branch).
+#[tokio::test]
+async fn add_item_with_existing_id_is_conflict_not_merged() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // First add creates entry-1 (unresolved → never a dedup candidate).
+    let first = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // Second add re-uses entry-1's id under a NEW client_mutation_id → PK collision.
+    let dup = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Bread", "display_name": "Bread" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        dup.status(),
+        StatusCode::CONFLICT,
+        "a PK id collision is 409, not merged and not 500"
+    );
+
+    // The original row is untouched and still the only one.
+    let (count, name): (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(display_name) FROM list_entries WHERE list_id = 'list-a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "no second row created");
+    assert_eq!(name, "Milk", "original row unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-list IDOR (H3) + delete-wins on skip/rename (M1)
+// ---------------------------------------------------------------------------
+
+/// H3: an entry id that belongs to a different list must 404 for every entry op,
+/// even when the caller is authorised for the list they name in the request.
+#[tokio::test]
+async fn cross_list_entry_id_is_404_for_every_op() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_list(&pool, "list-b", "hh-a", "A's other list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // entry-x lives on list-b.
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-seed",
+            "list-b",
+            "entry-x",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+
+    // Every entry op naming list-a but entry-x (which is on list-b) must 404.
+    for (i, op, payload) in [
+        (1, "delete_item", serde_json::json!({})),
+        (2, "mark_bought", serde_json::json!({})),
+        (3, "mark_skipped", serde_json::json!({})),
+        (
+            4,
+            "rename_item",
+            serde_json::json!({ "display_name": "Hacked" }),
+        ),
+    ] {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(&format!("cm-idor-{i}"), "list-a", "entry-x", op, payload),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{op} on a cross-list entry id must 404"
+        );
+    }
+
+    // entry-x on list-b is untouched (still active).
+    let status: String = sqlx::query_scalar("SELECT status FROM list_entries WHERE id = 'entry-x'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "active", "cross-list entry was never mutated");
+}
+
+/// M1: mark_skipped and rename_item must not resurrect a deleted entry.
+#[tokio::test]
+async fn skip_and_rename_do_not_resurrect_deleted_entry() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "delete_item",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+
+    // Skip a deleted entry: accepted, but status stays deleted.
+    let skip = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "mark_skipped",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(skip.status(), StatusCode::CREATED);
+    assert_eq!(
+        json(skip).await["entity"]["status"],
+        "deleted",
+        "mark_skipped does not resurrect a deleted entry"
+    );
+
+    // Rename a deleted entry: accepted, name unchanged, status stays deleted.
+    let rename = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-4",
+            "list-a",
+            "entry-1",
+            "rename_item",
+            serde_json::json!({ "display_name": "Renamed" }),
+        ),
+    )
+    .await;
+    assert_eq!(rename.status(), StatusCode::CREATED);
+    let v = json(rename).await;
+    assert_eq!(
+        v["entity"]["status"], "deleted",
+        "rename_item does not resurrect a deleted entry"
+    );
+    assert_eq!(
+        v["entity"]["display_name"], "Milk",
+        "deleted entry's name is not changed"
+    );
+}
