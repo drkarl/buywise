@@ -378,6 +378,89 @@ async fn since_backfills_only_newer_mutations() {
     );
 }
 
+/// Reconnecting with `?since == current_revision` yields no backfill: the client
+/// is already caught up, so the first frame it sees is a later live mutation
+/// (revision current + 1), never a replay of an already-held revision.
+#[tokio::test]
+async fn since_equal_to_current_revision_backfills_nothing() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", 3).await;
+    for rev in 1..=3 {
+        seed_mutation(&pool, "list-a", rev).await;
+    }
+    let base = spawn_server(pool.clone()).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    // since == current_revision (3): nothing newer to replay.
+    let mut r = SseReader::new(client.open_sse("list-a", Some(3)).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let status = client
+        .post_mutation(add_item_envelope("cm-live", "list-a", "entry-live"))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "live mutation accepted"
+    );
+
+    // The very first frame must be the live revision 4 — proving zero backfill
+    // frames for already-held revisions 1..=3 preceded it.
+    let frame = r.next_frame(SHORT).await.expect("first frame");
+    assert_eq!(frame.event, "mutation");
+    let v: serde_json::Value = serde_json::from_str(&frame.data).expect("json");
+    assert_eq!(
+        v["server_revision"], 4,
+        "first frame is the live revision 4"
+    );
+}
+
+/// Regression for the subscribe→backfill overlap (review finding #1): after a
+/// `?since=` backfill, revisions already replayed are never re-emitted on the
+/// live channel — the high-water mark suppresses them, so the next live frame is
+/// strictly newer than the last backfilled revision.
+#[tokio::test]
+async fn backfilled_revisions_are_not_re_emitted_live() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", 5).await;
+    for rev in 1..=5 {
+        seed_mutation(&pool, "list-a", rev).await;
+    }
+    let base = spawn_server(pool.clone()).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    // Backfill 3, 4, 5 (high-water mark = 5).
+    let mut r = SseReader::new(client.open_sse("list-a", Some(2)).await);
+    for expected in [3, 4, 5] {
+        let frame = r.next_frame(SHORT).await.expect("backfill frame");
+        let v: serde_json::Value = serde_json::from_str(&frame.data).expect("json");
+        assert_eq!(v["server_revision"], expected, "backfill in order");
+    }
+
+    // A new live mutation lands at revision 6; the next frame must be exactly 6,
+    // never a duplicate of an already-backfilled 3/4/5.
+    let status = client
+        .post_mutation(add_item_envelope("cm-live", "list-a", "entry-live"))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "live mutation accepted"
+    );
+
+    let frame = r.next_frame(SHORT).await.expect("live frame");
+    assert_eq!(frame.event, "mutation");
+    let v: serde_json::Value = serde_json::from_str(&frame.data).expect("json");
+    assert_eq!(
+        v["server_revision"], 6,
+        "next live frame is strictly past the high-water mark"
+    );
+}
+
 /// Reconnecting with a `?since=` below the retention floor yields a single
 /// `full_snapshot` event with the complete list state, not an incremental replay.
 #[tokio::test]
