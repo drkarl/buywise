@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_string_and_whitespace_only_array_are_empty() {
+    fn empty_string_value_and_nested_empty_object_hash_to_default() {
         // Empty string value is non-semantic.
         assert_eq!(
             effective_constraint_hash("e1", Some("item-1"), Some(&json!({ "brand": "" }))),
@@ -219,6 +219,11 @@ mod tests {
         // Nested empty object.
         assert_eq!(
             effective_constraint_hash("e1", Some("item-1"), Some(&json!({ "size": {} }))),
+            "default"
+        );
+        // An empty array value is likewise non-semantic.
+        assert_eq!(
+            effective_constraint_hash("e1", Some("item-1"), Some(&json!({ "dietary": [] }))),
             "default"
         );
     }
