@@ -198,10 +198,11 @@ pub fn sender_for(state: &AppState, list_id: &str) -> broadcast::Sender<SseEvent
 ///     pointing before them cannot be replayed incrementally.
 ///
 /// `oldest_replayable` is the oldest revision that is BOTH still in the log and
-/// inside the time window — i.e. `MAX(oldest_retained_overall,
-/// oldest_within_time_window)`. It is `None` only when the log has no
-/// revision-stamped rows at all (nothing to replay, so the floor check alone
-/// applies).
+/// inside the time window (see [`oldest_replayable_revision`]). It is `None` only
+/// when the log has no revision-stamped rows at all (nothing to replay, so the
+/// revision floor alone decides). When rows exist but all are outside the time
+/// window, the caller passes `Some(current_revision + 1)`, so any client behind
+/// `current_revision` is correctly forced to a snapshot.
 fn needs_snapshot(
     client_revision: i64,
     current_revision: i64,
@@ -233,14 +234,35 @@ fn needs_snapshot(
 ///
 /// `oldest_retained` is the overall minimum revision-stamped row;
 /// `oldest_within_window` is the minimum among rows whose `received_at_server` is
-/// within the 90-day window. A client must hold everything before the LATER of
-/// the two to be replayable, so this returns their `max`. Either being `None`
-/// (no rows / nothing recent) collapses to the other; both `None` ⇒ `None`.
+/// inside the 90-day window. A client must hold everything before the LATER of
+/// the revision-replay floor and the time floor to be replayable, so this returns
+/// their `max`.
+///
+/// The two `None` cases for `oldest_within_window` are NOT equivalent and need
+/// opposite handling:
+///   * `oldest_retained == None` too → there are no revision-stamped rows at all,
+///     so there is no replay constraint; return `None` and let the revision floor
+///     decide alone.
+///   * `oldest_retained == Some(_)` → rows exist but every one is OUTSIDE the
+///     time window (all evicted by age), so NOTHING is replayable. The time floor
+///     is then `current_revision + 1`: `needs_snapshot` must fire for any client
+///     behind `current_revision`, forcing a `full_snapshot` instead of replaying
+///     stale rows. (A client already AT `current_revision` still needs no
+///     snapshot — it gets an empty backfill.)
 fn oldest_replayable_revision(
     oldest_retained: Option<i64>,
     oldest_within_window: Option<i64>,
+    current_revision: i64,
 ) -> Option<i64> {
-    match (oldest_retained, oldest_within_window) {
+    // Effective time floor: the oldest in-window row, or — when rows exist but
+    // none are in-window — a sentinel just past the current revision so any
+    // `since < current_revision` is treated as un-replayable.
+    let time_floor = match oldest_within_window {
+        Some(w) => Some(w),
+        None if oldest_retained.is_some() => Some(current_revision + 1),
+        None => None,
+    };
+    match (oldest_retained, time_floor) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
@@ -307,7 +329,7 @@ async fn sse_handler(
         let oldest_in_window = oldest_retained_within(&state.pool, &list_id, &cutoff)
             .await
             .map_err(db_error("sse.oldest_in_window"))?;
-        let oldest = oldest_replayable_revision(oldest, oldest_in_window);
+        let oldest = oldest_replayable_revision(oldest, oldest_in_window, current_revision);
         if needs_snapshot(since, current_revision, oldest) {
             let detail = lists::list_snapshot(&state.pool, &list_id)
                 .await
@@ -675,11 +697,17 @@ mod tests {
     fn oldest_replayable_takes_the_later_of_both_floors() {
         // Time window starts at revision 80 even though the log retains from 50:
         // mutations 50..79 are older than 90 days, so the replayable floor is 80.
-        assert_eq!(oldest_replayable_revision(Some(50), Some(80)), Some(80));
-        // Either side missing collapses to the other; both missing ⇒ None.
-        assert_eq!(oldest_replayable_revision(Some(50), None), Some(50));
-        assert_eq!(oldest_replayable_revision(None, Some(80)), Some(80));
-        assert_eq!(oldest_replayable_revision(None, None), None);
+        // current_revision (100) is irrelevant when a row is in-window.
+        assert_eq!(
+            oldest_replayable_revision(Some(50), Some(80), 100),
+            Some(80)
+        );
+        // In-window row missing but rows exist ⇒ all evicted ⇒ time floor is
+        // current_revision + 1, so nothing below current is replayable.
+        assert_eq!(oldest_replayable_revision(Some(50), None, 100), Some(101));
+        // No rows in-window but also none retained ⇒ no replay constraint.
+        assert_eq!(oldest_replayable_revision(None, Some(80), 100), Some(80));
+        assert_eq!(oldest_replayable_revision(None, None, 100), None);
     }
 
     #[test]
@@ -687,11 +715,30 @@ mod tests {
         // current=100, revision floor=0 (within), but the oldest mutation inside
         // the 90-day window is 80 (older ones evicted by time). A client at 60 is
         // behind that time floor and must get a snapshot; one at 79 can replay.
-        let replayable = oldest_replayable_revision(Some(1), Some(80));
+        let replayable = oldest_replayable_revision(Some(1), Some(80), 100);
         assert!(needs_snapshot(60, 100, replayable), "behind time floor");
         assert!(
             !needs_snapshot(79, 100, replayable),
             "at time floor - 1 replays"
+        );
+    }
+
+    #[test]
+    fn all_rows_evicted_by_time_forces_snapshot_below_current() {
+        // Boundary hole regression: current=10, the only revision-stamped row is
+        // rev 10 but it is OUTSIDE the time window, so oldest_within_window=None
+        // while oldest_retained=Some(10). Nothing is replayable: a client at
+        // since=9 must snapshot (not backfill the stale rev 10), while a client
+        // already at the current revision (10) needs no snapshot.
+        let replayable = oldest_replayable_revision(Some(10), None, 10);
+        assert_eq!(replayable, Some(11), "evicted rows ⇒ floor is current + 1");
+        assert!(
+            needs_snapshot(9, 10, replayable),
+            "since < current ⇒ snapshot"
+        );
+        assert!(
+            !needs_snapshot(10, 10, replayable),
+            "since == current ⇒ no snapshot"
         );
     }
 

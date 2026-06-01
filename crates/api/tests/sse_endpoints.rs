@@ -545,6 +545,51 @@ async fn since_below_time_floor_yields_full_snapshot() {
     );
 }
 
+/// Boundary-hole regression: when EVERY retained mutation is outside the time
+/// window, a client just one revision behind current (`?since=9`, current=10)
+/// must get a `full_snapshot` rather than backfilling the single stale row —
+/// while a client already at the current revision (`?since=10`) gets no snapshot
+/// (an empty backfill, so the first frame it sees is a later heartbeat).
+#[tokio::test]
+async fn all_rows_evicted_by_time_snapshots_just_below_current() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", 10).await;
+    // The sole revision-stamped row (rev 10) is older than the 1-day window, so
+    // oldest_within_window is None while oldest_retained is Some(10).
+    let two_days_ago = (chrono::Utc::now() - chrono::Duration::days(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    seed_mutation_at(&pool, "list-a", 10, &two_days_ago).await;
+
+    // Fast heartbeat so the `?since=10` (no-snapshot) case produces an observable
+    // frame quickly instead of waiting 30s.
+    let config = SseConfig {
+        retention_window: chrono::Duration::days(1),
+        heartbeat_interval: Duration::from_millis(100),
+        ..SseConfig::default()
+    };
+    let base = spawn_server_with_config(pool.clone(), config).await;
+    let client = Client::login(&base, "a@example.test").await;
+
+    // since=9: one revision behind current, all rows evicted → full_snapshot.
+    let mut r = SseReader::new(client.open_sse("list-a", Some(9)).await);
+    let frame = r.next_frame(SHORT).await.expect("snapshot frame");
+    assert_eq!(
+        frame.event, "full_snapshot",
+        "since just below current with all rows evicted → full_snapshot"
+    );
+
+    // since=10 (== current): nothing newer to replay and the client is not behind
+    // current, so no snapshot — the first frame is a heartbeat, not full_snapshot.
+    let mut r2 = SseReader::new(client.open_sse("list-a", Some(10)).await);
+    let frame = r2.next_frame(SHORT).await.expect("first frame");
+    assert_eq!(
+        frame.event, "heartbeat",
+        "since == current ⇒ no snapshot, only the live heartbeat"
+    );
+}
+
 /// A subscriber that falls behind the bounded broadcast buffer self-heals: the
 /// stream emits a fresh `full_snapshot` (rather than silently skipping events).
 /// Forced with a 1-event buffer and a client that does not read while several
