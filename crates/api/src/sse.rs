@@ -36,10 +36,17 @@
 //!     delivered exactly once.
 //!   * Reconnect: the client sends `?since=<last_revision>`. If that revision is
 //!     still within the mutation-log retention window the server replays
-//!     `mutations WHERE server_revision > since` as `mutation` events. If it is
-//!     below the retention floor (`current_revision - 10_000`, or older than the
-//!     oldest retained mutation) the server cannot replay incrementally and sends
-//!     a single `full_snapshot` with the complete current list state instead.
+//!     `mutations WHERE server_revision > since` as `mutation` events. The
+//!     retention floor is two-part (per the plan: "`current_revision - 10000` or
+//!     90 days"): a `?since=` below EITHER the revision floor
+//!     (`current_revision - 10_000`) OR the oldest mutation still inside the
+//!     90-day time window gets a single `full_snapshot` with the complete current
+//!     list state instead of an incremental replay.
+//!   * Slow subscriber: if a client falls behind the bounded broadcast buffer the
+//!     receiver reports `Lagged`. Rather than silently resume mid-stream with a
+//!     gap, the live loop self-heals — it emits a fresh `full_snapshot` of the
+//!     current state and advances the high-water mark to that revision, so the
+//!     client converges without needing to reconnect.
 //!
 //! Error discipline mirrors the rest of the api crate: a DB error during the
 //! synchronous connect phase is logged and surfaced as 500 (never failing open);
@@ -69,24 +76,54 @@ use crate::AppState;
 /// `?since=` is more than this many revisions behind the list's current revision
 /// is served a `full_snapshot` instead of a replay (see [`needs_snapshot`]).
 ///
-/// The retention floor is intentionally revision-only. The canonical retention
-/// pseudocode in `docs/implementation-plan.md` (the source of truth) is purely
-/// revision-based — `retention_floor = (current_revision - 10_000).max(0)` plus
-/// the oldest-retained check; the "90 days" in the issue prose has no
-/// counterpart there, so it is deliberately not implemented. (A time-based floor
-/// *would* be computable from `mutations.received_at_server`, but the plan does
-/// not call for one, so adding it would diverge from the canonical schema.)
+/// This is the revision half of the canonical two-part retention floor in
+/// `docs/implementation-plan.md` (the source of truth): a `?since=` is replayable
+/// only if it is within BOTH `current_revision - 10_000` revisions AND the
+/// time window below; otherwise the server sends a `full_snapshot`.
 const RETENTION_FLOOR_REVISIONS: i64 = 10_000;
 
-/// Heartbeat cadence. A named `heartbeat` event every 30 s keeps intermediary
-/// proxies from closing an otherwise idle connection.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Time half of the canonical retention floor: mutations older than this are
+/// considered evicted, so a `?since=` pointing before the oldest mutation still
+/// inside this window is served a `full_snapshot` rather than a replay. The plan
+/// prose specifies "`current_revision - 10000` or 90 days".
+const RETENTION_FLOOR_DAYS: i64 = 90;
 
-/// Bound on the per-subscriber broadcast buffer. If a slow client falls this far
-/// behind, the oldest live events are dropped (a `Lagged` error); the client
-/// recovers by reconnecting with `?since=` and backfilling, so a drop is never
-/// data loss. Sized generously so only a genuinely stalled client lags.
-const BROADCAST_CAPACITY: usize = 256;
+/// Production heartbeat cadence. A named `heartbeat` event every 30 s keeps
+/// intermediary proxies from closing an otherwise idle connection.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Production per-subscriber broadcast buffer bound. If a slow client falls this
+/// far behind, the oldest live events are dropped (a `broadcast::error::RecvError::Lagged`);
+/// the live loop then self-heals by emitting a fresh `full_snapshot` (see the
+/// live loop in [`sse_handler`]). Sized generously so only a genuinely stalled
+/// client lags.
+const DEFAULT_BROADCAST_CAPACITY: usize = 256;
+
+/// Tunable SSE parameters, carried on [`AppState`] so integration tests can force
+/// timing- and capacity-dependent paths (heartbeat cadence, lag-driven snapshot,
+/// time-based retention floor) without waiting for real-world intervals. The
+/// production defaults match the plan: 30 s heartbeat, 256-event buffer, 90-day
+/// retention window.
+#[derive(Debug, Clone, Copy)]
+pub struct SseConfig {
+    /// Interval between named `heartbeat` events.
+    pub heartbeat_interval: Duration,
+    /// Per-subscriber broadcast channel buffer size.
+    pub broadcast_capacity: usize,
+    /// Age beyond which a mutation is treated as evicted for the time-based
+    /// retention floor.
+    pub retention_window: chrono::Duration,
+}
+
+impl Default for SseConfig {
+    fn default() -> Self {
+        SseConfig {
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
+            retention_window: chrono::Duration::days(RETENTION_FLOOR_DAYS),
+        }
+    }
+}
 
 /// An event fanned out over a list's broadcast channel.
 ///
@@ -141,33 +178,43 @@ pub fn router() -> Router<AppState> {
 /// the sender is tiny and reused on the next connect, which avoids a
 /// remove/recreate race against an in-flight `broadcast_mutation` lookup.
 pub fn sender_for(state: &AppState, list_id: &str) -> broadcast::Sender<SseEvent> {
+    let capacity = state.sse_config.broadcast_capacity;
     state
         .sse_channels
         .entry(list_id.to_string())
-        .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+        .or_insert_with(|| broadcast::channel(capacity).0)
         .clone()
 }
 
 /// True if a client at `client_revision` is too far behind for incremental
 /// backfill and must instead receive a full snapshot.
 ///
-/// Two conditions trigger a snapshot (see the plan's retention logic): the client
-/// is below the revision-count floor (`current_revision - 10_000`), or it is
-/// behind the oldest mutation the log still retains (so the rows needed to replay
-/// no longer exist). `oldest_retained` is `None` when the log is empty, in which
-/// case there is nothing to replay and the floor check alone applies.
+/// Implements the canonical two-part retention floor from
+/// `docs/implementation-plan.md` ("`current_revision - 10000` or 90 days"): a
+/// snapshot is required when the client is below EITHER
+///   * the revision floor (`current_revision - 10_000`), OR
+///   * the time-based retained floor — the oldest mutation still inside the
+///     90-day window. Rows older than that are treated as evicted, so a client
+///     pointing before them cannot be replayed incrementally.
+///
+/// `oldest_replayable` is the oldest revision that is BOTH still in the log and
+/// inside the time window — i.e. `MAX(oldest_retained_overall,
+/// oldest_within_time_window)`. It is `None` only when the log has no
+/// revision-stamped rows at all (nothing to replay, so the floor check alone
+/// applies).
 fn needs_snapshot(
     client_revision: i64,
     current_revision: i64,
-    oldest_retained: Option<i64>,
+    oldest_replayable: Option<i64>,
 ) -> bool {
     let retention_floor = (current_revision - RETENTION_FLOOR_REVISIONS).max(0);
     if client_revision < retention_floor {
         return true;
     }
-    match oldest_retained {
+    match oldest_replayable {
         // The client must already hold everything strictly before the oldest
-        // retained mutation; if it is behind that, the replay rows are gone.
+        // replayable mutation; if it is behind that, the rows it needs are gone
+        // (evicted by either the revision or the 90-day time window).
         //
         // Intentional `oldest - 1` divergence from the plan's literal
         // `client_revision < oldest_retained`: backfill replays
@@ -178,6 +225,26 @@ fn needs_snapshot(
         // `client_at_oldest_minus_one_can_replay`.
         Some(oldest) => client_revision < oldest - 1,
         None => false,
+    }
+}
+
+/// The oldest revision that is both still in the log and inside the time-based
+/// retention window — the floor below which incremental replay is impossible.
+///
+/// `oldest_retained` is the overall minimum revision-stamped row;
+/// `oldest_within_window` is the minimum among rows whose `received_at_server` is
+/// within the 90-day window. A client must hold everything before the LATER of
+/// the two to be replayable, so this returns their `max`. Either being `None`
+/// (no rows / nothing recent) collapses to the other; both `None` ⇒ `None`.
+fn oldest_replayable_revision(
+    oldest_retained: Option<i64>,
+    oldest_within_window: Option<i64>,
+) -> Option<i64> {
+    match (oldest_retained, oldest_within_window) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -233,6 +300,14 @@ async fn sse_handler(
         let oldest = oldest_retained_revision(&state.pool, &list_id)
             .await
             .map_err(db_error("sse.oldest_retained"))?;
+        // Time half of the canonical retention floor: the oldest mutation still
+        // inside the 90-day window (cutoff = now - retention_window).
+        let cutoff = (chrono::Utc::now() - state.sse_config.retention_window)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let oldest_in_window = oldest_retained_within(&state.pool, &list_id, &cutoff)
+            .await
+            .map_err(db_error("sse.oldest_in_window"))?;
+        let oldest = oldest_replayable_revision(oldest, oldest_in_window);
         if needs_snapshot(since, current_revision, oldest) {
             let detail = lists::list_snapshot(&state.pool, &list_id)
                 .await
@@ -267,7 +342,12 @@ async fn sse_handler(
     //    wants; when the client disconnects axum drops the stream, the receiver
     //    is dropped, the producer's `send` fails, and the task exits — so one
     //    client disconnecting never disturbs another's task.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(BROADCAST_CAPACITY);
+    let heartbeat_interval = state.sse_config.heartbeat_interval;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(
+        state.sse_config.broadcast_capacity,
+    );
+    // The lag-recovery path re-snapshots the list, so the task needs the pool.
+    let pool = state.pool.clone();
 
     tokio::spawn(async move {
         // 4a. Snapshot OR backfill first, in order, before any live event.
@@ -290,7 +370,7 @@ async fn sse_handler(
         }
 
         // 4b. Live events interleaved with the heartbeat until disconnect.
-        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
         // The immediate first tick would emit a heartbeat at t=0; skip it so the
         // first heartbeat lands one full interval after connect.
         heartbeat.tick().await;
@@ -316,10 +396,30 @@ async fn sse_handler(
                             }
                         }
                     }
-                    // Lagged: this slow client dropped some events. It recovers by
-                    // reconnecting with `?since=`; keep streaming the rest.
+                    // Lagged: this slow client fell behind the broadcast buffer and
+                    // dropped some revisions. Rather than silently resume mid-stream
+                    // with a gap, self-heal: re-snapshot the current list state,
+                    // emit it as a fresh `full_snapshot`, and reset the high-water
+                    // mark to that snapshot's revision so the now-stale buffered
+                    // events are suppressed and only strictly newer mutations flow.
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "sse: subscriber lagged, dropping events");
+                        tracing::warn!(skipped, "sse: subscriber lagged, re-snapshotting");
+                        match resnapshot(&pool, &list_id).await {
+                            Ok(Some((event, revision))) => {
+                                high_water = high_water.max(revision);
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // List deleted out from under us, or a serialisation
+                            // error: nothing safe to send. Stop the stream so the
+                            // client reconnects and re-evaluates from scratch.
+                            Ok(None) => return,
+                            Err(e) => {
+                                tracing::error!(error = %e, "sse: lag re-snapshot failed");
+                                return;
+                            }
+                        }
                     }
                     // Sender gone (no producers): nothing more will ever arrive.
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -364,6 +464,29 @@ fn heartbeat_event() -> Event {
 fn snapshot_event(detail: &lists::ListDetail) -> Result<Event, serde_json::Error> {
     let data = serde_json::to_string(detail)?;
     Ok(Event::default().event("full_snapshot").data(data))
+}
+
+/// Re-read the current list state and build a `full_snapshot` event plus the
+/// revision it reflects, for the lag-recovery path in the live loop.
+///
+/// Returns `Ok(None)` if the list no longer exists (concurrent delete) or its
+/// snapshot fails to serialise — both mean "nothing safe to resend", so the
+/// caller stops the stream and lets the client reconnect.
+async fn resnapshot(
+    pool: &sqlx::SqlitePool,
+    list_id: &str,
+) -> Result<Option<(Event, i64)>, sqlx::Error> {
+    let Some(detail) = lists::list_snapshot(pool, list_id).await? else {
+        return Ok(None);
+    };
+    let revision = detail.current_revision;
+    match snapshot_event(&detail) {
+        Ok(event) => Ok(Some((event, revision))),
+        Err(e) => {
+            tracing::error!(error = %e, list_id, "sse: failed to serialise lag snapshot");
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +541,30 @@ async fn oldest_retained_revision(
          WHERE list_id = ?1 AND server_revision IS NOT NULL",
     )
     .bind(list_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The lowest `server_revision` for a list that is still inside the time-based
+/// retention window — i.e. whose `received_at_server` is at or after `cutoff`
+/// (an RFC-3339 timestamp = `now - retention_window`). `None` when no retained
+/// row falls inside the window (all mutations are older than the cutoff).
+///
+/// `received_at_server` is stored as an RFC-3339 string (see `db::now_iso`); that
+/// format is lexicographically ordered for a fixed offset, and every row is
+/// written with the same `Z` UTC offset, so a string comparison is a correct
+/// chronological comparison here.
+async fn oldest_retained_within(
+    pool: &sqlx::SqlitePool,
+    list_id: &str,
+    cutoff: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT MIN(server_revision) FROM mutations \
+         WHERE list_id = ?1 AND server_revision IS NOT NULL AND received_at_server >= ?2",
+    )
+    .bind(list_id)
+    .bind(cutoff)
     .fetch_one(pool)
     .await
 }
@@ -525,8 +672,43 @@ mod tests {
     }
 
     #[test]
+    fn oldest_replayable_takes_the_later_of_both_floors() {
+        // Time window starts at revision 80 even though the log retains from 50:
+        // mutations 50..79 are older than 90 days, so the replayable floor is 80.
+        assert_eq!(oldest_replayable_revision(Some(50), Some(80)), Some(80));
+        // Either side missing collapses to the other; both missing ⇒ None.
+        assert_eq!(oldest_replayable_revision(Some(50), None), Some(50));
+        assert_eq!(oldest_replayable_revision(None, Some(80)), Some(80));
+        assert_eq!(oldest_replayable_revision(None, None), None);
+    }
+
+    #[test]
+    fn client_behind_time_window_floor_snapshots() {
+        // current=100, revision floor=0 (within), but the oldest mutation inside
+        // the 90-day window is 80 (older ones evicted by time). A client at 60 is
+        // behind that time floor and must get a snapshot; one at 79 can replay.
+        let replayable = oldest_replayable_revision(Some(1), Some(80));
+        assert!(needs_snapshot(60, 100, replayable), "behind time floor");
+        assert!(
+            !needs_snapshot(79, 100, replayable),
+            "at time floor - 1 replays"
+        );
+    }
+
+    #[test]
     fn heartbeat_event_is_named_with_empty_object() {
         // Smoke-test the builder does not panic and is wired to the right name.
         let _ = heartbeat_event();
+    }
+
+    #[test]
+    fn default_config_matches_production_constants() {
+        let c = SseConfig::default();
+        assert_eq!(c.heartbeat_interval, DEFAULT_HEARTBEAT_INTERVAL);
+        assert_eq!(c.broadcast_capacity, DEFAULT_BROADCAST_CAPACITY);
+        assert_eq!(
+            c.retention_window,
+            chrono::Duration::days(RETENTION_FLOOR_DAYS)
+        );
     }
 }

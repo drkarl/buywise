@@ -37,22 +37,36 @@ pub type SseChannels = Arc<DashMap<String, broadcast::Sender<sse::SseEvent>>>;
 ///
 /// `Clone` is cheap: [`SqlitePool`] is an `Arc` internally and the SSE channel
 /// registry is an `Arc<DashMap>`, so cloning shares both the connection pool and
-/// the broadcast registry.
+/// the broadcast registry. [`sse::SseConfig`] is small (three `Copy` fields) and
+/// cloned by value.
 #[derive(Clone)]
 pub struct AppState {
     /// The SQLite connection pool.
     pub pool: SqlitePool,
     /// Per-list SSE broadcast senders (P1-T5).
     pub sse_channels: SseChannels,
+    /// Tunable SSE parameters (P1-T5). Defaults to production values; integration
+    /// tests override the heartbeat interval / broadcast buffer / retention
+    /// cutoff to exercise timing- and capacity-dependent paths deterministically.
+    pub sse_config: sse::SseConfig,
 }
 
 impl AppState {
-    /// Build state for a ready pool with an empty SSE channel registry.
+    /// Build state for a ready pool with an empty SSE channel registry and the
+    /// production [`sse::SseConfig`] defaults.
     pub fn new(pool: SqlitePool) -> Self {
         AppState {
             pool,
             sse_channels: Arc::new(DashMap::new()),
+            sse_config: sse::SseConfig::default(),
         }
+    }
+
+    /// Override the SSE configuration (used by tests to force timing/capacity
+    /// paths without waiting for real-world intervals).
+    pub fn with_sse_config(mut self, config: sse::SseConfig) -> Self {
+        self.sse_config = config;
+        self
     }
 }
 
