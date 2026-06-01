@@ -1,0 +1,829 @@
+//! Integration tests for the P1-T4 mutation endpoint (issue #15).
+//!
+//! Drives the real axum router (`buywise_api::app`) against a private in-memory
+//! SQLite database with the full migrations applied, covering every acceptance
+//! criterion and testing-expectation scenario end-to-end:
+//!   * 5 mutations → `current_revision == 5`; each `server_revision` equals the
+//!     new `current_revision`.
+//!   * idempotency: the same `client_mutation_id` twice returns the byte-identical
+//!     response and writes exactly one `mutations` row.
+//!   * dedup: adding the same resolved item twice → `quantity == 2`, status
+//!     `merged`.
+//!   * unresolved dedup: adding the same unresolved item twice → two rows.
+//!   * a no-constraint resolved add stores `effective_constraint_hash == 'default'`.
+//!   * authorisation: 404 for a missing list, 403 for a foreign household, 401
+//!     unauthenticated, 403 without CSRF; 422 for an unknown operation.
+//!   * delete-vs-mark_bought: delete wins and the bought action is logged.
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use buywise_api::{app, AppState};
+use buywise_core::db;
+use http_body_util::BodyExt;
+use sqlx::SqlitePool;
+use tower::ServiceExt; // for `oneshot`
+
+const PASSWORD: &str = "correct horse battery staple";
+
+/// A logged-in user's session + CSRF tokens, ready to attach to requests.
+struct Session {
+    session: String,
+    csrf: String,
+}
+
+/// Build a fresh in-memory pool with migrations applied.
+async fn setup_pool() -> SqlitePool {
+    let pool = db::connect("sqlite::memory:").await.expect("connect");
+    db::run_migrations(&pool).await.expect("migrate");
+    pool
+}
+
+async fn seed_household(pool: &SqlitePool, id: &str, name: &str) {
+    sqlx::query("INSERT INTO households (id, name, created_at) VALUES (?1, ?2, ?3)")
+        .bind(id)
+        .bind(name)
+        .bind(db::now_iso())
+        .execute(pool)
+        .await
+        .expect("insert household");
+}
+
+async fn seed_user(pool: &SqlitePool, id: &str, email: &str, household_id: &str) {
+    let hash = buywise_api::auth::hash_password_for_storage(PASSWORD).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, display_name, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(email)
+    .bind(&hash)
+    .bind(id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert user");
+
+    sqlx::query(
+        "INSERT INTO household_members (household_id, user_id, role, joined_at) \
+         VALUES (?1, ?2, 'owner', ?3)",
+    )
+    .bind(household_id)
+    .bind(id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert membership");
+}
+
+async fn seed_list(pool: &SqlitePool, id: &str, household_id: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO shopping_lists \
+             (id, household_id, name, status, current_revision, created_at) \
+         VALUES (?1, ?2, ?3, 'active', 0, ?4)",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(name)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert list");
+}
+
+/// Seed a category and a canonical item belonging to `household_id`.
+async fn seed_canonical_item(
+    pool: &SqlitePool,
+    category_id: &str,
+    item_id: &str,
+    household_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+         VALUES (?1, 'Dairy', 'Lácteos', 'milk', 1)",
+    )
+    .bind(category_id)
+    .execute(pool)
+    .await
+    .expect("insert category");
+
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES (?1, ?2, 'Milk', 'Leche', ?3, 'any', ?4)",
+    )
+    .bind(item_id)
+    .bind(household_id)
+    .bind(category_id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert canonical item");
+}
+
+async fn login(pool: &SqlitePool, email: &str) -> Session {
+    let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
+    let resp = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login should succeed");
+    Session {
+        session: cookie(&resp, "session"),
+        csrf: cookie(&resp, "csrf"),
+    }
+}
+
+fn cookie(resp: &axum::response::Response, name: &str) -> String {
+    for value in resp.headers().get_all(header::SET_COOKIE) {
+        let s = value.to_str().unwrap();
+        let first = s.split(';').next().unwrap();
+        if let Some((k, v)) = first.split_once('=') {
+            if k.trim() == name {
+                return v.trim().to_string();
+            }
+        }
+    }
+    panic!("missing cookie {name}");
+}
+
+async fn json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Read the raw response bytes (for byte-identical idempotency checks).
+async fn raw_bytes(resp: axum::response::Response) -> Vec<u8> {
+    resp.into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
+}
+
+/// POST a mutation envelope with the session + CSRF attached.
+async fn post_mutation(
+    pool: &SqlitePool,
+    s: &Session,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mutations")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .header("X-CSRF-Token", &s.csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A mutation envelope with the common fields filled in.
+fn envelope(
+    client_mutation_id: &str,
+    list_id: &str,
+    entity_id: &str,
+    operation_type: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "client_mutation_id": client_mutation_id,
+        "device_id": "device-1",
+        "list_id": list_id,
+        "base_revision": 0,
+        "entity_type": "list_entry",
+        "entity_id": entity_id,
+        "operation_type": operation_type,
+        "payload": payload,
+        "created_at_client": "2026-05-31T00:00:00.000Z",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance criteria
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn five_mutations_advance_revision_to_five() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    for i in 1..=5 {
+        let body = envelope(
+            &format!("cm-{i}"),
+            "list-a",
+            &format!("entry-{i}"),
+            "add_item",
+            serde_json::json!({ "raw_text": format!("Item {i}"), "display_name": format!("Item {i}") }),
+        );
+        let resp = post_mutation(&pool, &s, body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "mutation {i} accepted");
+        let v = json(resp).await;
+        // server_revision equals the new current_revision (== i here).
+        assert_eq!(
+            v["server_revision"], i,
+            "server_revision tracks current_revision"
+        );
+        assert_eq!(v["status"], "accepted");
+    }
+
+    let current: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        current, 5,
+        "five accepted mutations advance the revision to 5"
+    );
+}
+
+#[tokio::test]
+async fn same_client_mutation_id_replays_byte_identical_response() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let body = envelope(
+        "cm-dup",
+        "list-a",
+        "entry-1",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+
+    let first = post_mutation(&pool, &s, body.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_bytes = raw_bytes(first).await;
+
+    // Replay the SAME client_mutation_id.
+    let second = post_mutation(&pool, &s, body).await;
+    // The replay is served from the stored response (200, not 201).
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_bytes = raw_bytes(second).await;
+
+    assert_eq!(first_bytes, second_bytes, "replay must be byte-identical");
+
+    // Exactly one mutations row and one entry: the replay re-applied nothing.
+    let mutation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mutations WHERE client_mutation_id = 'cm-dup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        mutation_count, 1,
+        "idempotent replay writes no extra mutation"
+    );
+
+    let entry_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(entry_count, 1);
+
+    // The revision advanced only once.
+    let current: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 1, "replay does not advance the revision");
+}
+
+#[tokio::test]
+async fn duplicate_resolved_add_merges_and_increments_quantity() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_canonical_item(&pool, "cat-1", "item-1", "hh-a").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // First resolved add (no constraints → 'default' hash).
+    let first = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(json(first).await["status"], "accepted");
+
+    // Second resolved add of the SAME item with the SAME (empty) constraints.
+    let second = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-2",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let v = json(second).await;
+    assert_eq!(v["status"], "merged", "duplicate resolved add merges");
+    assert_eq!(v["entity"]["quantity"], 2, "quantity incremented to 2");
+
+    // Exactly one active resolved row survives, with quantity 2.
+    let (count, qty): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(quantity), 0) FROM list_entries \
+         WHERE list_id = 'list-a' AND status = 'active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "merge keeps a single active row");
+    assert_eq!(qty, 2);
+
+    // Both mutations were recorded; the second as 'merged'.
+    let merged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mutations WHERE status = 'merged'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(merged, 1);
+
+    // Revision advanced for BOTH accepted mutations (a merge is still accepted).
+    let current: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 2);
+}
+
+#[tokio::test]
+async fn duplicate_unresolved_add_creates_two_rows() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    for (cm, entry) in [("cm-1", "entry-1"), ("cm-2", "entry-2")] {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(
+                cm,
+                "list-a",
+                entry,
+                "add_item",
+                // No canonical_item_id → unresolved → 'unresolved:<entry_id>' sentinel.
+                serde_json::json!({ "raw_text": "leche", "display_name": "leche" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            json(resp).await["status"],
+            "accepted",
+            "unresolved adds never merge"
+        );
+    }
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2, "two unresolved adds create two rows");
+
+    // Each carries its own unique sentinel hash.
+    let hashes: Vec<String> = sqlx::query_scalar(
+        "SELECT effective_constraint_hash FROM list_entries WHERE list_id = 'list-a' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hashes, vec!["unresolved:entry-1", "unresolved:entry-2"]);
+}
+
+#[tokio::test]
+async fn resolved_no_constraint_entry_hash_is_default() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_canonical_item(&pool, "cat-1", "item-1", "hh-a").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        json(resp).await["entity"]["effective_constraint_hash"],
+        "default"
+    );
+
+    let hash: String = sqlx::query_scalar(
+        "SELECT effective_constraint_hash FROM list_entries WHERE id = 'entry-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        hash, "default",
+        "no-constraint resolved entry hashes to 'default', not empty/NULL"
+    );
+}
+
+#[tokio::test]
+async fn resolved_add_with_constraints_hashes_to_digest() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_canonical_item(&pool, "cat-1", "item-1", "hh-a").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Same canonical item, but one with a real constraint → different hash → two rows.
+    let plain = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(plain.status(), StatusCode::CREATED);
+
+    let lactose_free = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-2",
+            "add_item",
+            serde_json::json!({
+                "canonical_item_id": "item-1",
+                "raw_text": "Lactose-free milk",
+                "display_name": "Lactose-free milk",
+                "constraints": { "dietary": ["lactose_free"] }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(lactose_free.status(), StatusCode::CREATED);
+    let v = json(lactose_free).await;
+    assert_eq!(
+        v["status"], "accepted",
+        "different constraints do not merge"
+    );
+    let hash = v["entity"]["effective_constraint_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 64, "real constraints hash to a SHA-256 digest");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2, "same item with different constraints → two rows");
+}
+
+// ---------------------------------------------------------------------------
+// Conflict rules
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_wins_over_concurrent_mark_bought_and_logs_event() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Add, then mark bought, then delete.
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    let bought = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "mark_bought",
+            serde_json::json!({ "bought_at": "2026-05-31T10:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(bought.status(), StatusCode::CREATED);
+
+    let deleted = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "delete_item",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+    assert_eq!(
+        json(deleted).await["entity"]["status"],
+        "deleted",
+        "delete wins"
+    );
+
+    // The entry is deleted, and the bought-then-deleted action is logged.
+    let status: String = sqlx::query_scalar("SELECT status FROM list_entries WHERE id = 'entry-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "deleted");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM list_entry_events WHERE entry_id = 'entry-1' AND event_type = 'bought_then_deleted'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1, "the losing bought action is preserved");
+}
+
+#[tokio::test]
+async fn mark_bought_after_delete_keeps_delete_and_logs_event() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "delete_item",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+
+    // mark_bought arrives AFTER the delete: delete wins, bought is logged.
+    let bought = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "mark_bought",
+            serde_json::json!({ "bought_at": "2026-05-31T10:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(bought.status(), StatusCode::CREATED);
+    assert_eq!(
+        json(bought).await["entity"]["status"],
+        "deleted",
+        "deleted entry is not resurrected"
+    );
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM list_entry_events WHERE entry_id = 'entry-1' AND event_type = 'bought_after_delete'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+}
+
+#[tokio::test]
+async fn mark_bought_stamps_bought_fields_and_revision() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    let bought = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "mark_bought",
+            serde_json::json!({ "bought_at": "2026-05-31T10:00:00Z" }),
+        ),
+    )
+    .await;
+    let v = json(bought).await;
+    assert_eq!(v["entity"]["status"], "bought");
+    assert_eq!(v["entity"]["bought_by"], "user-a");
+    assert_eq!(v["entity"]["bought_at"], "2026-05-31T10:00:00Z");
+    // last_updated_revision is stamped with the mutation's server revision (2).
+    assert_eq!(v["entity"]["last_updated_revision"], 2);
+}
+
+// ---------------------------------------------------------------------------
+// Authorisation / validation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mutation_on_missing_list_is_404() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "does-not-exist",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mutation_on_foreign_household_list_is_403() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_household(&pool, "hh-b", "Household B").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-b", "hh-b", "B's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-b",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn unknown_operation_is_422() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "frobnicate",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn mutation_without_csrf_is_403() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    let body = envelope(
+        "cm-1",
+        "list-a",
+        "entry-1",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+    let resp = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mutations")
+                // session present, but no X-CSRF-Token header.
+                .header(header::COOKIE, format!("session={}", s.session))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn unauthenticated_mutation_is_401() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+
+    let body = envelope(
+        "cm-1",
+        "list-a",
+        "entry-1",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+    let resp = app(AppState { pool: pool.clone() })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mutations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
