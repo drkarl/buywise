@@ -35,14 +35,19 @@
 //!      `list_id`, return the stored `response_json` verbatim (byte-identical
 //!      idempotent replay — never re-applied). A key recorded for a different list
 //!      is a 404 (it does not belong to `req.list_id`).
-//!   3. Apply the mutation to `list_entries` (insert / field update), honouring
-//!      the conflict rules below. (steps 3–5 inside ONE transaction.)
-//!   4. Increment `shopping_lists.current_revision` atomically.
-//!   5. Insert the `mutations` row with `server_revision = new current_revision`
-//!      and the serialised `response_json`. If two concurrent identical requests
-//!      both reached here, the loser hits the `client_mutation_id` UNIQUE
-//!      constraint; it rolls back and replays the winner's committed response.
-//!   6. After COMMIT, broadcast over SSE (P1-T5). Broadcasting is deliberately
+//!   3. Reserve the `mutations` row keyed by `client_mutation_id` as the FIRST
+//!      write of the transaction (before any entry write). This makes the
+//!      idempotency key authoritative: two concurrent identical requests that both
+//!      missed the fast-path replay check serialise here, and the loser hits the
+//!      `client_mutation_id` UNIQUE constraint, rolls back, and replays the
+//!      winner's committed response — before it can hit any entry-id PK collision.
+//!      (steps 3–6 inside ONE transaction.)
+//!   4. Apply the mutation to `list_entries` (insert / field update), honouring
+//!      the conflict rules below.
+//!   5. Increment `shopping_lists.current_revision` atomically.
+//!   6. Finalise the reserved `mutations` row with `server_revision = new
+//!      current_revision`, the real status, and the serialised `response_json`.
+//!   7. After COMMIT, broadcast over SSE (P1-T5). Broadcasting is deliberately
 //!      outside the transaction; it is a no-op stub until P1-T5 lands.
 //!
 //! Conflict rules (see `docs/design.md` §11):
@@ -274,12 +279,32 @@ async fn post_mutation(
         return replay;
     }
 
-    // 3–5. Apply, bump the revision, and log the mutation in one transaction.
+    // 3–5. Reserve the idempotency key, apply, bump the revision, and finalise the
+    //       mutation row — all in one transaction.
     let mut tx = state
         .pool
         .begin()
         .await
         .map_err(db_error("post_mutation.begin"))?;
+
+    // Reserve the `mutations` row keyed by `client_mutation_id` as the FIRST write,
+    // before any entry write. The pre-transaction replay check is only a fast path;
+    // two concurrent identical requests can both miss it, so the key must be made
+    // authoritative inside the transaction here. SQLite serialises writers, so the
+    // loser's reserve-insert blocks until the winner commits and then loses the
+    // `client_mutation_id` UNIQUE race (code 2067): it rolls back and replays the
+    // winner's committed response as a byte-identical 200. Reserving first means a
+    // duplicate replays BEFORE `apply_add_item` can hit the entry-id PK collision,
+    // so a duplicate never spuriously 409s (only a genuinely different
+    // `client_mutation_id` re-using a live entry id reaches that 409 path).
+    if let Err(e) = reserve_mutation_row(&mut tx, &req, &user).await {
+        if is_client_mutation_id_conflict(&e) {
+            let _ = tx.rollback().await;
+            return replay_after_conflict(&state.pool, &req.client_mutation_id, &req.list_id).await;
+        }
+        let _ = tx.rollback().await;
+        return Err(db_error("post_mutation.reserve_mutation")(e));
+    }
 
     let outcome = match apply_mutation(&mut tx, &user, &household_id, &req).await {
         Ok(outcome) => outcome,
@@ -331,28 +356,18 @@ async fn post_mutation(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Insert the mutation log row. The `client_mutation_id` is UNIQUE, so two
-    // concurrent identical requests can both pass the pre-transaction replay check
-    // and both reach this point; the second loses the UNIQUE race here (H1). When
-    // that happens, roll back our (now-redundant) apply and replay the response the
-    // winner committed, so the loser still sees a byte-identical 200 instead of a
-    // 500.
-    if let Err(e) = insert_mutation_row(
+    // Finalise the reserved mutation row with the real server_revision, status, and
+    // response_json. The UNIQUE-conflict replay was already handled at reserve time
+    // above, so this UPDATE only ever stamps our own reserved row.
+    finalize_mutation_row(
         &mut tx,
-        &req,
-        &user,
+        &req.client_mutation_id,
         server_revision,
         &outcome,
         &response_json,
     )
     .await
-    {
-        if is_client_mutation_id_conflict(&e) {
-            let _ = tx.rollback().await;
-            return replay_after_conflict(&state.pool, &req.client_mutation_id, &req.list_id).await;
-        }
-        return Err(db_error("post_mutation.insert_mutation")(e));
-    }
+    .map_err(db_error("post_mutation.finalize_mutation"))?;
 
     tx.commit()
         .await
@@ -966,14 +981,19 @@ async fn record_event(
     Ok(())
 }
 
-/// Insert the append-only `mutations` row recording this accepted/merged apply.
-async fn insert_mutation_row(
+/// Reserve the append-only `mutations` row keyed by `client_mutation_id` as the
+/// first write in the transaction, before any entry write.
+///
+/// `server_revision` and `response_json` are left NULL (the schema allows both);
+/// they are stamped by [`finalize_mutation_row`] once the apply succeeds. Status is
+/// the `accepted` default placeholder, also corrected at finalise. Reserving here
+/// makes the `client_mutation_id` UNIQUE constraint the authoritative idempotency
+/// guard: a duplicate loses this insert (code 2067) and replays the winner's
+/// response before it can reach the entry-id PK-collision path in `apply_add_item`.
+async fn reserve_mutation_row(
     tx: &mut Transaction<'_, Sqlite>,
     req: &MutationRequest,
     user: &AuthenticatedUser,
-    server_revision: i64,
-    outcome: &ApplyOutcome,
-    response_json: &str,
 ) -> Result<(), sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let received_at = buywise_core::db::now_iso();
@@ -983,7 +1003,7 @@ async fn insert_mutation_row(
              (id, client_mutation_id, device_id, user_id, list_id, entity_type, entity_id, \
               operation_type, payload, base_revision, created_at_client, received_at_server, \
               server_revision, status, response_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, 'accepted', NULL)",
     )
     .bind(&id)
     .bind(&req.client_mutation_id)
@@ -997,6 +1017,26 @@ async fn insert_mutation_row(
     .bind(req.base_revision)
     .bind(&req.created_at_client)
     .bind(&received_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Stamp the reserved `mutations` row (see [`reserve_mutation_row`]) with the real
+/// `server_revision`, `status`, and `response_json` once the apply has succeeded.
+async fn finalize_mutation_row(
+    tx: &mut Transaction<'_, Sqlite>,
+    client_mutation_id: &str,
+    server_revision: i64,
+    outcome: &ApplyOutcome,
+    response_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE mutations \
+         SET server_revision = ?2, status = ?3, response_json = ?4 \
+         WHERE client_mutation_id = ?1",
+    )
+    .bind(client_mutation_id)
     .bind(server_revision)
     .bind(outcome.status.as_str())
     .bind(response_json)
