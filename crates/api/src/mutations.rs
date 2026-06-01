@@ -1115,16 +1115,39 @@ fn string_field(payload: &Value, key: &str) -> Option<String> {
 
 /// Broadcast a committed mutation to SSE subscribers (P1-T5).
 ///
-/// A deliberate no-op stub until the SSE stream lands: it is the seam the SSE
-/// task will read from. Kept as a named function (rather than inlined) so the
-/// post-commit broadcast point is explicit and testable later.
+/// Called after COMMIT so subscribers never observe an uncommitted mutation. If
+/// no client is currently streaming this list there is no channel in the
+/// registry (or it has zero receivers); the send is then a silent no-op — a
+/// disconnected client simply backfills via `?since=` on reconnect, so a dropped
+/// live event is never lost. The broadcast carries the same `server_revision`
+/// and `entity` shape the SSE backfill path emits, so a live event and a
+/// replayed one are byte-identical to the client.
 fn broadcast_mutation(
-    _state: &AppState,
-    _list_id: &str,
-    _server_revision: i64,
-    _response: &MutationResponse,
+    state: &AppState,
+    list_id: &str,
+    server_revision: i64,
+    response: &MutationResponse,
 ) {
-    // Intentionally empty: wired in P1-T5.
+    // Only fan out if a channel already exists for this list (lazily created by
+    // the first SSE subscriber). Looking up without inserting avoids growing the
+    // registry for lists that nobody is streaming.
+    let Some(sender) = state.sse_channels.get(list_id) else {
+        return;
+    };
+    let entity = match serde_json::to_value(&response.entity) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, list_id, "sse: failed to serialise broadcast entity");
+            return;
+        }
+    };
+    // `send` errors only when there are zero receivers; that is an expected,
+    // benign state (all clients disconnected between lookup and send), so the
+    // result is intentionally ignored.
+    let _ = sender.send(crate::sse::SseEvent::Mutation {
+        server_revision,
+        entity,
+    });
 }
 
 #[cfg(test)]
