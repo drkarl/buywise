@@ -281,7 +281,7 @@ async fn post_mutation(
         .await
         .map_err(db_error("post_mutation.begin"))?;
 
-    let outcome = match apply_mutation(&mut tx, &user, &req).await {
+    let outcome = match apply_mutation(&mut tx, &user, &household_id, &req).await {
         Ok(outcome) => outcome,
         Err(status) => {
             // Best-effort rollback; the original status is what the client sees.
@@ -295,17 +295,25 @@ async fn post_mutation(
         .map_err(db_error("post_mutation.increment_revision"))?;
 
     // Stamp the touched entry with the new revision so reconnect replay and the
-    // detail view agree on which revision last changed it.
+    // detail view agree on which revision last changed it. Both the stamp and the
+    // re-read are scoped to `(id, list_id)`: this is the single shared post-apply
+    // path, so scoping it here closes cross-list IDOR for EVERY op (including the
+    // accept-and-log ops that do not run their own UPDATE) rather than relying on
+    // each op to scope individually. A non-matching entry id is a 404.
     if let Some(entry_id) = &outcome.entry_id {
-        stamp_entry_revision(&mut tx, entry_id, server_revision)
+        let stamped = stamp_entry_revision(&mut tx, entry_id, &req.list_id, server_revision)
             .await
             .map_err(db_error("post_mutation.stamp_entry"))?;
+        if !stamped {
+            let _ = tx.rollback().await;
+            return Err(StatusCode::NOT_FOUND);
+        }
     }
 
     // Re-read the affected entry so the response reflects the committed state
-    // (including the revision stamp and any merge increment).
+    // (including the revision stamp and any merge increment), scoped to the list.
     let entity = match &outcome.entry_id {
-        Some(entry_id) => load_entry(&mut tx, entry_id)
+        Some(entry_id) => load_entry(&mut tx, entry_id, &req.list_id)
             .await
             .map_err(db_error("post_mutation.load_entry"))?
             .map(EntityView::from),
@@ -394,10 +402,11 @@ struct ApplyOutcome {
 async fn apply_mutation(
     tx: &mut Transaction<'_, Sqlite>,
     user: &AuthenticatedUser,
+    household_id: &str,
     req: &MutationRequest,
 ) -> Result<ApplyOutcome, StatusCode> {
     match req.operation_type.as_str() {
-        "add_item" => apply_add_item(tx, user, req).await,
+        "add_item" => apply_add_item(tx, user, household_id, req).await,
         "delete_item" => apply_delete_item(tx, user, req).await,
         "mark_bought" => apply_mark_bought(tx, user, req).await,
         "mark_skipped" => apply_mark_skipped(tx, req).await,
@@ -406,6 +415,9 @@ async fn apply_mutation(
         // wins) and recorded; the richer field semantics land with the resolution
         // cascade (Phase 3). Accept-and-log keeps the revision counter correct
         // and the mutation auditable without inventing behaviour ahead of spec.
+        // The targeted entry is still verified to belong to `req.list_id` (the
+        // shared post-apply stamp/load path 404s a cross-list id), so these ops
+        // cannot touch or read a foreign entry.
         "resolve_alias" | "reject_match" | "set_constraint" => Ok(ApplyOutcome {
             entry_id: entry_target(req),
             status: MutationStatus::Accepted,
@@ -421,6 +433,7 @@ async fn apply_mutation(
 async fn apply_add_item(
     tx: &mut Transaction<'_, Sqlite>,
     user: &AuthenticatedUser,
+    household_id: &str,
     req: &MutationRequest,
 ) -> Result<ApplyOutcome, StatusCode> {
     let entry_id = req.entity_id.clone();
@@ -445,6 +458,20 @@ async fn apply_add_item(
     // raw_text / display_name are NOT NULL in the schema; a blank add is a 422.
     if raw_text.trim().is_empty() {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // canonical_items are household-scoped: a resolved add may only bind a catalogue
+    // item belonging to the target list's household. Without this check a caller
+    // could attach another household's item by guessing its id (cross-household
+    // catalogue leak). An unknown/foreign id is a 404 (the item does not exist for
+    // this household), matching how other entity-not-found cases are surfaced.
+    if let Some(item_id) = &canonical_item_id {
+        if !canonical_item_in_household(tx, item_id, household_id)
+            .await
+            .map_err(db_error("apply_add_item.canonical_item_check"))?
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
     }
 
     let hash = effective_constraint_hash(
@@ -839,18 +866,42 @@ async fn increment_revision(
     .await
 }
 
-/// Stamp an entry's `last_updated_revision` with the mutation's server revision.
+/// Stamp an entry's `last_updated_revision` with the mutation's server revision,
+/// scoped to `(id, list_id)`. Returns `true` if a row on that list was stamped,
+/// `false` if no `(id, list_id)` row matched — letting the caller 404 a cross-list
+/// id and never bump a foreign entry's revision (the shared IDOR guard).
 async fn stamp_entry_revision(
     tx: &mut Transaction<'_, Sqlite>,
     entry_id: &str,
+    list_id: &str,
     revision: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE list_entries SET last_updated_revision = ?2 WHERE id = ?1")
-        .bind(entry_id)
-        .bind(revision)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+) -> Result<bool, sqlx::Error> {
+    let affected = sqlx::query(
+        "UPDATE list_entries SET last_updated_revision = ?2 WHERE id = ?1 AND list_id = ?3",
+    )
+    .bind(entry_id)
+    .bind(revision)
+    .bind(list_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// True if `item_id` is a `canonical_items` row owned by `household_id`. Used to
+/// reject a resolved `add_item` that binds a catalogue item from another household.
+async fn canonical_item_in_household(
+    tx: &mut Transaction<'_, Sqlite>,
+    item_id: &str,
+    household_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM canonical_items WHERE id = ?1 AND household_id = ?2")
+            .bind(item_id)
+            .bind(household_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// The current `status` of a `list_entries` row scoped to `(id, list_id)`, or
@@ -869,14 +920,17 @@ async fn entry_status(
         .await
 }
 
-/// Load a full `list_entries` row by id (transaction-scoped).
+/// Load a full `list_entries` row scoped to `(id, list_id)` (transaction-scoped),
+/// so the response can never echo an entry from another list (IDOR guard).
 async fn load_entry(
     tx: &mut Transaction<'_, Sqlite>,
     entry_id: &str,
+    list_id: &str,
 ) -> Result<Option<EntryRow>, sqlx::Error> {
-    let sql = format!("SELECT {ENTRY_COLUMNS} FROM list_entries WHERE id = ?1");
+    let sql = format!("SELECT {ENTRY_COLUMNS} FROM list_entries WHERE id = ?1 AND list_id = ?2");
     sqlx::query_as::<_, EntryRow>(&sql)
         .bind(entry_id)
+        .bind(list_id)
         .fetch_optional(&mut **tx)
         .await
 }
