@@ -1,3 +1,4 @@
+pub mod constraint_hash;
 pub mod db;
 pub mod domain;
 pub mod matching;
