@@ -26,16 +26,22 @@
 //! { "client_mutation_id": "...", "status": "accepted", "server_revision": 48, "entity": { ... } }
 //! ```
 //!
-//! Processing (all of 1–5 inside ONE transaction):
-//!   1. If `client_mutation_id` already exists, return the stored `response_json`
-//!      verbatim (byte-identical idempotent replay — never re-applied).
-//!   2. Verify the caller is a member of the list's household (404 missing list,
-//!      403 non-member — the same distinction `lists.rs` draws).
+//! Processing:
+//!   1. Verify the caller is a member of the list's household (404 missing list,
+//!      403 non-member — the same distinction `lists.rs` draws). This runs FIRST,
+//!      before the replay lookup, so a guessed `client_mutation_id` can never leak
+//!      another household's stored response.
+//!   2. If `client_mutation_id` already exists AND it was recorded against this
+//!      `list_id`, return the stored `response_json` verbatim (byte-identical
+//!      idempotent replay — never re-applied). A key recorded for a different list
+//!      is a 404 (it does not belong to `req.list_id`).
 //!   3. Apply the mutation to `list_entries` (insert / field update), honouring
-//!      the conflict rules below.
+//!      the conflict rules below. (steps 3–5 inside ONE transaction.)
 //!   4. Increment `shopping_lists.current_revision` atomically.
 //!   5. Insert the `mutations` row with `server_revision = new current_revision`
-//!      and the serialised `response_json`.
+//!      and the serialised `response_json`. If two concurrent identical requests
+//!      both reached here, the loser hits the `client_mutation_id` UNIQUE
+//!      constraint; it rolls back and replays the winner's committed response.
 //!   6. After COMMIT, broadcast over SSE (P1-T5). Broadcasting is deliberately
 //!      outside the transaction; it is a no-op stub until P1-T5 lands.
 //!
@@ -87,6 +93,12 @@ pub struct MutationRequest {
     /// The list this mutation targets.
     pub list_id: String,
     /// Revision the client was at when it created the mutation.
+    ///
+    /// Recorded verbatim in `mutations.base_revision` but NOT used to gate the
+    /// apply: the conflict policy is last-write-wins, so a stale `base_revision`
+    /// never rejects a mutation today. It is persisted for audit and for a future
+    /// staleness/optimistic-concurrency check (e.g. surfacing "this changed since
+    /// you last synced") if the policy tightens beyond LWW.
     pub base_revision: i64,
     /// Entity kind (`list_entry` today; carried through for forward-compat).
     pub entity_type: String,
@@ -234,22 +246,11 @@ async fn post_mutation(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    // 1. Idempotent replay: a known client_mutation_id returns the stored bytes
-    //    without touching any state. Read on the pool (autocommit) before opening
-    //    the write transaction.
-    if let Some(stored) = stored_response(&state.pool, &req.client_mutation_id)
-        .await
-        .map_err(db_error("post_mutation.idempotency"))?
-    {
-        let response: MutationResponse = serde_json::from_str(&stored).map_err(|e| {
-            tracing::error!(error = %e, "mutations: stored response_json is not valid JSON");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        return Ok((StatusCode::OK, Json(response)));
-    }
-
-    // 2. Authorisation: the list must exist and belong to a household the caller
-    //    is a member of. 404 vs 403 mirrors lists.rs.
+    // 1. Authorisation: the list must exist and belong to a household the caller
+    //    is a member of. 404 vs 403 mirrors lists.rs. This runs BEFORE the
+    //    idempotent-replay lookup so a guessed `client_mutation_id` can never leak
+    //    another household's stored response (H4): a non-member is rejected before
+    //    any stored bytes are read.
     let household_id = list_household(&state.pool, &req.list_id)
         .await
         .map_err(db_error("post_mutation.list_household"))?
@@ -259,6 +260,18 @@ async fn post_mutation(
         .map_err(db_error("post_mutation.is_member"))?
     {
         return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 2. Idempotent replay: a known client_mutation_id returns the stored bytes
+    //    without touching any state. The stored row is only replayed when its
+    //    recorded `list_id` matches `req.list_id`; a mismatch means the key was
+    //    reused against a different list and is rejected (H4), so the response of
+    //    one list can never be served for another.
+    if let Some(replay) = replay_response(&state.pool, &req.client_mutation_id, &req.list_id)
+        .await
+        .map_err(db_error("post_mutation.idempotency"))?
+    {
+        return replay;
     }
 
     // 3–5. Apply, bump the revision, and log the mutation in one transaction.
@@ -310,7 +323,13 @@ async fn post_mutation(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    insert_mutation_row(
+    // Insert the mutation log row. The `client_mutation_id` is UNIQUE, so two
+    // concurrent identical requests can both pass the pre-transaction replay check
+    // and both reach this point; the second loses the UNIQUE race here (H1). When
+    // that happens, roll back our (now-redundant) apply and replay the response the
+    // winner committed, so the loser still sees a byte-identical 200 instead of a
+    // 500.
+    if let Err(e) = insert_mutation_row(
         &mut tx,
         &req,
         &user,
@@ -319,7 +338,13 @@ async fn post_mutation(
         &response_json,
     )
     .await
-    .map_err(db_error("post_mutation.insert_mutation"))?;
+    {
+        if is_client_mutation_id_conflict(&e) {
+            let _ = tx.rollback().await;
+            return replay_after_conflict(&state.pool, &req.client_mutation_id, &req.list_id).await;
+        }
+        return Err(db_error("post_mutation.insert_mutation")(e));
+    }
 
     tx.commit()
         .await
@@ -457,9 +482,17 @@ async fn apply_add_item(
             entry_id: Some(entry_id),
             status: MutationStatus::Accepted,
         }),
-        Err(e) if is_unique_violation(&e) => {
-            // Dedup: fold this add into the existing active row for the same
-            // (list, canonical item, constraint hash). Increment its quantity.
+        // A PRIMARY KEY collision (1555) means this exact `entity_id` already
+        // exists — it is NOT a dedup boundary. An add re-using a live id is a
+        // client conflict (e.g. a botched offline replay that did not carry the
+        // original `client_mutation_id`); surface 409 rather than silently merging
+        // into an unrelated row. True idempotent replay is handled earlier by the
+        // `client_mutation_id` path.
+        Err(e) if is_primary_key_violation(&e) => Err(StatusCode::CONFLICT),
+        // Only the partial dedup index (2067, uq_list_entries_active_dedup) drives
+        // the merge: fold this add into the existing active row for the same
+        // (list, canonical item, constraint hash) and increment its quantity.
+        Err(e) if is_dedup_index_violation(&e) => {
             let surviving: Option<String> = sqlx::query_scalar(
                 "UPDATE list_entries \
                  SET quantity = quantity + ?4, updated_at = ?5 \
@@ -502,7 +535,7 @@ async fn apply_delete_item(
     let entry_id = require_entry(req)?;
     let now = buywise_core::db::now_iso();
 
-    let prior_status = entry_status(tx, &entry_id)
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
         .await
         .map_err(db_error("apply_delete_item.lookup"))?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -522,12 +555,15 @@ async fn apply_delete_item(
         .map_err(db_error("apply_delete_item.event"))?;
     }
 
-    sqlx::query("UPDATE list_entries SET status = 'deleted', updated_at = ?2 WHERE id = ?1")
-        .bind(&entry_id)
-        .bind(&now)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_error("apply_delete_item.update"))?;
+    sqlx::query(
+        "UPDATE list_entries SET status = 'deleted', updated_at = ?2 WHERE id = ?1 AND list_id = ?3",
+    )
+    .bind(&entry_id)
+    .bind(&now)
+    .bind(&req.list_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_delete_item.update"))?;
 
     Ok(ApplyOutcome {
         entry_id: Some(entry_id),
@@ -547,7 +583,7 @@ async fn apply_mark_bought(
     let now = buywise_core::db::now_iso();
     let bought_at = string_field(&req.payload, "bought_at").unwrap_or_else(|| now.clone());
 
-    let prior_status = entry_status(tx, &entry_id)
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
         .await
         .map_err(db_error("apply_mark_bought.lookup"))?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -574,12 +610,13 @@ async fn apply_mark_bought(
     sqlx::query(
         "UPDATE list_entries \
          SET status = 'bought', bought_by = ?2, bought_at = ?3, updated_at = ?4 \
-         WHERE id = ?1",
+         WHERE id = ?1 AND list_id = ?5",
     )
     .bind(&entry_id)
     .bind(&user.user_id)
     .bind(&bought_at)
     .bind(&now)
+    .bind(&req.list_id)
     .execute(&mut **tx)
     .await
     .map_err(db_error("apply_mark_bought.update"))?;
@@ -590,7 +627,9 @@ async fn apply_mark_bought(
     })
 }
 
-/// `mark_skipped`: set status `skipped` (last-write-wins).
+/// `mark_skipped`: set status `skipped` (last-write-wins). Like `mark_bought`, a
+/// delete wins: a deleted entry is not resurrected (M1). The lookup and UPDATE are
+/// scoped to `(id, list_id)` so a cross-list id is a 404 (H3).
 async fn apply_mark_skipped(
     tx: &mut Transaction<'_, Sqlite>,
     req: &MutationRequest,
@@ -598,17 +637,30 @@ async fn apply_mark_skipped(
     let entry_id = require_entry(req)?;
     let now = buywise_core::db::now_iso();
 
-    let affected =
-        sqlx::query("UPDATE list_entries SET status = 'skipped', updated_at = ?2 WHERE id = ?1")
-            .bind(&entry_id)
-            .bind(&now)
-            .execute(&mut **tx)
-            .await
-            .map_err(db_error("apply_mark_skipped.update"))?
-            .rows_affected();
-    if affected == 0 {
-        return Err(StatusCode::NOT_FOUND);
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
+        .await
+        .map_err(db_error("apply_mark_skipped.lookup"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delete wins: do not resurrect a deleted entry to 'skipped'. The mutation is
+    // still recorded (accepted, no-op on the row), keeping the revision counter
+    // and audit log consistent with mark_bought's delete-wins handling.
+    if prior_status == "deleted" {
+        return Ok(ApplyOutcome {
+            entry_id: Some(entry_id),
+            status: MutationStatus::Accepted,
+        });
     }
+
+    sqlx::query(
+        "UPDATE list_entries SET status = 'skipped', updated_at = ?2 WHERE id = ?1 AND list_id = ?3",
+    )
+    .bind(&entry_id)
+    .bind(&now)
+    .bind(&req.list_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_mark_skipped.update"))?;
 
     Ok(ApplyOutcome {
         entry_id: Some(entry_id),
@@ -629,22 +681,33 @@ async fn apply_rename_item(
     let raw_text = string_field(&req.payload, "raw_text");
     let now = buywise_core::db::now_iso();
 
-    let affected = sqlx::query(
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
+        .await
+        .map_err(db_error("apply_rename_item.lookup"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delete wins: a deleted entry is not resurrected by a rename (M1). Record the
+    // mutation as a no-op accept, matching mark_bought/mark_skipped.
+    if prior_status == "deleted" {
+        return Ok(ApplyOutcome {
+            entry_id: Some(entry_id),
+            status: MutationStatus::Accepted,
+        });
+    }
+
+    sqlx::query(
         "UPDATE list_entries \
          SET display_name = ?2, raw_text = COALESCE(?3, raw_text), updated_at = ?4 \
-         WHERE id = ?1",
+         WHERE id = ?1 AND list_id = ?5",
     )
     .bind(&entry_id)
     .bind(&display_name)
     .bind(&raw_text)
     .bind(&now)
+    .bind(&req.list_id)
     .execute(&mut **tx)
     .await
-    .map_err(db_error("apply_rename_item.update"))?
-    .rows_affected();
-    if affected == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    .map_err(db_error("apply_rename_item.update"))?;
 
     Ok(ApplyOutcome {
         entry_id: Some(entry_id),
@@ -656,16 +719,79 @@ async fn apply_rename_item(
 // Small DB helpers (transaction-scoped + pool-scoped)
 // ---------------------------------------------------------------------------
 
-/// The stored `response_json` for a `client_mutation_id`, or `None` if unseen.
-async fn stored_response(
+/// The stored `(list_id, response_json)` for a `client_mutation_id`, or `None` if
+/// unseen. The recorded `list_id` lets the caller reject a key replayed against a
+/// different list (H4).
+async fn stored_mutation(
     pool: &sqlx::SqlitePool,
     client_mutation_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT response_json FROM mutations WHERE client_mutation_id = ?1")
+) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT list_id, response_json FROM mutations WHERE client_mutation_id = ?1")
         .bind(client_mutation_id)
         .fetch_optional(pool)
         .await
-        .map(Option::flatten)
+}
+
+/// Look up a prior mutation by idempotency key and, if it targeted `req_list_id`,
+/// build its byte-identical 200 replay. Returns `None` when the key is unseen so
+/// the caller proceeds to apply. A stored row whose `list_id` differs from
+/// `req_list_id` is rejected with 404 (the key belongs to a different list — never
+/// leak its response, H4).
+async fn replay_response(
+    pool: &sqlx::SqlitePool,
+    client_mutation_id: &str,
+    req_list_id: &str,
+) -> Result<Option<Result<(StatusCode, Json<MutationResponse>), StatusCode>>, sqlx::Error> {
+    Ok(stored_mutation(pool, client_mutation_id)
+        .await?
+        .map(|(stored_list_id, response_json)| {
+            decode_replay(&stored_list_id, response_json, req_list_id)
+        }))
+}
+
+/// Re-fetch and replay the response a concurrent winner committed after we lost
+/// the `client_mutation_id` UNIQUE race (H1). The winner is guaranteed to exist;
+/// a missing/mismatched row is an invariant break surfaced as 500.
+async fn replay_after_conflict(
+    pool: &sqlx::SqlitePool,
+    client_mutation_id: &str,
+    req_list_id: &str,
+) -> Result<(StatusCode, Json<MutationResponse>), StatusCode> {
+    match stored_mutation(pool, client_mutation_id)
+        .await
+        .map_err(db_error("post_mutation.replay_after_conflict"))?
+    {
+        Some((stored_list_id, response_json)) => {
+            decode_replay(&stored_list_id, response_json, req_list_id)
+        }
+        None => {
+            tracing::error!(
+                "mutations: client_mutation_id conflict but no committed row to replay"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Validate a stored mutation belongs to `req_list_id` and decode its response for
+/// a 200 replay. Mismatched list → 404; missing/invalid `response_json` → 500.
+fn decode_replay(
+    stored_list_id: &str,
+    response_json: Option<String>,
+    req_list_id: &str,
+) -> Result<(StatusCode, Json<MutationResponse>), StatusCode> {
+    if stored_list_id != req_list_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let stored = response_json.ok_or_else(|| {
+        tracing::error!("mutations: stored mutation has no response_json to replay");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let response: MutationResponse = serde_json::from_str(&stored).map_err(|e| {
+        tracing::error!(error = %e, "mutations: stored response_json is not valid JSON");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 /// The household owning a list, or `None` if the list does not exist.
@@ -727,13 +853,18 @@ async fn stamp_entry_revision(
     Ok(())
 }
 
-/// The current `status` of a `list_entries` row, or `None` if it does not exist.
+/// The current `status` of a `list_entries` row scoped to `(id, list_id)`, or
+/// `None` if no such entry exists on that list. Scoping by `list_id` (not `id`
+/// alone) prevents a caller authorised for one list from reaching an entry that
+/// belongs to a different list (cross-list IDOR, H3).
 async fn entry_status(
     tx: &mut Transaction<'_, Sqlite>,
     entry_id: &str,
+    list_id: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT status FROM list_entries WHERE id = ?1")
+    sqlx::query_scalar("SELECT status FROM list_entries WHERE id = ?1 AND list_id = ?2")
         .bind(entry_id)
+        .bind(list_id)
         .fetch_optional(&mut **tx)
         .await
 }
@@ -839,16 +970,34 @@ fn is_known_operation(op: &str) -> bool {
     )
 }
 
-/// True if a sqlx error is a SQLite UNIQUE/PRIMARY KEY constraint violation.
+/// The SQLite extended result code of a sqlx error, if it is a DB error.
 ///
-/// SQLite reports both unique-index conflicts and primary-key conflicts with
-/// extended result codes 2067 (`SQLITE_CONSTRAINT_UNIQUE`) and 1555
-/// (`SQLITE_CONSTRAINT_PRIMARYKEY`). Matching the code is more robust than string
-/// matching the message.
-fn is_unique_violation(e: &sqlx::Error) -> bool {
+/// Matching the extended code is more robust than string-matching the message.
+fn sqlite_extended_code(e: &sqlx::Error) -> Option<String> {
     e.as_database_error()
         .and_then(|db| db.code())
-        .is_some_and(|code| code == "2067" || code == "1555")
+        .map(|c| c.into_owned())
+}
+
+/// True if the error is a UNIQUE-index violation (`SQLITE_CONSTRAINT_UNIQUE`,
+/// 2067). On `list_entries` this is the partial dedup index
+/// `uq_list_entries_active_dedup` — the only conflict that triggers a merge.
+fn is_dedup_index_violation(e: &sqlx::Error) -> bool {
+    sqlite_extended_code(e).as_deref() == Some("2067")
+}
+
+/// True if the error is a PRIMARY KEY violation (`SQLITE_CONSTRAINT_PRIMARYKEY`,
+/// 1555) — a collision on `list_entries.id`, which is a client conflict, not a
+/// dedup boundary (see [`apply_add_item`]).
+fn is_primary_key_violation(e: &sqlx::Error) -> bool {
+    sqlite_extended_code(e).as_deref() == Some("1555")
+}
+
+/// True if the error is the UNIQUE violation on `mutations.client_mutation_id`
+/// (2067) — the in-flight idempotency race resolved by replaying the winner's
+/// stored response (see the H1 handling in [`post_mutation`]).
+fn is_client_mutation_id_conflict(e: &sqlx::Error) -> bool {
+    sqlite_extended_code(e).as_deref() == Some("2067")
 }
 
 /// The non-empty `entity_id` an entry op targets, or `None` for an empty id.
