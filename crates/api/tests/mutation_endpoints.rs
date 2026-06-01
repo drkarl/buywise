@@ -38,6 +38,19 @@ async fn setup_pool() -> SqlitePool {
     pool
 }
 
+/// Build a fresh SHARED-CACHE in-memory pool (multi-connection) with migrations
+/// applied. Unlike `setup_pool`'s private `sqlite::memory:` (capped at one
+/// connection), a shared-cache URL lets several connections see the same database,
+/// so concurrent requests genuinely contend for SQLite's single write lock. A
+/// unique database name per call keeps tests isolated from one another.
+async fn setup_shared_pool() -> SqlitePool {
+    let name = format!("buywise_test_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("file:{name}?mode=memory&cache=shared");
+    let pool = db::connect(&url).await.expect("connect shared");
+    db::run_migrations(&pool).await.expect("migrate");
+    pool
+}
+
 async fn seed_household(pool: &SqlitePool, id: &str, name: &str) {
     sqlx::query("INSERT INTO households (id, name, created_at) VALUES (?1, ?2, ?3)")
         .bind(id)
@@ -1322,4 +1335,114 @@ async fn add_item_rejects_foreign_household_canonical_item() {
     let v = json(ok).await;
     assert_eq!(v["entity"]["canonical_item_id"], "item-a");
     assert_eq!(v["entity"]["resolution_status"], "resolved");
+}
+
+// ---------------------------------------------------------------------------
+// In-flight duplicate add_item idempotency under real concurrency (HIGH)
+// ---------------------------------------------------------------------------
+
+/// HIGH regression: several identical `add_item` requests (same
+/// `client_mutation_id` AND same client-supplied `entity_id`) fired concurrently
+/// must ALL resolve to the idempotent contract — exactly one apply, every response
+/// a byte-identical 200/201, and never a 409 from the entry-id PRIMARY KEY
+/// collision.
+///
+/// Before the reserve-first fix, a loser ran `apply_add_item` before the
+/// `client_mutation_id` UNIQUE check, hit the `list_entries.id` PK collision, and
+/// 409'd instead of replaying. Reserving the `mutations` row as the first write
+/// makes the idempotency key authoritative, so the loser replays the winner's
+/// stored response. A shared-cache pool gives genuine multi-connection contention
+/// on SQLite's single write lock (busy_timeout absorbs the wait), so the loser
+/// path is exercised deterministically rather than relying on the fast-path check.
+#[tokio::test]
+async fn concurrent_duplicate_add_item_all_replay_never_409() {
+    let pool = setup_shared_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Eight identical requests: same client_mutation_id AND same entity_id.
+    let body = envelope(
+        "cm-race",
+        "list-a",
+        "entry-1",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let session = s.session.clone();
+        let csrf = s.csrf.clone();
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = app(AppState { pool })
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/mutations")
+                        .header(header::COOKIE, format!("session={session}"))
+                        .header("X-CSRF-Token", &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = raw_bytes(resp).await;
+            (status, bytes)
+        }));
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+
+    // No request 409'd or 500'd; each is a success (201 winner, 200 replays).
+    for (status, _) in &results {
+        assert!(
+            *status == StatusCode::CREATED || *status == StatusCode::OK,
+            "every concurrent duplicate is a success, got {status}"
+        );
+        assert_ne!(*status, StatusCode::CONFLICT, "no spurious 409");
+    }
+    // Exactly one winner (201), the rest replays (200).
+    let created = results
+        .iter()
+        .filter(|(s, _)| *s == StatusCode::CREATED)
+        .count();
+    assert_eq!(created, 1, "exactly one request applied the mutation");
+
+    // All response bodies are byte-identical (the winner's stored response).
+    let first_body = &results[0].1;
+    for (_, body) in &results {
+        assert_eq!(body, first_body, "all responses are byte-identical");
+    }
+
+    // Exactly one entry and one mutation row — the mutation was applied once.
+    let entries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(entries, 1, "the entry was created exactly once");
+
+    let mutations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mutations WHERE client_mutation_id = 'cm-race'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mutations, 1, "exactly one mutation row was committed");
+
+    // The revision advanced exactly once.
+    let revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(revision, 1, "revision advanced exactly once");
 }
