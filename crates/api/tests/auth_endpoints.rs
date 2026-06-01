@@ -85,7 +85,7 @@ fn login_request(email: &str, password: &str) -> Request<Body> {
 #[tokio::test]
 async fn login_with_correct_credentials_sets_both_cookies() {
     let pool = setup_pool().await;
-    let state = AppState { pool };
+    let state = AppState::new(pool);
     let resp = app(state)
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
@@ -127,7 +127,7 @@ async fn login_with_correct_credentials_sets_both_cookies() {
 #[tokio::test]
 async fn login_with_wrong_password_is_401_and_sets_no_cookies() {
     let pool = setup_pool().await;
-    let state = AppState { pool };
+    let state = AppState::new(pool);
     let resp = app(state)
         .oneshot(login_request(TEST_EMAIL, "wrong-password"))
         .await
@@ -141,7 +141,7 @@ async fn login_with_wrong_password_is_401_and_sets_no_cookies() {
 #[tokio::test]
 async fn login_with_unknown_user_is_401() {
     let pool = setup_pool().await;
-    let state = AppState { pool };
+    let state = AppState::new(pool);
     let resp = app(state)
         .oneshot(login_request("nobody@example.test", TEST_PASSWORD))
         .await
@@ -152,7 +152,7 @@ async fn login_with_unknown_user_is_401() {
 #[tokio::test]
 async fn stored_token_hash_is_sha256_of_cookie_value() {
     let pool = setup_pool().await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone());
     let resp = app(state)
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
@@ -184,7 +184,7 @@ async fn me_with_valid_session_returns_user_and_without_is_401() {
     let pool = setup_pool().await;
 
     // No cookie → 401.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
@@ -196,13 +196,13 @@ async fn me_with_valid_session_returns_user_and_without_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Login, then /me with the session cookie → 200 + user JSON.
-    let login = app(AppState { pool: pool.clone() })
+    let login = app(AppState::new(pool.clone()))
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
         .unwrap();
     let session = cookie_from_set_cookie(&login, "session").unwrap();
 
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
@@ -223,7 +223,7 @@ async fn me_with_valid_session_returns_user_and_without_is_401() {
 async fn logout_clears_cookies_deletes_session_and_me_then_401() {
     let pool = setup_pool().await;
 
-    let login = app(AppState { pool: pool.clone() })
+    let login = app(AppState::new(pool.clone()))
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
         .unwrap();
@@ -236,7 +236,7 @@ async fn logout_clears_cookies_deletes_session_and_me_then_401() {
         .unwrap();
     assert_eq!(before, 1);
 
-    let logout = app(AppState { pool: pool.clone() })
+    let logout = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -259,7 +259,7 @@ async fn logout_clears_cookies_deletes_session_and_me_then_401() {
     assert_eq!(after, 0, "logout must delete the session row");
 
     // /me with the now-deleted session → 401.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
@@ -275,14 +275,14 @@ async fn logout_clears_cookies_deletes_session_and_me_then_401() {
 #[tokio::test]
 async fn post_without_csrf_header_is_403() {
     let pool = setup_pool().await;
-    let login = app(AppState { pool: pool.clone() })
+    let login = app(AppState::new(pool.clone()))
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
         .unwrap();
     let session = cookie_from_set_cookie(&login, "session").unwrap();
 
     // POST /logout with a valid session but no X-CSRF-Token → 403.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -299,13 +299,13 @@ async fn post_without_csrf_header_is_403() {
 #[tokio::test]
 async fn post_with_wrong_csrf_header_is_403() {
     let pool = setup_pool().await;
-    let login = app(AppState { pool: pool.clone() })
+    let login = app(AppState::new(pool.clone()))
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
         .unwrap();
     let session = cookie_from_set_cookie(&login, "session").unwrap();
 
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -343,7 +343,7 @@ async fn expired_session_is_rejected_with_401() {
     .await
     .unwrap();
 
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
@@ -361,7 +361,7 @@ async fn unknown_session_cookie_is_rejected_with_401() {
     let pool = setup_pool().await;
 
     // A syntactically valid token whose hash matches no stored session.
-    let resp = app(AppState { pool })
+    let resp = app(AppState::new(pool))
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
@@ -378,7 +378,7 @@ async fn unknown_session_cookie_is_rejected_with_401() {
 async fn second_logout_after_session_deleted_is_401() {
     let pool = setup_pool().await;
 
-    let login = app(AppState { pool: pool.clone() })
+    let login = app(AppState::new(pool.clone()))
         .oneshot(login_request(TEST_EMAIL, TEST_PASSWORD))
         .await
         .unwrap();
@@ -386,7 +386,7 @@ async fn second_logout_after_session_deleted_is_401() {
     let csrf = cookie_from_set_cookie(&login, "csrf").unwrap();
 
     // First logout deletes the row and returns 204.
-    let first = app(AppState { pool: pool.clone() })
+    let first = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -402,7 +402,7 @@ async fn second_logout_after_session_deleted_is_401() {
 
     // Second logout with the same (now-deleted) session is rejected at the
     // extractor with 401, before the DELETE runs — logout is idempotent.
-    let second = app(AppState { pool: pool.clone() })
+    let second = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")

@@ -175,7 +175,7 @@ async fn seed_resolved_entry(
 /// Log in and return the session + csrf tokens.
 async fn login(pool: &SqlitePool, email: &str) -> Session {
     let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -222,7 +222,7 @@ async fn create_then_get_list_has_top_level_revision_zero() {
 
     // POST /api/lists.
     let body = serde_json::json!({ "name": "Groceries", "household_id": "hh-a" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -242,7 +242,7 @@ async fn create_then_get_list_has_top_level_revision_zero() {
     assert_eq!(created["name"], "Groceries");
 
     // GET /api/list/:id.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri(format!("/api/list/{list_id}"))
@@ -272,7 +272,7 @@ async fn list_lists_returns_only_own_household() {
     seed_list(&pool, "list-b", "hh-b", "B's list").await;
 
     let s = login(&pool, "a@example.test").await;
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/lists")
@@ -300,7 +300,7 @@ async fn cross_household_get_is_403_and_missing_is_404() {
     let s = login(&pool, "a@example.test").await;
 
     // A-user reading B's (existing) list → 403, NOT 404.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/list/list-b")
@@ -313,7 +313,7 @@ async fn cross_household_get_is_403_and_missing_is_404() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // A genuinely non-existent list id → 404.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/list/does-not-exist")
@@ -335,7 +335,7 @@ async fn get_list_includes_entry_resolution_and_constraint_hash() {
     seed_entry(&pool, "entry-1", "list-a", "user-a", "unresolved:entry-1").await;
 
     let s = login(&pool, "a@example.test").await;
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/list/list-a")
@@ -366,7 +366,7 @@ async fn create_list_in_foreign_household_is_403() {
     let s = login(&pool, "a@example.test").await;
 
     let body = serde_json::json!({ "name": "Sneaky", "household_id": "hh-b" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -390,7 +390,7 @@ async fn post_list_without_csrf_is_403() {
     let s = login(&pool, "a@example.test").await;
 
     let body = serde_json::json!({ "name": "Groceries", "household_id": "hh-a" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -408,7 +408,7 @@ async fn post_list_without_csrf_is_403() {
 #[tokio::test]
 async fn unauthenticated_list_request_is_401() {
     let pool = setup_pool().await;
-    let resp = app(AppState { pool })
+    let resp = app(AppState::new(pool))
         .oneshot(
             Request::builder()
                 .uri("/api/lists")
@@ -430,7 +430,7 @@ async fn patch_renames_and_archives_list() {
 
     // Rename.
     let body = serde_json::json!({ "name": "New name" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -450,7 +450,7 @@ async fn patch_renames_and_archives_list() {
 
     // Archive.
     let body = serde_json::json!({ "status": "archived" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -469,7 +469,7 @@ async fn patch_renames_and_archives_list() {
     assert!(detail["archived_at"].is_string(), "archived_at is set");
 
     // Archived list no longer appears in GET /api/lists.
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/lists")
@@ -497,7 +497,7 @@ async fn patch_foreign_list_is_403() {
     let s = login(&pool, "a@example.test").await;
 
     let body = serde_json::json!({ "name": "Hijacked" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -522,7 +522,7 @@ async fn patch_with_invalid_status_is_422() {
     let s = login(&pool, "a@example.test").await;
 
     let body = serde_json::json!({ "status": "deleted" }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -548,7 +548,7 @@ async fn patch_with_empty_body_is_422() {
 
     // An empty object changes nothing → 422 (no-op body is rejected).
     let body = serde_json::json!({}).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -582,7 +582,7 @@ async fn get_list_surfaces_resolved_entry_canonical_id_and_hash() {
     .await;
 
     let s = login(&pool, "a@example.test").await;
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/list/list-a")
@@ -647,7 +647,7 @@ async fn get_items_returns_items_with_aliases_and_constraints() {
     .unwrap();
 
     let s = login(&pool, "a@example.test").await;
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .uri("/api/items")

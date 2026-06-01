@@ -8,7 +8,9 @@ buywise-core = { workspace = true }
 buywise-ingest = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tower-http = { workspace = true }
+dashmap = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,3 +27,8 @@ chrono = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# SSE integration tests bind a real TCP server and read the streaming response
+# incrementally (a `oneshot` would block on the never-ending stream body).
+reqwest = { workspace = true, features = ["stream"] }
+futures-util = "0.3"
+bytes = "1"

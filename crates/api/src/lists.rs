@@ -350,6 +350,24 @@ async fn load_list(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<ListRow>,
     .await
 }
 
+/// Load the full [`ListDetail`] for a list, or `None` if no such list exists.
+///
+/// Public seam for the SSE stream (P1-T5): when a reconnecting client is below
+/// the mutation-log retention floor, the stream emits this complete list state as
+/// a `full_snapshot` event instead of an incremental backfill. Reuses
+/// [`load_list`] + [`load_detail`] so the snapshot is byte-identical in shape to
+/// `GET /api/list/:id`. The caller is responsible for the household-membership
+/// authorization check (the SSE handler performs it before calling this).
+pub async fn list_snapshot(
+    pool: &sqlx::SqlitePool,
+    list_id: &str,
+) -> Result<Option<ListDetail>, sqlx::Error> {
+    match load_list(pool, list_id).await? {
+        Some(row) => Ok(Some(load_detail(pool, row).await?)),
+        None => Ok(None),
+    }
+}
+
 /// Render a [`ListDetail`] from an already-loaded `shopping_lists` row plus a
 /// single query for its ACTIVE entries.
 ///

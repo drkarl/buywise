@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await.context("run migrations")?;
     db::assert_json1(&pool).await.context("assert JSON1")?;
 
-    let state = AppState { pool };
+    let state = AppState::new(pool);
     let app = app(state);
 
     let addr: SocketAddr = std::env::var("BIND_ADDR")

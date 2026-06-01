@@ -135,7 +135,7 @@ async fn seed_canonical_item(
 
 async fn login(pool: &SqlitePool, email: &str) -> Session {
     let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -187,7 +187,7 @@ async fn post_mutation(
     s: &Session,
     body: serde_json::Value,
 ) -> axum::response::Response {
-    app(AppState { pool: pool.clone() })
+    app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -798,7 +798,7 @@ async fn mutation_without_csrf_is_403() {
         "add_item",
         serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
     );
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -827,7 +827,7 @@ async fn unauthenticated_mutation_is_401() {
         "add_item",
         serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
     );
-    let resp = app(AppState { pool: pool.clone() })
+    let resp = app(AppState::new(pool.clone()))
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1378,7 +1378,7 @@ async fn concurrent_duplicate_add_item_all_replay_never_409() {
         let csrf = s.csrf.clone();
         let body = body.clone();
         handles.push(tokio::spawn(async move {
-            let resp = app(AppState { pool })
+            let resp = app(AppState::new(pool))
                 .oneshot(
                     Request::builder()
                         .method("POST")
