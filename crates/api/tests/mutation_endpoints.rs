@@ -1188,3 +1188,138 @@ async fn skip_and_rename_do_not_resurrect_deleted_entry() {
         "deleted entry's name is not changed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-list IDOR via accept-and-log ops + shared post-apply path (HIGH)
+// ---------------------------------------------------------------------------
+
+/// HIGH: resolve_alias / reject_match / set_constraint go through the shared
+/// stamp/load post-apply path, which is now scoped to (id, list_id). A caller
+/// authorised for list-a must not touch or read an entry on list-b by supplying
+/// its id: each op 404s and the foreign entry's revision stays unchanged.
+#[tokio::test]
+async fn cross_list_idor_via_accept_and_log_ops_is_404() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_list(&pool, "list-b", "hh-a", "A's other list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // entry-x lives on list-b (its own revision bump → last_updated_revision = 1).
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-seed",
+            "list-b",
+            "entry-x",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    let before: i64 =
+        sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = 'entry-x'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // Each accept-and-log op naming list-a but entry-x (on list-b) must 404.
+    for (i, op) in [
+        (1, "resolve_alias"),
+        (2, "reject_match"),
+        (3, "set_constraint"),
+    ] {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(
+                &format!("cm-idor-log-{i}"),
+                "list-a",
+                "entry-x",
+                op,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{op} on a cross-list entry id must 404"
+        );
+    }
+
+    // The foreign entry's revision is unchanged — it was never stamped.
+    let after: i64 =
+        sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = 'entry-x'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before, "foreign entry's revision was not bumped");
+}
+
+// ---------------------------------------------------------------------------
+// add_item canonical_item_id household scoping (MEDIUM)
+// ---------------------------------------------------------------------------
+
+/// MEDIUM: a resolved add may only bind a canonical_item belonging to the target
+/// list's household. Binding another household's item id is rejected (404), and a
+/// same-household resolved add still works.
+#[tokio::test]
+async fn add_item_rejects_foreign_household_canonical_item() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_household(&pool, "hh-b", "Household B").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    // item-a belongs to hh-a; item-b belongs to hh-b.
+    seed_canonical_item(&pool, "cat-a", "item-a", "hh-a").await;
+    seed_canonical_item(&pool, "cat-b", "item-b", "hh-b").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Binding hh-b's item to hh-a's list is rejected.
+    let foreign = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-foreign",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-b", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign.status(),
+        StatusCode::NOT_FOUND,
+        "a foreign-household canonical item cannot be attached"
+    );
+
+    // No entry was created and the revision did not advance.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM list_entries WHERE list_id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "rejected add creates no row");
+
+    // The same-household item binds normally.
+    let ok = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-ok",
+            "list-a",
+            "entry-2",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-a", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::CREATED);
+    let v = json(ok).await;
+    assert_eq!(v["entity"]["canonical_item_id"], "item-a");
+    assert_eq!(v["entity"]["resolution_status"], "resolved");
+}
