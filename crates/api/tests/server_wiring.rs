@@ -1,8 +1,10 @@
 //! Integration tests for the P1-T6 server wiring (issue #17).
 //!
-//! Binds the full application (`buywise_api::app_with_frontend`) on an
-//! OS-assigned port (`127.0.0.1:0`) over a real TCP listener, then smoke-tests
-//! every route for the correct HTTP status code via `reqwest`:
+//! Binds the full application on an OS-assigned port (`127.0.0.1:0`) over a real
+//! TCP listener, then smoke-tests every route for the correct HTTP status code
+//! via `reqwest`. Most tests bind [`buywise_api::app`] (production frontend dir);
+//! only the static-file tests bind [`buywise_api::app_with_frontend`] to point
+//! the fallback at a fixture directory:
 //!
 //!   * the auth routes (`/api/auth/{login,logout,me}`) authenticated and not;
 //!   * the list routes (`/api/lists`, `/api/list/:id`, `/api/items`);
@@ -92,6 +94,17 @@ async fn seed_household_user_and_list(pool: &SqlitePool) {
     .expect("insert list");
 }
 
+/// Panic-safe cleanup for a throwaway directory: removes it on drop, so a failed
+/// assertion mid-test does not leak the fixture under `std::env::temp_dir()`.
+/// Avoids pulling in the `tempfile` dev-dependency for one test.
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 /// Bind the full app on `127.0.0.1:0`, spawn it, and return the bound address.
 async fn spawn_app(app: axum::Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -106,6 +119,14 @@ async fn spawn_app(app: axum::Router) -> SocketAddr {
 
 /// A reqwest client with a cookie jar so the session/CSRF cookies persist across
 /// requests, plus a short timeout so a hung request fails the test.
+///
+/// The API sets the session/CSRF cookies with the `Secure` attribute, which a
+/// browser would withhold over plain `http://`. reqwest's cookie jar does **not**
+/// enforce `Secure` (it has no notion of a "secure transport"), so the cookies
+/// flow back over the test's `http://127.0.0.1` loopback and the authenticated
+/// happy path exercises the real routes. This is a deliberate test convenience,
+/// not a relaxation of production behaviour — the `Secure` flag is still set on
+/// the wire (and must stay set); production serves over HTTPS.
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .cookie_store(true)
@@ -301,6 +322,43 @@ async fn optimise_stub_returns_not_implemented() {
     );
 }
 
+/// A known API path hit with the wrong method returns `405 Method Not Allowed`
+/// from axum's method router — it must NOT fall through to the static SPA
+/// fallback (which would mask the API with a `200`/HTML shell). This is the key
+/// "does the catch-all fallback shadow the API?" assertion: `/api/mutations` is
+/// POST-only, so `GET` exercises the precedence of the API routes over the
+/// `fallback_service`.
+#[tokio::test]
+async fn wrong_method_on_api_route_is_405_not_spa_fallback() {
+    let pool = setup_pool().await;
+    let addr = spawn_app(app(AppState::new(pool))).await;
+    let base = format!("http://{addr}");
+    let client = client();
+
+    let resp = client
+        .get(format!("{base}/api/mutations"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "GET on POST-only /api/mutations must be 405, not the SPA fallback"
+    );
+
+    // Defensively confirm we did not receive the SPA shell HTML.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("<!doctype html"),
+        "405 response must not be the SPA shell (content-type {content_type:?})"
+    );
+}
+
 /// With no `frontend/build` directory, the SPA fallback 404s (Phase 2 ships the
 /// build). The API routes still take precedence and respond normally.
 #[tokio::test]
@@ -326,9 +384,11 @@ async fn static_fallback_404s_without_a_build() {
 async fn static_fallback_serves_spa_shell_when_built() {
     let pool = setup_pool().await;
 
-    // Create a throwaway build dir with an index + SPA fallback shell.
+    // Create a throwaway build dir with an index + SPA fallback shell. The guard
+    // removes it on drop, even if an assertion below panics mid-test.
     let build_dir =
         std::env::temp_dir().join(format!("buywise-build-{}", uuid::Uuid::new_v4().simple()));
+    let _build_guard = TempDirGuard(build_dir.clone());
     std::fs::create_dir_all(&build_dir).expect("mkdir build");
     std::fs::write(
         build_dir.join("index.html"),
@@ -365,5 +425,5 @@ async fn static_fallback_serves_spa_shell_when_built() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("SPA"), "200.html shell served on fallback");
 
-    std::fs::remove_dir_all(&build_dir).ok();
+    // `_build_guard` removes the fixture directory on drop.
 }
