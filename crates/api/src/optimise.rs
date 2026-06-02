@@ -18,6 +18,10 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Phase-1 placeholder handler: the optimiser endpoint is implemented in P4-T1.
+// TODO(P4-T1): require an `AuthenticatedUser` extractor (and CSRF guard) here, as
+// on every other `/api/...` route. Omitted now because the body is a static 501
+// with no state access and the auth contract is finalised in Phase 4; wiring the
+// extractor against an empty handler would be dead code until then.
 async fn optimise_stub() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
