@@ -118,8 +118,11 @@ pub fn app(state: AppState) -> Router {
     app_with_frontend(state, FRONTEND_BUILD_DIR)
 }
 
-/// Like [`app`], but with the static-asset directory chosen by the caller. Used
-/// by integration tests to point at a fixture build directory.
+/// Like [`app`], but with the static-asset directory chosen by the caller.
+///
+/// This is a test seam: it is `pub` only so integration tests can point the
+/// static fallback at a fixture build directory. Production code uses [`app`].
+#[doc(hidden)]
 pub fn app_with_frontend(state: AppState, frontend_dir: impl AsRef<Path>) -> Router {
     let dir = frontend_dir.as_ref();
     // Serve files from the build dir; for any path without a matching file fall
