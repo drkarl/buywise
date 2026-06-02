@@ -445,5 +445,19 @@ async fn static_fallback_serves_spa_shell_when_built() {
         "unknown /api/... 404 must not be the SPA shell"
     );
 
+    // The bare `/api` path (no trailing segment, so not covered by the
+    // `/api/{*rest}` catch-all) must also 404 rather than serve the SPA shell.
+    let resp = client.get(format!("{base}/api")).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "bare /api path must 404, not serve the SPA shell"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("SPA") && !body.contains("<!doctype html"),
+        "bare /api 404 must not be the SPA shell"
+    );
+
     // `_build_guard` removes the fixture directory on drop.
 }
