@@ -1,0 +1,191 @@
+# BuyWise — Hetzner deployment
+
+End-to-end runbook for deploying BuyWise to a Hetzner CAX11 (ARM64 / `aarch64`)
+Ubuntu server. The single `buywise-api` binary serves both the SvelteKit PWA
+static files and the Axum API on one port. A Litestream sidecar continuously
+replicates the SQLite database to Cloudflare R2.
+
+## Architecture
+
+Two systemd services run side by side:
+
+- `buywise.service` — runs `/usr/local/bin/buywise-api` as the `buywise` user.
+- `litestream.service` — runs `/usr/local/bin/litestream replicate` against the
+  same SQLite database, replicating to Cloudflare R2.
+
+| Item | Value |
+| --- | --- |
+| API binary | `/usr/local/bin/buywise-api` (package `crates/api`) |
+| Litestream binary | `/usr/local/bin/litestream` |
+| Database | `/var/lib/buywise/buywise.db` |
+| Env file | `/etc/buywise/buywise.env` |
+| Litestream config | `/etc/litestream.yml` |
+| Service user | `buywise` (no-login system user) |
+
+## Environment variables
+
+All variables live in `/etc/buywise/buywise.env`, loaded by both services.
+
+**`buywise-api` (the application):**
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | recommended | `sqlite://buywise.db` | SQLite connection URL. Set to `sqlite:///var/lib/buywise/buywise.db` so it matches the Litestream-replicated DB. |
+| `PORT` | no | `3000` | TCP port the API binds on (`0.0.0.0:PORT`). |
+| `RUST_LOG` | no | `info` | `tracing-subscriber` `EnvFilter` log directive. |
+
+**`litestream` (Cloudflare R2 credentials):**
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `LITESTREAM_ACCESS_KEY_ID` | yes | R2 API token access key id. |
+| `LITESTREAM_SECRET_ACCESS_KEY` | yes | R2 API token secret. |
+
+The variable names are referenced by `deploy/litestream.yml`. The default values
+above are the in-code defaults read by `crates/api/src/main.rs`.
+
+## 1. Build the ARM64 binary (on your build machine)
+
+Install the cross-compilation target and a linker, then build:
+
+```bash
+# One-time: add the aarch64 Rust target.
+rustup target add aarch64-unknown-linux-gnu
+
+# One-time (Debian/Ubuntu build host): install the cross linker.
+sudo apt-get install -y gcc-aarch64-linux-gnu
+
+# Tell cargo which linker to use for the target (or put this in .cargo/config.toml).
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+cargo build --release --target aarch64-unknown-linux-gnu -p buywise-api
+```
+
+The binary lands at `target/aarch64-unknown-linux-gnu/release/buywise-api`.
+
+> If cross-compilation is troublesome, build natively on the CAX11 itself
+> (ARM): `cargo build --release -p buywise-api`.
+
+### Frontend (SvelteKit PWA)
+
+The API serves the SvelteKit static build from `frontend/build/` via
+`tower-http`'s `ServeDir`. Until Phase 2 scaffolds the frontend, `GET /` returns
+404 and only the `/api/*` routes are live — that is expected and the API still
+deploys and runs. Once the frontend exists, build it (`npm run build` in
+`frontend/`) and ship `frontend/build/` to the server's working directory
+(`/var/lib/buywise/frontend/build`).
+
+## 2. Copy binaries to the server
+
+Copy the API binary:
+
+```bash
+scp target/aarch64-unknown-linux-gnu/release/buywise-api root@<server>:/usr/local/bin/buywise-api
+```
+
+Install Litestream on the server (ARM64 release). On the server:
+
+```bash
+LITESTREAM_VERSION=v0.3.13
+curl -L -o /tmp/litestream.tar.gz \
+  "https://github.com/benbjohnson/litestream/releases/download/${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-arm64.tar.gz"
+tar -C /usr/local/bin -xzf /tmp/litestream.tar.gz litestream
+rm /tmp/litestream.tar.gz
+```
+
+Confirm both binaries are present and executable:
+
+```bash
+ls -l /usr/local/bin/buywise-api /usr/local/bin/litestream
+```
+
+## 3. Run the setup script
+
+Copy the `deploy/` directory to the server and run the setup script as root:
+
+```bash
+scp -r deploy root@<server>:/tmp/buywise-deploy
+ssh root@<server>
+cd /tmp/buywise-deploy
+sudo ./setup.sh
+```
+
+`setup.sh` is idempotent. It:
+
+- creates the `buywise` no-login system user (if missing);
+- creates `/var/lib/buywise/` owned by `buywise`;
+- creates `/etc/buywise/` and a `buywise.env` template (mode 600) if absent;
+- installs the systemd units to `/etc/systemd/system/`;
+- installs `litestream.yml` to `/etc/litestream.yml`;
+- runs `systemctl daemon-reload`;
+- prints the next-step commands.
+
+## 4. Set environment variables and the R2 endpoint
+
+Edit `/etc/buywise/buywise.env` and fill in the values (see the table above).
+Then edit `/etc/litestream.yml` and replace `<ACCOUNT_ID>` in the endpoint with
+your Cloudflare account id (Cloudflare dashboard → R2). The bucket
+(`buywise-backup`) must already exist in R2.
+
+## 5. Enable and start the services
+
+```bash
+sudo systemctl enable --now buywise litestream
+```
+
+## 6. Smoke test (matches acceptance criteria)
+
+**Service is active:**
+
+```bash
+systemctl status buywise
+systemctl status litestream
+```
+
+**API responds** (`/api/auth/me` returns a response — `401`/`200` depending on
+session, not a connection refused):
+
+```bash
+curl -i http://localhost:3000/api/auth/me
+```
+
+**Litestream is replicating to R2:**
+
+```bash
+litestream replicas -config /etc/litestream.yml
+journalctl -u litestream -n 50 --no-pager
+# Confirm objects appear under the buywise-backup bucket (R2 dashboard).
+```
+
+**Restart preserves the database** (WAL checkpointed, Litestream replicated):
+
+```bash
+# Note a row count or a known value before restart.
+sudo systemctl restart buywise
+# Confirm the DB is intact after restart.
+sqlite3 /var/lib/buywise/buywise.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
+curl -i http://localhost:3000/api/auth/me
+```
+
+## Logs and troubleshooting
+
+```bash
+journalctl -u buywise -f
+journalctl -u litestream -f
+```
+
+- `buywise-api` logs at `RUST_LOG` level to the journal (`StandardOutput=journal`).
+- If `buywise` fails to start, check `DATABASE_URL` points at a writable path
+  owned by the `buywise` user.
+- If `litestream` fails, check the R2 credentials in `buywise.env` and the
+  `endpoint`/`region` in `/etc/litestream.yml`.
+
+## Disaster recovery (restore from R2)
+
+If the server is lost, restore the database from R2 before starting `buywise`:
+
+```bash
+litestream restore -config /etc/litestream.yml /var/lib/buywise/buywise.db
+chown buywise:buywise /var/lib/buywise/buywise.db
+sudo systemctl start buywise litestream
+```
