@@ -89,19 +89,24 @@ export default defineConfig({
 						// NetworkFirst with cache fallback for the two cacheable API
 						// reads ONLY: `GET /api/list/:id` and `GET /api/items`.
 						//
-						// SECURITY — TODO(P4-T1): these endpoints are session-
-						// authenticated and household-scoped, but Workbox keys the
-						// cache by request URL only, NOT by session. There is no auth
-						// yet (login/sessions land in P4-T1), so nothing leaks today —
-						// but the moment auth ships, a logout or account switch on a
-						// shared browser profile would leave the previous session's
-						// list/catalogue data in this cache, served offline to the
-						// next user. P4-T1 MUST purge it on logout/account-switch. No
-						// SW change is needed — the page can do it directly:
+						// SECURITY — purge on logout (see below): these endpoints are
+						// session-authenticated and household-scoped (the backend
+						// `get_list`/`list_items` handlers sit behind the
+						// `AuthenticatedUser` extractor, live since P1-T2). Workbox
+						// keys the cache by request URL only, NOT by session, so after
+						// a logout or an account switch on a shared browser profile
+						// this cache would serve the previous session's
+						// list/catalogue data offline to the next user.
+						//
+						// The frontend has no logout flow yet (login/logout UI is
+						// upcoming frontend work; the backend route is
+						// `POST /api/auth/logout`). Whoever wires that flow MUST clear
+						// this cache on logout/account-switch — no SW change needed,
+						// the page can do it directly:
 						//     await caches.delete('buywise-api-reads');
 						// (the precache/app-shell holds no user data, so it need not
-						// be cleared.) Until P4-T1 wires that call, this cache is a
-						// latent cross-account exposure.
+						// be cleared.) Until that call exists, this cache is a
+						// cross-account exposure once a second account uses the device.
 						//
 						// We match on `url.pathname` (not the whole href) with a
 						// matcher function so we can also pin the method to GET. This
