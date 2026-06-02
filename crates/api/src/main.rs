@@ -10,9 +10,18 @@ use anyhow::Context;
 use buywise_api::{app, AppState};
 use buywise_core::db;
 
+/// Default TCP port; override with the `PORT` env var.
+const DEFAULT_PORT: u16 = 3000;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // `RUST_LOG`-controlled logging; defaults to `info` when unset.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://buywise.db".to_string());
@@ -25,10 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool);
     let app = app(state);
 
-    let addr: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()
-        .context("parse BIND_ADDR")?;
+    let port: u16 = match std::env::var("PORT") {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("parse PORT={value}"))?,
+        Err(_) => DEFAULT_PORT,
+    };
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

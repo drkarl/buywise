@@ -29,6 +29,8 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # SSE integration tests bind a real TCP server and read the streaming response
 # incrementally (a `oneshot` would block on the never-ending stream body).
-reqwest = { workspace = true, features = ["stream"] }
+# `cookies` lets the P1-T6 server-wiring smoke tests carry the session/csrf
+# cookies across requests automatically.
+reqwest = { workspace = true, features = ["stream", "cookies"] }
 futures-util = "0.3"
 bytes = "1"

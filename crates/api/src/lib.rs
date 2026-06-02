@@ -3,26 +3,37 @@
 //! Phase 1 exposes the authentication routes (P1-T2) under `/api/auth`, the
 //! list-management routes (P1-T3) under `/api/lists`, `/api/list/:id`, and
 //! `/api/items`, the offline-sync mutation endpoint (P1-T4) at `/api/mutations`,
-//! and the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`. The shared
+//! the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`, and a Phase-4
+//! placeholder for the basket optimiser (P4-T1) at `/api/optimise`. The shared
 //! [`AppState`] carries the SQLite pool that handlers and the
 //! [`middleware::AuthenticatedUser`] extractor read from, plus the per-list SSE
 //! broadcast registry.
 //!
-//! The router is built by [`app`], kept separate from the binary entry point so
-//! integration tests can mount the exact same routes against an in-memory
-//! database without binding a socket.
+//! The full application is assembled by [`app`] (the API routes plus the static
+//! SvelteKit SPA served from `frontend/build`), while [`api_router`] builds just
+//! the API surface so integration tests can mount the exact same routes against
+//! an in-memory database without binding a socket or depending on a built
+//! frontend. Both are kept separate from the binary entry point.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::Router;
 use dashmap::DashMap;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
+use tower_http::services::{ServeDir, ServeFile};
+
+/// Default location of the built SvelteKit SPA, relative to the server's working
+/// directory. Produced by `npm run build` in `frontend/` (adapter-static, SPA
+/// mode); does not exist until Phase 2, so `GET /` 404s until then.
+pub const FRONTEND_BUILD_DIR: &str = "frontend/build";
 
 pub mod auth;
 pub mod lists;
 pub mod middleware;
 pub mod mutations;
+pub mod optimise;
 pub mod sse;
 
 /// Registry of per-list SSE broadcast senders, keyed by `list_id`.
@@ -70,8 +81,11 @@ impl AppState {
     }
 }
 
-/// Build the top-level application router from a ready [`AppState`].
-pub fn app(state: AppState) -> Router {
+/// Build just the API router (every `/api/...` route) from a ready [`AppState`].
+///
+/// Kept separate from [`app`] so integration tests can exercise the handlers
+/// without a built frontend on disk. The static-file fallback lives in [`app`].
+pub fn api_router(state: AppState) -> Router {
     // Warm the lazily-computed dummy password hash so the first unknown-user
     // login does not pay a one-time argon2 cost (which would briefly reintroduce
     // an account-existence timing signal).
@@ -87,5 +101,32 @@ pub fn app(state: AppState) -> Router {
         .merge(mutations::router())
         // `sse::router` carries the absolute `/api/sse/{list_id}` path (P1-T5).
         .merge(sse::router())
+        // `optimise::router` carries the absolute `/api/optimise` path; a Phase-4
+        // placeholder for now (P4-T1).
+        .merge(optimise::router())
         .with_state(state)
+}
+
+/// Build the top-level application: the API routes plus the SvelteKit SPA served
+/// from [`FRONTEND_BUILD_DIR`].
+///
+/// API routes take precedence; any other path falls through to [`ServeDir`],
+/// which serves a matching static file or, for client-side routes, the SPA shell
+/// (`200.html`, produced by SvelteKit's `adapter-static` in SPA mode). Until the
+/// frontend is built (Phase 2) the directory is absent, so unmatched paths 404.
+pub fn app(state: AppState) -> Router {
+    app_with_frontend(state, FRONTEND_BUILD_DIR)
+}
+
+/// Like [`app`], but with the static-asset directory chosen by the caller. Used
+/// by integration tests to point at a fixture build directory.
+pub fn app_with_frontend(state: AppState, frontend_dir: impl AsRef<Path>) -> Router {
+    let dir = frontend_dir.as_ref();
+    // Serve files from the build dir; for any path without a matching file fall
+    // back to the SPA shell so client-side routing works on hard reloads/deep
+    // links. The fallback file (and dir) may not exist yet — `ServeDir` returns
+    // 404 in that case rather than panicking.
+    let spa_shell = dir.join("200.html");
+    let serve_dir = ServeDir::new(dir).fallback(ServeFile::new(spa_shell));
+    api_router(state).fallback_service(serve_dir)
 }
