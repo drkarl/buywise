@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::routing::any;
 use axum::Router;
 use dashmap::DashMap;
 use sqlx::SqlitePool;
@@ -104,7 +106,22 @@ pub fn api_router(state: AppState) -> Router {
         // `optimise::router` carries the absolute `/api/optimise` path; a Phase-4
         // placeholder for now (P4-T1).
         .merge(optimise::router())
+        // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
+        // `fallback_service` in `app` would swallow unknown API URLs once
+        // `frontend/build/200.html` exists and serve the HTML shell with a `200`,
+        // masking client typos / removed endpoints as if they were app routes.
+        // Static routes above are matched before this wildcard (matchit gives
+        // literal segments priority over a catch-all), and a known path hit with
+        // the wrong method still yields the route's own `405` — only genuinely
+        // unrouted `/api/...` paths reach this handler.
+        .route("/api/{*rest}", any(api_not_found))
         .with_state(state)
+}
+
+/// Fallback handler for unmatched `/api/...` paths: always `404 Not Found`, so
+/// the API surface never falls through to the SPA shell (see [`api_router`]).
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 /// Build the top-level application: the API routes plus the SvelteKit SPA served

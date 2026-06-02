@@ -425,5 +425,25 @@ async fn static_fallback_serves_spa_shell_when_built() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("SPA"), "200.html shell served on fallback");
 
+    // An UNKNOWN /api/... path must still 404 even with a build present — it must
+    // NOT fall through to the SPA shell. This is the companion to the wrong-method
+    // test: that covers known paths; this covers unrouted API paths, which would
+    // otherwise be swallowed by the `fallback_service` once `200.html` exists.
+    let resp = client
+        .get(format!("{base}/api/does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "unknown /api/... path must 404, not serve the SPA shell"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("SPA") && !body.contains("<!doctype html"),
+        "unknown /api/... 404 must not be the SPA shell"
+    );
+
     // `_build_guard` removes the fixture directory on drop.
 }
