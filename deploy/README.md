@@ -149,10 +149,15 @@ session, not a connection refused):
 curl -i http://localhost:3000/api/auth/me
 ```
 
-**Litestream is replicating to R2:**
+**Litestream is replicating to R2:** the `litestream` CLI needs the R2
+credentials, which live only in `/etc/buywise/buywise.env` (root-owned, `0600`)
+and are otherwise injected solely by systemd's `EnvironmentFile`. Manual
+`litestream` commands won't see them, so run them as root with that env file
+loaded:
 
 ```bash
-litestream replicas -config /etc/litestream.yml
+# Load the R2 credentials the same way systemd's EnvironmentFile does.
+sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream replicas -config /etc/litestream.yml'
 journalctl -u litestream -n 50 --no-pager
 # Confirm objects appear under the buywise-backup bucket (R2 dashboard).
 ```
@@ -172,11 +177,12 @@ it to the live DB — proves the backup half of the acceptance criterion):
 
 ```bash
 # Restore the latest R2 replica into a scratch file (does NOT touch the live DB).
-litestream restore -o /tmp/verify.db -config /etc/litestream.yml /var/lib/buywise/buywise.db
+# Run as root with the env file loaded so litestream sees the R2 credentials.
+sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -o /tmp/verify.db -config /etc/litestream.yml /var/lib/buywise/buywise.db'
 # The restored copy must pass integrity_check and match the live row count.
 sqlite3 /tmp/verify.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
 sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
-rm -f /tmp/verify.db
+sudo rm -f /tmp/verify.db  # written by root
 ```
 
 ## Logs and troubleshooting
@@ -208,10 +214,12 @@ sudo systemctl disable --now buywise litestream
 # 2. Make sure the target path is empty so restore writes a fresh copy.
 sudo rm -f /var/lib/buywise/buywise.db /var/lib/buywise/buywise.db-wal /var/lib/buywise/buywise.db-shm
 
-# 3. Restore the latest replica from R2 into the live path.
-sudo -u buywise litestream restore -config /etc/litestream.yml /var/lib/buywise/buywise.db
+# 3. Restore the latest replica from R2 into the live path. Run as root with the
+#    env file loaded: the R2 credentials live only in the 0600 root-owned env
+#    file, which the buywise user cannot read.
+sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -config /etc/litestream.yml /var/lib/buywise/buywise.db'
 
-# 4. Confirm ownership (only needed if the restore ran as root).
+# 4. The restore ran as root, so hand the DB back to the buywise user.
 sudo chown buywise:buywise /var/lib/buywise/buywise.db
 
 # 5. Re-enable and start the services, in order, only AFTER the restore is done.
