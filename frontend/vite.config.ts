@@ -74,9 +74,14 @@ export default defineConfig({
 								maxAgeSeconds: 60 * 60 * 24 * 30 // 30 days
 							},
 							cacheableResponse: {
-								// Opaque (status 0) responses are cached too, so
-								// cross-origin/no-cors fonts still work offline.
-								statuses: [0, 200]
+								// Only successful (200) responses. This route is
+								// gated on `sameOrigin`, so it never sees opaque
+								// (status 0) no-cors responses — admitting `0` here
+								// would only risk caching opaque *failures*, never a
+								// real cross-origin asset. (If we ever serve fonts
+								// from a CDN, drop the sameOrigin gate AND switch to
+								// StaleWhileRevalidate so opaque errors can heal.)
+								statuses: [200]
 							}
 						}
 					},
@@ -91,6 +96,12 @@ export default defineConfig({
 						// cached. The singular `/api/list/<id>` pattern requires a
 						// non-empty id segment, so it never matches plural
 						// `/api/lists` or the bare `/api/list`.
+						//
+						// NOTE: the `request.method === 'GET'` guard below is
+						// belt-and-suspenders — Workbox registers function routes
+						// under the GET method bucket by default, so non-GET
+						// requests never reach this matcher. Kept as defensive,
+						// self-documenting intent; it is not load-bearing.
 						urlPattern: ({ url, request, sameOrigin }) =>
 							sameOrigin &&
 							request.method === 'GET' &&
