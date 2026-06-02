@@ -52,6 +52,8 @@ install -m 0644 "${SCRIPT_DIR}/systemd/buywise.service" "${SYSTEMD_DIR}/buywise.
 install -m 0644 "${SCRIPT_DIR}/systemd/litestream.service" "${SYSTEMD_DIR}/litestream.service"
 
 echo "==> Installing Litestream config to ${LITESTREAM_CONFIG}"
+# 0644 is intentional: litestream.yml contains no secrets (only placeholders);
+# the R2 keys come from /etc/buywise/buywise.env (mode 600).
 install -m 0644 "${SCRIPT_DIR}/litestream.yml" "${LITESTREAM_CONFIG}"
 
 echo "==> Reloading systemd"
@@ -117,6 +119,7 @@ Next steps:
 
        systemctl status buywise
        systemctl status litestream
-       curl -i http://localhost:${PORT:-3000}/api/auth/me
+       # Uses the default port 3000; adjust if you set PORT in ${ENV_FILE}.
+       curl -i http://localhost:3000/api/auth/me
 
 EOF

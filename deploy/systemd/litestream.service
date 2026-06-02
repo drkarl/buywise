@@ -1,6 +1,11 @@
 [Unit]
 Description=Litestream replication for BuyWise
-After=network.target
+# Order after buywise: the app owns the DB file and creates it via
+# create_if_missing (crates/core/src/db.rs). Replicating a missing path
+# crash-loops, so replication must follow the writer. Wants (not Requires) keeps
+# this best-effort: litestream still stops cleanly if the app is down.
+After=network.target buywise.service
+Wants=buywise.service
 
 [Service]
 Type=simple
