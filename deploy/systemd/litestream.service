@@ -1,0 +1,14 @@
+[Unit]
+Description=Litestream replication for BuyWise
+After=network.target
+
+[Service]
+Type=simple
+User=buywise
+ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/etc/buywise/buywise.env
+
+[Install]
+WantedBy=multi-user.target

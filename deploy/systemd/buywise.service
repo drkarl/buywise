@@ -1,0 +1,17 @@
+[Unit]
+Description=BuyWise grocery optimiser
+After=network.target
+
+[Service]
+Type=simple
+User=buywise
+WorkingDirectory=/var/lib/buywise
+ExecStart=/usr/local/bin/buywise-api
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/etc/buywise/buywise.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

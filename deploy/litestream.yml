@@ -1,9 +1,22 @@
+# Litestream configuration for BuyWise.
+#
+# Installed to /etc/litestream.yml by deploy/setup.sh and read by the
+# litestream.service systemd unit (`litestream replicate -config /etc/litestream.yml`).
+#
+# Backup target: Cloudflare R2 (S3-compatible, free tier).
+# The access keys are NOT stored here; they are read from the environment
+# (LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY), which litestream.service
+# loads from /etc/buywise/buywise.env. Set the same variable names there.
 dbs:
   - path: /var/lib/buywise/buywise.db
     replicas:
       - type: s3
         bucket: buywise-backup
         path: db
-        endpoint: https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com
+        # R2 endpoint format: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+        # Replace <ACCOUNT_ID> with your Cloudflare account ID (Cloudflare dashboard -> R2).
+        endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+        # R2 ignores AWS regions, but the S3 client still requires one; "auto" is correct for R2.
+        region: auto
         access-key-id: $LITESTREAM_ACCESS_KEY_ID
         secret-access-key: $LITESTREAM_SECRET_ACCESS_KEY
