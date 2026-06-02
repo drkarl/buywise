@@ -113,7 +113,10 @@ pub fn api_router(state: AppState) -> Router {
         // Static routes above are matched before this wildcard (matchit gives
         // literal segments priority over a catch-all), and a known path hit with
         // the wrong method still yields the route's own `405` — only genuinely
-        // unrouted `/api/...` paths reach this handler.
+        // unrouted `/api/...` paths reach this handler. The bare `/api` path needs
+        // its own route: `{*rest}` requires at least one trailing segment, so
+        // without this `GET /api` would fall through to the SPA shell.
+        .route("/api", any(api_not_found))
         .route("/api/{*rest}", any(api_not_found))
         .with_state(state)
 }
