@@ -45,6 +45,73 @@ export default defineConfig({
 						purpose: 'maskable'
 					}
 				]
+			},
+			workbox: {
+				// Precaching: leave `globPatterns` at the generateSW default
+				// (`**/*.{js,css,html,...}` under the build's `globDirectory`) so
+				// every JS/CSS chunk and the SPA shell are precached. The
+				// `@vite-pwa/sveltekit` plugin additionally appends the SvelteKit
+				// `client/**` and `prerendered/**` patterns when `globPatterns` is
+				// set; we deliberately do NOT set it so the broader default stands.
+				//
+				// `navigateFallback` is intentionally omitted: the plugin sets it to
+				// `adapterFallback` ('200.html') for us (see kit.adapterFallback
+				// above). Overriding it here would break offline deep-link routing.
+				runtimeCaching: [
+					{
+						// CacheFirst for static assets NOT covered by the precache
+						// manifest — chiefly images and fonts fetched at runtime
+						// (e.g. user/category icons). JS/CSS chunks are already
+						// precached, so they never reach this rule.
+						urlPattern: ({ request, sameOrigin }) =>
+							sameOrigin &&
+							(request.destination === 'image' || request.destination === 'font'),
+						handler: 'CacheFirst',
+						options: {
+							cacheName: 'buywise-static-assets',
+							expiration: {
+								maxEntries: 60,
+								maxAgeSeconds: 60 * 60 * 24 * 30 // 30 days
+							},
+							cacheableResponse: {
+								// Opaque (status 0) responses are cached too, so
+								// cross-origin/no-cors fonts still work offline.
+								statuses: [0, 200]
+							}
+						}
+					},
+					{
+						// NetworkFirst with cache fallback for the two cacheable API
+						// reads ONLY: `GET /api/list/:id` and `GET /api/items`.
+						//
+						// We match on `url.pathname` (not the whole href) with a
+						// matcher function so we can also pin the method to GET. This
+						// guarantees mutations (`POST /api/mutations`, `POST/PATCH`
+						// on lists) and the SSE stream (`GET /api/sse/:id`) are never
+						// cached. The singular `/api/list/<id>` pattern requires a
+						// non-empty id segment, so it never matches plural
+						// `/api/lists` or the bare `/api/list`.
+						urlPattern: ({ url, request, sameOrigin }) =>
+							sameOrigin &&
+							request.method === 'GET' &&
+							(/^\/api\/list\/[^/]+$/.test(url.pathname) ||
+								/^\/api\/items\/?$/.test(url.pathname)),
+						handler: 'NetworkFirst',
+						options: {
+							cacheName: 'buywise-api-reads',
+							// Fall back to the cache quickly when offline / on a flaky
+							// network rather than hanging on the failed request.
+							networkTimeoutSeconds: 5,
+							expiration: {
+								maxEntries: 50,
+								maxAgeSeconds: 60 * 60 * 24 // 1 day
+							},
+							cacheableResponse: {
+								statuses: [200]
+							}
+						}
+					}
+				]
 			}
 		})
 	]
