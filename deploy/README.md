@@ -30,7 +30,7 @@ All variables live in `/etc/buywise/buywise.env`, loaded by both services.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | recommended | `sqlite://buywise.db` | SQLite connection URL. Set to `sqlite:///var/lib/buywise/buywise.db` so it matches the Litestream-replicated DB. |
+| `DATABASE_URL` | recommended (to make the path explicit) | `sqlite://buywise.db` | SQLite connection URL. The default resolves under `WorkingDirectory=/var/lib/buywise` to the same file, but set it to `sqlite:///var/lib/buywise/buywise.db` to make the Litestream-replicated path explicit. |
 | `PORT` | no | `3000` | TCP port the API binds on (`0.0.0.0:PORT`). |
 | `RUST_LOG` | no | `info` | `tracing-subscriber` `EnvFilter` log directive. |
 
@@ -162,9 +162,21 @@ journalctl -u litestream -n 50 --no-pager
 ```bash
 # Note a row count or a known value before restart.
 sudo systemctl restart buywise
-# Confirm the DB is intact after restart.
+# Confirm the local DB is intact after restart.
 sqlite3 /var/lib/buywise/buywise.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
 curl -i http://localhost:3000/api/auth/me
+```
+
+**Replication reached R2** (restore the replica into a scratch path and compare
+it to the live DB — proves the backup half of the acceptance criterion):
+
+```bash
+# Restore the latest R2 replica into a scratch file (does NOT touch the live DB).
+litestream restore -o /tmp/verify.db -config /etc/litestream.yml /var/lib/buywise/buywise.db
+# The restored copy must pass integrity_check and match the live row count.
+sqlite3 /tmp/verify.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
+sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
+rm -f /tmp/verify.db
 ```
 
 ## Logs and troubleshooting
@@ -182,10 +194,31 @@ journalctl -u litestream -f
 
 ## Disaster recovery (restore from R2)
 
-If the server is lost, restore the database from R2 before starting `buywise`:
+If the server is lost, restore the database from R2 **before** `buywise` runs.
+This is order-sensitive: `buywise-api` opens the DB with `create_if_missing`, so
+if it starts (or is enabled at boot and the box reboots) before the restore
+completes, it will create an empty DB and race the restore. The restore must run
+into an empty path, so `buywise` must be **stopped and disabled** first.
 
 ```bash
-litestream restore -config /etc/litestream.yml /var/lib/buywise/buywise.db
-chown buywise:buywise /var/lib/buywise/buywise.db
-sudo systemctl start buywise litestream
+# 1. Stop AND disable buywise so it cannot start (now or at the next boot)
+#    and race the restore by re-creating an empty DB. litestream is also down.
+sudo systemctl disable --now buywise litestream
+
+# 2. Make sure the target path is empty so restore writes a fresh copy.
+sudo rm -f /var/lib/buywise/buywise.db /var/lib/buywise/buywise.db-wal /var/lib/buywise/buywise.db-shm
+
+# 3. Restore the latest replica from R2 into the live path.
+sudo -u buywise litestream restore -config /etc/litestream.yml /var/lib/buywise/buywise.db
+
+# 4. Confirm ownership (only needed if the restore ran as root).
+sudo chown buywise:buywise /var/lib/buywise/buywise.db
+
+# 5. Re-enable and start the services, in order, only AFTER the restore is done.
+sudo systemctl enable --now buywise litestream
 ```
+
+> Do not run `litestream restore` while `buywise` is enabled or active — the
+> `After=buywise.service`/`Wants=buywise.service` ordering on `litestream.service`
+> governs normal startup, but it does not protect a manual restore from an
+> already-running app. Disabling buywise (step 1) is what guards the restore.
