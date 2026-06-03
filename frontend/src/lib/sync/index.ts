@@ -11,6 +11,7 @@
 import { db } from '$lib/db/dexie';
 import { drainQueue, type FailedMutation, type SyncQueueOptions } from './SyncQueue';
 import { SseClient, applySnapshotEvent, type SseClientOptions } from './SseClient';
+import { onMutationEnqueued } from './enqueueSignal';
 import type { ListSnapshot } from './types';
 
 export { drainQueue, MAX_RETRIES } from './SyncQueue';
@@ -23,6 +24,7 @@ export {
   backoffFor
 } from './SseClient';
 export type { SseClientOptions } from './SseClient';
+export { notifyMutationEnqueued, onMutationEnqueued } from './enqueueSignal';
 export * from './types';
 
 export interface SyncOptions {
@@ -59,7 +61,7 @@ export async function fetchSnapshot(
   }
   if (!response.ok) return null;
   const snapshot = (await response.json()) as ListSnapshot;
-  await applySnapshotEvent(snapshot);
+  await applySnapshotEvent(listId, snapshot);
   return snapshot;
 }
 
@@ -133,6 +135,16 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
     window.addEventListener('online', onOnline);
   }
 
+  // Flush immediately when the store enqueues a mutation for THIS list while
+  // online, so edits don't sit `pending` until the next refresh/`online` event.
+  // Routed through the same `enqueueSync()` chain so it never races the
+  // bootstrap/online drains, and gated by `stopped` so a torn-down engine is a
+  // no-op (the unsubscribe in stop() also detaches it).
+  const unsubscribeEnqueue = onMutationEnqueued((enqueuedListId) => {
+    if (stopped || enqueuedListId !== listId) return;
+    void enqueueSync().catch((err) => console.error('[sync] enqueue re-drain failed', err));
+  });
+
   return {
     async resync() {
       await bootstrap; // ensure the initial pass has wired up before re-draining
@@ -140,6 +152,7 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
     },
     stop() {
       stopped = true;
+      unsubscribeEnqueue();
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', onOnline);
       }

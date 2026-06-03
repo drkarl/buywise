@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { db, type LocalMutation } from '$lib/db/dexie';
-import { startSync, fetchSnapshot } from './index';
+import { startSync, fetchSnapshot, notifyMutationEnqueued } from './index';
 import type { ListSnapshot, MutationResponse, ServerListEntry } from './types';
 import type { EventSourceLike } from './SseClient';
 
@@ -259,5 +259,81 @@ describe('startSync', () => {
 
     expect((await db.mutation_queue.where('status').equals('confirmed').count())).toBe(1);
     handle.stop();
+  });
+
+  it('flushes immediately when a mutation is enqueued while running', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    let posts = 0;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
+          { status: 200 }
+        );
+      }
+      posts += 1;
+      const sent = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          client_mutation_id: sent.client_mutation_id,
+          status: 'accepted',
+          server_revision: posts,
+          entity: serverEntity(sent.entity_id, 'active', posts)
+        } satisfies MutationResponse),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync(); // bootstrap settles (no pending rows yet)
+
+    // Enqueue + signal (as the store does). The engine flushes without a resync.
+    await enqueue('e1');
+    notifyMutationEnqueued(LIST);
+    await handle.resync(); // drains chain serially; settles the signalled flush
+
+    expect(posts).toBe(1);
+    expect(await db.mutation_queue.where('status').equals('confirmed').count()).toBe(1);
+    handle.stop();
+  });
+
+  it('ignores enqueue signals for other lists and after stop()', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    let posts = 0;
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
+          { status: 200 }
+        );
+      }
+      posts += 1;
+      const sent = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          client_mutation_id: sent.client_mutation_id,
+          status: 'accepted',
+          server_revision: posts,
+          entity: serverEntity(sent.entity_id, 'active', posts)
+        } satisfies MutationResponse),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+    await enqueue('e1');
+
+    // A signal for a different list must not flush this engine.
+    notifyMutationEnqueued('some-other-list');
+    await handle.resync().catch(() => {});
+    expect(posts).toBe(1); // only the resync drained it (the foreign signal didn't)
+
+    // After teardown, signals are a no-op.
+    await enqueue('e2');
+    handle.stop();
+    notifyMutationEnqueued(LIST);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await db.mutation_queue.where('status').equals('pending').count()).toBe(1); // e2 stays
   });
 });
