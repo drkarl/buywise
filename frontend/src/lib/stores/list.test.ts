@@ -6,8 +6,6 @@ import {
 	markBought,
 	markSkipped,
 	deleteItem,
-	incrementQuantity,
-	decrementQuantity,
 	activeEntries,
 	basketEntries
 } from './list';
@@ -161,48 +159,41 @@ describe('drift guard — mark/delete on an unknown or stale id', () => {
 	});
 });
 
-describe('quantity', () => {
-	it('increment-then-bought keeps queue and local in lockstep on the same entity', async () => {
-		const id = await addItem(LIST, 'Flour');
-		await incrementQuantity(LIST, id);
-		await markBought(LIST, id);
-
-		const entry = await db.list_entries.get(id);
-		expect(entry?.quantity).toBe(2);
-		expect(entry?.status).toBe('bought');
-
-		const muts = await db.mutation_queue.toArray();
-		// add_item (initial) + add_item (increment) + mark_bought, all on this id.
-		expect(muts).toHaveLength(3);
-		expect(muts.every((m) => m.entity_id === id)).toBe(true);
-		expect(muts.filter((m) => m.operation_type === 'add_item')).toHaveLength(2);
-		expect(muts.filter((m) => m.operation_type === 'mark_bought')).toHaveLength(1);
-	});
-
-	it('increment bumps local quantity AND queues an add_item on the existing entity', async () => {
-		const id = await addItem(LIST, 'Apples');
-		await incrementQuantity(LIST, id);
-
-		expect((await db.list_entries.get(id))?.quantity).toBe(2);
-		const addMuts = (await db.mutation_queue.toArray()).filter(
-			(m) => m.operation_type === 'add_item'
-		);
-		// initial add + the increment, both on the same entity id
-		expect(addMuts).toHaveLength(2);
-		expect(addMuts.every((m) => m.entity_id === id)).toBe(true);
-	});
-
-	it('decrement updates local quantity only (no mutation) and floors at 1', async () => {
-		const id = await addItem(LIST, 'Bananas', 2);
+describe('list_id / entryId mismatch guard', () => {
+	it('markBought with a listId that does not match the entry mutates nothing and queues no mutation', async () => {
+		const id = await addItem(LIST, 'Limes');
 		const before = await db.mutation_queue.count();
 
-		await decrementQuantity(id);
-		expect((await db.list_entries.get(id))?.quantity).toBe(1);
+		await markBought('other-list', id);
 
-		await decrementQuantity(id); // already at floor
-		expect((await db.list_entries.get(id))?.quantity).toBe(1);
+		// Entry untouched: still active, still on the original list.
+		const entry = await db.list_entries.get(id);
+		expect(entry?.status).toBe('active');
+		expect(entry?.list_id).toBe(LIST);
 
-		expect(await db.mutation_queue.count()).toBe(before); // no queue growth
+		// No mark_bought mutation enqueued.
+		expect(await db.mutation_queue.count()).toBe(before);
+		const boughtMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'mark_bought'
+		);
+		expect(boughtMut).toBeUndefined();
+	});
+
+	it('deleteItem with a listId that does not match the entry mutates nothing and queues no mutation', async () => {
+		const id = await addItem(LIST, 'Lemons');
+		const before = await db.mutation_queue.count();
+
+		await deleteItem('other-list', id);
+
+		const entry = await db.list_entries.get(id);
+		expect(entry?.status).toBe('active');
+		expect(entry?.list_id).toBe(LIST);
+
+		expect(await db.mutation_queue.count()).toBe(before);
+		const delMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'delete_item'
+		);
+		expect(delMut).toBeUndefined();
 	});
 });
 
