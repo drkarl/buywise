@@ -89,24 +89,21 @@ export default defineConfig({
 						// NetworkFirst with cache fallback for the two cacheable API
 						// reads ONLY: `GET /api/list/:id` and `GET /api/items`.
 						//
-						// SECURITY — purge on logout (see below): these endpoints are
+						// SECURITY — auth-boundary purge: these endpoints are
 						// session-authenticated and household-scoped (the backend
 						// `get_list`/`list_items` handlers sit behind the
 						// `AuthenticatedUser` extractor, live since P1-T2). Workbox
-						// keys the cache by request URL only, NOT by session, so after
-						// a logout or an account switch on a shared browser profile
-						// this cache would serve the previous session's
-						// list/catalogue data offline to the next user.
+						// keys this cache by request URL only, NOT by session, so on
+						// its own it would serve a previous session's list/catalogue
+						// data offline after a logout or an account switch on a
+						// shared device.
 						//
-						// The frontend has no logout flow yet (login/logout UI is
-						// upcoming frontend work; the backend route is
-						// `POST /api/auth/logout`). Whoever wires that flow MUST clear
-						// this cache on logout/account-switch — no SW change needed,
-						// the page can do it directly:
-						//     await caches.delete('buywise-api-reads');
-						// (the precache/app-shell holds no user data, so it need not
-						// be cleared.) Until that call exists, this cache is a
-						// cross-account exposure once a second account uses the device.
+						// That hole is closed in this PR by `static/sw-purge-on-auth.js`
+						// (imported via `workbox.importScripts` below): it owns
+						// `POST /api/auth/login` and `POST /api/auth/logout` and
+						// deletes this entire cache on a successful response,
+						// covering explicit logout and account-switch-via-login. The
+						// app-shell precache holds no user data and is left intact.
 						//
 						// We match on `url.pathname` (not the whole href) with a
 						// matcher function so we can also pin the method to GET. This
@@ -141,7 +138,11 @@ export default defineConfig({
 							}
 						}
 					}
-				]
+				],
+				// Imported into the generated SW. Closes the auth-scoped cache
+				// exposure documented on `buywise-api-reads` above by deleting that
+				// cache on a successful login/logout. See the file for the rationale.
+				importScripts: ['sw-purge-on-auth.js']
 			}
 		})
 	]
