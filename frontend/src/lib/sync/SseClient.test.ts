@@ -100,21 +100,64 @@ describe('event appliers', () => {
     await db.list_entries.put({ ...stale, id: 'other', list_id: 'list-2' });
     await db.list_meta.put({ id: LIST, name: 'Old name', current_revision: 1 });
 
-    const snapshot: SseSnapshotData = {
+    const snapshot = {
       id: LIST,
       name: 'Fresh name',
       current_revision: 42,
-      entries: [serverEntity('a', 'active', 40), serverEntity('b', 'bought', 41)]
-    };
-    await applySnapshotEvent(snapshot);
+      entries: [snapshotEntity('a', 'active', 40), snapshotEntity('b', 'active', 41)]
+    } as unknown as SseSnapshotData;
+    await applySnapshotEvent(LIST, snapshot);
 
-    const ids = (await db.list_entries.where('list_id').equals(LIST).toArray())
-      .map((e) => e.id)
-      .sort();
-    expect(ids).toEqual(['a', 'b']); // 'old' gone, replaced wholesale
+    const rows = await db.list_entries.where('list_id').equals(LIST).toArray();
+    const ids = rows.map((e) => e.id).sort();
+    expect(ids).toEqual(['a', 'b']); // 'old' active row gone; snapshot actives in
+    // Every snapshot row carries the stamped list_id (server omitted it).
+    expect(rows.every((e) => e.list_id === LIST)).toBe(true);
     expect(await db.list_entries.get('other')).toBeDefined(); // other list untouched
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(42);
     expect((await db.list_meta.get(LIST))?.name).toBe('Fresh name');
+  });
+
+  it('applySnapshotEvent preserves local bought/skipped rows (active-only endpoint)', async () => {
+    // A previously-bought row lives only locally — the active-only snapshot can't
+    // enumerate it, so it must survive the snapshot apply (basket history kept).
+    await db.list_entries.put({
+      id: 'bought-1',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'milk',
+      display_name: 'milk',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 5,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    // A stale local active row that the snapshot no longer lists must be removed.
+    await db.list_entries.put({
+      id: 'gone',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'gone',
+      display_name: 'gone',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 3,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+
+    await applySnapshotEvent(LIST, {
+      id: LIST,
+      name: 'L',
+      current_revision: 10,
+      entries: [snapshotEntity('still-active', 'active', 10)]
+    } as unknown as SseSnapshotData);
+
+    expect((await db.list_entries.get('bought-1'))?.status).toBe('bought'); // preserved
+    expect(await db.list_entries.get('gone')).toBeUndefined(); // stale active removed
+    expect(await db.list_entries.get('still-active')).toBeDefined(); // snapshot active in
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(10);
   });
 
   it('applySnapshotEvent does not roll the revision (and entries) backwards', async () => {
@@ -132,12 +175,12 @@ describe('event appliers', () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 9 });
 
     // A stale snapshot (revision 4 < local 9) must be skipped wholesale.
-    await applySnapshotEvent({
+    await applySnapshotEvent(LIST, {
       id: LIST,
       name: 'Stale',
       current_revision: 4,
-      entries: [serverEntity('old', 'active', 4)]
-    });
+      entries: [snapshotEntity('old', 'active', 4)]
+    } as unknown as SseSnapshotData);
 
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(9); // unchanged
     const ids = (await db.list_entries.where('list_id').equals(LIST).toArray()).map((e) => e.id);
@@ -158,7 +201,11 @@ describe('event appliers', () => {
     });
 
     await expect(
-      applySnapshotEvent({ id: LIST, name: 'x', current_revision: 5 } as unknown as SseSnapshotData)
+      applySnapshotEvent(LIST, {
+        id: LIST,
+        name: 'x',
+        current_revision: 5
+      } as unknown as SseSnapshotData)
     ).rejects.toThrow(/malformed/);
     // Local entries survive the rejected (malformed) snapshot.
     expect(await db.list_entries.get('keep')).toBeDefined();
