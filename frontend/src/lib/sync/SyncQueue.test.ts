@@ -312,4 +312,40 @@ describe('drainQueue', () => {
 
     expect(sentHeader).toBe('tok-123');
   });
+
+  it('does not let a stale (lower-revision) response overwrite a newer local entry', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    const id = await enqueue('e1', 'mark_bought');
+    // The SSE stream already advanced this entry to a deleted state at rev 7.
+    await db.list_entries.put({
+      id: 'e1',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'Milk',
+      display_name: 'Milk',
+      quantity: 1,
+      status: 'deleted',
+      last_updated_revision: 7,
+      updated_at: '2026-06-03T00:02:00.000Z'
+    });
+
+    // The (delayed) POST response carries an older entity (rev 6) for e1.
+    const fetchFn = vi.fn(async (_url, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      return okResponse({
+        client_mutation_id: sent.client_mutation_id,
+        status: 'accepted',
+        server_revision: 6,
+        entity: serverEntity('e1', 'bought', 6)
+      });
+    }) as unknown as typeof fetch;
+
+    await drainQueue(LIST, { fetchFn });
+
+    // The newer local row is preserved; the mutation is still confirmed and meta
+    // stays monotonic.
+    expect((await db.list_entries.get('e1'))?.status).toBe('deleted');
+    expect((await db.mutation_queue.get(id))?.status).toBe('confirmed');
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(6);
+  });
 });

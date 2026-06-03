@@ -83,7 +83,40 @@ describe('event appliers', () => {
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(9);
   });
 
-  it('applySnapshotEvent replaces all entries and resets the revision', async () => {
+  it('applyMutationEvent does not let an older entity overwrite a newer entry', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 1 });
+    // A newer SSE event (delete at rev 3) applied first.
+    await applyMutationEvent({ server_revision: 3, entity: serverEntity('e1', 'deleted', 3) });
+    expect((await db.list_entries.get('e1'))?.status).toBe('deleted');
+
+    // A delayed lower-revision entity (bought at rev 2) for the same entry must
+    // NOT clobber the newer row, even though meta is already at 3.
+    await applyMutationEvent({ server_revision: 2, entity: serverEntity('e1', 'bought', 2) });
+    expect((await db.list_entries.get('e1'))?.status).toBe('deleted'); // unchanged
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(3);
+  });
+
+  it('applyMutationEvent applies an equal-or-higher revision entity', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 2 });
+    await applyMutationEvent({ server_revision: 2, entity: serverEntity('e1', 'active', 2) });
+    // Equal per-entry revision still applies (the LWW server reissued the row).
+    await applyMutationEvent({ server_revision: 3, entity: serverEntity('e1', 'bought', 2) });
+    expect((await db.list_entries.get('e1'))?.status).toBe('bought');
+  });
+
+  // The server's snapshot EntryView OMITS `list_id` and is active-only, so the
+  // snapshot factory mirrors that: no `list_id` field; the applier stamps it.
+  function snapshotEntity(
+    id: string,
+    status: ServerListEntry['status'],
+    rev: number
+  ): Omit<ServerListEntry, 'list_id'> {
+    const { list_id: _omit, ...rest } = serverEntity(id, status, rev);
+    void _omit;
+    return rest;
+  }
+
+  it('applySnapshotEvent stamps list_id and upserts the active set', async () => {
     const stale: LocalListEntry = {
       id: 'old',
       list_id: LIST,

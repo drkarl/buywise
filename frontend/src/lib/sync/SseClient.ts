@@ -54,7 +54,16 @@ export interface SseClientOptions {
 export async function applyMutationEvent(data: SseMutationData): Promise<void> {
   const entry = toLocalEntry(data.entity);
   await db.transaction('rw', db.list_entries, db.list_meta, async () => {
-    await db.list_entries.put(entry);
+    // Per-entry monotonic guard: only overwrite the local row if the incoming
+    // entity is at least as new (by `last_updated_revision`). Events for the same
+    // entry can arrive out of order across the SSE and drain paths (e.g. an SSE
+    // delete at rev 3 racing a delayed POST response at rev 2); writing the older
+    // entity would clobber the newer one while meta stays advanced, leaving a
+    // stale row a reconnect won't repair. Read-modify-write stays in this txn.
+    const existing = await db.list_entries.get(entry.id);
+    if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+      await db.list_entries.put(entry);
+    }
     const meta = await db.list_meta.get(entry.list_id);
     const now = new Date().toISOString();
     if (meta) {
