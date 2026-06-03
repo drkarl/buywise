@@ -103,6 +103,11 @@ export async function addItem(
 ): Promise<string> {
   const text = rawText.trim();
   if (!text) throw new Error('addItem: rawText must not be empty');
+  if (!listId) throw new Error('addItem: listId must not be empty');
+
+  // Clamp to a sane positive integer; the UI never sends < 1 but a programmatic
+  // caller could, and a non-positive quantity is meaningless for an add.
+  const safeQuantity = Math.max(1, Math.floor(quantity));
 
   const entryId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -114,7 +119,7 @@ export async function addItem(
     resolution_status: 'unresolved',
     raw_text: text,
     display_name: text,
-    quantity,
+    quantity: safeQuantity,
     status: 'active',
     last_updated_revision: 0,
     updated_at: now
@@ -123,7 +128,7 @@ export async function addItem(
   const mutation = await buildMutation(listId, entryId, 'add_item', {
     raw_text: text,
     display_name: text,
-    quantity
+    quantity: safeQuantity
   });
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
@@ -142,11 +147,16 @@ export async function markBought(listId: string, entryId: string): Promise<void>
   });
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    await db.list_entries.update(entryId, {
+    // Only enqueue the mutation if the optimistic update actually applied.
+    // `update` returns the number of records changed (0 for a missing/stale id),
+    // which guards against queue/local drift on a rapid double-tap or a swipe-
+    // delete racing this check-off (mirrors the `incrementQuantity` guard).
+    const updated = await db.list_entries.update(entryId, {
       status: 'bought',
       bought_at: now,
       updated_at: now
     });
+    if (!updated) return;
     await db.mutation_queue.add(mutation);
   });
 }
@@ -157,10 +167,12 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
   const mutation = await buildMutation(listId, entryId, 'mark_skipped', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    await db.list_entries.update(entryId, {
+    // Guard against drift: skip the enqueue if no record matched the id.
+    const updated = await db.list_entries.update(entryId, {
       status: 'skipped',
       updated_at: now
     });
+    if (!updated) return;
     await db.mutation_queue.add(mutation);
   });
 }
@@ -171,10 +183,13 @@ export async function deleteItem(listId: string, entryId: string): Promise<void>
   const mutation = await buildMutation(listId, entryId, 'delete_item', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    await db.list_entries.update(entryId, {
+    // Guard against drift: skip the enqueue if no record matched the id
+    // (e.g. an already-deleted entry from a rapid double-tap/swipe).
+    const updated = await db.list_entries.update(entryId, {
       status: 'deleted',
       updated_at: now
     });
+    if (!updated) return;
     await db.mutation_queue.add(mutation);
   });
 }
