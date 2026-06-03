@@ -147,13 +147,16 @@ export async function markBought(listId: string, entryId: string): Promise<void>
   });
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Load the entry first and bail unless it exists AND belongs to `listId`.
-    // This keeps the optimistic update and the queued mutation about the SAME
-    // entry on the SAME list: a stale/bad caller can't mutate an entry from one
-    // list while queueing a mutation tagged with another. It also subsumes the
-    // old "missing id" drift guard (a missing entry simply fails the check).
+    // Load the entry first and bail unless it exists, belongs to `listId`, and is
+    // not already deleted. The list-id check keeps the optimistic update and the
+    // queued mutation about the SAME entry on the SAME list (and subsumes the old
+    // "missing id" drift guard). The `deleted` check mirrors the backend's
+    // "delete wins" rule — `apply_mark_bought` never resurrects a deleted entry —
+    // so without it a stale/racing check-off after a delete would locally
+    // resurrect a soft-deleted row as bought, diverging from the server. Any
+    // other status (active/bought/skipped) still transitions, matching backend LWW.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId) return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
     await db.list_entries.update(entryId, {
       status: 'bought',
       bought_at: now,
@@ -169,10 +172,11 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
   const mutation = await buildMutation(listId, entryId, 'mark_skipped', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Load + validate the entry against `listId` (see `markBought`) so the
-    // local update and the queued mutation never disagree about which list.
+    // Validate against `listId` and skip already-deleted entries (see
+    // `markBought`): the backend's "delete wins" rule never resurrects a deleted
+    // entry to 'skipped', so neither does the offline UI. Other statuses transition.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId) return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
     await db.list_entries.update(entryId, {
       status: 'skipped',
       updated_at: now
@@ -187,10 +191,12 @@ export async function deleteItem(listId: string, entryId: string): Promise<void>
   const mutation = await buildMutation(listId, entryId, 'delete_item', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Load + validate the entry against `listId` (see `markBought`) so the
-    // local update and the queued mutation never disagree about which list.
+    // Validate against `listId`; `deleted` is terminal, so deleting an
+    // already-deleted entry is an idempotent no-op (active/bought/skipped rows are
+    // all deletable). This also stops a racing double-tap or swipe from enqueuing
+    // a redundant second delete_item.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId) return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
     await db.list_entries.update(entryId, {
       status: 'deleted',
       updated_at: now

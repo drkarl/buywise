@@ -150,12 +150,43 @@ describe('drift guard — mark/delete on an unknown or stale id', () => {
 		await deleteItem(LIST, id);
 		const after = await db.mutation_queue.count();
 
-		// Racing double-tap / swipe-delete: the entry is still present (soft-deleted)
-		// so the update succeeds and a second delete_item IS enqueued. That is fine —
-		// the entity exists; the drift we guard against is mutations with no matching
-		// optimistic record at all.
+		// `deleted` is terminal: a racing double-tap / swipe-delete on an already
+		// soft-deleted entry is an idempotent no-op — no redundant delete_item.
 		await deleteItem(LIST, id);
-		expect(await db.mutation_queue.count()).toBe(after + 1);
+		expect(await db.mutation_queue.count()).toBe(after);
+	});
+});
+
+describe('delete-wins guard — no resurrection of a deleted entry', () => {
+	it('markBought on a deleted entry does not resurrect it and queues NO mutation', async () => {
+		const id = await addItem(LIST, 'Mustard');
+		await deleteItem(LIST, id);
+		const after = await db.mutation_queue.count();
+
+		await markBought(LIST, id);
+
+		// Mirrors the backend's "delete wins": status stays 'deleted'.
+		expect((await db.list_entries.get(id))?.status).toBe('deleted');
+		expect(await db.mutation_queue.count()).toBe(after);
+		const boughtMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'mark_bought'
+		);
+		expect(boughtMut).toBeUndefined();
+	});
+
+	it('markSkipped on a deleted entry does not resurrect it and queues NO mutation', async () => {
+		const id = await addItem(LIST, 'Relish');
+		await deleteItem(LIST, id);
+		const after = await db.mutation_queue.count();
+
+		await markSkipped(LIST, id);
+
+		expect((await db.list_entries.get(id))?.status).toBe('deleted');
+		expect(await db.mutation_queue.count()).toBe(after);
+		const skipMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'mark_skipped'
+		);
+		expect(skipMut).toBeUndefined();
 	});
 });
 
