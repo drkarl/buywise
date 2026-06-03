@@ -10,7 +10,12 @@
 
 import { db } from '$lib/db/dexie';
 import { drainQueue, type FailedMutation, type SyncQueueOptions } from './SyncQueue';
-import { SseClient, applySnapshotEvent, type SseClientOptions } from './SseClient';
+import {
+  SseClient,
+  applySnapshotEvent,
+  type SseClientOptions,
+  type ApplySnapshotOptions
+} from './SseClient';
 import { onMutationEnqueued } from './enqueueSignal';
 import type { ListSnapshot } from './types';
 
@@ -47,11 +52,14 @@ export interface SyncHandle {
  * Fetches the authoritative `GET /api/list/:id` snapshot and replaces local
  * `list_entries` + `list_meta` for the list. Used to seed state on first sync
  * (so reconnects have a `?since=` baseline) and reused by the `full_snapshot`
- * applier. Returns the snapshot, or `null` if the fetch fails (offline).
+ * applier. `reconcile` forwards to `applySnapshotEvent` to bypass the revision
+ * short-circuit after a rejected drain. Returns the snapshot, or `null` if the
+ * fetch fails (offline).
  */
 export async function fetchSnapshot(
   listId: string,
-  fetchFn: typeof fetch = fetch
+  fetchFn: typeof fetch = fetch,
+  options: ApplySnapshotOptions = {}
 ): Promise<ListSnapshot | null> {
   let response: Response;
   try {
@@ -61,14 +69,18 @@ export async function fetchSnapshot(
   }
   if (!response.ok) return null;
   const snapshot = (await response.json()) as ListSnapshot;
-  await applySnapshotEvent(listId, snapshot);
+  await applySnapshotEvent(listId, snapshot, options);
   return snapshot;
 }
 
 /**
  * Drains the queue then ensures `list_meta` exists for the list. If we have no
  * baseline revision yet (first run for this device), pull a snapshot first so
- * the queue's `base_revision`s and the SSE `?since=` are anchored.
+ * the queue's `base_revision`s and the SSE `?since=` are anchored. If the drain
+ * terminally rejected any mutation (4xx), re-fetch the snapshot with
+ * `{ reconcile: true }` afterwards so the optimistic local state for the rejected
+ * entries is corrected to server truth (the rejection doesn't bump the revision,
+ * so the snapshot's normal revision short-circuit would otherwise skip the fix).
  */
 async function runSync(listId: string, options: SyncOptions): Promise<void> {
   const fetchFn = options.fetchFn ?? fetch;
@@ -80,11 +92,17 @@ async function runSync(listId: string, options: SyncOptions): Promise<void> {
     await fetchSnapshot(listId, fetchFn);
   }
 
-  await drainQueue(listId, {
+  const result = await drainQueue(listId, {
     fetchFn,
     sleep: options.sleep,
     onFailed: options.onFailed
   });
+
+  if (result.failed.length > 0) {
+    // A 4xx means we're online, so this GET should succeed. (Offline drains leave
+    // rows `pending`, not `failed`, so this never fires spuriously.)
+    await fetchSnapshot(listId, fetchFn, { reconcile: true });
+  }
 }
 
 /**

@@ -112,10 +112,26 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  * while its mutation is still queued. So such ids are preserved. Rows backing a
  * terminal `failed` mutation are NOT preserved (the rejection is surfaced via
  * `onFailed`); confirmed mutations have their entity in the snapshot already.
+ *
+ * `reconcile`: a terminal 4xx rejection does NOT bump the server revision, so
+ * after a failed drain `meta.current_revision === snapshot.current_revision` and
+ * the revision short-circuit below would skip the whole apply, leaving the
+ * phantom optimistic row in place. When `runSync` detects failures it re-fetches
+ * with `{ reconcile: true }` to bypass ONLY that short-circuit; every other rule
+ * (pending-preservation, active-set scoping, non-active preservation, upsert) is
+ * unchanged, so a rejected `add_item` (now `failed`, not preserved, absent from
+ * the snapshot) is deleted and a rejected status change is reverted to the
+ * snapshot's authoritative `active` row.
  */
+export interface ApplySnapshotOptions {
+  /** Bypass the revision short-circuit to reconcile after a rejected drain. */
+  reconcile?: boolean;
+}
+
 export async function applySnapshotEvent(
   listId: string,
-  snapshot: SseSnapshotData
+  snapshot: SseSnapshotData,
+  options: ApplySnapshotOptions = {}
 ): Promise<void> {
   // Defensive parse guard: a snapshot with a missing/garbled `entries` array
   // would otherwise silently wipe local active state. The wire shape is
@@ -133,8 +149,10 @@ export async function applySnapshotEvent(
     // A snapshot carries state at its `current_revision`. If our local revision
     // is already >= the snapshot's, our state is newer (e.g. a stale GET racing
     // applied SSE mutations on the reused resync path), so applying it would roll
-    // both entries and revision backwards. Skip wholesale.
-    if (meta && meta.current_revision >= snapshot.current_revision) {
+    // both entries and revision backwards. Skip wholesale — UNLESS reconciling
+    // after a rejected drain, where the revision is unchanged but the optimistic
+    // row still needs correcting (see `reconcile` in the doc above).
+    if (!options.reconcile && meta && meta.current_revision >= snapshot.current_revision) {
       return;
     }
 
