@@ -5,7 +5,9 @@
 //   2. optimistically updates the `LocalListEntry` in `list_entries`.
 // The UI renders straight off Dexie via `liveQuery`, so it never waits for the
 // server. The sync loop (P2-T4) drains the queue when online; NO network code
-// lives here.
+// lives here. After each enqueue we fire `notifyMutationEnqueued(listId)` — a
+// decoupled in-process signal (not network) — so a running sync engine flushes
+// the new mutation immediately instead of leaving it `pending` until a refresh.
 
 import { liveQuery, type Observable } from 'dexie';
 import { readable, type Readable } from 'svelte/store';
@@ -15,6 +17,7 @@ import {
   type LocalMutation
 } from '$lib/db/dexie';
 import { getDeviceId } from '$lib/db/device';
+import { notifyMutationEnqueued } from '$lib/sync/enqueueSignal';
 
 /** Operation types in scope for P2-T3 (subset of the canonical enum). */
 type OperationType = 'add_item' | 'mark_bought' | 'mark_skipped' | 'delete_item';
@@ -136,6 +139,8 @@ export async function addItem(
     await db.mutation_queue.add(mutation);
   });
 
+  // Committed — let a running sync engine flush it now.
+  notifyMutationEnqueued(listId);
   return entryId;
 }
 
@@ -146,7 +151,7 @@ export async function markBought(listId: string, entryId: string): Promise<void>
     bought_at: now
   });
 
-  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
     // Load the entry first and bail unless it exists, belongs to `listId`, and is
     // not already deleted. The list-id check keeps the optimistic update and the
     // queued mutation about the SAME entry on the SAME list (and subsumes the old
@@ -156,14 +161,16 @@ export async function markBought(listId: string, entryId: string): Promise<void>
     // resurrect a soft-deleted row as bought, diverging from the server. Any
     // other status (active/bought/skipped) still transitions, matching backend LWW.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'bought',
       bought_at: now,
       updated_at: now
     });
     await db.mutation_queue.add(mutation);
+    return true;
   });
+  if (enqueued) notifyMutationEnqueued(listId);
 }
 
 /** Marks an entry as skipped (moves it into the basket section). */
@@ -171,18 +178,20 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
   const now = new Date().toISOString();
   const mutation = await buildMutation(listId, entryId, 'mark_skipped', {});
 
-  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
     // Validate against `listId` and skip already-deleted entries (see
     // `markBought`): the backend's "delete wins" rule never resurrects a deleted
     // entry to 'skipped', so neither does the offline UI. Other statuses transition.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'skipped',
       updated_at: now
     });
     await db.mutation_queue.add(mutation);
+    return true;
   });
+  if (enqueued) notifyMutationEnqueued(listId);
 }
 
 /** Soft-deletes an entry (status: 'deleted'); never shown in the UI again. */
@@ -190,17 +199,19 @@ export async function deleteItem(listId: string, entryId: string): Promise<void>
   const now = new Date().toISOString();
   const mutation = await buildMutation(listId, entryId, 'delete_item', {});
 
-  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
     // Validate against `listId`; `deleted` is terminal, so deleting an
     // already-deleted entry is an idempotent no-op (active/bought/skipped rows are
     // all deletable). This also stops a racing double-tap or swipe from enqueuing
     // a redundant second delete_item.
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return;
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'deleted',
       updated_at: now
     });
     await db.mutation_queue.add(mutation);
+    return true;
   });
+  if (enqueued) notifyMutationEnqueued(listId);
 }
