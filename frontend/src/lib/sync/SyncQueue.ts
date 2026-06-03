@@ -65,11 +65,17 @@ async function postMutation(
 ): Promise<{ ok: MutationResponse } | { rejected: { status: number; message: string } }> {
   const body = {
     client_mutation_id: mutation.client_mutation_id,
-    // Re-stamp the live device id rather than trusting the queued value: keeps
-    // attribution correct even if the row was created before `getDeviceId`
-    // settled (e.g. SSR/private-mode fallback), and costs nothing.
+    // Prefer the device id captured when the mutation was enqueued: the device
+    // that created the mutation owns its attribution. Fall back to the live
+    // `getDeviceId()` only when the queued value is missing (e.g. the row was
+    // created before `getDeviceId` settled in an SSR/private-mode fallback).
     device_id: mutation.device_id || getDeviceId(),
     list_id: mutation.list_id,
+    // `base_revision` is captured at enqueue and intentionally NOT re-stamped
+    // before each POST. The server is pure last-write-wins (plan P1-T4: "the
+    // server always accepts the mutation and assigns a new revision") and never
+    // rejects on a stale `base_revision`, so a multi-mutation offline batch
+    // carrying older base_revisions is harmless — the field is informational.
     base_revision: mutation.base_revision,
     entity_type: mutation.entity_type,
     entity_id: mutation.entity_id,
@@ -178,7 +184,12 @@ export async function drainQueue(
   for (const mutation of pending) {
     if (mutation.id === undefined) continue; // defensive — persisted rows always have an id
 
+    // `attempt` is the per-drain retry budget (bounded by MAX_RETRIES so a
+    // mutation that exhausted retries in a past drain still retries on the next
+    // reconnect). `retry_count` persisted on the row is the LIFETIME counter, so
+    // we accumulate onto the value already stored rather than resetting it.
     let attempt = 0;
+    let lifetimeRetries = mutation.retry_count ?? 0;
 
     // Retry loop for transport/5xx failures only. A 4xx breaks out via `failed`.
     for (;;) {
@@ -188,7 +199,8 @@ export async function drainQueue(
       } catch (err) {
         if (!(err instanceof NetworkError)) throw err;
         attempt += 1;
-        await db.mutation_queue.update(mutation.id, { retry_count: attempt });
+        lifetimeRetries += 1;
+        await db.mutation_queue.update(mutation.id, { retry_count: lifetimeRetries });
         if (attempt > MAX_RETRIES) {
           // Out of retries while offline/degraded: leave this and all later
           // mutations `pending` and stop, so ordering is preserved for the
