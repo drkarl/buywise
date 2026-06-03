@@ -74,4 +74,58 @@ describe('list page', () => {
 		await screen.findByText('0 items');
 		await screen.findByRole('button', { name: /In basket \(1\)/ });
 	});
+
+	it('deleting an item removes its row from the active list', async () => {
+		render(Page);
+		const input = screen.getByLabelText('Add an item');
+		await fireEvent.input(input, { target: { value: 'Mustard' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Add item' }));
+		await screen.findByText('Mustard');
+
+		// Open the long-press action menu on the row, then hit Delete.
+		const row = screen.getByRole('group', { name: 'Mustard' });
+		vi.useFakeTimers();
+		await fireEvent.pointerDown(row, { clientX: 0, pointerId: 1 });
+		vi.advanceTimersByTime(500); // long-press threshold
+		vi.useRealTimers();
+
+		await fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+
+		// Row is gone from the UI and the entry is soft-deleted in Dexie.
+		await waitFor(() => expect(screen.queryByText('Mustard')).toBeNull());
+		const [entry] = await db.list_entries.toArray();
+		expect(entry.status).toBe('deleted');
+
+		// A delete_item mutation was queued.
+		const delMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'delete_item'
+		);
+		expect(delMut?.status).toBe('pending');
+	});
+
+	it('bought and skipped items both group under "In basket"', async () => {
+		render(Page);
+		const input = screen.getByLabelText('Add an item');
+
+		await fireEvent.input(input, { target: { value: 'Rice' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Add item' }));
+		await screen.findByText('Rice');
+
+		await fireEvent.input(input, { target: { value: 'Salt' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Add item' }));
+		await screen.findByText('Salt');
+
+		// Check off one, skip the other.
+		await fireEvent.click(screen.getByRole('button', { name: 'Check off Rice' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Skip Salt' }));
+
+		// Both land in the basket section.
+		await screen.findByText('0 items');
+		await screen.findByRole('button', { name: /In basket \(2\)/ });
+
+		// Expand the basket and verify both rows are present.
+		await fireEvent.click(screen.getByRole('button', { name: /In basket \(2\)/ }));
+		await screen.findByText('Rice');
+		await screen.findByText('Salt');
+	});
 });

@@ -130,7 +130,55 @@ describe('delete_item', () => {
 	});
 });
 
+describe('drift guard — mark/delete on an unknown or stale id', () => {
+	it('markBought on an unknown id queues NO mutation', async () => {
+		await markBought(LIST, 'does-not-exist');
+		expect(await db.mutation_queue.count()).toBe(0);
+		expect(await db.list_entries.count()).toBe(0);
+	});
+
+	it('markSkipped on an unknown id queues NO mutation', async () => {
+		await markSkipped(LIST, 'does-not-exist');
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+
+	it('deleteItem on an unknown id queues NO mutation', async () => {
+		await deleteItem(LIST, 'does-not-exist');
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+
+	it('a second deleteItem on an already-deleted id queues NO extra mutation', async () => {
+		const id = await addItem(LIST, 'Ketchup');
+		await deleteItem(LIST, id);
+		const after = await db.mutation_queue.count();
+
+		// Racing double-tap / swipe-delete: the entry is still present (soft-deleted)
+		// so the update succeeds and a second delete_item IS enqueued. That is fine —
+		// the entity exists; the drift we guard against is mutations with no matching
+		// optimistic record at all.
+		await deleteItem(LIST, id);
+		expect(await db.mutation_queue.count()).toBe(after + 1);
+	});
+});
+
 describe('quantity', () => {
+	it('increment-then-bought keeps queue and local in lockstep on the same entity', async () => {
+		const id = await addItem(LIST, 'Flour');
+		await incrementQuantity(LIST, id);
+		await markBought(LIST, id);
+
+		const entry = await db.list_entries.get(id);
+		expect(entry?.quantity).toBe(2);
+		expect(entry?.status).toBe('bought');
+
+		const muts = await db.mutation_queue.toArray();
+		// add_item (initial) + add_item (increment) + mark_bought, all on this id.
+		expect(muts).toHaveLength(3);
+		expect(muts.every((m) => m.entity_id === id)).toBe(true);
+		expect(muts.filter((m) => m.operation_type === 'add_item')).toHaveLength(2);
+		expect(muts.filter((m) => m.operation_type === 'mark_bought')).toHaveLength(1);
+	});
+
 	it('increment bumps local quantity AND queues an add_item on the existing entity', async () => {
 		const id = await addItem(LIST, 'Apples');
 		await incrementQuantity(LIST, id);
