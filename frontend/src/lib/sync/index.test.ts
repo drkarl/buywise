@@ -413,6 +413,65 @@ describe('runSync reconcile-on-failure', () => {
     handle.stop();
   });
 
+  it('stale reconcile still reverts a failed mark_bought on a different entity', async () => {
+    // Failed mark_bought on entity X (server unchanged, still rev 5). While the
+    // reconcile GET is in flight, SSE advances meta to rev 6 for ANOTHER row. The
+    // stale snapshot skips the wholesale apply but must still revert X to active.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    await enqueueOp('x', 'mark_bought', 'bought');
+    // X's optimistic row is bought; its server rev is still 5.
+    await db.list_entries.update('x', { last_updated_revision: 5 });
+
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/list/')) {
+        // SSE advances meta to 6 for an unrelated row mid-flight.
+        await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+        await db.list_entries.put({
+          id: 'unrelated',
+          list_id: LIST,
+          resolution_status: 'unresolved',
+          raw_text: 'unrelated',
+          display_name: 'unrelated',
+          quantity: 1,
+          status: 'active',
+          last_updated_revision: 6,
+          updated_at: '2026-06-03T00:00:00.000Z'
+        });
+        // Stale rev-5 snapshot: X is still active server-side.
+        return new Response(
+          JSON.stringify({
+            id: LIST,
+            name: 'L',
+            current_revision: 5,
+            entries: [
+              {
+                id: 'x',
+                canonical_item_id: null,
+                resolution_status: 'unresolved',
+                raw_text: 'x',
+                display_name: 'x',
+                quantity: 1,
+                status: 'active',
+                last_updated_revision: 5,
+                updated_at: '2026-06-03T00:00:00.000Z'
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('conflict', { status: 409 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+
+    expect((await db.list_entries.get('x'))?.status).toBe('active'); // reverted
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(6); // no rollback
+    expect(await db.list_entries.get('unrelated')).toBeDefined(); // not deleted
+    handle.stop();
+  });
+
   it('removes a phantom optimistic add_item after a 4xx reconcile snapshot', async () => {
     // meta already exists (revision unchanged by a rejection), so without the
     // reconcile flag the snapshot apply would short-circuit and leave the phantom.
