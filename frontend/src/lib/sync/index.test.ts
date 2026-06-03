@@ -371,6 +371,48 @@ describe('runSync reconcile-on-failure', () => {
     } as LocalMutation);
   }
 
+  it('reconcile with a stale snapshot does not roll back newer SSE state', async () => {
+    // Rejected add at rev 5; while the reconcile GET is in flight, live SSE
+    // advances local state to rev 6 and adds a row. The stale rev-5 snapshot must
+    // NOT roll back, but the rejected add must STILL be removed.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    await enqueueOp('rejected', 'add_item', 'active');
+
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/list/')) {
+        // Simulate SSE advancing local state DURING the reconcile GET: bump meta
+        // to 6 and add a fresh active row before returning the stale rev-5 body.
+        await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+        await db.list_entries.put({
+          id: 'sse-added',
+          list_id: LIST,
+          resolution_status: 'unresolved',
+          raw_text: 'sse-added',
+          display_name: 'sse-added',
+          quantity: 1,
+          status: 'active',
+          last_updated_revision: 6,
+          updated_at: '2026-06-03T00:00:00.000Z'
+        });
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
+          { status: 200 }
+        );
+      }
+      return new Response('item not allowed', { status: 422 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+
+    // No rollback: meta stays at 6, the SSE-added row survives.
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(6);
+    expect(await db.list_entries.get('sse-added')).toBeDefined();
+    // The rejected add is still cleaned up despite the skipped wholesale reconcile.
+    expect(await db.list_entries.get('rejected')).toBeUndefined();
+    handle.stop();
+  });
+
   it('removes a phantom optimistic add_item after a 4xx reconcile snapshot', async () => {
     // meta already exists (revision unchanged by a rejection), so without the
     // reconcile flag the snapshot apply would short-circuit and leave the phantom.

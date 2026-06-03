@@ -312,6 +312,80 @@ describe('event appliers', () => {
     expect((await db.list_entries.get('keep-bought'))?.status).toBe('bought'); // preserved
   });
 
+  it('reconcile with a STALE snapshot skips wholesale but still forces removals', async () => {
+    // Live SSE already advanced local meta to rev 6 and added a row; a reconcile
+    // GET that started at rev 5 is now stale and must not roll state backward.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+    await db.list_entries.put({
+      id: 'sse-added',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'sse-added',
+      display_name: 'sse-added',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 6,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    // A rejected-add row that must STILL be force-removed despite the stale skip.
+    await db.list_entries.put({
+      id: 'rejected-add',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'rejected-add',
+      display_name: 'rejected-add',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 0,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    // Stale rev-5 snapshot that omits 'sse-added' (it was added at rev 6).
+    await applySnapshotEvent(
+      LIST,
+      { id: LIST, name: 'L', current_revision: 5, entries: [] } as unknown as SseSnapshotData,
+      { reconcile: true, removeEntityIds: ['rejected-add'] }
+    );
+
+    // Wholesale skipped: meta not rolled back, sse-added not deleted.
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(6);
+    expect(await db.list_entries.get('sse-added')).toBeDefined();
+    // Forced removal still happened.
+    expect(await db.list_entries.get('rejected-add')).toBeUndefined();
+  });
+
+  it('reconcile with a NEWER snapshot applies the wholesale reconcile', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    await db.list_entries.put({
+      id: 'old-active',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'old-active',
+      display_name: 'old-active',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 5,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    // Newer rev-7 snapshot that no longer lists 'old-active'.
+    await applySnapshotEvent(
+      LIST,
+      {
+        id: LIST,
+        name: 'L',
+        current_revision: 7,
+        entries: [snapshotEntity('new-active', 'active', 7)]
+      } as unknown as SseSnapshotData,
+      { reconcile: true }
+    );
+
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(7);
+    expect(await db.list_entries.get('old-active')).toBeUndefined(); // reconciled away
+    expect(await db.list_entries.get('new-active')).toBeDefined();
+  });
+
   it('applySnapshotEvent does not roll the revision (and entries) backwards', async () => {
     await db.list_entries.put({
       id: 'fresh',
