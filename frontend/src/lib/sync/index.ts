@@ -93,18 +93,41 @@ async function runSync(listId: string, options: SyncOptions): Promise<void> {
 export function startSync(listId: string, options: SyncOptions = {}): SyncHandle {
   const sse = new SseClient(listId, options.sse);
 
+  // Single cancellation flag checked by every async continuation. stop() flips
+  // it so post-teardown work (the deferred sse.start(), an in-flight resync, a
+  // late `online` re-drain) becomes a no-op and never re-opens a dead stream.
+  let stopped = false;
+
+  // Single in-flight-sync guard: every drain path (bootstrap, resync, online)
+  // chains onto this promise so only one runSync() runs at a time. Without it,
+  // an `online` event during the initial drain would start a second concurrent
+  // drainQueue() over the same pending rows (redundant POSTs / racing writes).
+  let syncChain: Promise<void> = Promise.resolve();
+  function enqueueSync(): Promise<void> {
+    syncChain = syncChain
+      .catch(() => {}) // a prior failure must not poison later runs
+      .then(() => {
+        if (stopped) return; // cancelled during teardown — skip
+        return runSync(listId, options);
+      });
+    return syncChain;
+  }
+
   // Kick off the initial drain, then open the live stream. Errors are logged,
   // not thrown, so a failed initial drain (offline) never blocks the stream or
-  // the mount.
-  const bootstrap = runSync(listId, options)
+  // the mount. The deferred sse.start() is gated on `stopped` so a stop() during
+  // the initial drain does not re-open SSE after teardown.
+  const bootstrap = enqueueSync()
     .catch((err) => console.error('[sync] initial drain failed', err))
-    .then(() => sse.start())
+    .then(() => {
+      if (stopped) return; // torn down before the drain finished
+      return sse.start();
+    })
     .catch((err) => console.error('[sync] SSE start failed', err));
 
   const onOnline = () => {
-    void runSync(listId, options).catch((err) =>
-      console.error('[sync] online re-drain failed', err)
-    );
+    if (stopped) return;
+    void enqueueSync().catch((err) => console.error('[sync] online re-drain failed', err));
   };
   if (typeof window !== 'undefined') {
     window.addEventListener('online', onOnline);
@@ -113,9 +136,10 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
   return {
     async resync() {
       await bootstrap; // ensure the initial pass has wired up before re-draining
-      await runSync(listId, options);
+      await enqueueSync();
     },
     stop() {
+      stopped = true;
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', onOnline);
       }

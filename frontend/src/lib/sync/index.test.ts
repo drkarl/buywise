@@ -143,6 +143,92 @@ describe('startSync', () => {
     handle.stop();
   });
 
+  it('stop() before the initial drain completes never opens SSE', async () => {
+    await enqueue('e1');
+
+    let started = false;
+    // A fetch that resolves on the next microtask, so we can call stop() while
+    // the bootstrap drain is still in flight.
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
+          { status: 200 }
+        );
+      }
+      const sent = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          client_mutation_id: sent.client_mutation_id,
+          status: 'accepted',
+          server_revision: 1,
+          entity: serverEntity('e1', 'active', 1)
+        } satisfies MutationResponse),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, {
+      fetchFn,
+      sse: {
+        eventSourceFactory: () => {
+          started = true;
+          return fakeSse();
+        }
+      }
+    });
+    handle.stop(); // tear down before the bootstrap chain resolves
+    await handle.resync().catch(() => {}); // let the bootstrap settle
+
+    expect(started).toBe(false); // gated by the cancellation flag
+  });
+
+  it('online during the in-flight initial drain runs only one sync', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await enqueue('e1');
+
+    let postCount = 0;
+    let releaseFirstPost!: () => void;
+    const firstPostGate = new Promise<void>((r) => {
+      releaseFirstPost = r;
+    });
+
+    const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
+          { status: 200 }
+        );
+      }
+      postCount += 1;
+      if (postCount === 1) await firstPostGate; // hold the first drain open
+      const sent = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          client_mutation_id: sent.client_mutation_id,
+          status: 'accepted',
+          server_revision: postCount,
+          entity: serverEntity(sent.entity_id, 'active', postCount)
+        } satisfies MutationResponse),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+
+    // Fire an `online` event while the bootstrap drain is parked on firstPostGate.
+    window.dispatchEvent(new Event('online'));
+    releaseFirstPost(); // let the in-flight drain finish
+
+    await handle.resync(); // drains chain serially; settles all queued syncs
+
+    // The single pending row was POSTed exactly once — the online event chained
+    // behind the bootstrap rather than running a second concurrent drain.
+    expect(postCount).toBe(1);
+    expect(await db.mutation_queue.where('status').equals('confirmed').count()).toBe(1);
+    handle.stop();
+  });
+
   it('resync re-drains newly queued mutations (online event path)', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
 
