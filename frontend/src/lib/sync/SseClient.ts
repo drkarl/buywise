@@ -103,7 +103,15 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  * set to exactly the snapshot's active set (upsert present, delete local actives
  * absent from the snapshot) and PRESERVE local non-active rows untouched. This is
  * a deliberate workaround for the active-only endpoint (see the backend gap noted
- * in the P2-T4 report); pending mutations in `mutation_queue` are never touched.
+ * in the P2-T4 report).
+ *
+ * One exception to the delete: an active row backing a not-yet-confirmed mutation
+ * (`mutation_queue` status `pending` or `sent`) is an OPTIMISTIC local insert the
+ * server snapshot cannot know about yet (e.g. an offline `add_item` whose POST
+ * hasn't drained). Deleting it would make the user's add/check visibly vanish
+ * while its mutation is still queued. So such ids are preserved. Rows backing a
+ * terminal `failed` mutation are NOT preserved (the rejection is surfaced via
+ * `onFailed`); confirmed mutations have their entity in the snapshot already.
  */
 export async function applySnapshotEvent(
   listId: string,
@@ -120,7 +128,7 @@ export async function applySnapshotEvent(
   const entries = snapshot.entries.map((e) => ({ ...toLocalEntry(e), list_id: listId }));
   const snapshotIds = new Set(entries.map((e) => e.id));
 
-  await db.transaction('rw', db.list_entries, db.list_meta, async () => {
+  await db.transaction('rw', db.list_entries, db.list_meta, db.mutation_queue, async () => {
     const meta = await db.list_meta.get(listId);
     // A snapshot carries state at its `current_revision`. If our local revision
     // is already >= the snapshot's, our state is newer (e.g. a stale GET racing
@@ -130,16 +138,31 @@ export async function applySnapshotEvent(
       return;
     }
 
+    // Ids of entries backing a queued/in-flight (not-yet-confirmed) mutation.
+    // Read inside this transaction so a concurrent drain can't race the delete.
+    const pendingEntityIds = new Set(
+      (
+        await db.mutation_queue
+          .where('list_id')
+          .equals(listId)
+          .filter((m) => m.status === 'pending' || m.status === 'sent')
+          .toArray()
+      ).map((m) => m.entity_id)
+    );
+
     // Reconcile ONLY the active set: delete local active rows the snapshot no
     // longer lists (e.g. another device bought/deleted them), then upsert the
     // snapshot's actives. Non-active rows (bought/skipped/deleted) are preserved
-    // because the active-only endpoint can't enumerate them.
+    // because the active-only endpoint can't enumerate them. Optimistic rows
+    // backing a pending/in-flight mutation are also preserved (see doc above).
     const localActiveIds = await db.list_entries
       .where('list_id')
       .equals(listId)
       .filter((e) => e.status === 'active')
       .primaryKeys();
-    const staleActive = localActiveIds.filter((id) => !snapshotIds.has(id));
+    const staleActive = localActiveIds.filter(
+      (id) => !snapshotIds.has(id) && !pendingEntityIds.has(id)
+    );
     if (staleActive.length > 0) await db.list_entries.bulkDelete(staleActive);
     if (entries.length > 0) await db.list_entries.bulkPut(entries);
 
