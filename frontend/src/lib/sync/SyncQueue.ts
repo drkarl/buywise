@@ -13,6 +13,7 @@
 
 import { db, type LocalMutation } from '$lib/db/dexie';
 import { getDeviceId } from '$lib/db/device';
+import { jsonMutationHeaders } from '$lib/api/csrf';
 import { toLocalEntry, type MutationResponse } from './types';
 
 /** Network-error retry budget per mutation (plan P2-T4). */
@@ -88,7 +89,10 @@ async function postMutation(
   try {
     response = await fetchFn('/api/mutations', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // The backend rejects writes without a matching X-CSRF-Token (403). Echo
+      // the JS-readable `csrf` cookie; if it's absent (unauthenticated) the 403
+      // is a legitimate auth failure surfaced via the normal 4xx → onFailed path.
+      headers: jsonMutationHeaders(),
       body: JSON.stringify(body)
     });
   } catch (cause) {

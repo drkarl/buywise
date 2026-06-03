@@ -282,4 +282,34 @@ describe('drainQueue', () => {
     expect(result.confirmed).toBe(1); // only e1
     expect((fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
   });
+
+  it('sends the X-CSRF-Token header read from the csrf cookie', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await enqueue('e1', 'add_item');
+    // The server sets a JS-readable `csrf` cookie at login; the drain must echo it.
+    const original = document.cookie;
+    document.cookie = 'csrf=tok-123';
+
+    let sentHeader: string | null = null;
+    const fetchFn = vi.fn(async (_url, init?: RequestInit) => {
+      sentHeader = new Headers(init?.headers).get('X-CSRF-Token');
+      const sent = JSON.parse(String(init?.body));
+      return okResponse({
+        client_mutation_id: sent.client_mutation_id,
+        status: 'accepted',
+        server_revision: 1,
+        entity: serverEntity(sent.entity_id, 'active', 1)
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      await drainQueue(LIST, { fetchFn });
+    } finally {
+      // jsdom doesn't support deleting cookies; clearing the value is enough for
+      // the other tests (which don't read it).
+      document.cookie = `csrf=; expires=${original ? '' : new Date(0).toUTCString()}`;
+    }
+
+    expect(sentHeader).toBe('tok-123');
+  });
 });
