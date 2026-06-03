@@ -16,13 +16,20 @@
 	let value = $state('');
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
+	// Clear the pending debounce on teardown so a queued add can't fire after the
+	// component unmounts.
+	$effect(() => () => clearTimeout(timer));
+
 	function submit() {
 		const text = value.trim();
 		if (!text) return;
 
+		// Clear the field at submit time (not inside the deferred fire) so the
+		// debounce window can't re-submit the same text on a fast second Enter.
+		value = '';
+
 		const fire = () => {
 			void onadd(text);
-			value = '';
 		};
 
 		if (debounceMs <= 0) {
