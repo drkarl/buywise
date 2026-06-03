@@ -706,4 +706,18 @@ describe('SseClient', () => {
     source.fail();
     expect(FakeEventSource.instances).toHaveLength(1);
   });
+
+  it('stop() during the in-flight connect() leaves no live source (no leak)', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    const { client } = makeClient();
+    // connect() suspends on the real `db.list_meta.get` await; stop() runs
+    // synchronously in that window. Without the post-await recheck, connect()
+    // would resume and open a live EventSource that nothing ever closes.
+    const p = client.start();
+    client.stop();
+    await p;
+    // The factory must not have left a live source: either it was never called,
+    // or any source it created is closed.
+    expect(FakeEventSource.instances.every((s) => s.closed)).toBe(true);
+  });
 });

@@ -324,6 +324,13 @@ export class SseClient {
     if (this.stopped) return;
 
     const meta = await db.list_meta.get(this.listId);
+    // Recheck after the await: stop() may have run during the `list_meta.get`,
+    // setting `stopped = true` while `this.source` was still null (nothing to
+    // close). The create-and-assign below is synchronous with no further await,
+    // so this recheck fully closes the race window — without it we'd open a live
+    // SSE connection for an unmounted view that nothing would ever close (leak).
+    if (this.stopped) return;
+
     const since = meta?.current_revision ?? 0;
     const url = `/api/sse/${encodeURIComponent(this.listId)}?since=${since}`;
 
