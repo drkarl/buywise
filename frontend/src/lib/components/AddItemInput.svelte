@@ -1,44 +1,29 @@
 <script lang="ts">
-	// Text input for adding items. Submission is debounced so rapid Enter presses
-	// (or programmatic submits) collapse into a single add, and the caller is
-	// handed the trimmed text via the `onadd` callback prop.
+	// Text input for adding items. The trimmed text is handed to the caller via
+	// the `onadd` callback synchronously on submit — deliberately NOT debounced.
+	// Debouncing the submit could drop a queued add (a rapid second submit would
+	// cancel the first, and an unmount within the window would drop it), which
+	// violates the PR's "every action queues immediately" invariant. Clearing the
+	// field on submit is what prevents a fast duplicate Enter on the same text.
 
 	interface Props {
-		/** Called with the trimmed item text when a (debounced) add fires. */
+		/** Called with the trimmed item text on each add. */
 		onadd: (rawText: string) => void | Promise<void>;
-		/** Debounce window in ms; 0 disables debouncing (handy for tests). */
-		debounceMs?: number;
 		placeholder?: string;
 	}
 
-	let { onadd, debounceMs = 250, placeholder = 'Add an item…' }: Props = $props();
+	let { onadd, placeholder = 'Add an item…' }: Props = $props();
 
 	let value = $state('');
-	let timer: ReturnType<typeof setTimeout> | undefined;
-
-	// Clear the pending debounce on teardown so a queued add can't fire after the
-	// component unmounts.
-	$effect(() => () => clearTimeout(timer));
 
 	function submit() {
 		const text = value.trim();
 		if (!text) return;
 
-		// Clear the field at submit time (not inside the deferred fire) so the
-		// debounce window can't re-submit the same text on a fast second Enter.
+		// Clear the field before firing so a fast second Enter can't re-submit the
+		// same text — the empty value short-circuits the guard above.
 		value = '';
-
-		const fire = () => {
-			void onadd(text);
-		};
-
-		if (debounceMs <= 0) {
-			fire();
-			return;
-		}
-
-		clearTimeout(timer);
-		timer = setTimeout(fire, debounceMs);
+		void onadd(text);
 	}
 
 	function onsubmit(event: SubmitEvent) {
