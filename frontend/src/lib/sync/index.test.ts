@@ -447,6 +447,88 @@ describe('runSync reconcile-on-failure', () => {
     handle.stop();
   });
 
+  it('removes a rejected add whose row drifted to bought before draining', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    // Offline add, then marked bought before the add drained → row is `bought`,
+    // but the failing mutation is the add_item.
+    await enqueueOp('drifted', 'add_item', 'bought');
+
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/list/')) {
+        // Active-only snapshot — the rejected add isn't in it.
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
+          { status: 200 }
+        );
+      }
+      return new Response('item not allowed', { status: 422 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+
+    // The bogus add entity is gone even though it was `bought` (not active).
+    expect(await db.list_entries.get('drifted')).toBeUndefined();
+    handle.stop();
+  });
+
+  it('removes a rejected add whose row drifted to skipped before draining', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    await enqueueOp('drifted-skip', 'add_item', 'skipped');
+
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
+          { status: 200 }
+        );
+      }
+      return new Response('item not allowed', { status: 422 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+
+    expect(await db.list_entries.get('drifted-skip')).toBeUndefined();
+    handle.stop();
+  });
+
+  it('preserves a legitimate bought row while removing a different failed add', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    // A legitimately-bought item: its add_item already CONFIRMED (not in failed set).
+    await db.list_entries.put({
+      id: 'kept-bought',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'kept-bought',
+      display_name: 'kept-bought',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 4,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    // A separate failing add whose row drifted to bought.
+    await enqueueOp('bad-add', 'add_item', 'bought');
+
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.startsWith('/api/list/')) {
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
+          { status: 200 }
+        );
+      }
+      return new Response('item not allowed', { status: 422 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    await handle.resync();
+
+    expect((await db.list_entries.get('kept-bought'))?.status).toBe('bought'); // preserved
+    expect(await db.list_entries.get('bad-add')).toBeUndefined(); // failed add removed
+    handle.stop();
+  });
+
   it('does not fetch a reconcile snapshot when no mutation fails (meta exists)', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     await enqueue('ok-1');

@@ -109,23 +109,32 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  * (`mutation_queue` status `pending` or `sent`) is an OPTIMISTIC local insert the
  * server snapshot cannot know about yet (e.g. an offline `add_item` whose POST
  * hasn't drained). Deleting it would make the user's add/check visibly vanish
- * while its mutation is still queued. So such ids are preserved. Rows backing a
- * terminal `failed` mutation are NOT preserved (the rejection is surfaced via
- * `onFailed`); confirmed mutations have their entity in the snapshot already.
+ * while its mutation is still queued. So such ids are preserved.
  *
  * `reconcile`: a terminal 4xx rejection does NOT bump the server revision, so
  * after a failed drain `meta.current_revision === snapshot.current_revision` and
  * the revision short-circuit below would skip the whole apply, leaving the
  * phantom optimistic row in place. When `runSync` detects failures it re-fetches
- * with `{ reconcile: true }` to bypass ONLY that short-circuit; every other rule
- * (pending-preservation, active-set scoping, non-active preservation, upsert) is
- * unchanged, so a rejected `add_item` (now `failed`, not preserved, absent from
- * the snapshot) is deleted and a rejected status change is reverted to the
- * snapshot's authoritative `active` row.
+ * with `{ reconcile: true }` to bypass ONLY that short-circuit.
+ *
+ * `removeEntityIds`: entity ids to delete UNCONDITIONALLY, regardless of local
+ * status. `runSync` passes the ids of terminally-rejected `add_item` mutations
+ * here. `add_item` is the only op that creates a client-side entity, so a rejected
+ * add means the id is bogus in ANY status — including a row the user marked
+ * bought/skipped before the add drained (which the active-scoped `staleActive`
+ * delete would otherwise miss, leaving it stuck in the basket). These ids are
+ * `failed` (so absent from `pendingEntityIds`) and absent from the snapshot (so
+ * `bulkPut` won't re-add them); the forced delete takes precedence over
+ * pending-preservation. Failed NON-add ops (mark_bought/skipped/delete) act on
+ * entities that DO exist server-side, so they are NOT removed — the snapshot
+ * upsert reverts them to the authoritative `active` row. Legitimate bought/skipped
+ * history (entities whose add succeeded) is never touched.
  */
 export interface ApplySnapshotOptions {
   /** Bypass the revision short-circuit to reconcile after a rejected drain. */
   reconcile?: boolean;
+  /** Entity ids to delete regardless of status (terminally-rejected add_items). */
+  removeEntityIds?: Iterable<string>;
 }
 
 export async function applySnapshotEvent(
@@ -181,7 +190,13 @@ export async function applySnapshotEvent(
     const staleActive = localActiveIds.filter(
       (id) => !snapshotIds.has(id) && !pendingEntityIds.has(id)
     );
-    if (staleActive.length > 0) await db.list_entries.bulkDelete(staleActive);
+    // Union in the forced removals (rejected add_items): these must be deleted in
+    // ANY status, so they win over the active-only scoping and pending-preservation.
+    const toDelete = new Set(staleActive);
+    if (options.removeEntityIds) {
+      for (const id of options.removeEntityIds) toDelete.add(id);
+    }
+    if (toDelete.size > 0) await db.list_entries.bulkDelete([...toDelete]);
     if (entries.length > 0) await db.list_entries.bulkPut(entries);
 
     const now = new Date().toISOString();

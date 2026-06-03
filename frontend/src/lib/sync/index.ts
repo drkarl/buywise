@@ -81,6 +81,10 @@ export async function fetchSnapshot(
  * `{ reconcile: true }` afterwards so the optimistic local state for the rejected
  * entries is corrected to server truth (the rejection doesn't bump the revision,
  * so the snapshot's normal revision short-circuit would otherwise skip the fix).
+ * Rejected `add_item`s also pass their entity ids as `removeEntityIds` so the
+ * bogus client-created entity is deleted in ANY status — including one the user
+ * marked bought/skipped before the add drained, which the active-only snapshot
+ * can't enumerate and the active-scoped delete would otherwise miss.
  */
 async function runSync(listId: string, options: SyncOptions): Promise<void> {
   const fetchFn = options.fetchFn ?? fetch;
@@ -99,9 +103,15 @@ async function runSync(listId: string, options: SyncOptions): Promise<void> {
   });
 
   if (result.failed.length > 0) {
+    // Rejected add_items created bogus client-side entities — remove them in any
+    // status. Non-add failures act on server-known entities and are reverted to
+    // `active` by the snapshot upsert, so they are not force-deleted.
+    const rejectedAddIds = result.failed
+      .filter((f) => f.operation_type === 'add_item')
+      .map((f) => f.entity_id);
     // A 4xx means we're online, so this GET should succeed. (Offline drains leave
     // rows `pending`, not `failed`, so this never fires spuriously.)
-    await fetchSnapshot(listId, fetchFn, { reconcile: true });
+    await fetchSnapshot(listId, fetchFn, { reconcile: true, removeEntityIds: rejectedAddIds });
   }
 }
 
