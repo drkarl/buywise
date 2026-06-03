@@ -117,6 +117,53 @@ describe('event appliers', () => {
     expect((await db.list_meta.get(LIST))?.name).toBe('Fresh name');
   });
 
+  it('applySnapshotEvent does not roll the revision (and entries) backwards', async () => {
+    await db.list_entries.put({
+      id: 'fresh',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'fresh',
+      display_name: 'fresh',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 9,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 9 });
+
+    // A stale snapshot (revision 4 < local 9) must be skipped wholesale.
+    await applySnapshotEvent({
+      id: LIST,
+      name: 'Stale',
+      current_revision: 4,
+      entries: [serverEntity('old', 'active', 4)]
+    });
+
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(9); // unchanged
+    const ids = (await db.list_entries.where('list_id').equals(LIST).toArray()).map((e) => e.id);
+    expect(ids).toEqual(['fresh']); // entries not replaced by the stale snapshot
+  });
+
+  it('applySnapshotEvent throws on a malformed payload instead of wiping state', async () => {
+    await db.list_entries.put({
+      id: 'keep',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'keep',
+      display_name: 'keep',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 1,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    await expect(
+      applySnapshotEvent({ id: LIST, name: 'x', current_revision: 5 } as unknown as SseSnapshotData)
+    ).rejects.toThrow(/malformed/);
+    // Local entries survive the rejected (malformed) snapshot.
+    expect(await db.list_entries.get('keep')).toBeDefined();
+  });
+
   it('applyHeartbeat updates last_synced_at without changing the revision', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
     await applyHeartbeat(LIST);
@@ -220,6 +267,54 @@ describe('SseClient', () => {
     FakeEventSource.instances[1].fail(); // back to 1000, not 2000
     expect(delays).toEqual([1000, 1000]);
     client.stop();
+  });
+
+  it('schedules only one reconnect when EventSource fires repeated errors', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    const delays: number[] = [];
+    const { client, timers } = makeClient({ onReconnectScheduled: (ms) => delays.push(ms) });
+    await client.start();
+
+    // EventSource commonly emits several error events for a single drop.
+    FakeEventSource.instances[0].fail();
+    FakeEventSource.instances[0].fail();
+    FakeEventSource.instances[0].fail();
+
+    // Only one timer armed (and thus only one onReconnectScheduled), not three.
+    expect(timers).toHaveLength(1);
+    expect(delays).toEqual([1000]);
+
+    // Firing it opens exactly one new connection.
+    timers[0].fn();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    client.stop();
+  });
+
+  it('an SSE mutation and a drain applying the same entry: server-authoritative wins', async () => {
+    // Simulates the SSE-vs-drain race the reviewer called out: the live stream
+    // delivers a newer authoritative copy of an entry that a queued mutation
+    // also touched. The server is authoritative, so the higher-revision SSE
+    // payload must be the one that survives in list_entries.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 1 });
+    await db.list_entries.put({
+      id: 'e1',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'e1',
+      display_name: 'e1',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 1,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    // Drain confirms the entry as `active` at revision 2.
+    await applyMutationEvent({ server_revision: 2, entity: serverEntity('e1', 'active', 2) });
+    // SSE then delivers the authoritative `bought` at the higher revision 3.
+    await applyMutationEvent({ server_revision: 3, entity: serverEntity('e1', 'bought', 3) });
+
+    expect((await db.list_entries.get('e1'))?.status).toBe('bought');
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(3);
   });
 
   it('stop() closes the source and prevents reconnects', async () => {
