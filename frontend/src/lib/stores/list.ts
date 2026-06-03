@@ -147,16 +147,18 @@ export async function markBought(listId: string, entryId: string): Promise<void>
   });
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Only enqueue the mutation if the optimistic update actually applied.
-    // `update` returns the number of records changed (0 for a missing/stale id),
-    // which guards against queue/local drift on a rapid double-tap or a swipe-
-    // delete racing this check-off (mirrors the `incrementQuantity` guard).
-    const updated = await db.list_entries.update(entryId, {
+    // Load the entry first and bail unless it exists AND belongs to `listId`.
+    // This keeps the optimistic update and the queued mutation about the SAME
+    // entry on the SAME list: a stale/bad caller can't mutate an entry from one
+    // list while queueing a mutation tagged with another. It also subsumes the
+    // old "missing id" drift guard (a missing entry simply fails the check).
+    const entry = await db.list_entries.get(entryId);
+    if (!entry || entry.list_id !== listId) return;
+    await db.list_entries.update(entryId, {
       status: 'bought',
       bought_at: now,
       updated_at: now
     });
-    if (!updated) return;
     await db.mutation_queue.add(mutation);
   });
 }
@@ -167,12 +169,14 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
   const mutation = await buildMutation(listId, entryId, 'mark_skipped', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Guard against drift: skip the enqueue if no record matched the id.
-    const updated = await db.list_entries.update(entryId, {
+    // Load + validate the entry against `listId` (see `markBought`) so the
+    // local update and the queued mutation never disagree about which list.
+    const entry = await db.list_entries.get(entryId);
+    if (!entry || entry.list_id !== listId) return;
+    await db.list_entries.update(entryId, {
       status: 'skipped',
       updated_at: now
     });
-    if (!updated) return;
     await db.mutation_queue.add(mutation);
   });
 }
@@ -183,68 +187,15 @@ export async function deleteItem(listId: string, entryId: string): Promise<void>
   const mutation = await buildMutation(listId, entryId, 'delete_item', {});
 
   await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    // Guard against drift: skip the enqueue if no record matched the id
-    // (e.g. an already-deleted entry from a rapid double-tap/swipe).
-    const updated = await db.list_entries.update(entryId, {
+    // Load + validate the entry against `listId` (see `markBought`) so the
+    // local update and the queued mutation never disagree about which list.
+    const entry = await db.list_entries.get(entryId);
+    if (!entry || entry.list_id !== listId) return;
+    await db.list_entries.update(entryId, {
       status: 'deleted',
       updated_at: now
     });
-    if (!updated) return;
     await db.mutation_queue.add(mutation);
-  });
-}
-
-/**
- * Increases an entry's quantity by 1.
- *
- * Modeled on the canonical `add_item` dedup path: the server's `add_item`
- * handler increments `quantity` when it sees the existing `entity_id` (see
- * implementation-plan §P2-T5 "Merge quantity"). So we re-enqueue an `add_item`
- * mutation on the EXISTING entry id and optimistically bump the local count.
- */
-export async function incrementQuantity(
-  listId: string,
-  entryId: string
-): Promise<void> {
-  const entry = await db.list_entries.get(entryId);
-  if (!entry) return;
-
-  const now = new Date().toISOString();
-  // Build the mutation up front (it reads list_meta, which is outside the rw
-  // transaction scope below) so the write stays atomic over the two tables.
-  const mutation = await buildMutation(listId, entryId, 'add_item', {
-    raw_text: entry.raw_text,
-    display_name: entry.display_name,
-    quantity: 1
-  });
-
-  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    const current = await db.list_entries.get(entryId);
-    if (!current) return;
-    await db.list_entries.update(entryId, {
-      quantity: current.quantity + 1,
-      updated_at: now
-    });
-    await db.mutation_queue.add(mutation);
-  });
-}
-
-/**
- * Decreases an entry's quantity by 1 (floor of 1).
- *
- * TODO(contract): there is no canonical decrement operation_type in the enum
- * (add_item, mark_bought, mark_skipped, delete_item, rename_item, resolve_alias,
- * reject_match, set_constraint). We update locally only — no mutation is queued —
- * until the backend supports it. Flagged for the user in the P2-T3 report.
- */
-export async function decrementQuantity(entryId: string): Promise<void> {
-  await db.transaction('rw', db.list_entries, async () => {
-    const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.quantity <= 1) return;
-    await db.list_entries.update(entryId, {
-      quantity: entry.quantity - 1,
-      updated_at: new Date().toISOString()
-    });
   });
 }
 
