@@ -133,15 +133,28 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  * ids are `failed` (so absent from `pendingEntityIds`) and absent from the
  * snapshot (so `bulkPut` won't re-add them). Failed NON-add ops
  * (mark_bought/skipped/delete) act on entities that DO exist server-side, so they
- * are NOT removed — the snapshot upsert reverts them to the authoritative `active`
- * row. Legitimate bought/skipped history (entities whose add succeeded) is never
- * touched.
+ * are NOT removed — instead `runSync` passes them as `revertEntityIds` so the
+ * authoritative `active` row is restored. Legitimate bought/skipped history
+ * (entities whose add succeeded) is never touched.
+ *
+ * `revertEntityIds`: entity ids of failed NON-add ops (mark_bought/skipped/delete)
+ * to revert to the snapshot's authoritative copy. The EQUAL/NEWER wholesale path
+ * already reverts these via `bulkPut`, but the STALE path returns before that
+ * upsert — so the stale branch performs a SELECTIVE, per-entry revision-guarded
+ * revert for these ids only (`put` the snapshot's row iff the local row is absent
+ * or `snapshotEntry.last_updated_revision >= localRow.last_updated_revision`).
+ * The guard is essential: if live SSE legitimately advanced that same entity to a
+ * higher revision during the in-flight reconcile GET, the stale snapshot's older
+ * copy must not clobber it; a failed `mark_bought` that never changed server state
+ * leaves the local row at its prior (equal) revision, so `>=` allows the revert.
  */
 export interface ApplySnapshotOptions {
   /** Bypass the revision short-circuit to reconcile after a rejected drain. */
   reconcile?: boolean;
   /** Entity ids to delete regardless of status (terminally-rejected add_items). */
   removeEntityIds?: Iterable<string>;
+  /** Entity ids of failed non-add ops to revert to the snapshot's copy (guarded). */
+  revertEntityIds?: Iterable<string>;
 }
 
 export async function applySnapshotEvent(
@@ -159,6 +172,7 @@ export async function applySnapshotEvent(
   // Stamp the known list id onto every row (server EntryView omits list_id).
   const entries = snapshot.entries.map((e) => ({ ...toLocalEntry(e), list_id: listId }));
   const snapshotIds = new Set(entries.map((e) => e.id));
+  const snapshotById = new Map(entries.map((e) => [e.id, e]));
 
   await db.transaction('rw', db.list_entries, db.list_meta, db.mutation_queue, async () => {
     const meta = await db.list_meta.get(listId);
@@ -183,7 +197,22 @@ export async function applySnapshotEvent(
     const skipWholesale = options.reconcile
       ? !!meta && snapshot.current_revision < meta.current_revision
       : !!meta && meta.current_revision >= snapshot.current_revision;
-    if (skipWholesale) return;
+    if (skipWholesale) {
+      // Stale reconcile: we skipped the wholesale upsert, so failed non-add ops
+      // (mark_bought/skipped/delete) would otherwise stay stuck in their optimistic
+      // status. Selectively revert those ids to the snapshot's authoritative copy,
+      // per-entry monotonic-guarded so a concurrently-advanced (higher-revision)
+      // SSE row is never clobbered by the stale snapshot's older copy.
+      for (const id of options.revertEntityIds ?? []) {
+        const snapEntry = snapshotById.get(id);
+        if (!snapEntry) continue; // not in this snapshot — nothing authoritative to revert to
+        const local = await db.list_entries.get(id);
+        if (!local || snapEntry.last_updated_revision >= local.last_updated_revision) {
+          await db.list_entries.put(snapEntry);
+        }
+      }
+      return;
+    }
 
     // Ids of entries backing a queued/in-flight (not-yet-confirmed) mutation.
     // Read inside this transaction so a concurrent drain can't race the delete.

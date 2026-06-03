@@ -355,6 +355,111 @@ describe('event appliers', () => {
     expect(await db.list_entries.get('rejected-add')).toBeUndefined();
   });
 
+  it('stale reconcile reverts a failed non-add entity (guarded) without rollback', async () => {
+    // Local meta advanced to rev 6 by SSE on a DIFFERENT row; a failed mark_bought
+    // on entity X (still at its prior rev 5) must revert to the snapshot's active X.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+    // X: optimistically bought locally, server never changed it (still rev 5).
+    await db.list_entries.put({
+      id: 'x',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'x',
+      display_name: 'x',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 5,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    // An unrelated active row added by SSE at rev 6, absent from the rev-5 snapshot.
+    await db.list_entries.put({
+      id: 'unrelated',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'unrelated',
+      display_name: 'unrelated',
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 6,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    await applySnapshotEvent(
+      LIST,
+      {
+        id: LIST,
+        name: 'L',
+        current_revision: 5,
+        entries: [snapshotEntity('x', 'active', 5)]
+      } as unknown as SseSnapshotData,
+      { reconcile: true, revertEntityIds: ['x'] }
+    );
+
+    expect((await db.list_entries.get('x'))?.status).toBe('active'); // reverted
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(6); // no rollback
+    expect(await db.list_entries.get('unrelated')).toBeDefined(); // not deleted
+  });
+
+  it('stale reconcile does NOT revert a non-add entity SSE advanced to a higher rev', async () => {
+    // SSE advanced entity X itself to rev 6 (bought); the stale rev-5 snapshot's
+    // older active X must NOT clobber it (per-entry monotonic guard).
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+    await db.list_entries.put({
+      id: 'x',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'x',
+      display_name: 'x',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 6,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    await applySnapshotEvent(
+      LIST,
+      {
+        id: LIST,
+        name: 'L',
+        current_revision: 5,
+        entries: [snapshotEntity('x', 'active', 5)]
+      } as unknown as SseSnapshotData,
+      { reconcile: true, revertEntityIds: ['x'] }
+    );
+
+    expect((await db.list_entries.get('x'))?.status).toBe('bought'); // SSE state kept
+  });
+
+  it('stale reconcile reverts a failed delete_item entity to active (guarded)', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
+    await db.list_entries.put({
+      id: 'd',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'd',
+      display_name: 'd',
+      quantity: 1,
+      status: 'deleted',
+      last_updated_revision: 5,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+
+    await applySnapshotEvent(
+      LIST,
+      {
+        id: LIST,
+        name: 'L',
+        current_revision: 5,
+        entries: [snapshotEntity('d', 'active', 5)]
+      } as unknown as SseSnapshotData,
+      { reconcile: true, revertEntityIds: ['d'] }
+    );
+
+    expect((await db.list_entries.get('d'))?.status).toBe('active'); // reverted
+  });
+
   it('reconcile with a NEWER snapshot applies the wholesale reconcile', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
     await db.list_entries.put({
