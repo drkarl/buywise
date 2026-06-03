@@ -85,12 +85,26 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  * replayed separately; the snapshot only owns `list_entries`.
  */
 export async function applySnapshotEvent(snapshot: SseSnapshotData): Promise<void> {
+  // Defensive parse guard: a snapshot with a missing/garbled `entries` array
+  // would otherwise silently wipe local state (delete + bulkPut nothing). The
+  // wire shape is `GET /api/list/:id` / Rust `ListDetail` (plan P1-T3/T5), whose
+  // `entries` is always an array. Surface a malformed event instead of no-oping.
+  if (!snapshot || !Array.isArray(snapshot.entries) || typeof snapshot.id !== 'string') {
+    throw new Error('[SseClient] malformed full_snapshot payload');
+  }
   const entries = snapshot.entries.map(toLocalEntry);
   await db.transaction('rw', db.list_entries, db.list_meta, async () => {
+    const meta = await db.list_meta.get(snapshot.id);
+    // A snapshot replaces entries and revision together, atomically. If our
+    // local revision is already >= the snapshot's, our state is newer (e.g. a
+    // stale GET racing applied SSE mutations on the reused resync path), so
+    // applying it would roll BOTH entries and revision backwards. Skip wholesale.
+    if (meta && meta.current_revision >= snapshot.current_revision) {
+      return;
+    }
     await db.list_entries.where('list_id').equals(snapshot.id).delete();
     if (entries.length > 0) await db.list_entries.bulkPut(entries);
     const now = new Date().toISOString();
-    const meta = await db.list_meta.get(snapshot.id);
     await db.list_meta.put({
       id: snapshot.id,
       name: snapshot.name || meta?.name || '',
@@ -100,7 +114,15 @@ export async function applySnapshotEvent(snapshot: SseSnapshotData): Promise<voi
   });
 }
 
-/** Updates the list's last-seen timestamp on a heartbeat (liveness only). */
+/**
+ * Bumps `last_synced_at` on a heartbeat (liveness only — no entries change).
+ *
+ * NOTE: `last_synced_at` is overloaded — both confirmed mutations / snapshots
+ * AND bare heartbeats stamp it, so it means "last time we heard from the server"
+ * (last-seen), not strictly "last time data changed". A dedicated `last_seen_at`
+ * field would disambiguate but requires a schema migration (the P1-T2 Dexie
+ * schema only defines `last_synced_at`); deferred as out of scope for P2-T4.
+ */
 export async function applyHeartbeat(listId: string): Promise<void> {
   const now = new Date().toISOString();
   const meta = await db.list_meta.get(listId);
@@ -202,6 +224,11 @@ export class SseClient {
 
   private scheduleReconnect(): void {
     if (this.stopped) return;
+    // EventSource often fires repeated `error` events for a single drop, and
+    // each one calls scheduleReconnect(). If a reconnect timer is already armed,
+    // do nothing — otherwise we'd stack timers and open several concurrent
+    // connections when they all fire.
+    if (this.reconnectHandle !== null) return;
     // Close the dead source before reconnecting so we don't leak listeners.
     if (this.source) {
       this.source.close();
