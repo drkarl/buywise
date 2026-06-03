@@ -78,35 +78,65 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
 }
 
 /**
- * Applies a `full_snapshot` event: the local copy is stale beyond the server's
- * retention window, so we discard ALL local entries for this list and replace
- * them with the snapshot, then reset the revision to the snapshot's. Pending
- * (un-drained) mutations are NOT touched — they live in `mutation_queue` and are
- * replayed separately; the snapshot only owns `list_entries`.
+ * Applies a `full_snapshot` event (also reused by the initial `GET /api/list/:id`
+ * fetch). `listId` is supplied by the caller — the SSE client knows its own list
+ * id, and `fetchSnapshot` knows the id it requested — because the server's
+ * `EntryView` rows OMIT `list_id` (see `EntryView` in crates/api/src/lists.rs),
+ * so we cannot read it off each entry. We stamp `listId` onto every snapshot row
+ * here.
+ *
+ * IMPORTANT — the snapshot is ACTIVE-ONLY. `GET /api/list/:id` / `full_snapshot`
+ * serialise `WHERE status = 'active'` only (confirmed: `load_detail` /
+ * `list_snapshot` in lists.rs); they do NOT enumerate bought/skipped/deleted
+ * rows. A naive wholesale "delete all rows for this list, then bulkPut" would
+ * therefore destroy local basket history (bought/skipped). So the destructive
+ * replace is SCOPED TO ACTIVE ENTRIES: we reconcile the local `status='active'`
+ * set to exactly the snapshot's active set (upsert present, delete local actives
+ * absent from the snapshot) and PRESERVE local non-active rows untouched. This is
+ * a deliberate workaround for the active-only endpoint (see the backend gap noted
+ * in the P2-T4 report); pending mutations in `mutation_queue` are never touched.
  */
-export async function applySnapshotEvent(snapshot: SseSnapshotData): Promise<void> {
+export async function applySnapshotEvent(
+  listId: string,
+  snapshot: SseSnapshotData
+): Promise<void> {
   // Defensive parse guard: a snapshot with a missing/garbled `entries` array
-  // would otherwise silently wipe local state (delete + bulkPut nothing). The
-  // wire shape is `GET /api/list/:id` / Rust `ListDetail` (plan P1-T3/T5), whose
-  // `entries` is always an array. Surface a malformed event instead of no-oping.
+  // would otherwise silently wipe local active state. The wire shape is
+  // `GET /api/list/:id` / Rust `ListDetail` (plan P1-T3/T5), whose `entries` is
+  // always an array. Surface a malformed event instead of no-oping.
   if (!snapshot || !Array.isArray(snapshot.entries) || typeof snapshot.id !== 'string') {
     throw new Error('[SseClient] malformed full_snapshot payload');
   }
-  const entries = snapshot.entries.map(toLocalEntry);
+  // Stamp the known list id onto every row (server EntryView omits list_id).
+  const entries = snapshot.entries.map((e) => ({ ...toLocalEntry(e), list_id: listId }));
+  const snapshotIds = new Set(entries.map((e) => e.id));
+
   await db.transaction('rw', db.list_entries, db.list_meta, async () => {
-    const meta = await db.list_meta.get(snapshot.id);
-    // A snapshot replaces entries and revision together, atomically. If our
-    // local revision is already >= the snapshot's, our state is newer (e.g. a
-    // stale GET racing applied SSE mutations on the reused resync path), so
-    // applying it would roll BOTH entries and revision backwards. Skip wholesale.
+    const meta = await db.list_meta.get(listId);
+    // A snapshot carries state at its `current_revision`. If our local revision
+    // is already >= the snapshot's, our state is newer (e.g. a stale GET racing
+    // applied SSE mutations on the reused resync path), so applying it would roll
+    // both entries and revision backwards. Skip wholesale.
     if (meta && meta.current_revision >= snapshot.current_revision) {
       return;
     }
-    await db.list_entries.where('list_id').equals(snapshot.id).delete();
+
+    // Reconcile ONLY the active set: delete local active rows the snapshot no
+    // longer lists (e.g. another device bought/deleted them), then upsert the
+    // snapshot's actives. Non-active rows (bought/skipped/deleted) are preserved
+    // because the active-only endpoint can't enumerate them.
+    const localActiveIds = await db.list_entries
+      .where('list_id')
+      .equals(listId)
+      .filter((e) => e.status === 'active')
+      .primaryKeys();
+    const staleActive = localActiveIds.filter((id) => !snapshotIds.has(id));
+    if (staleActive.length > 0) await db.list_entries.bulkDelete(staleActive);
     if (entries.length > 0) await db.list_entries.bulkPut(entries);
+
     const now = new Date().toISOString();
     await db.list_meta.put({
-      id: snapshot.id,
+      id: listId,
       name: snapshot.name || meta?.name || '',
       current_revision: snapshot.current_revision,
       last_synced_at: now
@@ -202,7 +232,9 @@ export class SseClient {
       void this.handle(() => applyMutationEvent(JSON.parse(event.data) as SseMutationData));
     });
     source.addEventListener('full_snapshot', (event) => {
-      void this.handle(() => applySnapshotEvent(JSON.parse(event.data) as SseSnapshotData));
+      void this.handle(() =>
+        applySnapshotEvent(this.listId, JSON.parse(event.data) as SseSnapshotData)
+      );
     });
     source.addEventListener('heartbeat', () => {
       void this.handle(() => applyHeartbeat(this.listId));
