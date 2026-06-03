@@ -128,7 +128,14 @@ async function postMutation(
 async function applySuccess(mutationId: number, res: MutationResponse): Promise<void> {
   const entry = toLocalEntry(res.entity);
   await db.transaction('rw', db.list_entries, db.list_meta, db.mutation_queue, async () => {
-    await db.list_entries.put(entry);
+    // Per-entry monotonic guard (mirrors applyMutationEvent): a delayed POST
+    // response can carry an older entity than one the SSE stream already applied
+    // for the same entry. Only overwrite when the response is at least as new by
+    // `last_updated_revision`, so a stale response can't clobber a newer row.
+    const existing = await db.list_entries.get(entry.id);
+    if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+      await db.list_entries.put(entry);
+    }
 
     const meta = await db.list_meta.get(entry.list_id);
     if (meta) {
