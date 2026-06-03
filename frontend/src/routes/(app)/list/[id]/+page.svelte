@@ -16,8 +16,6 @@
 		markBought,
 		markSkipped,
 		deleteItem,
-		incrementQuantity,
-		decrementQuantity,
 		forceSync
 	} from '$lib/stores/list';
 
@@ -69,8 +67,6 @@
 				onbought={(id) => markBought(listId, id)}
 				onskipped={(id) => markSkipped(listId, id)}
 				ondelete={(id) => deleteItem(listId, id)}
-				onincrement={(id) => incrementQuantity(listId, id)}
-				ondecrement={(id) => decrementQuantity(id)}
 			/>
 		{:else}
 			<li class="empty">Nothing here yet — add your first item above.</li>
@@ -94,8 +90,6 @@
 							onbought={(id) => markBought(listId, id)}
 							onskipped={(id) => markSkipped(listId, id)}
 							ondelete={(id) => deleteItem(listId, id)}
-							onincrement={(id) => incrementQuantity(listId, id)}
-							ondecrement={(id) => decrementQuantity(id)}
 						/>
 					{/each}
 				</ul>
