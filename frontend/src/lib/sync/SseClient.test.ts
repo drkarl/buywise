@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { db, type LocalListEntry } from '$lib/db/dexie';
+import { db, type LocalListEntry, type LocalMutation } from '$lib/db/dexie';
 import {
   SseClient,
   applyMutationEvent,
@@ -191,6 +191,86 @@ describe('event appliers', () => {
     expect(await db.list_entries.get('gone')).toBeUndefined(); // stale active removed
     expect(await db.list_entries.get('still-active')).toBeDefined(); // snapshot active in
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(10);
+  });
+
+  /** Seeds an optimistic active row + a queued mutation for it, like the store. */
+  async function queueOptimisticAdd(
+    entryId: string,
+    status: LocalMutation['status']
+  ): Promise<void> {
+    await db.list_entries.put({
+      id: entryId,
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: entryId,
+      display_name: entryId,
+      quantity: 1,
+      status: 'active',
+      last_updated_revision: 0, // optimistic insert; server hasn't assigned one
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    await db.mutation_queue.add({
+      client_mutation_id: `cmid-${entryId}`,
+      device_id: 'dev-1',
+      list_id: LIST,
+      entity_type: 'list_entry',
+      entity_id: entryId,
+      operation_type: 'add_item',
+      payload: {},
+      base_revision: 0,
+      created_at_client: '2026-06-03T00:00:00.000Z',
+      status,
+      retry_count: 0
+    } as LocalMutation);
+  }
+
+  it('applySnapshotEvent preserves an active row backing a pending mutation', async () => {
+    // Optimistic offline add: row exists locally, mutation still pending, so the
+    // server snapshot cannot contain its id yet. It must NOT be deleted.
+    await queueOptimisticAdd('opt-1', 'pending');
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+
+    await applySnapshotEvent(LIST, {
+      id: LIST,
+      name: 'L',
+      current_revision: 4,
+      entries: [snapshotEntity('server-a', 'active', 4)]
+    } as unknown as SseSnapshotData);
+
+    expect(await db.list_entries.get('opt-1')).toBeDefined(); // preserved (pending)
+    expect(await db.list_entries.get('server-a')).toBeDefined(); // snapshot active in
+  });
+
+  it('applySnapshotEvent deletes an absent active row with only a confirmed mutation', async () => {
+    // A confirmed mutation means the server already knows the entity; if the
+    // active-only snapshot omits it, another device bought/deleted it → delete.
+    await queueOptimisticAdd('done-1', 'confirmed');
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+
+    await applySnapshotEvent(LIST, {
+      id: LIST,
+      name: 'L',
+      current_revision: 4,
+      entries: []
+    } as unknown as SseSnapshotData);
+
+    expect(await db.list_entries.get('done-1')).toBeUndefined();
+  });
+
+  it('applySnapshotEvent deletes an absent active row backing a failed mutation', async () => {
+    // A server-rejected mutation is terminal (surfaced via onFailed); it must not
+    // pin a phantom active row forever.
+    await queueOptimisticAdd('rej-1', 'failed');
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+
+    await applySnapshotEvent(LIST, {
+      id: LIST,
+      name: 'L',
+      current_revision: 4,
+      entries: []
+    } as unknown as SseSnapshotData);
+
+    expect(await db.list_entries.get('rej-1')).toBeUndefined();
   });
 
   it('applySnapshotEvent does not roll the revision (and entries) backwards', async () => {
