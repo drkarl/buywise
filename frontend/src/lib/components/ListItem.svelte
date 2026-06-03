@@ -33,6 +33,11 @@
 	function onpointerdown(event: PointerEvent) {
 		startX = event.clientX;
 		dragging = true;
+		// Capture the pointer so we keep getting move/up events even if the pointer
+		// leaves the element mid-swipe (otherwise a fast drag can drop the gesture).
+		// Guarded: not all environments (e.g. jsdom) implement pointer capture.
+		const target = event.currentTarget as HTMLElement;
+		target.setPointerCapture?.(event.pointerId);
 		longPressTimer = setTimeout(() => {
 			menuOpen = true;
 			dragging = false;
@@ -104,11 +109,9 @@
 	</div>
 
 	{#if menuOpen}
-		<div class="context-menu" role="menu">
-			<button role="menuitem" onclick={() => { menuOpen = false; ondelete(entry.id); }}
-				>Delete</button
-			>
-			<button role="menuitem" onclick={() => (menuOpen = false)}>Cancel</button>
+		<div class="context-menu" role="group" aria-label="Item actions">
+			<button onclick={() => { menuOpen = false; ondelete(entry.id); }}>Delete</button>
+			<button onclick={() => (menuOpen = false)}>Cancel</button>
 		</div>
 	{/if}
 </li>
