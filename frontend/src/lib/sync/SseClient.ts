@@ -113,22 +113,29 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  *
  * `reconcile`: a terminal 4xx rejection does NOT bump the server revision, so
  * after a failed drain `meta.current_revision === snapshot.current_revision` and
- * the revision short-circuit below would skip the whole apply, leaving the
- * phantom optimistic row in place. When `runSync` detects failures it re-fetches
- * with `{ reconcile: true }` to bypass ONLY that short-circuit.
+ * the non-reconcile short-circuit would skip the whole apply, leaving the phantom
+ * optimistic row in place. When `runSync` detects failures it re-fetches with
+ * `{ reconcile: true }`, which allows the EQUAL-revision 4xx cleanup and any NEWER
+ * snapshot, but STILL skips the wholesale apply for a STALE snapshot (strictly
+ * older than local meta — e.g. live SSE advanced local state while the reconcile
+ * GET was in flight) so it can't roll entries/revision backward. The forced
+ * `removeEntityIds` deletions are revision-independent and run even when the
+ * wholesale apply is skipped (see below).
  *
  * `removeEntityIds`: entity ids to delete UNCONDITIONALLY, regardless of local
- * status. `runSync` passes the ids of terminally-rejected `add_item` mutations
- * here. `add_item` is the only op that creates a client-side entity, so a rejected
- * add means the id is bogus in ANY status — including a row the user marked
- * bought/skipped before the add drained (which the active-scoped `staleActive`
- * delete would otherwise miss, leaving it stuck in the basket). These ids are
- * `failed` (so absent from `pendingEntityIds`) and absent from the snapshot (so
- * `bulkPut` won't re-add them); the forced delete takes precedence over
- * pending-preservation. Failed NON-add ops (mark_bought/skipped/delete) act on
- * entities that DO exist server-side, so they are NOT removed — the snapshot
- * upsert reverts them to the authoritative `active` row. Legitimate bought/skipped
- * history (entities whose add succeeded) is never touched.
+ * status AND regardless of snapshot revision. `runSync` passes the ids of
+ * terminally-rejected `add_item` mutations here. `add_item` is the only op that
+ * creates a client-side entity, so a rejected add means the id is bogus in ANY
+ * status — including a row the user marked bought/skipped before the add drained
+ * (which the active-scoped `staleActive` delete would otherwise miss, leaving it
+ * stuck in the basket). The deletion happens up front, before any stale-skip
+ * decision, so it applies even when a stale wholesale reconcile is skipped. These
+ * ids are `failed` (so absent from `pendingEntityIds`) and absent from the
+ * snapshot (so `bulkPut` won't re-add them). Failed NON-add ops
+ * (mark_bought/skipped/delete) act on entities that DO exist server-side, so they
+ * are NOT removed — the snapshot upsert reverts them to the authoritative `active`
+ * row. Legitimate bought/skipped history (entities whose add succeeded) is never
+ * touched.
  */
 export interface ApplySnapshotOptions {
   /** Bypass the revision short-circuit to reconcile after a rejected drain. */
@@ -155,15 +162,28 @@ export async function applySnapshotEvent(
 
   await db.transaction('rw', db.list_entries, db.list_meta, db.mutation_queue, async () => {
     const meta = await db.list_meta.get(listId);
-    // A snapshot carries state at its `current_revision`. If our local revision
-    // is already >= the snapshot's, our state is newer (e.g. a stale GET racing
-    // applied SSE mutations on the reused resync path), so applying it would roll
-    // both entries and revision backwards. Skip wholesale — UNLESS reconciling
-    // after a rejected drain, where the revision is unchanged but the optimistic
-    // row still needs correcting (see `reconcile` in the doc above).
-    if (!options.reconcile && meta && meta.current_revision >= snapshot.current_revision) {
-      return;
-    }
+
+    // Forced removals (rejected add_item ids) are revision-INDEPENDENT: a rejected
+    // add's entity is bogus regardless of snapshot age, so delete it up front,
+    // unconditionally, before any skip decision. This keeps the cleanup correct
+    // even when we skip a stale wholesale reconcile below.
+    const forced = new Set(options.removeEntityIds ?? []);
+    if (forced.size > 0) await db.list_entries.bulkDelete([...forced]);
+
+    // The WHOLESALE active-set reconcile (staleActive delete + bulkPut + meta.put)
+    // is revision-DEPENDENT and must not roll local state backward:
+    //   - non-reconcile: skip if local is already >= the snapshot (a stale GET
+    //     racing applied SSE mutations would otherwise undo them).
+    //   - reconcile: the 4xx cleanup runs at the SAME revision (allowed), and a
+    //     NEWER snapshot is allowed, but a STALE snapshot (strictly older than
+    //     local meta — e.g. live SSE advanced to rev 6 while the reconcile GET at
+    //     rev 5 was in flight) must skip the wholesale apply so it can't delete
+    //     rows the newer state added or downgrade current_revision. The forced
+    //     removals above still applied either way.
+    const skipWholesale = options.reconcile
+      ? !!meta && snapshot.current_revision < meta.current_revision
+      : !!meta && meta.current_revision >= snapshot.current_revision;
+    if (skipWholesale) return;
 
     // Ids of entries backing a queued/in-flight (not-yet-confirmed) mutation.
     // Read inside this transaction so a concurrent drain can't race the delete.
@@ -190,13 +210,7 @@ export async function applySnapshotEvent(
     const staleActive = localActiveIds.filter(
       (id) => !snapshotIds.has(id) && !pendingEntityIds.has(id)
     );
-    // Union in the forced removals (rejected add_items): these must be deleted in
-    // ANY status, so they win over the active-only scoping and pending-preservation.
-    const toDelete = new Set(staleActive);
-    if (options.removeEntityIds) {
-      for (const id of options.removeEntityIds) toDelete.add(id);
-    }
-    if (toDelete.size > 0) await db.list_entries.bulkDelete([...toDelete]);
+    if (staleActive.length > 0) await db.list_entries.bulkDelete(staleActive);
     if (entries.length > 0) await db.list_entries.bulkPut(entries);
 
     const now = new Date().toISOString();
