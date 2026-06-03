@@ -273,6 +273,45 @@ describe('event appliers', () => {
     expect(await db.list_entries.get('rej-1')).toBeUndefined();
   });
 
+  it('applySnapshotEvent removeEntityIds deletes a row in ANY status', async () => {
+    // A rejected add whose row drifted to `bought` (active-scoped delete misses it).
+    await db.list_entries.put({
+      id: 'force-del',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'force-del',
+      display_name: 'force-del',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 0,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    // A legit bought row that is NOT in removeEntityIds must survive.
+    await db.list_entries.put({
+      id: 'keep-bought',
+      list_id: LIST,
+      resolution_status: 'unresolved',
+      raw_text: 'keep-bought',
+      display_name: 'keep-bought',
+      quantity: 1,
+      status: 'bought',
+      bought_at: '2026-06-03T00:00:00.000Z',
+      last_updated_revision: 0,
+      updated_at: '2026-06-03T00:00:00.000Z'
+    });
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+
+    await applySnapshotEvent(
+      LIST,
+      { id: LIST, name: 'L', current_revision: 4, entries: [] } as unknown as SseSnapshotData,
+      { removeEntityIds: ['force-del'] }
+    );
+
+    expect(await db.list_entries.get('force-del')).toBeUndefined(); // forced delete
+    expect((await db.list_entries.get('keep-bought'))?.status).toBe('bought'); // preserved
+  });
+
   it('applySnapshotEvent does not roll the revision (and entries) backwards', async () => {
     await db.list_entries.put({
       id: 'fresh',
