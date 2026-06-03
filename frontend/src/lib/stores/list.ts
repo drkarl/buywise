@@ -204,14 +204,3 @@ export async function deleteItem(listId: string, entryId: string): Promise<void>
     await db.mutation_queue.add(mutation);
   });
 }
-
-/**
- * Pull-to-refresh / force-sync hook.
- *
- * TODO(P2-T4): the sync loop is out of scope for this task. This is a no-op
- * placeholder so the UI can wire pull-to-refresh now; P2-T4 fills it in with the
- * real queue-drain + snapshot fetch.
- */
-export async function forceSync(_listId: string): Promise<void> {
-  // intentionally empty — see TODO(P2-T4)
-}

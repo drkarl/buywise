@@ -15,9 +15,9 @@
 		addItem,
 		markBought,
 		markSkipped,
-		deleteItem,
-		forceSync
+		deleteItem
 	} from '$lib/stores/list';
+	import { startSync, type SyncHandle } from '$lib/sync';
 
 	const listId = $derived(page.params.id ?? '');
 
@@ -28,11 +28,24 @@
 	let basketOpen = $state(false);
 	let refreshing = $state(false);
 
+	// Start the sync engine (queue drain + live SSE) for the current list and
+	// tear it down when the id changes or the view unmounts. `$effect` re-runs
+	// whenever `listId` changes; its cleanup stops the previous handle.
+	let sync: SyncHandle | null = null;
+	$effect(() => {
+		if (!listId) return;
+		const handle = startSync(listId);
+		sync = handle;
+		return () => {
+			handle.stop();
+			if (sync === handle) sync = null;
+		};
+	});
+
 	async function onRefresh() {
 		refreshing = true;
 		try {
-			// TODO(P2-T4): wired to the sync-loop placeholder; currently a no-op.
-			await forceSync(listId);
+			await sync?.resync();
 		} finally {
 			refreshing = false;
 		}
