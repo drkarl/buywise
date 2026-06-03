@@ -12,12 +12,9 @@
 		onbought: (id: string) => void;
 		onskipped: (id: string) => void;
 		ondelete: (id: string) => void;
-		onincrement: (id: string) => void;
-		ondecrement: (id: string) => void;
 	}
 
-	let { entry, onbought, onskipped, ondelete, onincrement, ondecrement }: Props =
-		$props();
+	let { entry, onbought, onskipped, ondelete }: Props = $props();
 
 	const inBasket = $derived(entry.status === 'bought' || entry.status === 'skipped');
 
@@ -87,19 +84,11 @@
 
 		<span class="name">{entry.display_name}</span>
 
-		{#if !inBasket}
-			<div class="qty" role="group" aria-label="Quantity">
-				<button
-					aria-label="Decrease quantity"
-					onclick={() => ondecrement(entry.id)}
-					disabled={entry.quantity <= 1}>−</button
-				>
-				<span class="qty-value" aria-live="polite">{entry.quantity}</span>
-				<button aria-label="Increase quantity" onclick={() => onincrement(entry.id)}
-					>+</button
-				>
-			</div>
+		{#if entry.quantity > 1}
+			<span class="qty-value">×{entry.quantity}</span>
+		{/if}
 
+		{#if !inBasket}
 			<button class="skip" aria-label="Skip {entry.display_name}" onclick={() => onskipped(entry.id)}
 				>Skip</button
 			>
@@ -155,26 +144,11 @@
 	.check.done {
 		color: #0f766e;
 	}
-	.qty {
-		display: flex;
-		align-items: center;
-		gap: 0.35rem;
-	}
-	.qty button {
-		width: 1.6rem;
-		height: 1.6rem;
-		border: 1px solid #cbd5e1;
-		border-radius: 0.4rem;
-		background: #f8fafc;
-		cursor: pointer;
-	}
-	.qty button:disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
 	.qty-value {
 		min-width: 1.25rem;
 		text-align: center;
+		font-size: 0.9rem;
+		color: #64748b;
 	}
 	.skip {
 		padding: 0.3rem 0.6rem;
