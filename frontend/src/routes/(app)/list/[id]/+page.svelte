@@ -17,7 +17,7 @@
 		markSkipped,
 		deleteItem
 	} from '$lib/stores/list';
-	import { startSync, type SyncHandle } from '$lib/sync';
+	import { startSync, type SyncHandle, type FailedMutation } from '$lib/sync';
 
 	const listId = $derived(page.params.id ?? '');
 
@@ -28,13 +28,47 @@
 	let basketOpen = $state(false);
 	let refreshing = $state(false);
 
+	// Server-rejected mutations surfaced by the sync engine. runSync has already
+	// reconciled the optimistic local state away/reverted for these, so the notice
+	// relies on the failure's own fields (operation + message), not a row lookup.
+	let failures = $state<FailedMutation[]>([]);
+
+	/** Human-readable verb for the rejected operation. */
+	function describeOperation(op: string): string {
+		switch (op) {
+			case 'add_item':
+				return 'add';
+			case 'mark_bought':
+				return 'check off';
+			case 'mark_skipped':
+				return 'skip';
+			case 'delete_item':
+				return 'delete';
+			default:
+				return op;
+		}
+	}
+
+	function dismissFailure(clientMutationId: string) {
+		failures = failures.filter((f) => f.client_mutation_id !== clientMutationId);
+	}
+
 	// Start the sync engine (queue drain + live SSE) for the current list and
 	// tear it down when the id changes or the view unmounts. `$effect` re-runs
 	// whenever `listId` changes; its cleanup stops the previous handle.
 	let sync: SyncHandle | null = null;
 	$effect(() => {
 		if (!listId) return;
-		const handle = startSync(listId);
+		failures = []; // clear notices when switching lists
+		const handle = startSync(listId, {
+			onFailed: (failure) => {
+				// De-dupe by client_mutation_id (a replayed drain could re-report it).
+				failures = [
+					...failures.filter((f) => f.client_mutation_id !== failure.client_mutation_id),
+					failure
+				];
+			}
+		});
 		sync = handle;
 		return () => {
 			handle.stop();
@@ -66,6 +100,23 @@
 			>
 		</div>
 	</header>
+
+	{#if failures.length > 0}
+		<div class="failures" role="alert" aria-live="assertive">
+			{#each failures as failure (failure.client_mutation_id)}
+				<div class="failure">
+					<span class="failure-text"
+						>Couldn’t {describeOperation(failure.operation_type)} this item: {failure.message}</span
+					>
+					<button
+						class="failure-dismiss"
+						aria-label="Dismiss"
+						onclick={() => dismissFailure(failure.client_mutation_id)}>×</button
+					>
+				</div>
+			{/each}
+		</div>
+	{/if}
 
 	<AddItemInput
 		onadd={async (text) => {
@@ -145,6 +196,32 @@
 		width: 2rem;
 		height: 2rem;
 		cursor: pointer;
+	}
+	.failures {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.failure {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 0.5rem;
+		padding: 0.6rem 0.75rem;
+		background: #fef2f2;
+		border: 1px solid #fecaca;
+		border-radius: 0.5rem;
+		color: #991b1b;
+		font-size: 0.9rem;
+	}
+	.failure-dismiss {
+		border: none;
+		background: transparent;
+		color: #991b1b;
+		font-size: 1.1rem;
+		line-height: 1;
+		cursor: pointer;
+		padding: 0 0.25rem;
 	}
 	.entries {
 		margin: 0;

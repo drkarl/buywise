@@ -103,6 +103,43 @@ describe('list page', () => {
 		expect(delMut?.status).toBe('pending');
 	});
 
+	it('surfaces a visible alert when the server rejects a queued mutation', async () => {
+		// Stub the global fetch the sync engine uses: reject the mutation POST with a
+		// terminal 4xx, and serve an active-only snapshot (so reconcile removes the
+		// phantom). The onFailed wiring should then render an accessible alert.
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/list/')) {
+				return new Response(
+					JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
+					{ status: 200 }
+				);
+			}
+			return new Response('rejected by server', { status: 422 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+
+		try {
+			render(Page);
+			const input = screen.getByLabelText('Add an item');
+			await fireEvent.input(input, { target: { value: 'Caviar' } });
+			await fireEvent.click(screen.getByRole('button', { name: 'Add item' }));
+			await screen.findByText('Caviar');
+
+			// The enqueue signals the running engine, which drains, gets the 422,
+			// and calls onFailed → an alert appears mentioning the operation + reason.
+			const alert = await screen.findByRole('alert');
+			expect(alert.textContent).toMatch(/add/i);
+			expect(alert.textContent).toMatch(/rejected by server/);
+
+			// Dismissible.
+			await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+			await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it('bought and skipped items both group under "In basket"', async () => {
 		render(Page);
 		const input = screen.getByLabelText('Add an item');
