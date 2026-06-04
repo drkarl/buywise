@@ -38,10 +38,40 @@ export interface LocalListMeta {
   last_synced_at?: string;
 }
 
+/**
+ * A product category, mirroring the `categories` row in the Rust core
+ * (crates/core/src/domain.rs::Category). Cached from the `GET /api/items`
+ * response so shopping mode can render category names + icons and fall back to
+ * `default_order` for any (store, category) pair the household has not curated.
+ */
+export interface LocalCategory {
+  id: string;                    // category_id; matches store_category_orders.category_id
+  name_en: string;
+  name_es: string;
+  icon: string;
+  default_order: number;
+}
+
+/**
+ * One per-household, per-store aisle-ordering row, mirroring the
+ * `store_category_orders` table (migrations/003_phase1_schema.sql). Cached from
+ * `GET /api/items` so shopping mode can re-order categories per store fully
+ * offline. `store` is a Retailer DB string (tesco | dunnes | supervalu | aldi |
+ * lidl); see crates/core/src/domain.rs::Retailer::as_db_str.
+ */
+export interface LocalStoreCategoryOrder {
+  id: string;                    // server row id (e.g. "sco-tesco-<category_id>")
+  store: string;                 // tesco | dunnes | supervalu | aldi | lidl
+  category_id: string;
+  display_order: number;
+}
+
 export class BuyWiseDB extends Dexie {
   list_entries!: Table<LocalListEntry, string>;
   mutation_queue!: Table<LocalMutation, number>;
   list_meta!: Table<LocalListMeta, string>;
+  categories!: Table<LocalCategory, string>;
+  store_category_orders!: Table<LocalStoreCategoryOrder, string>;
 
   constructor() {
     super('buywise');
@@ -49,6 +79,16 @@ export class BuyWiseDB extends Dexie {
       list_entries: 'id, list_id, status, canonical_item_id, last_updated_revision',
       mutation_queue: '++id, list_id, status, client_mutation_id',
       list_meta: 'id',
+    });
+    // v2 (P2-T6 shopping mode): cache the category catalogue and the per-store
+    // aisle orders from `GET /api/items`. Additive migration — Dexie carries the
+    // existing v1 stores forward untouched, so no upgrade function is needed.
+    // `store_category_orders` is indexed by `store` (the shopping-mode lookup)
+    // and by the compound `[store+category_id]` (mirrors the server's UNIQUE
+    // constraint for idempotent upserts).
+    this.version(2).stores({
+      categories: 'id, default_order',
+      store_category_orders: 'id, store, [store+category_id]',
     });
   }
 }
