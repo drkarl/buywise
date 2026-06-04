@@ -124,6 +124,56 @@ describe('drainQueue', () => {
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(5);
   });
 
+  it('resolves category_id from the cached catalogue on a confirmed mutation', async () => {
+    // The mutation entity never carries category_id; a confirmed mark_bought
+    // must derive it from the cached item→category map rather than overwriting
+    // the row with undefined (which would drop it into "Other" in shopping mode).
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await db.item_categories.put({ canonical_item_id: 'ci-milk', category_id: 'cat-dairy' });
+    await enqueue('e1', 'mark_bought');
+
+    const fetchFn = vi.fn(async (_url, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      const entity = serverEntity('e1', 'bought', 5);
+      entity.canonical_item_id = 'ci-milk'; // resolved item, but no category on the wire
+      return okResponse({
+        client_mutation_id: sent.client_mutation_id,
+        status: 'accepted',
+        server_revision: 5,
+        entity
+      });
+    }) as unknown as typeof fetch;
+
+    await drainQueue(LIST, { fetchFn });
+
+    expect((await db.list_entries.get('e1'))?.category_id).toBe('cat-dairy');
+  });
+
+  it('preserves an already-resolved category when the catalogue cache is cold', async () => {
+    // No item_categories mapping cached (e.g. an offline drain before the
+    // catalogue was fetched): the confirmation must not clobber a category the
+    // SSE/snapshot path had already resolved on the existing row.
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await enqueue('e1', 'mark_bought');
+    await db.list_entries.update('e1', { category_id: 'cat-dairy' });
+
+    const fetchFn = vi.fn(async (_url, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      const entity = serverEntity('e1', 'bought', 5);
+      entity.canonical_item_id = 'ci-milk';
+      return okResponse({
+        client_mutation_id: sent.client_mutation_id,
+        status: 'accepted',
+        server_revision: 5,
+        entity
+      });
+    }) as unknown as typeof fetch;
+
+    await drainQueue(LIST, { fetchFn });
+
+    expect((await db.list_entries.get('e1'))?.category_id).toBe('cat-dairy');
+  });
+
   it('retries network errors with exponential backoff up to MAX_RETRIES', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     const id = await enqueue('e1', 'add_item');
