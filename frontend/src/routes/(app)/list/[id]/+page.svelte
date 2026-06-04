@@ -119,6 +119,7 @@
 	{/if}
 
 	<AddItemInput
+		activeItems={$active}
 		onadd={async (text) => {
 			await addItem(listId, text);
 		}}
