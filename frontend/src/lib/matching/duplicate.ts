@@ -162,7 +162,11 @@ export function checkForDuplicate(
   let bestMatch: DuplicateMatch | null = null;
 
   for (const item of activeItems) {
-    const normalizedItem = normalize(item.display_name);
+    // Parse the existing item through the SAME pipeline as the new input.
+    // `display_name` is stored as raw typed text, so an entry like "2x milk" or
+    // "two eggs" must have its quantity/unit stripped before matching — otherwise
+    // it normalizes to "2x milk" and never matches a later plain "milk".
+    const normalizedItem = normalize(parseQuantityAndUnit(item.display_name).text);
 
     if (!normalizedItem) {
       continue;

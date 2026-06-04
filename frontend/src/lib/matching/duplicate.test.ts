@@ -206,6 +206,44 @@ describe("DuplicateDetector", () => {
     });
   });
 
+  describe("quantity-parsed existing items (Finding A)", () => {
+    // `display_name` is stored as raw typed text. Existing entries that carry a
+    // leading/trailing quantity must be parsed through the same pipeline as the
+    // new input, otherwise e.g. "2x milk" normalizes to "2x milk" and never
+    // matches a later plain "milk".
+    it('warns when active "2x milk" is matched by a later "milk"', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "2x milk" }];
+      const result = checkForDuplicate("milk", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+        expect(result.duplicate.matchedItem.display_name).toBe("2x milk");
+      }
+    });
+
+    it('warns when active "two eggs" (word number) is matched by a later "eggs"', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "two eggs" }];
+      const result = checkForDuplicate("eggs", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+        expect(result.duplicate.matchedItem.display_name).toBe("two eggs");
+      }
+    });
+
+    it('warns when active "milk 2" (trailing count) is matched by a later "milk"', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "milk 2" }];
+      const result = checkForDuplicate("milk", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+  });
+
   describe("fuzzy matching", () => {
     it("matches common typos (distance 1)", () => {
       const items: ActiveItem[] = [{ id: "1", display_name: "Tomato" }];
