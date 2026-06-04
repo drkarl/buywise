@@ -3,7 +3,9 @@
  * Used for duplicate detection and category auto-assignment.
  */
 
-// Category IDs matching the database seed (supabase/migrations/002_seed_categories.sql)
+import { normalize } from "./normalize";
+
+// Category IDs matching the database seed (migrations/002_seed.sql)
 export const CATEGORY_IDS = {
   PRODUCE: "c1000000-0000-0000-0000-000000000001",
   MEAT_FISH: "c1000000-0000-0000-0000-000000000002",
@@ -1622,6 +1624,21 @@ export const DICTIONARY: readonly DictionaryEntry[] = [
 // Type for normalized lookup keys
 type NormalizedKey = string;
 
+/**
+ * Produces the canonical lookup key for a dictionary term or query.
+ *
+ * Both the lookup maps and every lookup query MUST funnel through this helper
+ * so keys and queries are normalized identically. It reuses `normalize` (case
+ * fold + accent strip + punctuation/whitespace cleanup), which is the same
+ * transform `checkForDuplicate` applies to input. Without this, accented
+ * dictionary terms (e.g. "lasaña congelada", "pañuelos de papel") would be
+ * stored under accented keys but queried with accent-stripped input, making
+ * them unreachable.
+ */
+function normalizeKey(term: string): NormalizedKey {
+  return normalize(term);
+}
+
 // Build lookup maps for O(1) access
 function buildLookupMaps(): {
   byEnglish: Map<NormalizedKey, DictionaryEntry>;
@@ -1633,17 +1650,14 @@ function buildLookupMaps(): {
   const byVariant = new Map<NormalizedKey, DictionaryEntry>();
 
   for (const entry of DICTIONARY) {
-    // Normalize keys for case-insensitive lookup
-    const normalizedEn = entry.termEn.toLowerCase();
-    const normalizedEs = entry.termEs.toLowerCase();
-
-    byEnglish.set(normalizedEn, entry);
-    bySpanish.set(normalizedEs, entry);
+    // Normalize keys so lookups (which pass normalized input) always hit.
+    byEnglish.set(normalizeKey(entry.termEn), entry);
+    bySpanish.set(normalizeKey(entry.termEs), entry);
 
     // Add all variants to the variant map
     if (entry.variants) {
       for (const variant of entry.variants) {
-        byVariant.set(variant.toLowerCase(), entry);
+        byVariant.set(normalizeKey(variant), entry);
       }
     }
   }
@@ -1659,7 +1673,7 @@ const lookupMaps = buildLookupMaps();
  * @returns The dictionary entry or undefined if not found
  */
 export function lookupByEnglish(term: string): DictionaryEntry | undefined {
-  return lookupMaps.byEnglish.get(term.toLowerCase());
+  return lookupMaps.byEnglish.get(normalizeKey(term));
 }
 
 /**
@@ -1668,7 +1682,7 @@ export function lookupByEnglish(term: string): DictionaryEntry | undefined {
  * @returns The dictionary entry or undefined if not found
  */
 export function lookupBySpanish(term: string): DictionaryEntry | undefined {
-  return lookupMaps.bySpanish.get(term.toLowerCase());
+  return lookupMaps.bySpanish.get(normalizeKey(term));
 }
 
 /**
@@ -1677,7 +1691,7 @@ export function lookupBySpanish(term: string): DictionaryEntry | undefined {
  * @returns The dictionary entry or undefined if not found
  */
 export function lookupByVariant(variant: string): DictionaryEntry | undefined {
-  return lookupMaps.byVariant.get(variant.toLowerCase());
+  return lookupMaps.byVariant.get(normalizeKey(variant));
 }
 
 /**
@@ -1687,7 +1701,7 @@ export function lookupByVariant(variant: string): DictionaryEntry | undefined {
  * @returns The dictionary entry or undefined if not found
  */
 export function lookupTerm(term: string): DictionaryEntry | undefined {
-  const normalized = term.toLowerCase();
+  const normalized = normalizeKey(term);
   return (
     lookupMaps.byEnglish.get(normalized) ??
     lookupMaps.bySpanish.get(normalized) ??
