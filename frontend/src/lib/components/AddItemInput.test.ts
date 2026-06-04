@@ -106,17 +106,61 @@ describe('AddItemInput', () => {
 			expect(onadd).not.toHaveBeenCalled();
 		});
 
-		it('"Cancel" dismisses the warning without adding', async () => {
+		it('"Cancel" dismisses the warning without adding and restores the typed text', async () => {
 			const onadd = vi.fn();
 			render(AddItemInput, { onadd, activeItems: milkList });
+			const input = screen.getByLabelText('Add an item') as HTMLInputElement;
 
-			await add(screen.getByLabelText('Add an item'), 'leche');
+			await add(input, 'leche');
 			await screen.findByRole('alert');
 
 			await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
 			expect(onadd).not.toHaveBeenCalled();
 			await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+			// The text the user typed is restored, not lost.
+			expect(input.value).toBe('leche');
+		});
+
+		it('holds the flow while a warning is pending: a second submit is blocked and submit is disabled', async () => {
+			const onadd = vi.fn();
+			render(AddItemInput, { onadd, activeItems: milkList });
+			const input = screen.getByLabelText('Add an item') as HTMLInputElement;
+
+			await add(input, 'leche');
+			await screen.findByRole('alert');
+
+			// Submit button is disabled while the prompt is active.
+			const submitBtn = screen.getByRole('button', { name: 'Add item' }) as HTMLButtonElement;
+			expect(submitBtn.disabled).toBe(true);
+
+			// Typing a different item and submitting must NOT commit it or dismiss
+			// the warning — the user still has to resolve the pending prompt.
+			await add(input, 'bread');
+			expect(onadd).not.toHaveBeenCalled();
+			expect(screen.queryByRole('alert')).not.toBeNull();
+
+			// Resolving via "Add anyway" commits only the held duplicate text.
+			await fireEvent.click(screen.getByRole('button', { name: /Add anyway/i }));
+			expect(onadd).toHaveBeenCalledTimes(1);
+			expect(onadd).toHaveBeenCalledWith('leche');
+		});
+
+		it('performs the duplicate check with no server call', async () => {
+			const fetchSpy = vi.spyOn(globalThis, 'fetch');
+			const onadd = vi.fn();
+			render(AddItemInput, { onadd, activeItems: milkList });
+
+			// Duplicate path (warning shown) ...
+			await add(screen.getByLabelText('Add an item'), 'leche');
+			await screen.findByRole('alert');
+			await fireEvent.click(screen.getByRole('button', { name: /Add anyway/i }));
+
+			// ... and non-duplicate path both run entirely client-side.
+			await add(screen.getByLabelText('Add an item'), 'bread');
+
+			expect(fetchSpy).not.toHaveBeenCalled();
+			fetchSpy.mockRestore();
 		});
 
 		it('does not warn for a genuinely distinct item ("bread")', async () => {
