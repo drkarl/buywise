@@ -84,8 +84,11 @@ export class BuyWiseDB extends Dexie {
     // aisle orders from `GET /api/items`. Additive migration — Dexie carries the
     // existing v1 stores forward untouched, so no upgrade function is needed.
     // `store_category_orders` is indexed by `store` (the shopping-mode lookup)
-    // and by the compound `[store+category_id]` (mirrors the server's UNIQUE
-    // constraint for idempotent upserts).
+    // and by the compound `[store+category_id]` for idempotent upserts. The
+    // server's UNIQUE constraint is `(household_id, store, category_id)`
+    // (migrations/003_phase1_schema.sql); this cache is single-household, so
+    // `household_id` is implicit and the index scopes only the (store,
+    // category_id) pair.
     this.version(2).stores({
       categories: 'id, default_order',
       store_category_orders: 'id, store, [store+category_id]',
