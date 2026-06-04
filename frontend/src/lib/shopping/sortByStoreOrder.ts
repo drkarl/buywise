@@ -29,36 +29,55 @@ export interface CategoryGroup {
  */
 export const UNCATEGORISED_ID = '__uncategorised__';
 
-// Categories absent from a store's curated order, and the uncategorised bucket,
-// are pushed past every real `display_order` so they always sort last in a
-// deterministic, store-independent way.
-const FALLBACK_BASE = Number.MAX_SAFE_INTEGER;
+/**
+ * Ordering tiers, compared before any numeric key. Banding by an explicit tier
+ * (rather than offsetting one numeric key past another) keeps every key inside
+ * the safe-integer range, so neither a large `default_order` nor a hostile
+ * cached `display_order` can collapse distinct keys by overflowing
+ * `Number.MAX_SAFE_INTEGER`.
+ */
+const enum OrderTier {
+  /** Curated by the household for the selected store. */
+  Curated = 0,
+  /** Known category, but not curated for this store — uses `default_order`. */
+  Default = 1,
+  /** Unknown/uncategorised — always sorts last. */
+  Fallback = 2
+}
+
+/** A composite ordering key: tier first, then the in-tier numeric key. */
+interface OrderKey {
+  tier: OrderTier;
+  value: number;
+}
 
 /**
- * Resolves a category's effective ordering key for the selected store.
+ * Resolves a category's composite ordering key for the selected store.
  *
  * Precedence (deterministic at every level):
  *   1. The store's `display_order` if the household curated this (store,
  *      category) pair — this is what the store selector switches between.
- *   2. Otherwise the category's own `default_order`, offset past all real
- *      store orders so curated categories always precede uncurated ones.
- *   3. Otherwise (unknown/uncategorised) the maximum key, so it sorts last.
+ *   2. Otherwise the category's own `default_order`.
+ *   3. Otherwise (unknown/uncategorised) a fixed key, so it sorts last.
  *
- * Ties are broken by `category_id` at the call site, keeping the sort stable
- * and reproducible regardless of input order.
+ * The tier guarantees the precedence regardless of the magnitude of any stored
+ * order, so we never add one band's range onto another's (which previously
+ * risked overflowing `Number.MAX_SAFE_INTEGER`). Ties within a tier fall to the
+ * numeric key, then to a `category_id` tiebreak at the call site, keeping the
+ * sort stable and reproducible regardless of input order.
  */
 function displayOrderFor(
   categoryId: string,
   storeOrder: Map<string, number>,
   defaultOrder: Map<string, number>
-): number {
+): OrderKey {
   const curated = storeOrder.get(categoryId);
-  if (curated !== undefined) return curated;
+  if (curated !== undefined) return { tier: OrderTier.Curated, value: curated };
 
   const fallback = defaultOrder.get(categoryId);
-  if (fallback !== undefined) return FALLBACK_BASE - 1 + fallback;
+  if (fallback !== undefined) return { tier: OrderTier.Default, value: fallback };
 
-  return FALLBACK_BASE;
+  return { tier: OrderTier.Fallback, value: 0 };
 }
 
 /**
@@ -119,7 +138,8 @@ export function sortByStoreOrder(
   groups.sort((a, b) => {
     const oa = displayOrderFor(a.category_id, storeOrder, defaultOrder);
     const ob = displayOrderFor(b.category_id, storeOrder, defaultOrder);
-    if (oa !== ob) return oa - ob;
+    if (oa.tier !== ob.tier) return oa.tier - ob.tier;
+    if (oa.value !== ob.value) return oa.value - ob.value;
     return a.category_id < b.category_id ? -1 : a.category_id > b.category_id ? 1 : 0;
   });
 

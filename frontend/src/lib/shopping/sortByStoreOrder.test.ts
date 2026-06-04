@@ -54,7 +54,7 @@ const ids = (groups: CategoryGroup[]) => groups.map((g) => g.category_id);
 describe('sortByStoreOrder', () => {
 	it('returns an empty array for empty inputs', () => {
 		expect(sortByStoreOrder([], [], 'tesco', [])).toEqual([]);
-		// Items but no orders/categories still groups (falls back to category id).
+		// No items still yields no groups even when orders/categories are present.
 		expect(sortByStoreOrder([], [order('tesco', PRODUCE, 1)], 'tesco', categories)).toEqual([]);
 	});
 
@@ -160,6 +160,34 @@ describe('sortByStoreOrder', () => {
 		expect(groups).toHaveLength(1);
 		expect(groups[0].items).toHaveLength(3); // bought item kept in place
 		expect(groups[0].remaining).toBe(2); // only the two active items count
+	});
+
+	it('orders curated, then known-but-absent, then uncategorised (three-tier precedence)', () => {
+		// One curated category (DAIRY), one known category absent from the store
+		// order (PRODUCE, falls back to default_order), and one uncategorised entry.
+		// Expected: curated first, then the default-ordered known category, then the
+		// uncategorised bucket last — regardless of input order.
+		const items = [entry('u', undefined), entry('p', PRODUCE), entry('d', DAIRY)];
+		const orders = [order('tesco', DAIRY, 5)];
+
+		const groups = sortByStoreOrder(items, orders, 'tesco', categories);
+		expect(ids(groups)).toEqual([DAIRY, PRODUCE, UNCATEGORISED_ID]);
+	});
+
+	it('keeps ordering deterministic even when stored orders are huge (no overflow)', () => {
+		// A hostile/large curated display_order must still precede default-ordered
+		// categories, and large default_orders must not collapse into one another.
+		const bigCats: LocalCategory[] = [
+			{ ...categories[0], id: PRODUCE, default_order: Number.MAX_SAFE_INTEGER - 1 },
+			{ ...categories[1], id: DAIRY, default_order: Number.MAX_SAFE_INTEGER }
+		];
+		const items = [entry('p', PRODUCE), entry('d', DAIRY), entry('b', BAKERY)];
+		// BAKERY is curated with a large order; it must still come before the two
+		// default-ordered categories. PRODUCE (smaller default) precedes DAIRY.
+		const orders = [order('tesco', BAKERY, Number.MAX_SAFE_INTEGER)];
+
+		const groups = sortByStoreOrder(items, orders, 'tesco', bigCats);
+		expect(ids(groups)).toEqual([BAKERY, PRODUCE, DAIRY]);
 	});
 
 	it('attaches resolved category metadata to each group', () => {
