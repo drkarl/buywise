@@ -293,6 +293,61 @@ describe("DuplicateDetector", () => {
     });
   });
 
+  describe("parser aligned with core (SI units, spaced form, base-equivalence)", () => {
+    // The frontend parser mirrors `parse_count_and_size` in
+    // crates/core/src/normalise.rs: SI units only (incl. Spanish long-form),
+    // spaced "<number> <unit>" pairs, base-unit conversion, and imperial units
+    // are NOT sizes. Without this, these legitimate duplicates were missed.
+
+    it('spaced unit: "500 g rice" vs active "500g rice" → warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "500g rice" }];
+      const result = checkForDuplicate("500 g rice", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('Spanish long-form: "dos litros leche" vs active "2l leche" → warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "2l leche" }];
+      const result = checkForDuplicate("dos litros leche", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('base-unit equivalence: "1000g rice" vs active "1kg rice" → warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "1kg rice" }];
+      const result = checkForDuplicate("1000g rice", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('imperial is not a size: "1lb butter" vs active "butter" → warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "butter" }];
+      const result = checkForDuplicate("1lb butter", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        // "lb" is not an SI size, so "1lb butter" stays as text and contains-matches.
+        expect(result.duplicate.matchType).toBe("contains");
+      }
+    });
+
+    it('distinct sizes still suppressed: "500g rice" vs active "1kg rice" → no warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "1kg rice" }];
+      const result = checkForDuplicate("500g rice", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+  });
+
   describe("distinct dictionary items are not falsely matched via contains", () => {
     // The dictionary is authoritative: when BOTH terms are dictionary-known but
     // resolve to DIFFERENT canonicals, they are genuinely distinct and must not
@@ -481,24 +536,23 @@ describe("DuplicateDetector", () => {
   });
 
   describe("parsed input", () => {
-    it("extracts quantity from beginning", () => {
+    it("extracts count from beginning", () => {
       const result = checkForDuplicate("2 milk", []);
       expect(result.parsed.text).toBe("milk");
-      expect(result.parsed.quantity).toBe(2);
-      expect(result.parsed.unit).toBeNull();
+      expect(result.parsed.count).toBe(2);
+      expect(result.parsed.requestedSize).toBeNull();
     });
 
-    it("extracts quantity and unit", () => {
+    it("extracts a size constraint in base units", () => {
       const result = checkForDuplicate("500g cheese", []);
       expect(result.parsed.text).toBe("cheese");
-      expect(result.parsed.quantity).toBe(500);
-      expect(result.parsed.unit).toBe("g");
+      expect(result.parsed.requestedSize).toEqual({ value: 500, basis: "g" });
     });
 
-    it("extracts quantity with x notation", () => {
+    it("extracts count with x notation", () => {
       const result = checkForDuplicate("3x apples", []);
       expect(result.parsed.text).toBe("apples");
-      expect(result.parsed.quantity).toBe(3);
+      expect(result.parsed.count).toBe(3);
     });
 
     it("preserves original input", () => {
@@ -506,12 +560,12 @@ describe("DuplicateDetector", () => {
       expect(result.parsed.original).toBe("2x milk");
     });
 
-    it("defaults quantity to 1 when not specified", () => {
+    it("defaults count to 1 when not specified", () => {
       const result = checkForDuplicate("eggs", []);
-      expect(result.parsed.quantity).toBe(1);
+      expect(result.parsed.count).toBe(1);
     });
 
-    it("matches after extracting quantity", () => {
+    it("matches after extracting count", () => {
       const items: ActiveItem[] = [{ id: "1", display_name: "Milk" }];
       const result = checkForDuplicate("2x milk", items);
 
@@ -591,13 +645,15 @@ describe("DuplicateDetector", () => {
       expect(result.duplicate.found).toBe(false);
     });
 
-    it("handles input with only quantity", () => {
+    it("treats a lone count token as item text (mirrors the core parser)", () => {
       const items: ActiveItem[] = [{ id: "1", display_name: "Milk" }];
       const result = checkForDuplicate("2x", items);
 
       expect(result.duplicate.found).toBe(false);
-      expect(result.parsed.text).toBe("");
-      expect(result.parsed.quantity).toBe(2);
+      // A lone "2x" is ambiguous; like `parse_count_and_size`, only a leading
+      // count *with residual item text* is stripped, so "2x" stays as text.
+      expect(result.parsed.text).toBe("2x");
+      expect(result.parsed.count).toBe(1);
     });
   });
 
