@@ -20,7 +20,9 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use buywise_api::{app, AppState};
+use buywise_api::sse::SseEvent;
+use buywise_api::{app, sse, AppState};
+use buywise_core::constraint_hash::effective_constraint_hash;
 use buywise_core::db;
 use http_body_util::BodyExt;
 use sqlx::SqlitePool;
@@ -142,6 +144,22 @@ async fn post_mutation(
 }
 
 fn add_item(client_mutation_id: &str, entity_id: &str, raw_text: &str) -> serde_json::Value {
+    add_item_with_constraints(client_mutation_id, entity_id, raw_text, None)
+}
+
+/// Like [`add_item`] but with an optional `constraints` payload. A non-empty
+/// constraints set survives onto the entry and is fed into the recomputed
+/// `effective_constraint_hash` when the cascade resolves the entry.
+fn add_item_with_constraints(
+    client_mutation_id: &str,
+    entity_id: &str,
+    raw_text: &str,
+    constraints: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "raw_text": raw_text, "display_name": raw_text });
+    if let Some(constraints) = constraints {
+        payload["constraints"] = constraints;
+    }
     serde_json::json!({
         "client_mutation_id": client_mutation_id,
         "device_id": "device-1",
@@ -150,7 +168,7 @@ fn add_item(client_mutation_id: &str, entity_id: &str, raw_text: &str) -> serde_
         "entity_type": "list_entry",
         "entity_id": entity_id,
         "operation_type": "add_item",
-        "payload": { "raw_text": raw_text, "display_name": raw_text },
+        "payload": payload,
         "created_at_client": "2026-06-04T00:00:00.000Z",
     })
 }
@@ -262,11 +280,18 @@ async fn adding_unknown_term_stays_unresolved() {
     let state = AppState::new(pool.clone());
     let s = seed_seed_household_user_and_list(&pool).await;
 
+    // The unknown term we expect to stay unresolved.
     let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", "xyzqrst_unknown")).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Give the spawned task time to run; it must leave the entry unresolved.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // A "leche" sentinel posted AFTER the unknown. Polling it to `resolved` proves
+    // the spawned cascade has actually run for adds enqueued up to this point, so a
+    // still-`unresolved` "entry-1" below is a real NoMatch — not a task that simply
+    // had not been scheduled yet (which a fixed sleep could not distinguish).
+    let sentinel = post_mutation(&state, &s, add_item("cm-2", "sentinel", "leche")).await;
+    assert_eq!(sentinel.status(), StatusCode::CREATED);
+    poll_entry(&pool, "sentinel", |e| e.resolution_status == "resolved").await;
+
     let state = entry_state(&pool, "entry-1").await.unwrap();
     assert_eq!(state.resolution_status, "unresolved");
     assert!(state.canonical_item_id.is_none());
@@ -389,8 +414,13 @@ async fn resolution_db_failure_does_not_corrupt_committed_mutation() {
         "mutation accepted immediately, before resolution runs"
     );
 
-    // Let the spawned task run and fail.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // A "leche" sentinel posted AFTER the failing add. Polling it to `resolved`
+    // proves the cascade has run (and failed) for the earlier add, rather than
+    // relying on a fixed sleep that could pass simply because the failing task had
+    // not been scheduled yet.
+    let sentinel = post_mutation(&state, &s, add_item("cm-2", "sentinel", "leche")).await;
+    assert_eq!(sentinel.status(), StatusCode::CREATED);
+    poll_entry(&pool, "sentinel", |e| e.resolution_status == "resolved").await;
 
     // The committed mutation row is intact: accepted, revision 1.
     let (status, revision): (String, Option<i64>) = sqlx::query_as(
@@ -412,13 +442,162 @@ async fn resolution_db_failure_does_not_corrupt_committed_mutation() {
     );
     assert!(entry.canonical_item_id.is_none());
 
-    let current_revision: i64 =
-        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+    // The failed resolution never bumped a revision: entry-1 still carries the
+    // revision its (cm-1) mutation commit stamped (1), unchanged by the cascade.
+    // (The successful sentinel resolution advances the list's current_revision, so
+    // we assert on this entry's own stamp rather than the global counter.)
+    let entry_revision: i64 =
+        sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = 'entry-1'")
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        current_revision, 1,
-        "the failed resolution did not bump the list revision"
+        entry_revision, 1,
+        "the failed resolution did not bump entry-1's revision"
     );
+}
+
+// ---------------------------------------------------------------------------
+// effective_constraint_hash recompute: a resolution with real constraints must
+// recompute the hash from them, NOT fall back to the `default` sentinel.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resolving_an_entry_with_constraints_recomputes_a_non_default_hash() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    // "leche" with a real constraint set. The add commits unresolved (constraints
+    // alone do not resolve it), then the cascade resolves it to Milk and must
+    // recompute the hash from these constraints rather than hardcoding `default`.
+    let constraints = serde_json::json!({ "brand": "Hacendado", "fat": "semi" });
+    let resp = post_mutation(
+        &state,
+        &s,
+        add_item_with_constraints("cm-1", "entry-1", "leche", Some(constraints.clone())),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resolved = poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(resolved.canonical_item_id.as_deref(), Some(MILK_ID));
+
+    // The stored hash must equal the hash of the constraints, and must not be the
+    // `default` sentinel — the issue's "never hardcode default unless constraints
+    // empty" requirement.
+    let hash: String = sqlx::query_scalar(
+        "SELECT effective_constraint_hash FROM list_entries WHERE id = 'entry-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let expected = effective_constraint_hash("entry-1", Some(MILK_ID), Some(&constraints));
+    assert_ne!(
+        hash, "default",
+        "constraints present must not hash to default"
+    );
+    assert_eq!(
+        hash, expected,
+        "stored hash must equal effective_constraint_hash(constraints)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSE broadcast: the cascade emits a `mutation` event for each resolution
+// outcome (and two for a dedup merge) — the issue's explicit acceptance criterion.
+// ---------------------------------------------------------------------------
+
+/// Subscribe to a list's broadcast channel and receive the next `mutation` event,
+/// or panic if none arrives within 500ms.
+async fn recv_event(
+    rx: &mut tokio::sync::broadcast::Receiver<SseEvent>,
+) -> (i64, serde_json::Value) {
+    let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("an SSE event within 500ms")
+        .expect("broadcast channel open");
+    match event {
+        SseEvent::Mutation {
+            server_revision,
+            entity,
+        } => (server_revision, entity),
+    }
+}
+
+#[tokio::test]
+async fn resolution_broadcasts_an_sse_event() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    // Subscribe BEFORE posting so the channel exists when the cascade broadcasts.
+    let mut rx = sse::sender_for(&state, "list-a").subscribe();
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The mutation commit itself broadcasts the unresolved add (revision 1); the
+    // cascade then broadcasts the resolved entry. Drain until we see the resolution
+    // event (resolution_status == "resolved").
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let (revision, entity) = recv_event(&mut rx).await;
+        if entity["resolution_status"] == "resolved" {
+            assert_eq!(entity["id"], "entry-1");
+            assert_eq!(entity["canonical_item_id"], MILK_ID);
+            assert!(revision >= 1, "resolution event carries a list revision");
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("no resolved SSE event broadcast for the resolution outcome");
+        }
+    }
+}
+
+#[tokio::test]
+async fn dedup_merge_broadcasts_two_sse_events() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let mut rx = sse::sender_for(&state, "list-a").subscribe();
+
+    // Two unresolved "leche" adds. The second to resolve hits the dedup index and
+    // merges into the survivor, which must broadcast TWO events: the survivor's
+    // updated quantity and the loser's deletion.
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-2", "entry-2", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // Collect events until we have observed both a quantity-2 survivor and a
+    // deleted loser among the broadcast entities (the two merge outcomes).
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut saw_survivor = false;
+    let mut saw_deleted = false;
+    while !(saw_survivor && saw_deleted) {
+        if Instant::now() >= deadline {
+            panic!(
+                "merge did not broadcast both events (survivor={saw_survivor}, deleted={saw_deleted})"
+            );
+        }
+        let (_, entity) = recv_event(&mut rx).await;
+        if entity["status"] == "deleted" {
+            saw_deleted = true;
+        } else if entity["status"] == "active"
+            && entity["resolution_status"] == "resolved"
+            && entity["quantity"] == 2
+        {
+            saw_survivor = true;
+        }
+    }
 }
