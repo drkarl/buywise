@@ -30,7 +30,7 @@
 	const existingName = $derived(match.matchedItem.display_name);
 </script>
 
-<div class="duplicate-warning" role="alert" aria-live="assertive">
+<div class="duplicate-warning" role="alert">
 	<p class="message">
 		<strong>“{existingName}”</strong> is already on your list.
 	</p>
