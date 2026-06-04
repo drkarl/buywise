@@ -36,6 +36,7 @@ pub mod lists;
 pub mod middleware;
 pub mod mutations;
 pub mod optimise;
+pub mod resolution;
 pub mod sse;
 
 /// Registry of per-list SSE broadcast senders, keyed by `list_id`.
