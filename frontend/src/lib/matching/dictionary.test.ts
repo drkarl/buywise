@@ -200,6 +200,21 @@ describe("dictionary", () => {
     });
   });
 
+  describe("punctuation normalization", () => {
+    // normalize() turns punctuation into a space, so "coca-cola" → "coca cola",
+    // which is the bundled variant of the "cola" entry. Lookup keys and queries
+    // both funnel through normalizeKey, so the hyphenated form resolves.
+    it('finds the "coca cola" variant from the hyphenated "coca-cola"', () => {
+      const entry = lookupByVariant("coca-cola");
+      expect(entry).toBeDefined();
+      expect(entry?.canonical).toBe("cola");
+    });
+
+    it("resolves a hyphenated query the same as its spaced form", () => {
+      expect(lookupByVariant("coca-cola")).toEqual(lookupByVariant("coca cola"));
+    });
+  });
+
   describe("lookupByVariant", () => {
     it("returns entry for plural variants", () => {
       const entry = lookupByVariant("apples");

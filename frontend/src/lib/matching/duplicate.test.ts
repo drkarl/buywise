@@ -91,13 +91,22 @@ describe("DuplicateDetector", () => {
       }
     });
 
-    it("matches after removing punctuation", () => {
+    it("matches after normalizing punctuation to spaces", () => {
+      // BuyWise contract: punctuation → space, so "Coca-Cola" normalizes to
+      // "coca cola". A spaced or differently-punctuated form of the same text
+      // is therefore an exact match (not the old deletion behaviour).
       const items: ActiveItem[] = [{ id: "1", display_name: "Coca-Cola" }];
-      const result = checkForDuplicate("cocacola", items);
 
-      expect(result.duplicate.found).toBe(true);
-      if (result.duplicate.found) {
-        expect(result.duplicate.matchType).toBe("exact");
+      const spaced = checkForDuplicate("coca cola", items);
+      expect(spaced.duplicate.found).toBe(true);
+      if (spaced.duplicate.found) {
+        expect(spaced.duplicate.matchType).toBe("exact");
+      }
+
+      const hyphenated = checkForDuplicate("Coca-Cola", items);
+      expect(hyphenated.duplicate.found).toBe(true);
+      if (hyphenated.duplicate.found) {
+        expect(hyphenated.duplicate.matchType).toBe("exact");
       }
     });
 
@@ -178,6 +187,21 @@ describe("DuplicateDetector", () => {
       expect(result.duplicate.found).toBe(true);
       if (result.duplicate.found) {
         expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('matches a hyphenated brand to its spaced variant: "coca-cola" → "Coke"', () => {
+      // "coca-cola" normalizes to "coca cola" (punctuation → space), which is the
+      // bundled variant of the "cola" entry. "Coke" is also a "cola" variant, so
+      // the two resolve to the same canonical → dictionary match. Before the
+      // punctuation→space fix, "coca-cola" became "cocacola" and missed entirely.
+      const items: ActiveItem[] = [{ id: "1", display_name: "Coke" }];
+      const result = checkForDuplicate("coca-cola", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("dictionary");
+        expect(result.duplicate.confidence).toBe(0.95);
       }
     });
   });
