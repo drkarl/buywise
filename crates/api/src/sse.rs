@@ -461,6 +461,32 @@ async fn sse_handler(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
+/// Fan a committed `mutation` out to every client streaming `list_id`.
+///
+/// Shared by the mutation commit path ([`crate::mutations`]) and the async
+/// resolution task ([`crate::resolution`]) so both emit the identical wire shape
+/// (`server_revision` + pre-serialised `entity`). Looks the channel up without
+/// inserting: if no client is currently subscribed there is no channel (or it has
+/// zero receivers), and the send is a silent no-op — a disconnected client
+/// backfills via `?since=` on reconnect, so a dropped live event is never lost.
+pub(crate) fn broadcast_entity(
+    state: &AppState,
+    list_id: &str,
+    server_revision: i64,
+    entity: Value,
+) {
+    let Some(sender) = state.sse_channels.get(list_id) else {
+        return;
+    };
+    // `send` errors only when there are zero receivers; that is an expected,
+    // benign state (all clients disconnected between lookup and send), so the
+    // result is intentionally ignored.
+    let _ = sender.send(SseEvent::Mutation {
+        server_revision,
+        entity,
+    });
+}
+
 /// Build the `mutation` SSE event from a broadcast payload.
 fn event_from(event: &SseEvent) -> Result<Event, serde_json::Error> {
     match event {

@@ -137,7 +137,7 @@ pub struct MutationResponse {
 
 /// A `list_entries` row as returned in [`MutationResponse::entity`]. Mirrors the
 /// `EntryView` shape `lists.rs` returns so a client decodes both identically.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EntityView {
     /// `list_entries.id`.
     pub id: String,
@@ -175,7 +175,7 @@ pub struct EntityView {
 
 /// Every `list_entries` column, in a fixed SELECT order, as a flat tuple sqlx can
 /// decode. Shared by the load + render helpers.
-type EntryRow = (
+pub(crate) type EntryRow = (
     String,         // id
     String,         // list_id
     Option<String>, // canonical_item_id
@@ -195,7 +195,7 @@ type EntryRow = (
 );
 
 /// The `list_entries` SELECT column list, matching [`EntryRow`] order.
-const ENTRY_COLUMNS: &str = "id, list_id, canonical_item_id, resolution_status, \
+pub(crate) const ENTRY_COLUMNS: &str = "id, list_id, canonical_item_id, resolution_status, \
      resolution_candidates_json, raw_text, display_name, added_by, quantity, status, \
      bought_by, bought_at, effective_constraint_hash, last_updated_revision, created_at, updated_at";
 
@@ -373,9 +373,31 @@ async fn post_mutation(
         .await
         .map_err(db_error("post_mutation.commit"))?;
 
-    // 6. Broadcast over SSE (P1-T5). Stub until that lands; intentionally after
-    //    COMMIT so subscribers never observe an uncommitted mutation.
+    // 6. Broadcast over SSE (P1-T5). Intentionally after COMMIT so subscribers
+    //    never observe an uncommitted mutation.
     broadcast_mutation(&state, &req.list_id, server_revision, &response);
+
+    // 7. Server-side resolution cascade (P3-T1). An `add_item` that committed as
+    //    `unresolved` is resolved asynchronously: the mutation is already
+    //    accepted, so the UI never blocks on it. Anything else (a resolved add, a
+    //    field update, or a merge into an existing row) needs no cascade.
+    if req.operation_type == "add_item" {
+        if let Some(entity) = &response.entity {
+            if entity.resolution_status == "unresolved" {
+                crate::resolution::spawn_resolution(
+                    state.clone(),
+                    crate::resolution::ResolutionJob {
+                        entry_id: entity.id.clone(),
+                        list_id: req.list_id.clone(),
+                        household_id: household_id.clone(),
+                        user_id: user.user_id.clone(),
+                        raw_text: entity.raw_text.clone(),
+                        constraints: req.payload.get("constraints").cloned(),
+                    },
+                );
+            }
+        }
+    }
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -950,6 +972,24 @@ async fn load_entry(
         .await
 }
 
+/// Load a full `list_entries` row scoped to `(id, list_id)` on the pool (not a
+/// transaction), for the async resolution task which runs after the original
+/// mutation's transaction has committed. Returns the row as an [`EntityView`] so
+/// the SSE broadcast matches the `entity` shape `POST /api/mutations` emits.
+pub(crate) async fn load_entry_view(
+    pool: &sqlx::SqlitePool,
+    entry_id: &str,
+    list_id: &str,
+) -> Result<Option<EntityView>, sqlx::Error> {
+    let sql = format!("SELECT {ENTRY_COLUMNS} FROM list_entries WHERE id = ?1 AND list_id = ?2");
+    Ok(sqlx::query_as::<_, EntryRow>(&sql)
+        .bind(entry_id)
+        .bind(list_id)
+        .fetch_optional(pool)
+        .await?
+        .map(EntityView::from))
+}
+
 /// Append a `list_entry_events` row (used to preserve a losing action under a
 /// delete-vs-mark_bought conflict). The mutation payload is stored verbatim.
 async fn record_event(
@@ -1128,12 +1168,6 @@ fn broadcast_mutation(
     server_revision: i64,
     response: &MutationResponse,
 ) {
-    // Only fan out if a channel already exists for this list (lazily created by
-    // the first SSE subscriber). Looking up without inserting avoids growing the
-    // registry for lists that nobody is streaming.
-    let Some(sender) = state.sse_channels.get(list_id) else {
-        return;
-    };
     let entity = match serde_json::to_value(&response.entity) {
         Ok(v) => v,
         Err(e) => {
@@ -1141,13 +1175,7 @@ fn broadcast_mutation(
             return;
         }
     };
-    // `send` errors only when there are zero receivers; that is an expected,
-    // benign state (all clients disconnected between lookup and send), so the
-    // result is intentionally ignored.
-    let _ = sender.send(crate::sse::SseEvent::Mutation {
-        server_revision,
-        entity,
-    });
+    crate::sse::broadcast_entity(state, list_id, server_revision, entity);
 }
 
 #[cfg(test)]
