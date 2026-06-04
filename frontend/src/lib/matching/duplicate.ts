@@ -72,29 +72,6 @@ export interface DuplicateCheckResult {
 }
 
 /**
- * Checks if two normalized terms match via the dictionary (bilingual matching).
- * Returns true if both terms resolve to the same dictionary entry.
- *
- * @param normalizedInput - The normalized user input term
- * @param normalizedItem - The normalized term from an existing list item
- * @returns True if both terms resolve to the same canonical dictionary entry
- */
-function isDictionaryMatch(
-  normalizedInput: string,
-  normalizedItem: string
-): boolean {
-  const inputEntry = lookupTerm(normalizedInput);
-  const itemEntry = lookupTerm(normalizedItem);
-
-  if (!inputEntry || !itemEntry) {
-    return false;
-  }
-
-  // Both must resolve to the same canonical term
-  return inputEntry.canonical === itemEntry.canonical;
-}
-
-/**
  * Gets the dictionary entry for a normalized term.
  *
  * @param normalizedTerm - The normalized term to look up
@@ -188,8 +165,14 @@ export function checkForDuplicate(
       };
     }
 
-    // 2. Dictionary match (bilingual)
-    if (isDictionaryMatch(normalizedInput, normalizedItem)) {
+    // Resolve both terms in the dictionary once (O(1) Map gets) and reuse the
+    // result for the same-canonical match below and the different-canonical
+    // negative guard.
+    const inputEntry = lookupTerm(normalizedInput);
+    const itemEntry = lookupTerm(normalizedItem);
+
+    // 2. Dictionary match (bilingual): both resolve to the SAME canonical.
+    if (inputEntry && itemEntry && inputEntry.canonical === itemEntry.canonical) {
       const match: DuplicateMatch = {
         found: true,
         matchedItem: item,
@@ -201,6 +184,16 @@ export function checkForDuplicate(
         bestMatch = match;
       }
       continue; // Don't check lower priority matches for this item
+    }
+
+    // Definitive negative: when BOTH terms are dictionary-known but resolve to
+    // DIFFERENT canonicals, they are genuinely distinct items (the dictionary is
+    // authoritative). Skip the fuzzy/contains fallback for this item so e.g.
+    // "bread" doesn't falsely warn against "whole wheat bread" via the
+    // bidirectional 5-char contains rule. The fallback is only for unknown/typo'd
+    // terms, so it stays active when only one side (or neither) is known.
+    if (inputEntry && itemEntry) {
+      continue;
     }
 
     // 3. Fuzzy match (skip if we already have a dictionary match)
