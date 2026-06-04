@@ -14,14 +14,13 @@
 	let { selected, onselect }: Props = $props();
 </script>
 
-<div class="stores" role="radiogroup" aria-label="Choose a store">
+<div class="stores" role="group" aria-label="Choose a store">
 	{#each RETAILERS as retailer (retailer.id)}
 		<button
 			type="button"
 			class="store"
 			class:active={retailer.id === selected}
-			role="radio"
-			aria-checked={retailer.id === selected}
+			aria-pressed={retailer.id === selected}
 			onclick={() => onselect(retailer.id)}
 		>
 			{retailer.label}
