@@ -658,11 +658,61 @@ async fn get_items_returns_items_with_aliases_and_constraints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let items = json(resp).await;
-    let arr = items.as_array().unwrap();
+    let body = json(resp).await;
+    // P2-T6: the endpoint now returns an envelope { items, categories,
+    // store_category_orders } rather than a bare array.
+    let arr = body["items"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["id"], "item-1");
     assert_eq!(arr[0]["aliases"].as_array().unwrap().len(), 1);
     assert_eq!(arr[0]["aliases"][0]["alias"], "leche");
     assert_eq!(arr[0]["constraints"]["brand"], "Avonmore");
+    // The catalogue echoes the one category seeded above.
+    let cats = body["categories"].as_array().unwrap();
+    assert!(cats.iter().any(|c| c["id"] == "cat-1"));
+    // store_category_orders is present (empty here: this synthetic household has
+    // no seeded aisle orders — that path is covered against the migration seed in
+    // `get_items_returns_categories_and_store_orders_for_seeded_household`).
+    assert!(body["store_category_orders"].is_array());
+}
+
+/// P2-T6: against the migration-seeded default household, `GET /api/items` must
+/// return the full `categories` catalogue (11) and every per-store aisle order
+/// (5 stores x 11 categories = 55, see migrations/004_seed_phase1.sql). This
+/// exercises the real envelope shape the shopping-mode fetch path consumes.
+#[tokio::test]
+async fn get_items_returns_categories_and_store_orders_for_seeded_household() {
+    let pool = setup_pool().await;
+    // The migration seed (004) creates household 0000…0001 with 55 aisle orders.
+    const SEEDED_HOUSEHOLD: &str = "00000000-0000-0000-0000-000000000001";
+    seed_user(&pool, "user-seed", "seed@example.test", SEEDED_HOUSEHOLD).await;
+
+    let s = login(&pool, "seed@example.test").await;
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .uri("/api/items")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+
+    let cats = body["categories"].as_array().unwrap();
+    assert_eq!(cats.len(), 11, "11 seeded categories");
+
+    let orders = body["store_category_orders"].as_array().unwrap();
+    assert_eq!(orders.len(), 55, "5 stores x 11 categories");
+    // Every order references one of the five canonical retailers.
+    let stores: std::collections::HashSet<&str> = orders
+        .iter()
+        .map(|o| o["store"].as_str().unwrap())
+        .collect();
+    assert_eq!(stores.len(), 5);
+    for store in ["tesco", "dunnes", "supervalu", "aldi", "lidl"] {
+        assert!(stores.contains(store), "missing store {store}");
+    }
 }
