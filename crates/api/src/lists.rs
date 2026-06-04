@@ -10,7 +10,9 @@
 //!     `current_revision`, and all ACTIVE `list_entries`.
 //!   * `PATCH /api/list/:id`  — rename or archive a list (CSRF-protected).
 //!   * `GET   /api/items`     — the full canonical catalogue (items + aliases +
-//!     constraints) for client-side resolution / category assignment.
+//!     constraints) plus the `categories` catalogue and the household's
+//!     `store_category_orders`, for client-side resolution / category assignment
+//!     and offline store-ordering (P2-T6). Returns an [`ItemsResponse`] envelope.
 //!
 //! Authorization model (see also `migrations/003_phase1_schema.sql`):
 //!   * A user belongs to household(s) via `household_members`. Collection
@@ -212,6 +214,54 @@ pub struct ConstraintsView {
     pub dietary_flags: Option<String>,
     /// `item_constraints.substitution_policy` (`any` | `ask` | `strict`).
     pub substitution_policy: String,
+}
+
+/// The full `GET /api/items` payload: the canonical catalogue plus the two
+/// reference tables shopping mode needs to group + order items by store entirely
+/// offline (P2-T6). Canonical shape per `docs/implementation-plan.md` ("Store
+/// category orders: fetched from `GET /api/items` response").
+///
+/// Contract change (P2-T6): the endpoint previously returned a bare
+/// `Vec<ItemView>`; it now returns this envelope so the client can cache the
+/// `categories` catalogue and the per-store aisle orders alongside the items.
+#[derive(Debug, Serialize)]
+pub struct ItemsResponse {
+    /// The canonical items with their aliases and (optional) constraints.
+    pub items: Vec<ItemView>,
+    /// The shared `categories` catalogue (id, names, icon, default order).
+    pub categories: Vec<CategoryView>,
+    /// The caller's household per-store aisle orders (`store_category_orders`).
+    pub store_category_orders: Vec<StoreCategoryOrderView>,
+}
+
+/// One `categories` row, mirroring `crates/core/src/domain.rs::Category`.
+#[derive(Debug, Serialize)]
+pub struct CategoryView {
+    /// `categories.id`.
+    pub id: String,
+    /// `categories.name_en`.
+    pub name_en: String,
+    /// `categories.name_es`.
+    pub name_es: String,
+    /// `categories.icon`.
+    pub icon: String,
+    /// `categories.default_order`.
+    pub default_order: i64,
+}
+
+/// One `store_category_orders` row (household-scoped to the caller). `store` is a
+/// Retailer DB string (`tesco`|`dunnes`|`supervalu`|`aldi`|`lidl`); see
+/// `crates/core/src/domain.rs::Retailer::as_db_str`.
+#[derive(Debug, Serialize)]
+pub struct StoreCategoryOrderView {
+    /// `store_category_orders.id`.
+    pub id: String,
+    /// `store_category_orders.store`.
+    pub store: String,
+    /// `store_category_orders.category_id`.
+    pub category_id: String,
+    /// `store_category_orders.display_order`.
+    pub display_order: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -570,11 +620,15 @@ async fn patch_list(
 }
 
 /// `GET /api/items` — the full canonical catalogue for the caller's
-/// household(s): each item with its aliases and (optional) constraints.
+/// household(s): each item with its aliases and (optional) constraints, plus the
+/// shared `categories` catalogue and the household's per-store aisle orders
+/// (`store_category_orders`). The two reference tables let shopping mode (P2-T6)
+/// resolve `canonical_item_id -> category_id` and order categories per store
+/// fully offline. See [`ItemsResponse`].
 async fn list_items(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-) -> Result<Json<Vec<ItemView>>, StatusCode> {
+) -> Result<Json<ItemsResponse>, StatusCode> {
     let item_rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
         "SELECT id, household_id, name_en, name_es, category_id, default_constraint_policy \
          FROM canonical_items \
@@ -587,8 +641,23 @@ async fn list_items(
     .await
     .map_err(db_error("list_items.items"))?;
 
+    // The categories catalogue is shared (not household-scoped) and the per-store
+    // aisle orders are scoped to the caller's household set. Both are returned
+    // even when the caller has no canonical items yet, so a fresh household can
+    // still render shopping mode's store ordering from its seeded defaults.
+    let categories = load_categories(&state.pool)
+        .await
+        .map_err(db_error("list_items.categories"))?;
+    let store_category_orders = load_store_category_orders(&state.pool, &user.user_id)
+        .await
+        .map_err(db_error("list_items.store_category_orders"))?;
+
     if item_rows.is_empty() {
-        return Ok(Json(Vec::new()));
+        return Ok(Json(ItemsResponse {
+            items: Vec::new(),
+            categories,
+            store_category_orders,
+        }));
     }
 
     // Batch all aliases and constraints for the scoped item set in a small,
@@ -623,7 +692,68 @@ async fn list_items(
         )
         .collect();
 
-    Ok(Json(items))
+    Ok(Json(ItemsResponse {
+        items,
+        categories,
+        store_category_orders,
+    }))
+}
+
+/// Load the shared `categories` catalogue (id, names, icon, default order).
+///
+/// Categories are global reference data (not household-scoped): every household
+/// orders the same canonical category set per store.
+async fn load_categories(pool: &sqlx::SqlitePool) -> Result<Vec<CategoryView>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, i64)>(
+        "SELECT id, name_en, name_es, icon, default_order \
+         FROM categories \
+         ORDER BY default_order, id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, name_en, name_es, icon, default_order)| CategoryView {
+            id,
+            name_en,
+            name_es,
+            icon,
+            default_order,
+        })
+        .collect())
+}
+
+/// Load the per-store aisle orders for the caller's household(s).
+///
+/// Household-scoped via the same `household_members` sub-select the items query
+/// uses, so a user only sees their own household's curated (or seeded) orders.
+async fn load_store_category_orders(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Vec<StoreCategoryOrderView>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+        "SELECT id, store, category_id, display_order \
+         FROM store_category_orders \
+         WHERE household_id IN \
+               (SELECT household_id FROM household_members WHERE user_id = ?1) \
+         ORDER BY store, display_order, category_id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, store, category_id, display_order)| StoreCategoryOrderView {
+                id,
+                store,
+                category_id,
+                display_order,
+            },
+        )
+        .collect())
 }
 
 /// Max bound parameters per chunked `IN (...)` query. SQLite's compile-time
