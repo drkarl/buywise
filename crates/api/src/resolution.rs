@@ -151,12 +151,15 @@ async fn resolve_single_match(
             let revision = increment_revision(&mut tx, &job.list_id).await?;
             stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
             tx.commit().await?;
-            broadcast_entry(state, job, revision).await?;
+            // Broadcast is best-effort and runs AFTER commit: a read/serialise
+            // failure here must not make the cascade report failure (the entry is
+            // already resolved). Logged inside, never propagated.
+            broadcast_entry(state, job, revision).await;
             Ok(())
         }
         // The partial dedup index fired: a resolved active row for the same
         // (list, canonical item, hash) already exists. Merge this entry into it.
-        Err(e) if is_dedup_index_violation(&e) => {
+        Err(e) if crate::mutations::is_dedup_index_violation(&e) => {
             merge_into_survivor(state, job, canonical_item_id, &hash, &now, tx).await
         }
         Err(e) => Err(e),
@@ -251,9 +254,10 @@ async fn merge_into_survivor(
     tx.commit().await?;
 
     // Broadcast both outcomes: the survivor's updated quantity and this entry's
-    // deletion. Read-after-commit so each event reflects the committed row.
-    broadcast_entry_id(state, &job.list_id, &survivor_id, revision).await?;
-    broadcast_entry_id(state, &job.list_id, &job.entry_id, revision).await?;
+    // deletion. Read-after-commit so each event reflects the committed row. Both
+    // are best-effort (post-commit): a failure here is logged, never propagated.
+    broadcast_entry_id(state, &job.list_id, &survivor_id, revision).await;
+    broadcast_entry_id(state, &job.list_id, &job.entry_id, revision).await;
     Ok(())
 }
 
@@ -294,7 +298,8 @@ async fn resolve_ambiguous(
     stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
     tx.commit().await?;
 
-    broadcast_entry(state, job, revision).await?;
+    // Best-effort post-commit broadcast (see [`broadcast_entry_id`]).
+    broadcast_entry(state, job, revision).await;
     Ok(())
 }
 
@@ -337,35 +342,37 @@ async fn stamp_entry_revision(
 }
 
 /// Read the job's entry back (post-commit) and broadcast it over SSE.
-async fn broadcast_entry(
-    state: &AppState,
-    job: &ResolutionJob,
-    revision: i64,
-) -> Result<(), sqlx::Error> {
+async fn broadcast_entry(state: &AppState, job: &ResolutionJob, revision: i64) {
     broadcast_entry_id(state, &job.list_id, &job.entry_id, revision).await
 }
 
 /// Read `entry_id` back from the pool and broadcast it as a `mutation` SSE event
-/// carrying `revision`, matching the wire shape `POST /api/mutations` emits. A
-/// vanished entry (concurrent delete) is a no-op.
-async fn broadcast_entry_id(
-    state: &AppState,
-    list_id: &str,
-    entry_id: &str,
-    revision: i64,
-) -> Result<(), sqlx::Error> {
-    let Some(view) = crate::mutations::load_entry_view(&state.pool, entry_id, list_id).await?
-    else {
-        return Ok(());
+/// carrying `revision`, matching the wire shape `POST /api/mutations` emits.
+///
+/// This always runs AFTER the resolution transaction has committed, so the entry
+/// is already in its final state. The broadcast is therefore best-effort: a
+/// vanished entry (concurrent delete), a transient read failure, or a
+/// serialisation failure is logged and swallowed — it must never make the cascade
+/// report failure, because a disconnected client backfills via `?since=` on
+/// reconnect and a dropped live event is never lost.
+async fn broadcast_entry_id(state: &AppState, list_id: &str, entry_id: &str, revision: i64) {
+    let view = match crate::mutations::load_entry_view(&state.pool, entry_id, list_id).await {
+        Ok(Some(view)) => view,
+        // Entry vanished (concurrent delete): nothing to broadcast.
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(error = %e, entry_id, "resolution: failed to read entry for broadcast (best-effort, skipped)");
+            return;
+        }
     };
-    let entity = serde_json::to_value(&view).map_err(|e| {
-        tracing::error!(error = %e, entry_id, "resolution: failed to serialise broadcast entity");
-        // Map to a sqlx-shaped error so the caller's logging path is uniform; the
-        // broadcast is best-effort, so this only skips the live event.
-        sqlx::Error::Protocol(format!("entity serialisation failed: {e}"))
-    })?;
+    let entity = match serde_json::to_value(&view) {
+        Ok(entity) => entity,
+        Err(e) => {
+            tracing::error!(error = %e, entry_id, "resolution: failed to serialise broadcast entity (best-effort, skipped)");
+            return;
+        }
+    };
     crate::sse::broadcast_entity(state, list_id, revision, entity);
-    Ok(())
 }
 
 /// Map a [`buywise_core::db::DbError`] back to its underlying [`sqlx::Error`] so
@@ -377,15 +384,4 @@ fn into_sqlx_error(e: buywise_core::db::DbError) -> sqlx::Error {
         buywise_core::db::DbError::Sqlx(inner) => inner,
         other => sqlx::Error::Protocol(other.to_string()),
     }
-}
-
-/// True if the error is a UNIQUE-index violation (`SQLITE_CONSTRAINT_UNIQUE`,
-/// 2067) — on `list_entries` this is the partial dedup index
-/// `uq_list_entries_active_dedup`, the only conflict that drives a merge.
-fn is_dedup_index_violation(e: &sqlx::Error) -> bool {
-    e.as_database_error()
-        .and_then(|db| db.code())
-        .map(|c| c.into_owned())
-        .as_deref()
-        == Some("2067")
 }
