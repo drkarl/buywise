@@ -66,6 +66,19 @@ function fakeSse(): EventSourceLike {
   };
 }
 
+/**
+ * runSync now also GETs /api/items (P2-T6 catalogue refresh). Every routing mock
+ * must answer it so the call doesn't fall through to the POST branch (which would
+ * spuriously inflate the mutation count). An empty envelope is sufficient — these
+ * tests don't exercise category resolution.
+ */
+function emptyCatalogueResponse(): Response {
+  return new Response(
+    JSON.stringify({ items: [], categories: [], store_category_orders: [] }),
+    { status: 200 }
+  );
+}
+
 describe('fetchSnapshot', () => {
   it('replaces local entries from GET /api/list/:id and sets the revision', async () => {
     await db.list_entries.put({
@@ -118,6 +131,7 @@ describe('startSync', () => {
     };
 
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(JSON.stringify(snapshot), { status: 200 });
       }
@@ -150,6 +164,7 @@ describe('startSync', () => {
     // A fetch that resolves on the next microtask, so we can call stop() while
     // the bootstrap drain is still in flight.
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
@@ -194,6 +209,7 @@ describe('startSync', () => {
     });
 
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
@@ -234,6 +250,7 @@ describe('startSync', () => {
 
     let rev = 0;
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }), {
           status: 200
@@ -265,6 +282,7 @@ describe('startSync', () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     let posts = 0;
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
@@ -301,6 +319,7 @@ describe('startSync', () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     let posts = 0;
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 0, entries: [] }),
@@ -379,6 +398,7 @@ describe('runSync reconcile-on-failure', () => {
     await enqueueOp('rejected', 'add_item', 'active');
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         // Simulate SSE advancing local state DURING the reconcile GET: bump meta
         // to 6 and add a fresh active row before returning the stale rev-5 body.
@@ -423,6 +443,7 @@ describe('runSync reconcile-on-failure', () => {
     await db.list_entries.update('x', { last_updated_revision: 5 });
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         // SSE advances meta to 6 for an unrelated row mid-flight.
         await db.list_meta.put({ id: LIST, name: 'L', current_revision: 6 });
@@ -480,6 +501,7 @@ describe('runSync reconcile-on-failure', () => {
 
     let snapshotGets = 0;
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         snapshotGets += 1;
         // Active-only snapshot at the SAME revision — the rejected add isn't in it.
@@ -513,6 +535,7 @@ describe('runSync reconcile-on-failure', () => {
     await enqueueOp('item-1', 'mark_bought', 'bought');
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         // Server still has the entry ACTIVE (the bought never applied).
         return new Response(
@@ -555,6 +578,7 @@ describe('runSync reconcile-on-failure', () => {
     await enqueueOp('drifted', 'add_item', 'bought');
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         // Active-only snapshot — the rejected add isn't in it.
         return new Response(
@@ -578,6 +602,7 @@ describe('runSync reconcile-on-failure', () => {
     await enqueueOp('drifted-skip', 'add_item', 'skipped');
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
@@ -613,6 +638,7 @@ describe('runSync reconcile-on-failure', () => {
     await enqueueOp('bad-add', 'add_item', 'bought');
 
     const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         return new Response(
           JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
@@ -637,6 +663,7 @@ describe('runSync reconcile-on-failure', () => {
     let snapshotGets = 0;
     let rev = 0;
     const fetchFn = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
       if (url.startsWith('/api/list/')) {
         snapshotGets += 1;
         return new Response(

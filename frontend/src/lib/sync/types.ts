@@ -8,7 +8,7 @@
 // `LocalListEntry` shape, dropping server-only columns the client doesn't store
 // (e.g. `added_by`, `effective_constraint_hash`, `resolution_candidates_json`).
 
-import type { LocalListEntry } from '$lib/db/dexie';
+import { db, type LocalListEntry } from '$lib/db/dexie';
 
 /**
  * Server `list_entry` row as serialised by `GET /api/list/:id`, the
@@ -87,4 +87,28 @@ export function toLocalEntry(entity: ServerListEntry): LocalListEntry {
     last_updated_revision: entity.last_updated_revision,
     updated_at: entity.updated_at
   };
+}
+
+/**
+ * Resolves the `category_id` for a local entry from the cached `item_categories`
+ * map (P2-T6). List entries carry only a (nullable) `canonical_item_id`; shopping
+ * mode buckets on `category_id`, so we derive it client-side from the catalogue
+ * cached by the `GET /api/items` fetch.
+ *
+ * Precedence: an explicit server-supplied `category_id` (should the backend ever
+ * start sending one) wins; otherwise we look up the entry's `canonical_item_id`
+ * in the cache. An unresolved entry (no `canonical_item_id`) or a cache miss (the
+ * catalogue hasn't been fetched yet, or the item is newer than the cache)
+ * correctly leaves `category_id` undefined, so the entry buckets as uncategorised
+ * ("Other") until a catalogue (re)fetch backfills it.
+ *
+ * Mutates `entry.category_id` in place and returns the same entry for chaining.
+ * Must be called inside (or before) the same Dexie write the caller performs.
+ */
+export async function resolveCategoryId(entry: LocalListEntry): Promise<LocalListEntry> {
+  if (entry.category_id !== undefined) return entry; // already known — keep it
+  if (entry.canonical_item_id === undefined) return entry; // unresolved → "Other"
+  const mapping = await db.item_categories.get(entry.canonical_item_id);
+  if (mapping) entry.category_id = mapping.category_id;
+  return entry;
 }

@@ -17,6 +17,7 @@ import {
   type ApplySnapshotOptions
 } from './SseClient';
 import { onMutationEnqueued } from './enqueueSignal';
+import { fetchCatalogue } from './catalogue';
 import type { ListSnapshot } from './types';
 
 export { drainQueue, MAX_RETRIES } from './SyncQueue';
@@ -30,6 +31,7 @@ export {
 } from './SseClient';
 export type { SseClientOptions } from './SseClient';
 export { notifyMutationEnqueued, onMutationEnqueued } from './enqueueSignal';
+export { fetchCatalogue } from './catalogue';
 export * from './types';
 
 export interface SyncOptions {
@@ -95,6 +97,15 @@ async function runSync(listId: string, options: SyncOptions): Promise<void> {
     // known. (Offline → fetchSnapshot returns null and we drain against 0.)
     await fetchSnapshot(listId, fetchFn);
   }
+
+  // Refresh the shopping-mode catalogue (categories, store orders, and the
+  // canonical_item → category map). Runs AFTER the snapshot so the backfill sees
+  // freshly-synced entries; offline-safe (a failed fetch keeps the cached
+  // catalogue) and must never block or fail the drain, so its errors are
+  // swallowed rather than propagated.
+  await fetchCatalogue(fetchFn).catch((err) =>
+    console.error('[sync] catalogue refresh failed', err)
+  );
 
   const result = await drainQueue(listId, {
     fetchFn,

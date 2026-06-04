@@ -14,6 +14,7 @@
 
 import { db } from '$lib/db/dexie';
 import {
+  resolveCategoryId,
   toLocalEntry,
   type SseMutationData,
   type SseSnapshotData
@@ -53,7 +54,11 @@ export interface SseClientOptions {
 /** Applies a `mutation` event: authoritative upsert + monotonic revision bump. */
 export async function applyMutationEvent(data: SseMutationData): Promise<void> {
   const entry = toLocalEntry(data.entity);
-  await db.transaction('rw', db.list_entries, db.list_meta, async () => {
+  await db.transaction('rw', db.list_entries, db.list_meta, db.item_categories, async () => {
+    // Derive category_id from the cached catalogue (P2-T6) so shopping mode can
+    // bucket this synced entry. A cache miss leaves it undefined ("Other"); a
+    // later catalogue (re)fetch backfills it (see catalogue.ts backfill).
+    await resolveCategoryId(entry);
     // Per-entry monotonic guard: only overwrite the local row if the incoming
     // entity is at least as new (by `last_updated_revision`). Events for the same
     // entry can arrive out of order across the SSE and drain paths (e.g. an SSE
@@ -174,7 +179,14 @@ export async function applySnapshotEvent(
   const snapshotIds = new Set(entries.map((e) => e.id));
   const snapshotById = new Map(entries.map((e) => [e.id, e]));
 
-  await db.transaction('rw', db.list_entries, db.list_meta, db.mutation_queue, async () => {
+  const txTables = [db.list_entries, db.list_meta, db.mutation_queue, db.item_categories] as const;
+  await db.transaction('rw', txTables, async () => {
+    // Resolve each entry's category_id from the cached catalogue (P2-T6) before
+    // any write, so both the wholesale bulkPut and the stale-path revert persist
+    // the grouped category. Cache misses leave it undefined ("Other") until a
+    // catalogue (re)fetch backfills it.
+    for (const e of entries) await resolveCategoryId(e);
+
     const meta = await db.list_meta.get(listId);
 
     // Forced removals (rejected add_item ids) are revision-INDEPENDENT: a rejected
