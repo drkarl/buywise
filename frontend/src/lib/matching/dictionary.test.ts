@@ -173,6 +173,32 @@ describe("dictionary", () => {
     });
   });
 
+  describe("accent normalization", () => {
+    // Duplicate detection always passes accent-stripped input (normalize()) into
+    // these lookups, so accented dictionary terms must resolve from their
+    // accent-stripped form. These would have been unreachable before normalizeKey.
+    it("finds an accented Spanish term from its accent-stripped form", () => {
+      // "lasaña congelada" → normalized "lasana congelada"
+      const entry = lookupBySpanish("lasana congelada");
+      expect(entry).toBeDefined();
+      expect(entry?.canonical).toBe("frozen lasagna");
+    });
+
+    it("finds an accented variant from its accent-stripped form", () => {
+      // "pañuelos de papel" → normalized "panuelos de papel"
+      const entry = lookupByVariant("panuelos de papel");
+      expect(entry).toBeDefined();
+      expect(entry?.canonical).toBe("tissues");
+    });
+
+    it("still finds an accented term when queried with accents", () => {
+      expect(lookupBySpanish("lasaña congelada")?.canonical).toBe(
+        "frozen lasagna"
+      );
+      expect(lookupByVariant("pañuelos de papel")?.canonical).toBe("tissues");
+    });
+  });
+
   describe("lookupByVariant", () => {
     it("returns entry for plural variants", () => {
       const entry = lookupByVariant("apples");
