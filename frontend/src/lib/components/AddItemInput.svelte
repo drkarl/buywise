@@ -13,6 +13,11 @@
 	// match is found the original synchronous, field-clearing add path is used
 	// unchanged, so the "every action queues immediately" invariant is preserved
 	// for the common (non-duplicate) case.
+	//
+	// While a prompt is pending the flow is held: submissions are blocked and the
+	// submit button is disabled until the user resolves it, so a different item
+	// can't silently dismiss the warning. "Cancel" restores the held text back into
+	// the input so the user doesn't lose what they typed.
 
 	import { checkForDuplicate, type DuplicateMatch, type ActiveItem } from '$lib/matching/duplicate';
 	import DuplicateWarning from '$lib/components/DuplicateWarning.svelte';
@@ -44,6 +49,11 @@
 	}
 
 	function submit() {
+		// While a duplicate prompt is active the flow is held: the user must pick
+		// "Add anyway" or "Cancel" before any further submit. This prevents a new
+		// submit from silently dismissing the warning by committing a different item.
+		if (pendingMatch) return;
+
 		const text = value.trim();
 		if (!text) return;
 
@@ -64,6 +74,13 @@
 		commit(text);
 	}
 
+	/** Dismiss the pending warning, restoring the held text into the input. */
+	function cancel() {
+		value = pendingText;
+		pendingMatch = null;
+		pendingText = '';
+	}
+
 	function onsubmit(event: SubmitEvent) {
 		event.preventDefault();
 		submit();
@@ -79,7 +96,9 @@
 		autocomplete="off"
 		enterkeyhint="done"
 	/>
-	<button type="submit" disabled={!value.trim()} aria-label="Add item">Add</button>
+	<button type="submit" disabled={!value.trim() || pendingMatch !== null} aria-label="Add item">
+		Add
+	</button>
 </form>
 
 {#if pendingMatch}
@@ -87,10 +106,7 @@
 		newItemText={pendingText}
 		match={pendingMatch}
 		onaddanyway={() => commit(pendingText)}
-		oncancel={() => {
-			pendingMatch = null;
-			pendingText = '';
-		}}
+		oncancel={cancel}
 	/>
 {/if}
 
