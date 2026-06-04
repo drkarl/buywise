@@ -1114,9 +1114,17 @@ fn sqlite_extended_code(e: &sqlx::Error) -> Option<String> {
 }
 
 /// True if the error is a UNIQUE-index violation (`SQLITE_CONSTRAINT_UNIQUE`,
-/// 2067). On `list_entries` this is the partial dedup index
-/// `uq_list_entries_active_dedup` — the only conflict that triggers a merge.
-fn is_dedup_index_violation(e: &sqlx::Error) -> bool {
+/// 2067) raised by an INSERT/UPDATE on `list_entries`, where the only unique
+/// index is the partial dedup index `uq_list_entries_active_dedup` — the conflict
+/// that triggers a merge. Shared with the resolution cascade
+/// ([`crate::resolution`]), which catches the same violation when it binds a
+/// `canonical_item_id`.
+///
+/// NB: this is deliberately distinct from [`is_client_mutation_id_conflict`],
+/// which matches the same extended code 2067 but for the unrelated UNIQUE
+/// constraint on `mutations.client_mutation_id`; the two are kept separate so each
+/// call site documents *which* constraint it expects to fire.
+pub(crate) fn is_dedup_index_violation(e: &sqlx::Error) -> bool {
     sqlite_extended_code(e).as_deref() == Some("2067")
 }
 
