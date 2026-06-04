@@ -467,35 +467,53 @@ describe("normalize", () => {
     });
   });
 
-  describe("punctuation removal", () => {
-    it('converts "coca-cola" to "cocacola"', () => {
-      expect(normalize("coca-cola")).toBe("cocacola");
+  describe("punctuation → space (BuyWise core contract)", () => {
+    // Mirrors crates/core/src/normalise.rs: punctuation becomes a single SPACE
+    // (not deletion), so hyphenated/apostrophised words split into tokens.
+    it('converts "coca-cola" to "coca cola"', () => {
+      expect(normalize("coca-cola")).toBe("coca cola");
     });
 
-    it("removes apostrophes", () => {
-      expect(normalize("mother's milk")).toBe("mothers milk");
+    it("replaces apostrophes with a space", () => {
+      expect(normalize("mother's milk")).toBe("mother s milk");
     });
 
-    it("removes periods", () => {
+    it("replaces periods with a space (collapsing)", () => {
       expect(normalize("Dr. Pepper")).toBe("dr pepper");
     });
 
-    it("removes commas", () => {
+    it("replaces commas with a space", () => {
       expect(normalize("salt, pepper")).toBe("salt pepper");
     });
 
-    it("removes exclamation marks", () => {
+    it("replaces exclamation marks with a space", () => {
       expect(normalize("Wow!")).toBe("wow");
     });
 
-    it("removes question marks", () => {
+    it("replaces question marks with a space", () => {
       expect(normalize("milk?")).toBe("milk");
     });
 
-    it("removes multiple punctuation types", () => {
+    it("replaces multiple punctuation types with spaces", () => {
       expect(normalize("Hello, World! How's it going?")).toBe(
-        "hello world hows it going"
+        "hello world how s it going"
       );
+    });
+  });
+
+  describe("brand compaction", () => {
+    // Brands in BRAND_COMPACTIONS compact instead of splitting on punctuation.
+    it('compacts "7-up" to "7up" instead of splitting', () => {
+      expect(normalize("7-up")).toBe("7up");
+    });
+
+    it("compacts case-insensitively", () => {
+      expect(normalize("7-Up")).toBe("7up");
+      expect(normalize("7-UP")).toBe("7up");
+    });
+
+    it("leaves an already-compacted brand untouched", () => {
+      expect(normalize("7up")).toBe("7up");
     });
   });
 
@@ -583,14 +601,7 @@ describe("normalize", () => {
 
     it("normalizes for matching purposes", () => {
       // These should all normalize to the same value
-      const variants = [
-        "Jamón",
-        "JAMON",
-        "jamón",
-        "  jamón  ",
-        "JAMÓN!",
-        "ja-món",
-      ];
+      const variants = ["Jamón", "JAMON", "jamón", "  jamón  ", "JAMÓN!"];
       const normalized = variants.map(normalize);
       expect(new Set(normalized).size).toBe(1);
       expect(normalized[0]).toBe("jamon");

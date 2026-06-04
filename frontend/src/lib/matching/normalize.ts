@@ -6,35 +6,62 @@ export interface ParsedInput {
 }
 
 /**
- * Normalizes text for matching by:
- * 1. Converting to lowercase
- * 2. Removing accents (NFD normalization + strip combining marks)
- * 3. Removing punctuation (keeps alphanumeric and spaces)
- * 4. Collapsing multiple whitespace to single space
- * 5. Trimming leading/trailing whitespace
+ * Brands whose internal punctuation must *compact* rather than split into
+ * separate tokens. Applied as a whole-string substring replacement *before* the
+ * general punctuation→space rule.
+ *
+ * Mirrors `BRAND_COMPACTIONS` in `crates/core/src/normalise.rs` — keep this
+ * table short, explicit, and in sync with the Rust core. Only the hyphenated
+ * "7-up" form is compacted: a spaced "7 up" entry would corrupt unrelated text
+ * (e.g. "level 7 update").
+ */
+const BRAND_COMPACTIONS: ReadonlyArray<readonly [string, string]> = [
+  ["7-up", "7up"],
+];
+
+/**
+ * Normalizes text for matching. Mirrors the authoritative core normaliser in
+ * `crates/core/src/normalise.rs` exactly. Steps, in order:
+ * 1. Lowercase.
+ * 2. Apply the brand-compaction table (BRAND_COMPACTIONS) before punctuation
+ *    handling.
+ * 3. NFD normalization + strip combining marks (accents removed).
+ * 4. Punctuation → single SPACE (every char that is neither alphanumeric nor
+ *    whitespace), NOT deletion.
+ * 5. Collapse multiple whitespace to a single space + trim.
  *
  * @example
  * normalize("LECHE") // "leche"
  * normalize("Jamón") // "jamon"
- * normalize("coca-cola") // "cocacola"
+ * normalize("coca-cola") // "coca cola"
+ * normalize("7-up") // "7up"
  * normalize("  multiple   spaces  ") // "multiple spaces"
  */
 export function normalize(text: string): string {
   // Defensive guard for null/undefined when called from JS or through type escapes
   if (!text) return "";
+
+  // 1. Convert to lowercase.
+  let lowered = text.toLowerCase();
+
+  // 2. Brand compaction (before punctuation handling). Already lowercased, so a
+  //    plain substring replace is effectively case-insensitive.
+  for (const [from, to] of BRAND_COMPACTIONS) {
+    lowered = lowered.split(from).join(to);
+  }
+
   return (
-    text
-      // 1. Convert to lowercase
-      .toLowerCase()
-      // 2. NFD normalization decomposes accented chars (é → e + combining acute)
+    lowered
+      // 3. NFD normalization decomposes accented chars (é → e + combining acute)
       //    Then remove combining diacritical marks (Unicode range \u0300-\u036f)
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
-      // 3. Remove punctuation (keep only alphanumeric and whitespace)
-      .replace(/[^\p{L}\p{N}\s]/gu, "")
-      // 4. Collapse multiple whitespace to single space
+      // 4. Punctuation → single space (replace every non-alphanumeric,
+      //    non-whitespace char with a space, NOT deletion).
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      // 5. Collapse multiple whitespace to single space ...
       .replace(/\s+/g, " ")
-      // 5. Trim
+      // ... and trim.
       .trim()
   );
 }
