@@ -82,25 +82,21 @@ function getDictionaryEntry(normalizedTerm: string): DictionaryEntry | null {
 }
 
 /**
- * Derives a size signature from a parsed input.
+ * Derives a size signature from a parsed input, in canonical base units.
  *
- * A bare COUNT (`2x`, `x2`, word-number "two") has `unit === null` and is NOT a
- * constraint — items differing only by count collapse and merge (design.md:209).
- * A SIZE/measure request (`500g`, `1kg`, `1l`) has a non-null `unit` and IS a
+ * A bare COUNT (`2x`, `x2`, word-number "two") carries no `requestedSize` and is
+ * NOT a constraint — items differing only by count collapse and merge
+ * (design.md:209). A SIZE/measure request (`500g`, `1kg`, `dos litros`) IS a
  * distinct constraint dimension (design.md:202, 240-246), so it must not collapse
- * into a differently-sized (or unsized) entry.
+ * into a differently-sized (or unsized) entry. Because the parser stores sizes in
+ * base units (g / ml), equivalent requests share a signature: `1kg` == `1000g`,
+ * `2l` == `dos litros` == `2000ml`.
  *
- * Phase-2 approximation: the signature is the exact `quantity+unit` string, so
- * base-unit conversion (`1kg` == `1000g`) is intentionally NOT applied here — it
- * is deferred to the core normaliser / P3. This only ever SUPPRESSES false
- * positives: a `1kg` vs `1000g` near-miss simply yields two rows that P3
- * reconciles, never a wrong merge.
- *
- * @param p - Parsed input (text, quantity, unit)
- * @returns `"<quantity><unit>"` for a size request, or `null` for a bare count
+ * @param p - Parsed input.
+ * @returns `"<basis>:<baseValue>"` for a size request, or `null` for a bare count.
  */
 function sizeKey(p: ParsedInput): string | null {
-  return p.unit ? `${p.quantity}${p.unit}` : null;
+  return p.requestedSize ? `${p.requestedSize.basis}:${p.requestedSize.value}` : null;
 }
 
 /**
