@@ -19,6 +19,9 @@
 	// keeping it open preserves the "see what's done in context" behaviour.
 	let open = $state(true);
 
+	// User-facing label for the bucket `sortByStoreOrder` keys as UNCATEGORISED_ID
+	// (entries with no `category_id`). "Other" reads better in the UI than
+	// "uncategorised"; they refer to the same bucket.
 	const title = $derived(group.category?.name_en ?? 'Other');
 </script>
 
