@@ -244,6 +244,55 @@ describe("DuplicateDetector", () => {
     });
   });
 
+  describe("size constraint (Finding A: size requests don't collapse)", () => {
+    // A SIZE request (unit !== null, e.g. "500g") is a constraint dimension and
+    // must not collapse into a differently-sized (or unsized) entry. A bare COUNT
+    // (unit === null, e.g. "2x") is not a constraint and still collapses.
+    it('"500g rice" vs active "1kg rice" → no warning (different size)', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "1kg rice" }];
+      const result = checkForDuplicate("500g rice", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    it('"1kg rice" vs active "rice" (no size) → no warning (size vs no-size)', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "rice" }];
+      const result = checkForDuplicate("1kg rice", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    it('"500g rice" vs active "500g rice" → warning (same size)', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "500g rice" }];
+      const result = checkForDuplicate("500g rice", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('regression: counts still collapse — "2x milk" vs active "milk" warns', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "milk" }];
+      const result = checkForDuplicate("2x milk", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+
+    it('regression: counts still collapse — "3x milk" vs active "2x milk" warns', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "2x milk" }];
+      const result = checkForDuplicate("3x milk", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("exact");
+      }
+    });
+  });
+
   describe("distinct dictionary items are not falsely matched via contains", () => {
     // The dictionary is authoritative: when BOTH terms are dictionary-known but
     // resolve to DIFFERENT canonicals, they are genuinely distinct and must not

@@ -82,6 +82,28 @@ function getDictionaryEntry(normalizedTerm: string): DictionaryEntry | null {
 }
 
 /**
+ * Derives a size signature from a parsed input.
+ *
+ * A bare COUNT (`2x`, `x2`, word-number "two") has `unit === null` and is NOT a
+ * constraint — items differing only by count collapse and merge (design.md:209).
+ * A SIZE/measure request (`500g`, `1kg`, `1l`) has a non-null `unit` and IS a
+ * distinct constraint dimension (design.md:202, 240-246), so it must not collapse
+ * into a differently-sized (or unsized) entry.
+ *
+ * Phase-2 approximation: the signature is the exact `quantity+unit` string, so
+ * base-unit conversion (`1kg` == `1000g`) is intentionally NOT applied here — it
+ * is deferred to the core normaliser / P3. This only ever SUPPRESSES false
+ * positives: a `1kg` vs `1000g` near-miss simply yields two rows that P3
+ * reconciles, never a wrong merge.
+ *
+ * @param p - Parsed input (text, quantity, unit)
+ * @returns `"<quantity><unit>"` for a size request, or `null` for a bare count
+ */
+function sizeKey(p: ParsedInput): string | null {
+  return p.unit ? `${p.quantity}${p.unit}` : null;
+}
+
+/**
  * Checks for a duplicate item in the active list.
  *
  * Match priority order (highest to lowest confidence):
@@ -143,9 +165,19 @@ export function checkForDuplicate(
     // `display_name` is stored as raw typed text, so an entry like "2x milk" or
     // "two eggs" must have its quantity/unit stripped before matching — otherwise
     // it normalizes to "2x milk" and never matches a later plain "milk".
-    const normalizedItem = normalize(parseQuantityAndUnit(item.display_name).text);
+    const parsedItem = parseQuantityAndUnit(item.display_name);
+    const normalizedItem = normalize(parsedItem.text);
 
     if (!normalizedItem) {
+      continue;
+    }
+
+    // Size is a constraint dimension; a bare count is not. Two items that carry
+    // a DIFFERENT size request (or one with a size and one without) are distinct
+    // constraints and must never collapse, even when their base text matches.
+    // Counts (unit === null on both sides) compare equal here and fall through
+    // to the normal match cascade so e.g. "2x milk" still merges with "milk".
+    if (sizeKey(parsed) !== sizeKey(parsedItem)) {
       continue;
     }
 
