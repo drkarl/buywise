@@ -25,7 +25,7 @@
 		aria-valuemax={total}
 		aria-label="Items bought"
 	>
-		<div class="fill" style:width="{percent}%"></div>
+		<div class="fill" style:width={`${percent}%`}></div>
 	</div>
 	<span class="label" aria-live="polite">{bought} / {total} bought</span>
 </div>
