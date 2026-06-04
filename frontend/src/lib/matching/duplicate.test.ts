@@ -244,6 +244,66 @@ describe("DuplicateDetector", () => {
     });
   });
 
+  describe("distinct dictionary items are not falsely matched via contains", () => {
+    // The dictionary is authoritative: when BOTH terms are dictionary-known but
+    // resolve to DIFFERENT canonicals, they are genuinely distinct and must not
+    // fall through to the bidirectional contains rule (which would otherwise warn
+    // because "bread" is a 5-char substring of "whole wheat bread").
+    it('"bread" vs active "whole wheat bread" → no warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "Whole Wheat Bread" }];
+      const result = checkForDuplicate("bread", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    it('"bread" vs active "white bread" → no warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "White Bread" }];
+      const result = checkForDuplicate("bread", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    it('reverse direction: "whole wheat bread" vs active "bread" → no warning', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "Bread" }];
+      const result = checkForDuplicate("whole wheat bread", items);
+
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    // Regression: the fallback must stay active when a dictionary term is only
+    // known on ONE side. "oatmeal" is a dictionary entry but "oatmeal cookies"
+    // is not, so this still warns via contains (the guard must not over-suppress).
+    it('"oatmeal" vs active "oatmeal cookies" still warns via contains', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "Oatmeal Cookies" }];
+      const result = checkForDuplicate("oatmeal", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("contains");
+      }
+    });
+
+    it('regression: "leche" vs "Milk" still dictionary-matches', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "Milk" }];
+      const result = checkForDuplicate("leche", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("dictionary");
+      }
+    });
+
+    it('regression: "milks" vs "Milk" still fuzzy-matches', () => {
+      const items: ActiveItem[] = [{ id: "1", display_name: "Milk" }];
+      const result = checkForDuplicate("milks", items);
+
+      expect(result.duplicate.found).toBe(true);
+      if (result.duplicate.found) {
+        expect(result.duplicate.matchType).toBe("fuzzy");
+      }
+    });
+  });
+
   describe("fuzzy matching", () => {
     it("matches common typos (distance 1)", () => {
       const items: ActiveItem[] = [{ id: "1", display_name: "Tomato" }];
@@ -529,15 +589,23 @@ describe("DuplicateDetector", () => {
       expect(result.duplicate.found).toBe(false);
     });
 
-    it("handles complex items with multiple words", () => {
+    it("treats two different known dictionary canonicals as distinct", () => {
+      // "chicken" (canonical "chicken") and "Chicken Breast" (canonical
+      // "chicken breast") are both dictionary-known but resolve to DIFFERENT
+      // canonicals, so they are genuinely distinct — no false contains warning.
       const result = checkForDuplicate("chicken", mockShoppingList);
+      expect(result.duplicate.found).toBe(false);
+    });
+
+    it("still warns via contains for a multi-word, one-side-unknown item", () => {
+      // "Olive Oil" is dictionary-known but "olive oil spray" is not, so the
+      // contains fallback stays active and warns.
+      const result = checkForDuplicate("olive oil spray", mockShoppingList);
 
       expect(result.duplicate.found).toBe(true);
       if (result.duplicate.found) {
         expect(result.duplicate.matchType).toBe("contains");
-        expect(result.duplicate.matchedItem.display_name).toBe(
-          "Chicken Breast"
-        );
+        expect(result.duplicate.matchedItem.display_name).toBe("Olive Oil");
       }
     });
   });
