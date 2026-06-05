@@ -369,6 +369,33 @@ async fn post_mutation(
     .await
     .map_err(db_error("post_mutation.finalize_mutation"))?;
 
+    // A dedup-merge that deleted a PRE-EXISTING row clients already hold (the
+    // `resolve_alias` ambiguous loser) must broadcast that deletion too. The
+    // survivor was stamped/finalised at R above; the loser gets its OWN distinct
+    // revision R+1, stamp, and replayable `mutations` row — INSIDE this same
+    // transaction, so both bumps commit atomically — exactly mirroring
+    // `resolution::merge_into_survivor`. Without this the deletion carries no
+    // revision and is never broadcast, so peers and `?since=` reconnects show the
+    // ambiguous row forever (the SSE-cursor partial-delivery failure mode).
+    let loser_broadcast = if let Some(loser_id) = &outcome.deleted_loser_entry_id {
+        let loser_revision = increment_revision(&mut tx, &req.list_id)
+            .await
+            .map_err(db_error("post_mutation.increment_revision_loser"))?;
+        let stamped = stamp_entry_revision(&mut tx, loser_id, &req.list_id, loser_revision)
+            .await
+            .map_err(db_error("post_mutation.stamp_loser"))?;
+        if !stamped {
+            let _ = tx.rollback().await;
+            return Err(StatusCode::NOT_FOUND);
+        }
+        insert_loser_replay_row(&mut tx, &req, &user, loser_id, loser_revision)
+            .await
+            .map_err(db_error("post_mutation.loser_replay_row"))?;
+        Some(loser_revision)
+    } else {
+        None
+    };
+
     tx.commit()
         .await
         .map_err(db_error("post_mutation.commit"))?;
@@ -376,6 +403,17 @@ async fn post_mutation(
     // 6. Broadcast over SSE (P1-T5). Intentionally after COMMIT so subscribers
     //    never observe an uncommitted mutation.
     broadcast_mutation(&state, &req.list_id, server_revision, &response);
+
+    // Broadcast the merged-away loser's deletion at R+1, after R, matching the
+    // ascending-revision order `?since=` backfill replays (so live and replay order
+    // are identical). Read-after-commit and best-effort, like the cascade's loser
+    // broadcast: a failure here is logged, never propagated.
+    if let Some(loser_revision) = loser_broadcast {
+        if let Some(loser_id) = &outcome.deleted_loser_entry_id {
+            crate::resolution::broadcast_entry_id(&state, &req.list_id, loser_id, loser_revision)
+                .await;
+        }
+    }
 
     // 7. Server-side resolution cascade (P3-T1). An `add_item` that committed as
     //    `unresolved` is resolved asynchronously: the mutation is already
@@ -431,6 +469,28 @@ struct ApplyOutcome {
     entry_id: Option<String>,
     /// How to record the mutation.
     status: MutationStatus,
+    /// A SECOND entry the apply marked `deleted` that must get its OWN distinct
+    /// revision stamp, replayable `mutations` row, and SSE broadcast — set only by
+    /// the `resolve_alias` dedup-merge branch for the ambiguous loser row.
+    ///
+    /// The shared post-apply path stamps/broadcasts `entry_id` (the survivor) at
+    /// revision R; when this is `Some`, it stamps this loser at a distinct R+1,
+    /// writes its replayable row, and broadcasts it — mirroring the resolution
+    /// cascade's `merge_into_survivor` (two distinct revisions, both broadcast) so
+    /// peers and `?since=R` reconnects learn the row was deleted (the SSE-cursor
+    /// partial-delivery failure mode a shared revision would re-introduce).
+    deleted_loser_entry_id: Option<String>,
+}
+
+impl ApplyOutcome {
+    /// The common case: an op touched one entry and has no merged-away loser.
+    fn touched(entry_id: Option<String>, status: MutationStatus) -> Self {
+        ApplyOutcome {
+            entry_id,
+            status,
+            deleted_loser_entry_id: None,
+        }
+    }
 }
 
 /// Apply one mutation to `list_entries`, returning which entry was affected and
@@ -459,10 +519,10 @@ async fn apply_mutation(
         // targeted entry is still verified to belong to `req.list_id` (the shared
         // post-apply stamp/load path 404s a cross-list id), so these ops cannot
         // touch or read a foreign entry.
-        "reject_match" | "set_constraint" => Ok(ApplyOutcome {
-            entry_id: entry_target(req),
-            status: MutationStatus::Accepted,
-        }),
+        "reject_match" | "set_constraint" => Ok(ApplyOutcome::touched(
+            entry_target(req),
+            MutationStatus::Accepted,
+        )),
         // Unreachable: the discriminator was validated by is_known_operation.
         _ => Err(StatusCode::UNPROCESSABLE_ENTITY),
     }
@@ -546,10 +606,10 @@ async fn apply_add_item(
     .await;
 
     match insert {
-        Ok(_) => Ok(ApplyOutcome {
-            entry_id: Some(entry_id),
-            status: MutationStatus::Accepted,
-        }),
+        Ok(_) => Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        )),
         // A PRIMARY KEY collision (1555) means this exact `entity_id` already
         // exists — it is NOT a dedup boundary. An add re-using a live id is a
         // client conflict (e.g. a botched offline replay that did not carry the
@@ -583,10 +643,14 @@ async fn apply_add_item(
                 tracing::error!("mutations: add_item conflict but no row to merge into");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-            Ok(ApplyOutcome {
-                entry_id: Some(surviving),
-                status: MutationStatus::Merged,
-            })
+            // No loser broadcast here: `apply_add_item`'s loser was the INSERT that
+            // just failed the dedup index, so it never created a row any client
+            // holds. (Contrast `apply_resolve_alias`, whose loser is a pre-existing
+            // ambiguous row clients DO hold — that one must be broadcast.)
+            Ok(ApplyOutcome::touched(
+                Some(surviving),
+                MutationStatus::Merged,
+            ))
         }
         Err(e) => Err(db_error("apply_add_item.insert")(e)),
     }
@@ -633,10 +697,10 @@ async fn apply_delete_item(
     .await
     .map_err(db_error("apply_delete_item.update"))?;
 
-    Ok(ApplyOutcome {
-        entry_id: Some(entry_id),
-        status: MutationStatus::Accepted,
-    })
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
 }
 
 /// `mark_bought`: set status `bought`, stamp `bought_by`/`bought_at`. If the
@@ -669,10 +733,10 @@ async fn apply_mark_bought(
         )
         .await
         .map_err(db_error("apply_mark_bought.event"))?;
-        return Ok(ApplyOutcome {
-            entry_id: Some(entry_id),
-            status: MutationStatus::Accepted,
-        });
+        return Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        ));
     }
 
     sqlx::query(
@@ -689,10 +753,10 @@ async fn apply_mark_bought(
     .await
     .map_err(db_error("apply_mark_bought.update"))?;
 
-    Ok(ApplyOutcome {
-        entry_id: Some(entry_id),
-        status: MutationStatus::Accepted,
-    })
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
 }
 
 /// `mark_skipped`: set status `skipped` (last-write-wins). Like `mark_bought`, a
@@ -714,10 +778,10 @@ async fn apply_mark_skipped(
     // still recorded (accepted, no-op on the row), keeping the revision counter
     // and audit log consistent with mark_bought's delete-wins handling.
     if prior_status == "deleted" {
-        return Ok(ApplyOutcome {
-            entry_id: Some(entry_id),
-            status: MutationStatus::Accepted,
-        });
+        return Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        ));
     }
 
     sqlx::query(
@@ -730,10 +794,10 @@ async fn apply_mark_skipped(
     .await
     .map_err(db_error("apply_mark_skipped.update"))?;
 
-    Ok(ApplyOutcome {
-        entry_id: Some(entry_id),
-        status: MutationStatus::Accepted,
-    })
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
 }
 
 /// `rename_item`: update `display_name` (and `raw_text` when supplied),
@@ -757,10 +821,10 @@ async fn apply_rename_item(
     // Delete wins: a deleted entry is not resurrected by a rename (M1). Record the
     // mutation as a no-op accept, matching mark_bought/mark_skipped.
     if prior_status == "deleted" {
-        return Ok(ApplyOutcome {
-            entry_id: Some(entry_id),
-            status: MutationStatus::Accepted,
-        });
+        return Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        ));
     }
 
     sqlx::query(
@@ -777,10 +841,10 @@ async fn apply_rename_item(
     .await
     .map_err(db_error("apply_rename_item.update"))?;
 
-    Ok(ApplyOutcome {
-        entry_id: Some(entry_id),
-        status: MutationStatus::Accepted,
-    })
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
 }
 
 /// `resolve_alias`: the user-confirmation step (P3-T3). An `ambiguous` entry is
@@ -864,20 +928,20 @@ async fn apply_resolve_alias(
                 // Nothing to resolve (already resolved/deleted, or a cross-list id
                 // — the shared stamp/load path 404s a genuinely foreign id). Accept
                 // as a no-op so a repeat confirm is idempotent.
-                return Ok(ApplyOutcome {
-                    entry_id: Some(entry_id),
-                    status: MutationStatus::Accepted,
-                });
+                return Ok(ApplyOutcome::touched(
+                    Some(entry_id),
+                    MutationStatus::Accepted,
+                ));
             }
             // Bound cleanly — the guarded UPDATE proved the entry was current, so
             // persist the confirmed alias INSIDE this transaction (committed with
             // the bind, atomically, never on a no-op).
             insert_accepted_alias(tx, household_id, &canonical_item_id, raw_text.as_deref())
                 .await?;
-            Ok(ApplyOutcome {
-                entry_id: Some(entry_id),
-                status: MutationStatus::Accepted,
-            })
+            Ok(ApplyOutcome::touched(
+                Some(entry_id),
+                MutationStatus::Accepted,
+            ))
         }
         // The partial dedup index fired: a resolved active row for the same
         // (list, canonical item, hash) already exists. Fold this entry into it,
@@ -926,9 +990,18 @@ async fn apply_resolve_alias(
             insert_accepted_alias(tx, household_id, &canonical_item_id, raw_text.as_deref())
                 .await?;
 
+            // The loser is a PRE-EXISTING `ambiguous` row that clients already hold
+            // (unlike `apply_add_item`'s merge, whose loser was the INSERT that just
+            // failed and so was never visible). Its deletion MUST therefore get its
+            // own distinct revision + replayable `mutations` row + SSE broadcast, or
+            // peers and `?since=` reconnects show the deleted row forever (the
+            // SSE-cursor partial-delivery failure mode). The shared post-apply path
+            // does this for `deleted_loser_entry_id` at R+1, mirroring the cascade's
+            // `resolution::merge_into_survivor`.
             Ok(ApplyOutcome {
                 entry_id: Some(surviving),
                 status: MutationStatus::Merged,
+                deleted_loser_entry_id: Some(entry_id),
             })
         }
         Err(e) => Err(db_error("apply_resolve_alias.bind")(e)),
@@ -1295,6 +1368,62 @@ async fn finalize_mutation_row(
     .bind(server_revision)
     .bind(outcome.status.as_str())
     .bind(response_json)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Write the replayable `mutations` row for a dedup-merge's deleted loser, INSIDE
+/// the request transaction, at the loser's OWN distinct `revision` (R+1).
+///
+/// Closes the same invariant `resolution::insert_resolution_mutation_row` does:
+/// every revision bump needs a `mutations` row so a client reconnecting via
+/// `?since=` backfills the outcome (`sse::backfill_since` replays only `mutations`
+/// rows). Without it the loser's R+1 deletion would be lost on reconnect — the
+/// SSE-cursor partial-delivery bug.
+///
+/// The row is server-origin (a fresh `client_mutation_id` UUID in the server's own
+/// idempotency space, `device_id='server'`) and honest about what it represents:
+/// `delete_item` / `merged`, matching the loser side of the cascade's merge. The
+/// `entity` is loaded WITHIN this transaction so the stored `response_json.entity`
+/// is byte-identical to the live broadcast the post-commit step emits.
+async fn insert_loser_replay_row(
+    tx: &mut Transaction<'_, Sqlite>,
+    req: &MutationRequest,
+    user: &AuthenticatedUser,
+    loser_entry_id: &str,
+    revision: i64,
+) -> Result<(), sqlx::Error> {
+    let entity = load_entry_view_tx(tx, loser_entry_id, &req.list_id).await?;
+    let response = MutationResponse {
+        client_mutation_id: uuid::Uuid::new_v4().to_string(),
+        status: "merged".to_string(),
+        server_revision: revision,
+        entity,
+    };
+    let response_json = serde_json::to_value(&response)
+        .map(|v| v.to_string())
+        .map_err(|e| sqlx::Error::Protocol(format!("loser replay serialise failed: {e}")))?;
+
+    let payload = serde_json::json!({ "merged_into": req.entity_id }).to_string();
+    let now = buywise_core::db::now_iso();
+    sqlx::query(
+        "INSERT INTO mutations \
+             (id, client_mutation_id, device_id, user_id, list_id, entity_type, entity_id, \
+              operation_type, payload, base_revision, created_at_client, received_at_server, \
+              server_revision, status, response_json) \
+         VALUES (?1, ?2, 'server', ?3, ?4, 'list_entry', ?5, 'delete_item', ?6, ?7, ?8, ?8, ?9, 'merged', ?10)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&response.client_mutation_id)
+    .bind(&user.user_id)
+    .bind(&req.list_id)
+    .bind(loser_entry_id)
+    .bind(&payload)
+    .bind(revision - 1)
+    .bind(&now)
+    .bind(revision)
+    .bind(&response_json)
     .execute(&mut **tx)
     .await?;
     Ok(())
