@@ -20,8 +20,14 @@
 //!   * [`ResolutionOutcome::MultipleCandidates`] → the entry becomes `ambiguous`
 //!     with `resolution_candidates_json` set; `canonical_item_id` stays NULL, so
 //!     no dedup conflict is possible.
-//!   * [`ResolutionOutcome::NoMatch`] → the entry is left `unresolved` (the LLM
-//!     fallback lands in P3-T2); nothing is written or broadcast.
+//!   * [`ResolutionOutcome::NoMatch`] → step 3, the LLM fallback (P3-T2): when
+//!     `LLM_FALLBACK_ENABLED=true`, a cheap LLM call is asked which household
+//!     canonical item the raw term most likely names. A unique exact match against
+//!     `canonical_items.name_en` persists a `source='llm'` alias and resolves the
+//!     entry through [`resolve_single_match`] (same dedup/merge/SSE path as any
+//!     other SingleMatch); otherwise — disabled, no match, or any LLM/DB failure —
+//!     the entry is left `unresolved`. `MultipleCandidates` deliberately does NOT
+//!     go through the LLM (it skips straight to user clarification).
 //!
 //! Error discipline: this runs OUTSIDE the mutation's request/transaction. A DB
 //! error here is logged and swallowed — it never affects the already-committed
@@ -92,8 +98,166 @@ async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx
         ResolutionOutcome::MultipleCandidates { candidates } => {
             resolve_ambiguous(state, job, &candidates).await
         }
-        // NoMatch: leave the entry unresolved (P3-T2 adds the LLM fallback).
-        ResolutionOutcome::NoMatch => Ok(()),
+        // NoMatch: step 3, the LLM fallback (P3-T2). Best-effort — any LLM/DB
+        // failure inside leaves the entry unresolved without propagating.
+        ResolutionOutcome::NoMatch => resolve_no_match_via_llm(state, job).await,
+    }
+}
+
+/// Step 3 of the cascade: ask the LLM which household canonical item `raw_text`
+/// most likely names, and — on a unique exact match — resolve the entry through
+/// [`resolve_single_match`].
+///
+/// Flow:
+///   1. Skip entirely unless the LLM fallback is enabled+configured; a disabled
+///      client returns [`crate::llm::LlmError::Disabled`], which we treat as a
+///      no-op (the entry stays `unresolved`). No `api_usage_events` row is written
+///      for a call that never went out.
+///   2. Load the household's `canonical_items.name_en` list as the candidate set.
+///   3. Call the LLM. On any error, log and leave the entry unresolved — never
+///      retry inline (the issue's no-retry-storm contract).
+///   4. Record the (attempted) call in `api_usage_events` with `source='llm'` for
+///      cost tracking, regardless of the answer.
+///   5. Map the answer to a canonical id by EXACT `name_en` match. A hallucinated
+///      or ambiguous answer (zero or >1 matches) falls through to user
+///      clarification rather than binding a wrong item.
+///   6. Persist the `raw_text` → item mapping as a `source='llm'` alias (so a
+///      second add of the same term resolves via step 1 with no LLM call), then
+///      resolve via [`resolve_single_match`] for the shared dedup/merge/SSE path.
+async fn resolve_no_match_via_llm(
+    state: &AppState,
+    job: &ResolutionJob,
+) -> Result<(), sqlx::Error> {
+    // Candidate set: every canonical item name_en in the household. Loaded up
+    // front so a disabled client costs us nothing extra (it short-circuits below).
+    let candidates: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, name_en FROM canonical_items WHERE household_id = ?1 ORDER BY name_en",
+    )
+    .bind(&job.household_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let candidate_names: Vec<String> = candidates.iter().map(|(_, name)| name.clone()).collect();
+
+    // Ask the LLM. The client itself enforces the enabled/configured gate.
+    let answer = match state
+        .llm_client
+        .resolve_item(&job.raw_text, &candidate_names)
+        .await
+    {
+        Ok(answer) => answer,
+        // Disabled/unconfigured: not an error condition — the fallback is simply
+        // off, so leave the entry unresolved silently.
+        Err(crate::llm::LlmError::Disabled) => return Ok(()),
+        // A real failure (HTTP, status, malformed): log and leave unresolved. No
+        // retry — the user will see the entry flagged for clarification instead.
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                entry_id = %job.entry_id,
+                raw_text = %job.raw_text,
+                "resolution: LLM fallback failed; entry left unresolved"
+            );
+            return Ok(());
+        }
+    };
+
+    // A call went out (the client was operational): record it for cost tracking.
+    // Best-effort — a bookkeeping write failure must not abort an otherwise
+    // successful resolution, so it is logged, not propagated.
+    record_llm_usage(&state.pool).await;
+
+    // Map the answer to a canonical id by exact name_en match. None / no-match /
+    // ambiguous → leave unresolved (fall through to user clarification).
+    let Some(answer) = answer else {
+        return Ok(());
+    };
+    let matched: Vec<&str> = candidates
+        .iter()
+        .filter(|(_, name)| name.eq_ignore_ascii_case(answer.trim()))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let [canonical_item_id] = matched.as_slice() else {
+        // Zero matches (hallucination) or, defensively, more than one: do not bind.
+        tracing::info!(
+            entry_id = %job.entry_id,
+            raw_text = %job.raw_text,
+            answer = %answer,
+            "resolution: LLM answer did not uniquely match a canonical item; left unresolved"
+        );
+        return Ok(());
+    };
+    let canonical_item_id = canonical_item_id.to_string();
+
+    // Persist the learned mapping as a `source='llm'` alias FIRST, so a later add
+    // of the same term resolves via step 1 (alias lookup) without another LLM call.
+    // INSERT OR IGNORE respects the unique (household, lower(alias), language)
+    // index: a concurrent/repeat insert is a harmless no-op.
+    insert_llm_alias(&state.pool, job, &canonical_item_id).await?;
+
+    // Resolve through the shared SingleMatch path for identical dedup/merge/SSE
+    // behaviour to steps 1 and 2.
+    resolve_single_match(state, job, &canonical_item_id).await
+}
+
+/// Persist a `raw_text` → canonical-item mapping discovered by the LLM as an
+/// `item_aliases` row with `source='llm'`.
+///
+/// The alias is stored NORMALISED (matching how step-1 alias lookup compares) so
+/// the next add of the same term is an exact normalised hit. Language defaults to
+/// `'en'` (the design's "default en if unclear"). `INSERT OR IGNORE` makes the
+/// write idempotent against the `uq_item_aliases_household_alias_lang` index.
+async fn insert_llm_alias(
+    pool: &sqlx::SqlitePool,
+    job: &ResolutionJob,
+    canonical_item_id: &str,
+) -> Result<(), sqlx::Error> {
+    let normalised = buywise_core::normalise::normalize(&job.raw_text);
+    if normalised.is_empty() {
+        return Ok(());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = buywise_core::db::now_iso();
+    sqlx::query(
+        "INSERT OR IGNORE INTO item_aliases \
+             (id, household_id, canonical_item_id, alias, language, source, created_at) \
+         VALUES (?1, ?2, ?3, ?4, 'en', 'llm', ?5)",
+    )
+    .bind(&id)
+    .bind(&job.household_id)
+    .bind(canonical_item_id)
+    .bind(&normalised)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record one LLM fallback call in `api_usage_events` with `source='llm'` for
+/// cost tracking. Best-effort: a failure here is logged, never propagated, so it
+/// cannot abort an otherwise successful resolution.
+///
+/// Written with a raw INSERT rather than [`buywise_core::db::insert_api_usage_event`]
+/// because that helper takes the `Source` enum (basketwatch/lidl_direct/manual);
+/// `'llm'` is a valid plain-TEXT value for this table (no CHECK constraint) but is
+/// outside that enum.
+async fn record_llm_usage(pool: &sqlx::SqlitePool) {
+    let now = buywise_core::db::now_iso();
+    // `month_year` is the `YYYY-MM` prefix of the ISO timestamp (matches the ingest
+    // quota bookkeeping convention).
+    let month_year = now.get(..7).unwrap_or(&now).to_string();
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = sqlx::query(
+        "INSERT INTO api_usage_events \
+             (id, source, endpoint, requests_count, month_year, created_at) \
+         VALUES (?1, 'llm', 'resolve_item', 1, ?2, ?3)",
+    )
+    .bind(&id)
+    .bind(&month_year)
+    .bind(&now)
+    .execute(pool)
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "resolution: failed to record LLM api_usage_event (best-effort)");
     }
 }
 

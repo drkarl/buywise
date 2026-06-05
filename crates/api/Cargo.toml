@@ -23,6 +23,11 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+thiserror = { workspace = true }
+# LLM fallback (P3-T2): production HTTP transport for the LLM client. Kept behind
+# the `LlmClient` trait so unit tests inject a fake and never touch the network.
+reqwest = { workspace = true, features = ["json"] }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
