@@ -193,9 +193,22 @@ async fn resolve_single_match(
 /// 3. Insert a `list_entry_events` row on this entry with `event_type='merged'`
 ///    and `payload={"merged_into":"<survivor_id>"}`.
 ///
-/// Then bump the list revision once, stamp both rows with it, commit, and
-/// broadcast two SSE events (the survivor's new quantity and this entry's
-/// deletion) so every connected client converges.
+/// Then bump the list revision TWICE — survivor at `R`, loser at `R+1` — stamping
+/// and broadcasting each row at its own revision, all in this one transaction
+/// (atomic: both revisions and both replay rows commit together or not at all).
+///
+/// Why two revisions, not one: the SSE cursor IS the revision, and backfill is
+/// strictly `server_revision > since`. If both events shared revision `R`, a
+/// client could process the survivor (advancing its cursor to `R`), disconnect
+/// before the loser, and reconnect with `?since=R` — the loser's deletion (`R`)
+/// is `R > R` = false and would NEVER replay, leaving the loser undeleted and the
+/// survivor's quantity stale forever. Distinct monotonic revisions give every
+/// replayable event a unique cursor, so partial delivery is always recoverable.
+///
+/// Accepted transient (the endorsed tradeoff): between `R` and `R+1` a client may
+/// briefly see the survivor's combined quantity AND the not-yet-deleted loser (a
+/// slight over-count) until the `R+1` event lands — a sub-second
+/// eventual-consistency blip, far preferable to permanent loss.
 async fn merge_into_survivor(
     state: &AppState,
     job: &ResolutionJob,
@@ -262,17 +275,16 @@ async fn merge_into_survivor(
     .execute(&mut *tx)
     .await?;
 
-    // Bump the revision once for the whole merge and stamp both touched rows so
-    // the broadcast entities carry the revision they were last changed at.
-    let revision = increment_revision(&mut tx, &job.list_id).await?;
-    stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
-    stamp_entry_revision(&mut tx, &survivor_id, &job.list_id, revision).await?;
-
-    // Persist TWO replayable `mutations` rows at this same revision — mirroring the
-    // two live SSE broadcasts below — so a reconnecting client backfills both the
-    // survivor's incremented quantity and the loser's deletion. The survivor row is
-    // `resolve_alias`/accepted; the loser is `delete_item`/merged (it lost the dedup
-    // race, so its status matches the merge-on-add convention in `apply_add_item`).
+    // Survivor at R, loser at R+1 — DISTINCT, strictly-increasing revisions so each
+    // replayable event has a unique monotonic cursor (see the fn doc for why a
+    // shared revision is unrecoverable on partial-delivery reconnect). Each row's
+    // `last_updated_revision` is the revision at which THAT row changed.
+    //
+    // The survivor's replay row is `resolve_alias`/accepted; the loser's is
+    // `delete_item`/merged (it lost the dedup race, matching the merge-on-add
+    // convention in `apply_add_item`).
+    let rev_survivor = increment_revision(&mut tx, &job.list_id).await?;
+    stamp_entry_revision(&mut tx, &survivor_id, &job.list_id, rev_survivor).await?;
     let survivor_payload = serde_json::json!({
         "raw_text": job.raw_text,
         "canonical_item_id": canonical_item_id,
@@ -282,18 +294,21 @@ async fn merge_into_survivor(
         &mut tx,
         job,
         &survivor_id,
-        revision,
+        rev_survivor,
         "accepted",
         "resolve_alias",
         &survivor_payload,
     )
     .await?;
+
+    let rev_loser = increment_revision(&mut tx, &job.list_id).await?;
+    stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, rev_loser).await?;
     let loser_payload = serde_json::json!({ "merged_into": survivor_id });
     insert_resolution_mutation_row(
         &mut tx,
         job,
         &job.entry_id,
-        revision,
+        rev_loser,
         "merged",
         "delete_item",
         &loser_payload,
@@ -302,11 +317,12 @@ async fn merge_into_survivor(
 
     tx.commit().await?;
 
-    // Broadcast both outcomes: the survivor's updated quantity and this entry's
-    // deletion. Read-after-commit so each event reflects the committed row. Both
-    // are best-effort (post-commit): a failure here is logged, never propagated.
-    broadcast_entry_id(state, &job.list_id, &survivor_id, revision).await;
-    broadcast_entry_id(state, &job.list_id, &job.entry_id, revision).await;
+    // Broadcast survivor at R then loser at R+1, matching backfill's
+    // `ORDER BY server_revision ASC` so live and replay order are identical. Both
+    // are read-after-commit and best-effort (post-commit): a failure here is
+    // logged, never propagated.
+    broadcast_entry_id(state, &job.list_id, &survivor_id, rev_survivor).await;
+    broadcast_entry_id(state, &job.list_id, &job.entry_id, rev_loser).await;
     Ok(())
 }
 
