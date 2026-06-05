@@ -747,7 +747,12 @@ async fn broadcast_entry(state: &AppState, job: &ResolutionJob, revision: i64) {
 /// serialisation failure is logged and swallowed — it must never make the cascade
 /// report failure, because a disconnected client backfills via `?since=` on
 /// reconnect and a dropped live event is never lost.
-async fn broadcast_entry_id(state: &AppState, list_id: &str, entry_id: &str, revision: i64) {
+pub(crate) async fn broadcast_entry_id(
+    state: &AppState,
+    list_id: &str,
+    entry_id: &str,
+    revision: i64,
+) {
     let view = match crate::mutations::load_entry_view(&state.pool, entry_id, list_id).await {
         Ok(Some(view)) => view,
         // Entry vanished (concurrent delete): nothing to broadcast.
