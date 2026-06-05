@@ -901,33 +901,52 @@ async fn apply_resolve_alias(
     );
     let now = buywise_core::db::now_iso();
 
+    // The non-empty `raw_text` we are about to learn as an alias, used to GUARD the
+    // bind: we only bind/learn for the term the entry actually still carries. A
+    // blank/absent `raw_text` learns nothing, so it does NOT gate the bind (the
+    // legitimate bind-but-no-alias path stays a plain `ambiguous`→`resolved`
+    // transition). `None` here means "do not guard on raw_text".
+    let raw_text_guard = raw_text.as_deref().filter(|s| !s.trim().is_empty());
+
     // Guarded bind: only an `ambiguous`, still-`active` entry on this list
     // transitions. A row already resolved/deleted (e.g. a concurrent confirm or a
     // stale replay that slipped past idempotency) matches 0 rows — a no-op accept,
     // so a double-confirm never errors. The dedup index fires here if a survivor
     // exists.
+    //
+    // TOCTOU/integrity guard (review Medium): when a non-empty `raw_text` is
+    // supplied we additionally require the row's CURRENT `raw_text` to equal it
+    // (`?6 IS NULL OR raw_text = ?6`). Without this, a rename arriving while the
+    // confirmation modal is open (or a malicious client supplying an arbitrary
+    // `raw_text`) would bind the entry AND persist an alias for a term the row no
+    // longer holds. This mirrors `resolution::resolve_single_match`'s
+    // `raw_text`-guarded UPDATE: a renamed row simply matches 0 rows → no-op accept,
+    // never a stale bind/alias.
     let update = sqlx::query(
         "UPDATE list_entries \
          SET resolution_status = 'resolved', canonical_item_id = ?3, \
              effective_constraint_hash = ?4, resolution_candidates_json = NULL, \
              updated_at = ?5 \
          WHERE id = ?1 AND list_id = ?2 \
-           AND resolution_status = 'ambiguous' AND status = 'active'",
+           AND resolution_status = 'ambiguous' AND status = 'active' \
+           AND (?6 IS NULL OR raw_text = ?6)",
     )
     .bind(&entry_id)
     .bind(&req.list_id)
     .bind(&canonical_item_id)
     .bind(&hash)
     .bind(&now)
+    .bind(raw_text_guard)
     .execute(&mut **tx)
     .await;
 
     match update {
         Ok(result) => {
             if result.rows_affected() == 0 {
-                // Nothing to resolve (already resolved/deleted, or a cross-list id
-                // — the shared stamp/load path 404s a genuinely foreign id). Accept
-                // as a no-op so a repeat confirm is idempotent.
+                // Nothing to resolve (already resolved/deleted, a cross-list id —
+                // the shared stamp/load path 404s a genuinely foreign id — or the
+                // raw_text guard failed because the row was renamed). Accept as a
+                // no-op so a repeat confirm is idempotent.
                 return Ok(ApplyOutcome::touched(
                     Some(entry_id),
                     MutationStatus::Accepted,
