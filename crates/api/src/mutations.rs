@@ -990,6 +990,21 @@ pub(crate) async fn load_entry_view(
         .map(EntityView::from))
 }
 
+/// Transaction-scoped variant of [`load_entry_view`], scoped to `(id, list_id)`,
+/// for the resolution cascade ([`crate::resolution`]) which must read the
+/// post-resolution row WITHIN the same transaction that wrote it — so the entity
+/// stored in the synthetic replay `mutations` row is byte-identical to the live
+/// broadcast (both reflect the committed state).
+pub(crate) async fn load_entry_view_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    entry_id: &str,
+    list_id: &str,
+) -> Result<Option<EntityView>, sqlx::Error> {
+    Ok(load_entry(tx, entry_id, list_id)
+        .await?
+        .map(EntityView::from))
+}
+
 /// Append a `list_entry_events` row (used to preserve a losing action under a
 /// delete-vs-mark_bought conflict). The mutation payload is stored verbatim.
 async fn record_event(

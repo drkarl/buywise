@@ -455,6 +455,183 @@ async fn resolution_db_failure_does_not_corrupt_committed_mutation() {
         entry_revision, 1,
         "the failed resolution did not bump entry-1's revision"
     );
+
+    // The failed resolution wrote NO synthetic replay row for entry-1: only the
+    // client's original add (device_id != 'server') touched it. A server-origin
+    // row would mean a revision bump leaked without its entry change (the rollback
+    // must take both or neither — atomicity of the revision-bump + replay-row).
+    let server_rows_for_entry1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mutations WHERE entity_id = 'entry-1' AND device_id = 'server'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        server_rows_for_entry1, 0,
+        "a failed resolution writes no replayable mutations row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect/backfill: every resolution outcome writes a replayable `mutations`
+// row, so a client that disconnected before the async resolution still receives
+// the outcome on reconnect via `?since=` (sse::backfill_since).
+// ---------------------------------------------------------------------------
+
+/// The single `mutation` event `backfill_since(list, since)` replays at exactly
+/// `revision`, or a panic if the count is not one. Returns its entity.
+async fn backfill_one(pool: &SqlitePool, since: i64, revision: i64) -> serde_json::Value {
+    let events = sse::backfill_since(pool, "list-a", since).await.unwrap();
+    let at_revision: Vec<&SseEvent> = events
+        .iter()
+        .filter(|e| match e {
+            SseEvent::Mutation {
+                server_revision, ..
+            } => *server_revision == revision,
+        })
+        .collect();
+    assert_eq!(
+        at_revision.len(),
+        1,
+        "exactly one backfilled event at revision {revision}, got {}",
+        at_revision.len()
+    );
+    match at_revision[0] {
+        SseEvent::Mutation { entity, .. } => entity.clone(),
+    }
+}
+
+/// The entry's `last_updated_revision` (the revision a backfill replays it at).
+async fn entry_revision(pool: &SqlitePool, entry_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = ?1")
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn resolved_outcome_is_replayable_on_reconnect() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resolved = poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(resolved.canonical_item_id.as_deref(), Some(MILK_ID));
+
+    // The resolution landed at the entry's stamped revision (2: add=1, resolve=2).
+    let revision = entry_revision(&pool, "entry-1").await;
+    // A client that saw the unresolved add at revision 1 and reconnects with
+    // ?since=1 must backfill the resolved entity at the resolution revision.
+    let entity = backfill_one(&pool, revision - 1, revision).await;
+    assert_eq!(entity["id"], "entry-1");
+    assert_eq!(entity["resolution_status"], "resolved");
+    assert_eq!(entity["canonical_item_id"], MILK_ID);
+}
+
+#[tokio::test]
+async fn ambiguous_outcome_is_replayable_on_reconnect() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", "cream")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    poll_entry(&pool, "entry-1", |e| e.resolution_status == "ambiguous").await;
+
+    let revision = entry_revision(&pool, "entry-1").await;
+    let entity = backfill_one(&pool, revision - 1, revision).await;
+    assert_eq!(entity["id"], "entry-1");
+    assert_eq!(entity["resolution_status"], "ambiguous");
+    assert!(
+        entity["canonical_item_id"].is_null(),
+        "ambiguous keeps NULL canonical in the replayed entity"
+    );
+    assert!(
+        entity["resolution_candidates_json"].is_string(),
+        "replayed ambiguous entity carries the candidate ids"
+    );
+}
+
+#[tokio::test]
+async fn merge_outcome_replays_both_survivor_and_loser_on_reconnect() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-2", "entry-2", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // Wait for the merge: one active resolved Milk row with quantity 2.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let (active, qty): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(quantity), 0) FROM list_entries \
+             WHERE list_id = 'list-a' AND status = 'active' AND canonical_item_id = ?1",
+        )
+        .bind(MILK_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if active == 1 && qty == 2 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("entries did not merge within 500ms (active={active}, qty={qty})");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The merge bumped the revision once; both touched rows carry it. Backfill from
+    // just before that revision must replay BOTH the survivor (quantity 2) and the
+    // loser (deleted), mirroring the two live SSE broadcasts.
+    let merge_revision = entry_revision(&pool, "entry-1").await;
+    let events = sse::backfill_since(&pool, "list-a", merge_revision - 1)
+        .await
+        .unwrap();
+    let at_merge: Vec<&serde_json::Value> = events
+        .iter()
+        .filter_map(|e| {
+            let SseEvent::Mutation {
+                server_revision,
+                entity,
+            } = e;
+            (*server_revision == merge_revision).then_some(entity)
+        })
+        .collect();
+    assert_eq!(
+        at_merge.len(),
+        2,
+        "the merge replays two events at its revision (survivor + loser)"
+    );
+
+    let survivor = at_merge
+        .iter()
+        .find(|e| e["status"] == "active")
+        .expect("a survivor entity in the replay");
+    assert_eq!(survivor["resolution_status"], "resolved");
+    assert_eq!(survivor["quantity"], 2, "survivor replays with quantity 2");
+
+    let loser = at_merge
+        .iter()
+        .find(|e| e["status"] == "deleted")
+        .expect("a deleted loser entity in the replay");
+    assert!(
+        ["entry-1", "entry-2"].contains(&loser["id"].as_str().unwrap()),
+        "loser is one of the two adds"
+    );
 }
 
 // ---------------------------------------------------------------------------
