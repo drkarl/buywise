@@ -1210,6 +1210,13 @@ async fn skip_and_rename_do_not_resurrect_deleted_entry() {
 /// stamp/load post-apply path, which is now scoped to (id, list_id). A caller
 /// authorised for list-a must not touch or read an entry on list-b by supplying
 /// its id: each op 404s and the foreign entry's revision stays unchanged.
+///
+/// `resolve_alias` now has a real handler (P3-T3): its guarded bind UPDATE is
+/// scoped to (id, list_id) and matches 0 rows for a cross-list id, so the entry
+/// is never bound and the shared stamp path 404s it — the IDOR guard holds. It is
+/// sent with a valid payload (a same-household canonical item) so the request
+/// reaches that guarded UPDATE rather than short-circuiting on payload validation;
+/// reject_match / set_constraint remain accept-and-log and are sent empty.
 #[tokio::test]
 async fn cross_list_idor_via_accept_and_log_ops_is_404() {
     let pool = setup_pool().await;
@@ -1217,6 +1224,27 @@ async fn cross_list_idor_via_accept_and_log_ops_is_404() {
     seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
     seed_list(&pool, "list-a", "hh-a", "A's list").await;
     seed_list(&pool, "list-b", "hh-a", "A's other list").await;
+    // A same-household canonical item so the resolve_alias payload passes the
+    // catalogue household check and reaches the (id, list_id)-scoped bind UPDATE.
+    // Its name is deliberately NOT "Milk" so the async add_item resolution cascade
+    // below finds no match and leaves entry-x `unresolved` at revision 1 (a
+    // matching name would resolve it and bump its revision, masking the IDOR check).
+    sqlx::query(
+        "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+         VALUES ('cat-idor', 'Misc', 'Varios', 'box', 9)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES ('item-idor', 'hh-a', 'Zzqxwidget', 'Zzqxwidget', 'cat-idor', 'any', ?1)",
+    )
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .unwrap();
     let s = login(&pool, "a@example.test").await;
 
     // entry-x lives on list-b (its own revision bump → last_updated_revision = 1).
@@ -1238,11 +1266,17 @@ async fn cross_list_idor_via_accept_and_log_ops_is_404() {
             .await
             .unwrap();
 
-    // Each accept-and-log op naming list-a but entry-x (on list-b) must 404.
-    for (i, op) in [
-        (1, "resolve_alias"),
-        (2, "reject_match"),
-        (3, "set_constraint"),
+    // Each op naming list-a but entry-x (on list-b) must 404. `resolve_alias`
+    // carries a valid (same-household) payload so it exercises the guarded bind
+    // path; the other two are accept-and-log and are sent empty.
+    for (i, op, payload) in [
+        (
+            1,
+            "resolve_alias",
+            serde_json::json!({ "chosen_canonical_item_id": "item-idor", "raw_text": "milk" }),
+        ),
+        (2, "reject_match", serde_json::json!({})),
+        (3, "set_constraint", serde_json::json!({})),
     ] {
         let resp = post_mutation(
             &pool,
@@ -1252,7 +1286,7 @@ async fn cross_list_idor_via_accept_and_log_ops_is_404() {
                 "list-a",
                 "entry-x",
                 op,
-                serde_json::json!({}),
+                payload,
             ),
         )
         .await;
@@ -1262,6 +1296,15 @@ async fn cross_list_idor_via_accept_and_log_ops_is_404() {
             "{op} on a cross-list entry id must 404"
         );
     }
+
+    // The cross-list resolve_alias must not have leaked an alias either (the bind
+    // never matched a row, so no alias is learned).
+    let alias_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases WHERE household_id = 'hh-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(alias_count, 0, "a no-op cross-list bind learns no alias");
 
     // The foreign entry's revision is unchanged — it was never stamped.
     let after: i64 =

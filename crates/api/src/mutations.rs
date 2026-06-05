@@ -448,14 +448,18 @@ async fn apply_mutation(
         "mark_bought" => apply_mark_bought(tx, user, req).await,
         "mark_skipped" => apply_mark_skipped(tx, req).await,
         "rename_item" => apply_rename_item(tx, req).await,
-        // resolve_alias / reject_match / set_constraint are accepted (last-write-
-        // wins) and recorded; the richer field semantics land with the resolution
-        // cascade (Phase 3). Accept-and-log keeps the revision counter correct
-        // and the mutation auditable without inventing behaviour ahead of spec.
-        // The targeted entry is still verified to belong to `req.list_id` (the
-        // shared post-apply stamp/load path 404s a cross-list id), so these ops
-        // cannot touch or read a foreign entry.
-        "resolve_alias" | "reject_match" | "set_constraint" => Ok(ApplyOutcome {
+        // resolve_alias is the user-confirmation step of the resolution flow
+        // (P3-T3): it binds the chosen canonical item to an `ambiguous` entry,
+        // transitions it to `resolved`, and persists the confirmed raw-text →
+        // canonical mapping as an `accepted_match` alias — both writes inside this
+        // one transaction (atomic; never a half-applied bind/alias).
+        "resolve_alias" => apply_resolve_alias(tx, household_id, req).await,
+        // reject_match / set_constraint remain accept-and-log (last-write-wins,
+        // no extra row mutation): the richer field semantics land later. The
+        // targeted entry is still verified to belong to `req.list_id` (the shared
+        // post-apply stamp/load path 404s a cross-list id), so these ops cannot
+        // touch or read a foreign entry.
+        "reject_match" | "set_constraint" => Ok(ApplyOutcome {
             entry_id: entry_target(req),
             status: MutationStatus::Accepted,
         }),
@@ -777,6 +781,202 @@ async fn apply_rename_item(
         entry_id: Some(entry_id),
         status: MutationStatus::Accepted,
     })
+}
+
+/// `resolve_alias`: the user-confirmation step (P3-T3). An `ambiguous` entry is
+/// bound to the canonical item the user chose, transitioning it to `resolved`,
+/// and the confirmed `raw_text` → canonical mapping is persisted as an
+/// `accepted_match` alias so a later add of the same term resolves via the
+/// step-1 alias lookup with no fuzzy/LLM work (docs/implementation-plan.md
+/// P3-T3 / P3-T4 step 4).
+///
+/// Contract (payload, per the design doc — NOT the issue body's older field
+/// name): `chosen_canonical_item_id` is the bound item; `raw_text` is the term
+/// to learn as an alias.
+///
+/// Atomicity / TOCTOU: the bind UPDATE is guarded on the entry still being
+/// `ambiguous` + `active` and scoped to `(id, list_id)`, and the alias write
+/// runs INSIDE the same transaction — so the alias is committed iff the bind it
+/// justifies also commits (never on a stale no-op). This mirrors the resolution
+/// cascade's `resolve_single_match` ordering (the exact concern P3-T2's review
+/// fixes hardened). Binding a `canonical_item_id` makes the row a dedup
+/// candidate, so the partial unique index `uq_list_entries_active_dedup` can
+/// fire *during* the UPDATE if a resolved active row for the same
+/// `(list, canonical item, hash)` already exists; that violation is caught and
+/// the two entries are merged (status `merged`), matching `apply_add_item`.
+async fn apply_resolve_alias(
+    tx: &mut Transaction<'_, Sqlite>,
+    household_id: &str,
+    req: &MutationRequest,
+) -> Result<ApplyOutcome, StatusCode> {
+    let entry_id = require_entry(req)?;
+    let canonical_item_id = string_field(&req.payload, "chosen_canonical_item_id")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    // `raw_text` is the term to learn as an alias. It is required for the
+    // confirmation flow (the doc's payload always carries it); a blank/absent
+    // value means we cannot learn anything, so we still bind but persist no alias
+    // rather than writing an empty alias the unique index could not dedup on.
+    let raw_text = string_field(&req.payload, "raw_text");
+
+    // The chosen item must belong to the target list's household — without this a
+    // caller could bind another household's catalogue item by guessing its id
+    // (the same cross-household guard `apply_add_item` applies). Unknown/foreign
+    // id → 404.
+    if !canonical_item_in_household(tx, &canonical_item_id, household_id)
+        .await
+        .map_err(db_error("apply_resolve_alias.canonical_item_check"))?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let hash = effective_constraint_hash(
+        &entry_id,
+        Some(&canonical_item_id),
+        req.payload.get("constraints"),
+    );
+    let now = buywise_core::db::now_iso();
+
+    // Guarded bind: only an `ambiguous`, still-`active` entry on this list
+    // transitions. A row already resolved/deleted (e.g. a concurrent confirm or a
+    // stale replay that slipped past idempotency) matches 0 rows — a no-op accept,
+    // so a double-confirm never errors. The dedup index fires here if a survivor
+    // exists.
+    let update = sqlx::query(
+        "UPDATE list_entries \
+         SET resolution_status = 'resolved', canonical_item_id = ?3, \
+             effective_constraint_hash = ?4, resolution_candidates_json = NULL, \
+             updated_at = ?5 \
+         WHERE id = ?1 AND list_id = ?2 \
+           AND resolution_status = 'ambiguous' AND status = 'active'",
+    )
+    .bind(&entry_id)
+    .bind(&req.list_id)
+    .bind(&canonical_item_id)
+    .bind(&hash)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await;
+
+    match update {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                // Nothing to resolve (already resolved/deleted, or a cross-list id
+                // — the shared stamp/load path 404s a genuinely foreign id). Accept
+                // as a no-op so a repeat confirm is idempotent.
+                return Ok(ApplyOutcome {
+                    entry_id: Some(entry_id),
+                    status: MutationStatus::Accepted,
+                });
+            }
+            // Bound cleanly — the guarded UPDATE proved the entry was current, so
+            // persist the confirmed alias INSIDE this transaction (committed with
+            // the bind, atomically, never on a no-op).
+            insert_accepted_alias(tx, household_id, &canonical_item_id, raw_text.as_deref())
+                .await?;
+            Ok(ApplyOutcome {
+                entry_id: Some(entry_id),
+                status: MutationStatus::Accepted,
+            })
+        }
+        // The partial dedup index fired: a resolved active row for the same
+        // (list, canonical item, hash) already exists. Fold this entry into it,
+        // mirroring `apply_add_item`'s merge. The alias is still valid (the chosen
+        // item is unchanged), so it is persisted on this path too.
+        Err(e) if is_dedup_index_violation(&e) => {
+            let surviving: Option<String> = sqlx::query_scalar(
+                "UPDATE list_entries \
+                 SET quantity = quantity + ( \
+                         SELECT quantity FROM list_entries WHERE id = ?5 AND list_id = ?1 \
+                     ), \
+                     updated_at = ?4 \
+                 WHERE list_id = ?1 AND canonical_item_id = ?2 \
+                   AND effective_constraint_hash = ?3 AND status = 'active' \
+                 RETURNING id",
+            )
+            .bind(&req.list_id)
+            .bind(&canonical_item_id)
+            .bind(&hash)
+            .bind(&now)
+            .bind(&entry_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_error("apply_resolve_alias.merge"))?;
+
+            // The conflict proves a colliding active row exists, so the UPDATE
+            // must have matched it.
+            let surviving = surviving.ok_or_else(|| {
+                tracing::error!("mutations: resolve_alias conflict but no row to merge into");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // Mark the ambiguous entry deleted (it loses to the survivor; `merged`
+            // is not a valid `status`), then learn the confirmed alias.
+            sqlx::query(
+                "UPDATE list_entries SET status = 'deleted', updated_at = ?2 \
+                 WHERE id = ?1 AND list_id = ?3",
+            )
+            .bind(&entry_id)
+            .bind(&now)
+            .bind(&req.list_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error("apply_resolve_alias.merge_delete"))?;
+
+            insert_accepted_alias(tx, household_id, &canonical_item_id, raw_text.as_deref())
+                .await?;
+
+            Ok(ApplyOutcome {
+                entry_id: Some(surviving),
+                status: MutationStatus::Merged,
+            })
+        }
+        Err(e) => Err(db_error("apply_resolve_alias.bind")(e)),
+    }
+}
+
+/// Persist a confirmed `raw_text` → canonical-item mapping as an `item_aliases`
+/// row with `source='accepted_match'` (P3-T3 / P3-T4 step 4).
+///
+/// The alias is stored NORMALISED (matching how step-1 alias lookup compares),
+/// so the next add of the same term is an exact normalised hit. Language defaults
+/// to `'en'` (the design's "default en if unclear"). `INSERT OR IGNORE` makes the
+/// write idempotent against the `uq_item_aliases_household_alias_lang` unique
+/// index, exactly like the LLM-alias write in [`crate::resolution`] — confirming
+/// the same term twice is a harmless no-op rather than a constraint error.
+///
+/// Runs on the caller's transaction so it commits atomically with the guarded
+/// bind/merge UPDATE that proved the entry was current. A blank/absent `raw_text`
+/// (or one that normalises to empty) learns nothing and is skipped.
+async fn insert_accepted_alias(
+    tx: &mut Transaction<'_, Sqlite>,
+    household_id: &str,
+    canonical_item_id: &str,
+    raw_text: Option<&str>,
+) -> Result<(), StatusCode> {
+    let Some(raw_text) = raw_text else {
+        return Ok(());
+    };
+    let normalised = buywise_core::normalise::normalize(raw_text);
+    if normalised.is_empty() {
+        return Ok(());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = buywise_core::db::now_iso();
+    sqlx::query(
+        "INSERT OR IGNORE INTO item_aliases \
+             (id, household_id, canonical_item_id, alias, language, source, created_at) \
+         VALUES (?1, ?2, ?3, ?4, 'en', 'accepted_match', ?5)",
+    )
+    .bind(&id)
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .bind(&normalised)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_resolve_alias.insert_alias"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
