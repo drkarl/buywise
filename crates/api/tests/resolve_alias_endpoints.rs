@@ -9,7 +9,8 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use buywise_api::{app, AppState};
+use buywise_api::sse::SseEvent;
+use buywise_api::{app, sse, AppState};
 use buywise_core::db;
 use http_body_util::BodyExt;
 use sqlx::SqlitePool;
@@ -141,6 +142,35 @@ async fn seed_ambiguous_entry(
     .execute(pool)
     .await
     .expect("insert ambiguous entry");
+}
+
+/// Seed an already-`resolved`, active entry bound to `canonical_item_id` with the
+/// `default` constraint hash — the survivor a later resolve_alias into the same
+/// item collides with on the partial dedup index.
+async fn seed_resolved_entry(
+    pool: &SqlitePool,
+    entry_id: &str,
+    list_id: &str,
+    user_id: &str,
+    canonical_item_id: &str,
+    raw_text: &str,
+) {
+    sqlx::query(
+        "INSERT INTO list_entries \
+             (id, list_id, canonical_item_id, resolution_status, resolution_candidates_json, \
+              raw_text, display_name, added_by, quantity, status, effective_constraint_hash, \
+              last_updated_revision, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'resolved', NULL, ?4, ?4, ?5, 1, 'active', 'default', 0, ?6, ?6)",
+    )
+    .bind(entry_id)
+    .bind(list_id)
+    .bind(canonical_item_id)
+    .bind(raw_text)
+    .bind(user_id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert resolved entry");
 }
 
 async fn login(pool: &SqlitePool, email: &str) -> Session {
@@ -379,4 +409,194 @@ async fn resolve_alias_without_chosen_item_is_422() {
 
     let resp = post_mutation(&pool, &s, body).await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// The `last_updated_revision` an entry was stamped at (the revision a `?since=`
+/// backfill replays it at).
+async fn entry_revision(pool: &SqlitePool, entry_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = ?1")
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Dedup-merge branch (review High): confirming an ambiguous entry into a canonical
+/// item that ALREADY has an active resolved entry folds it into that survivor and
+/// deletes the ambiguous loser. The loser's deletion MUST get its own DISTINCT
+/// revision (R+1, after the survivor's R) and be replayable via `?since=`, or a
+/// peer/reconnect that only saw the survivor (cursor → R) would show the deleted
+/// ambiguous row forever (the SSE-cursor partial-delivery failure mode).
+#[tokio::test]
+async fn resolve_alias_dedup_merge_broadcasts_loser_deletion_with_distinct_revision() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+    // A pre-existing resolved "double cream" survivor on the same canonical item the
+    // ambiguous "cream" entry will be confirmed into → dedup collision on resolve.
+    seed_resolved_entry(
+        &pool,
+        "survivor-1",
+        "list-a",
+        "user-a",
+        "ci-double",
+        "double cream",
+    )
+    .await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-double", "cream"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    // The mutation merged into the survivor; the response entity is the survivor.
+    assert_eq!(v["status"], "merged");
+    assert_eq!(v["entity"]["id"], "survivor-1");
+    assert_eq!(
+        v["entity"]["quantity"], 2,
+        "survivor absorbed the loser's qty"
+    );
+
+    // The ambiguous loser is now deleted.
+    let loser_status: String =
+        sqlx::query_scalar("SELECT status FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(loser_status, "deleted");
+
+    // Survivor at R, loser at R+1 — DISTINCT, consecutive revisions.
+    let rev_survivor = entry_revision(&pool, "survivor-1").await;
+    let rev_loser = entry_revision(&pool, "entry-1").await;
+    assert_eq!(
+        rev_survivor + 1,
+        rev_loser,
+        "survivor and loser are stamped at consecutive revisions (R, R+1)"
+    );
+
+    // A peer that processed only the survivor (cursor → R) and reconnects with
+    // `?since=R` MUST still receive the loser's deletion at R+1 (the bug this fixes).
+    let after_survivor = sse::backfill_since(&pool, "list-a", rev_survivor)
+        .await
+        .unwrap();
+    let loser_events: Vec<&serde_json::Value> = after_survivor
+        .iter()
+        .filter_map(|e| {
+            let SseEvent::Mutation {
+                server_revision,
+                entity,
+            } = e;
+            (*server_revision == rev_loser).then_some(entity)
+        })
+        .collect();
+    assert_eq!(
+        loser_events.len(),
+        1,
+        "the loser deletion IS replayed after a survivor-only (?since=R) reconnect"
+    );
+    assert_eq!(loser_events[0]["status"], "deleted");
+    assert_eq!(loser_events[0]["id"], "entry-1");
+
+    // A fuller reconnect (?since=R-1) replays BOTH the survivor (R) and loser (R+1).
+    let both = sse::backfill_since(&pool, "list-a", rev_survivor - 1)
+        .await
+        .unwrap();
+    let in_merge = both
+        .iter()
+        .filter(|e| {
+            let SseEvent::Mutation {
+                server_revision, ..
+            } = e;
+            *server_revision >= rev_survivor
+        })
+        .count();
+    assert_eq!(in_merge, 2, "?since=R-1 replays both merge events");
+}
+
+/// Bind-but-no-alias branch (`insert_accepted_alias` early return): a blank/absent
+/// `raw_text` still binds the ambiguous entry to `resolved`, but learns NO alias —
+/// we never write an empty `item_aliases` row the unique index could not dedup on.
+#[tokio::test]
+async fn resolve_alias_with_blank_raw_text_binds_but_writes_no_alias() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+
+    // A payload carrying chosen_canonical_item_id but a blank raw_text.
+    let mut body = resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-double", "");
+    body["payload"] = serde_json::json!({
+        "chosen_canonical_item_id": "ci-double",
+        "raw_text": "   ",
+    });
+
+    let resp = post_mutation(&pool, &s, body).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    assert_eq!(v["status"], "accepted");
+    assert_eq!(v["entity"]["resolution_status"], "resolved");
+    assert_eq!(v["entity"]["canonical_item_id"], "ci-double");
+
+    // The entry bound, but no alias was learned.
+    let status: String =
+        sqlx::query_scalar("SELECT resolution_status FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "resolved");
+    let alias_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases WHERE household_id = 'hh-a' AND source = 'accepted_match'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(alias_count, 0, "a blank raw_text binds but learns no alias");
+}
+
+/// raw_text TOCTOU guard (review Medium): if the entry is renamed (its `raw_text`
+/// changes) after the confirmation was prepared, a resolve_alias carrying the STALE
+/// raw_text must NOT bind the entry — the guarded UPDATE matches 0 rows and the
+/// mutation is an idempotent no-op accept, never a stale bind/alias.
+#[tokio::test]
+async fn resolve_alias_with_stale_raw_text_does_not_bind_or_alias() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+
+    // The entry was renamed "cream" → "double cream" while the modal was open.
+    sqlx::query("UPDATE list_entries SET raw_text = 'double cream' WHERE id = 'entry-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The confirmation still carries the stale "cream" term.
+    let resp = post_mutation(
+        &pool,
+        &s,
+        resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-double", "cream"),
+    )
+    .await;
+    // Accepted as a no-op (the guard matched 0 rows), never an error.
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    assert_eq!(v["status"], "accepted");
+
+    // The entry stays ambiguous (unbound) and no alias was learned for the stale term.
+    let (status, canonical): (String, Option<String>) = sqlx::query_as(
+        "SELECT resolution_status, canonical_item_id FROM list_entries WHERE id = 'entry-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status, "ambiguous",
+        "a renamed row is not bound to a stale term"
+    );
+    assert!(canonical.is_none());
+    let alias_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases WHERE household_id = 'hh-a' AND source = 'accepted_match'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(alias_count, 0, "no alias learned for a stale raw_text");
 }
