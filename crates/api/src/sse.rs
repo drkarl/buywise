@@ -629,7 +629,7 @@ async fn oldest_retained_within(
 /// reach here), and the caller needs the highest replayed revision for the
 /// live-dedup high-water mark, which is read directly off the collected slice.
 /// The bounded allocation makes streaming an unnecessary complication.
-async fn backfill_since(
+pub async fn backfill_since(
     pool: &sqlx::SqlitePool,
     list_id: &str,
     since: i64,

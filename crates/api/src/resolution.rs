@@ -33,6 +33,7 @@ use buywise_core::matching::{self, ResolutionOutcome};
 use serde_json::Value;
 use sqlx::{Sqlite, Transaction};
 
+use crate::mutations::{EntityView, MutationResponse};
 use crate::AppState;
 
 /// The inputs the async resolution task needs, captured from the committed
@@ -147,9 +148,25 @@ async fn resolve_single_match(
                 tx.rollback().await?;
                 return Ok(());
             }
-            // Resolved cleanly: bump the revision, stamp, broadcast the entry.
+            // Resolved cleanly: bump the revision, stamp, persist a replayable
+            // `mutations` row (so a client that reconnects via `?since=` after the
+            // async resolution still receives this outcome), then broadcast.
             let revision = increment_revision(&mut tx, &job.list_id).await?;
             stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
+            let payload = serde_json::json!({
+                "raw_text": job.raw_text,
+                "canonical_item_id": canonical_item_id,
+            });
+            insert_resolution_mutation_row(
+                &mut tx,
+                job,
+                &job.entry_id,
+                revision,
+                "accepted",
+                "resolve_alias",
+                &payload,
+            )
+            .await?;
             tx.commit().await?;
             // Broadcast is best-effort and runs AFTER commit: a read/serialise
             // failure here must not make the cascade report failure (the entry is
@@ -251,6 +268,38 @@ async fn merge_into_survivor(
     stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
     stamp_entry_revision(&mut tx, &survivor_id, &job.list_id, revision).await?;
 
+    // Persist TWO replayable `mutations` rows at this same revision — mirroring the
+    // two live SSE broadcasts below — so a reconnecting client backfills both the
+    // survivor's incremented quantity and the loser's deletion. The survivor row is
+    // `resolve_alias`/accepted; the loser is `delete_item`/merged (it lost the dedup
+    // race, so its status matches the merge-on-add convention in `apply_add_item`).
+    let survivor_payload = serde_json::json!({
+        "raw_text": job.raw_text,
+        "canonical_item_id": canonical_item_id,
+        "merged_from": job.entry_id,
+    });
+    insert_resolution_mutation_row(
+        &mut tx,
+        job,
+        &survivor_id,
+        revision,
+        "accepted",
+        "resolve_alias",
+        &survivor_payload,
+    )
+    .await?;
+    let loser_payload = serde_json::json!({ "merged_into": survivor_id });
+    insert_resolution_mutation_row(
+        &mut tx,
+        job,
+        &job.entry_id,
+        revision,
+        "merged",
+        "delete_item",
+        &loser_payload,
+    )
+    .await?;
+
     tx.commit().await?;
 
     // Broadcast both outcomes: the survivor's updated quantity and this entry's
@@ -296,6 +345,22 @@ async fn resolve_ambiguous(
 
     let revision = increment_revision(&mut tx, &job.list_id).await?;
     stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
+    // Persist a replayable `mutations` row so a reconnecting client backfills the
+    // `ambiguous` outcome (candidates + NULL canonical) just like a live event.
+    let payload = serde_json::json!({
+        "raw_text": job.raw_text,
+        "candidates": candidates,
+    });
+    insert_resolution_mutation_row(
+        &mut tx,
+        job,
+        &job.entry_id,
+        revision,
+        "accepted",
+        "resolve_alias",
+        &payload,
+    )
+    .await?;
     tx.commit().await?;
 
     // Best-effort post-commit broadcast (see [`broadcast_entry_id`]).
@@ -336,6 +401,76 @@ async fn stamp_entry_revision(
     .bind(entry_id)
     .bind(revision)
     .bind(list_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Persist a synthetic, replayable `mutations` row for one resolution outcome,
+/// INSIDE the cascade's transaction.
+///
+/// The High invariant this closes: every revision bump must have a corresponding
+/// `mutations` row so a client reconnecting via `?since=` backfills the outcome
+/// (`sse::backfill_since` replays only `mutations` rows). A revision bump without
+/// its row would otherwise be lost on reconnect — the original bug.
+///
+/// The row mirrors what `POST /api/mutations` would have written for an equivalent
+/// client mutation, with two server-origin distinctions:
+///   * `client_mutation_id` is a fresh server-generated UUID — it lives in the
+///     server's own idempotency space and can never collide with a client's keys.
+///   * `device_id` is the `"server"` sentinel.
+///
+/// `entity` is the post-resolution [`EntityView`] loaded WITHIN this transaction,
+/// so the `response_json.entity` is byte-identical to the live broadcast entity
+/// (backfill extracts exactly `.entity`). `operation_type` only has to satisfy the
+/// schema CHECK — backfill ignores it — but we pass an honest value at each call
+/// site (`resolve_alias` for a resolution, `delete_item` for a merged-away loser).
+#[allow(clippy::too_many_arguments)]
+async fn insert_resolution_mutation_row(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &ResolutionJob,
+    entity_id: &str,
+    revision: i64,
+    status: &str,
+    operation_type: &str,
+    payload: &Value,
+) -> Result<(), sqlx::Error> {
+    // Load the affected row's committed-state view within the transaction so the
+    // stored entity matches the live broadcast exactly. A vanished row (impossible
+    // here — we just wrote it) yields a null entity rather than failing the write.
+    let entity: Option<EntityView> =
+        crate::mutations::load_entry_view_tx(tx, entity_id, &job.list_id).await?;
+
+    let response = MutationResponse {
+        client_mutation_id: uuid::Uuid::new_v4().to_string(),
+        status: status.to_string(),
+        server_revision: revision,
+        entity,
+    };
+    let response_json = serde_json::to_value(&response)
+        .map(|v| v.to_string())
+        .map_err(|e| sqlx::Error::Protocol(format!("resolution response serialise failed: {e}")))?;
+
+    let now = buywise_core::db::now_iso();
+    sqlx::query(
+        "INSERT INTO mutations \
+             (id, client_mutation_id, device_id, user_id, list_id, entity_type, entity_id, \
+              operation_type, payload, base_revision, created_at_client, received_at_server, \
+              server_revision, status, response_json) \
+         VALUES (?1, ?2, 'server', ?3, ?4, 'list_entry', ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&response.client_mutation_id)
+    .bind(&job.user_id)
+    .bind(&job.list_id)
+    .bind(entity_id)
+    .bind(operation_type)
+    .bind(payload.to_string())
+    .bind(revision - 1)
+    .bind(&now)
+    .bind(revision)
+    .bind(status)
+    .bind(&response_json)
     .execute(&mut **tx)
     .await?;
     Ok(())
