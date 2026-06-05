@@ -235,7 +235,17 @@ export async function resolveAlias(
 
   const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
     const entry = await db.list_entries.get(entryId);
-    if (!entry || entry.list_id !== listId || entry.resolution_status !== 'ambiguous') {
+    // Re-check the guard inside the tx, INCLUDING `raw_text`: the mutation payload
+    // captured `existing.raw_text` before the tx, so if the entry was renamed
+    // between the pre-read and here, the queued `resolve_alias` would carry a stale
+    // term. Bail in that case rather than learning an alias for text the row no
+    // longer holds (the server applies the same raw_text-guarded bind).
+    if (
+      !entry ||
+      entry.list_id !== listId ||
+      entry.resolution_status !== 'ambiguous' ||
+      entry.raw_text !== existing.raw_text
+    ) {
       return false;
     }
     await db.list_entries.update(entryId, {
