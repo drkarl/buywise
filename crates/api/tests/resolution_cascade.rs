@@ -510,6 +510,18 @@ async fn entry_revision(pool: &SqlitePool, entry_id: &str) -> i64 {
         .unwrap()
 }
 
+/// The id of the sole active Milk entry on list-a (the merge survivor).
+async fn active_milk_entry(pool: &SqlitePool) -> String {
+    sqlx::query_scalar(
+        "SELECT id FROM list_entries \
+         WHERE list_id = 'list-a' AND status = 'active' AND canonical_item_id = ?1",
+    )
+    .bind(MILK_ID)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn resolved_outcome_is_replayable_on_reconnect() {
     let pool = setup_pool().await;
@@ -594,43 +606,160 @@ async fn merge_outcome_replays_both_survivor_and_loser_on_reconnect() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The merge bumped the revision once; both touched rows carry it. Backfill from
-    // just before that revision must replay BOTH the survivor (quantity 2) and the
-    // loser (deleted), mirroring the two live SSE broadcasts.
-    let merge_revision = entry_revision(&pool, "entry-1").await;
-    let events = sse::backfill_since(&pool, "list-a", merge_revision - 1)
+    // Identify survivor (active) and loser (deleted) — which add wins is not
+    // deterministic, so derive each from the committed state.
+    let survivor_id = active_milk_entry(&pool).await;
+    let loser_id = if survivor_id == "entry-1" {
+        "entry-2"
+    } else {
+        "entry-1"
+    };
+
+    // The merge now bumps the revision TWICE: survivor at R, loser at R+1.
+    let rev_survivor = entry_revision(&pool, &survivor_id).await;
+    let rev_loser = entry_revision(&pool, loser_id).await;
+    assert_eq!(
+        rev_survivor + 1,
+        rev_loser,
+        "survivor and loser are at consecutive revisions (R, R+1)"
+    );
+
+    // Backfill from just before the survivor's revision replays BOTH events, in
+    // ascending revision order: survivor (quantity 2) then loser (deleted).
+    let events = sse::backfill_since(&pool, "list-a", rev_survivor - 1)
         .await
         .unwrap();
-    let at_merge: Vec<&serde_json::Value> = events
+    let merge_events: Vec<(i64, &serde_json::Value)> = events
         .iter()
         .filter_map(|e| {
             let SseEvent::Mutation {
                 server_revision,
                 entity,
             } = e;
-            (*server_revision == merge_revision).then_some(entity)
+            (*server_revision >= rev_survivor).then_some((*server_revision, entity))
         })
         .collect();
     assert_eq!(
-        at_merge.len(),
+        merge_events.len(),
         2,
-        "the merge replays two events at its revision (survivor + loser)"
+        "the merge replays two events (survivor at R, loser at R+1)"
+    );
+    assert_eq!(
+        merge_events[0].0, rev_survivor,
+        "survivor event replays first (R)"
+    );
+    assert_eq!(
+        merge_events[1].0, rev_loser,
+        "loser event replays second (R+1)"
     );
 
-    let survivor = at_merge
-        .iter()
-        .find(|e| e["status"] == "active")
-        .expect("a survivor entity in the replay");
+    let survivor = merge_events[0].1;
+    assert_eq!(survivor["status"], "active");
     assert_eq!(survivor["resolution_status"], "resolved");
     assert_eq!(survivor["quantity"], 2, "survivor replays with quantity 2");
 
-    let loser = at_merge
+    let loser = merge_events[1].1;
+    assert_eq!(loser["status"], "deleted");
+    assert_eq!(
+        loser["id"].as_str().unwrap(),
+        loser_id,
+        "loser deletion replays at R+1"
+    );
+}
+
+/// Regression for the same-revision merge bug (review High): a client that
+/// processed only the survivor event (advancing its cursor to R) and reconnected
+/// with `?since=R` MUST still receive the loser's deletion at R+1. With both
+/// events at a shared revision R, `R > R` is false and the deletion was lost
+/// forever; distinct revisions make it recoverable.
+#[tokio::test]
+async fn merge_loser_deletion_replays_after_survivor_only_reconnect() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-2", "entry-2", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // Wait for the merge: one active resolved Milk row with quantity 2.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let (active, qty): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(quantity), 0) FROM list_entries \
+             WHERE list_id = 'list-a' AND status = 'active' AND canonical_item_id = ?1",
+        )
+        .bind(MILK_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if active == 1 && qty == 2 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("entries did not merge within 500ms (active={active}, qty={qty})");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let survivor_id = active_milk_entry(&pool).await;
+    let loser_id = if survivor_id == "entry-1" {
+        "entry-2"
+    } else {
+        "entry-1"
+    };
+    let rev_survivor = entry_revision(&pool, &survivor_id).await;
+    let rev_loser = entry_revision(&pool, loser_id).await;
+
+    // Simulate a client that saw the survivor event (cursor → R) then reconnected.
+    // `?since=R` must still replay the loser's deletion at R+1 — the bug was that
+    // it did not, because the loser also lived at R.
+    let after_survivor = sse::backfill_since(&pool, "list-a", rev_survivor)
+        .await
+        .unwrap();
+    let loser_events: Vec<&serde_json::Value> = after_survivor
         .iter()
-        .find(|e| e["status"] == "deleted")
-        .expect("a deleted loser entity in the replay");
-    assert!(
-        ["entry-1", "entry-2"].contains(&loser["id"].as_str().unwrap()),
-        "loser is one of the two adds"
+        .filter_map(|e| {
+            let SseEvent::Mutation {
+                server_revision,
+                entity,
+            } = e;
+            (*server_revision == rev_loser).then_some(entity)
+        })
+        .collect();
+    assert_eq!(
+        loser_events.len(),
+        1,
+        "the loser deletion IS replayed after a survivor-only (?since=R) reconnect"
+    );
+    assert_eq!(loser_events[0]["status"], "deleted");
+    assert_eq!(loser_events[0]["id"].as_str().unwrap(), loser_id);
+
+    // And a fuller reconnect (?since=R-1) still returns BOTH events.
+    let both = sse::backfill_since(&pool, "list-a", rev_survivor - 1)
+        .await
+        .unwrap();
+    let count_in_merge = both
+        .iter()
+        .filter(|e| {
+            let SseEvent::Mutation {
+                server_revision, ..
+            } = e;
+            *server_revision >= rev_survivor
+        })
+        .count();
+    assert_eq!(
+        count_in_merge, 2,
+        "?since=R-1 still replays both merge events"
     );
 }
 
