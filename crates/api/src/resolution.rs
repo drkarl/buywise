@@ -147,6 +147,13 @@ async fn resolve_no_match_via_llm(
     .await?;
     let candidate_names: Vec<String> = candidates.iter().map(|(_, name)| name.clone()).collect();
 
+    // No candidates → there is nothing for the LLM to match against. Skip the whole
+    // step BEFORE `resolve_item`/`record_llm_usage`: no network goes out and no
+    // `api_usage_events` row must be written for a call that never happened.
+    if candidate_names.is_empty() {
+        return Ok(());
+    }
+
     // Ask the LLM. The client itself enforces the enabled/configured gate.
     let answer = match state
         .llm_client
@@ -207,6 +214,32 @@ async fn resolve_no_match_via_llm(
         return Ok(());
     };
     let canonical_item_id = canonical_item_id.to_string();
+
+    // Revalidate the row BEFORE persisting an alias: the LLM call is slow and the
+    // user may have renamed this still-unresolved/active row mid-flight
+    // (`update_item` changing `raw_text`). If the current text no longer equals the
+    // text we asked the LLM about, the answer is stale — bail without persisting a
+    // `old_text -> canonical` alias for a term the user already moved away from. A
+    // small residual TOCTOU between this read and the UPDATE is acceptable: the
+    // `raw_text` guard on the `resolve_single_match` UPDATE is the real safety net.
+    let current_raw_text: Option<String> = sqlx::query_scalar(
+        "SELECT raw_text FROM list_entries \
+         WHERE id = ?1 AND list_id = ?2 \
+           AND resolution_status = 'unresolved' AND status = 'active'",
+    )
+    .bind(&job.entry_id)
+    .bind(&job.list_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if current_raw_text.as_deref() != Some(job.raw_text.as_str()) {
+        // Row was renamed, resolved, or removed while the LLM call was in flight.
+        tracing::info!(
+            entry_id = %job.entry_id,
+            raw_text = %job.raw_text,
+            "resolution: row changed during LLM call; skipping stale alias + bind"
+        );
+        return Ok(());
+    }
 
     // Persist the learned mapping as a `source='llm'` alias FIRST, so a later add
     // of the same term resolves via step 1 (alias lookup) without another LLM call.
@@ -306,22 +339,29 @@ async fn resolve_single_match(
 
     let mut tx = state.pool.begin().await?;
 
-    // Attempt to resolve in place. The entry must still be `active` and
-    // `unresolved` — a concurrent delete or an earlier resolution makes this a
-    // no-op (0 rows), which we treat as "already handled" and skip.
+    // Attempt to resolve in place. The entry must still be `active`, `unresolved`,
+    // AND carry the exact `raw_text` this job resolved — a concurrent delete, an
+    // earlier resolution, or an in-flight rename (`update_item` changing `raw_text`
+    // while the cascade ran, e.g. across a slow LLM call) makes this a no-op (0
+    // rows), which we treat as "already handled" and skip. The `raw_text` guard is
+    // the authoritative concurrency-safe defence against binding a renamed row to a
+    // stale answer: it is a guarded UPDATE, not check-then-act, so a row whose text
+    // changed simply doesn't match and we roll back.
     let update = sqlx::query(
         "UPDATE list_entries \
          SET resolution_status = 'resolved', canonical_item_id = ?3, \
              effective_constraint_hash = ?4, resolution_candidates_json = NULL, \
              updated_at = ?5 \
          WHERE id = ?1 AND list_id = ?2 \
-           AND resolution_status = 'unresolved' AND status = 'active'",
+           AND resolution_status = 'unresolved' AND status = 'active' \
+           AND raw_text = ?6",
     )
     .bind(&job.entry_id)
     .bind(&job.list_id)
     .bind(canonical_item_id)
     .bind(&hash)
     .bind(&now)
+    .bind(&job.raw_text)
     .execute(&mut *tx)
     .await;
 
