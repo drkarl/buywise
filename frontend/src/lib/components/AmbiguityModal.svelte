@@ -39,13 +39,38 @@
 		if (selectedId === null) return;
 		onconfirm(selectedId);
 	}
+
+	// Dismissal mirrors "Keep as-is": both Escape and a backdrop (outside-modal)
+	// click keep the entry `ambiguous` without resolving — the modal is non-
+	// destructive, so the least-surprising dismissal is the same no-op as the
+	// explicit "Keep as-is" button (never an implicit resolve).
+	function onKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			onkeep();
+		}
+	}
+
+	// Only a click on the backdrop itself (not a bubbled click from inside the
+	// modal) dismisses, so interacting with the candidates/buttons never closes it.
+	function onBackdropClick(event: MouseEvent) {
+		if (event.target === event.currentTarget) onkeep();
+	}
 </script>
 
+<svelte:window onkeydown={onKeydown} />
+
+<!-- Backdrop click + Escape (via svelte:window) dismiss to "Keep as-is"; the
+     dialog is programmatically focusable (tabindex=-1) so the keyboard path is the
+     Escape handler, justifying the static-interaction suppression. -->
+<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
 	class="backdrop"
 	role="dialog"
 	aria-modal="true"
 	aria-label={`What did you mean by "${rawText}"?`}
+	tabindex="-1"
+	onclick={onBackdropClick}
 >
 	<div class="modal">
 		<h2 class="prompt">What did you mean by “{rawText}”?</h2>

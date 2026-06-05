@@ -86,6 +86,11 @@
 		const entry = await db.list_entries.get(entryId);
 		if (!entry || entry.resolution_status !== 'ambiguous') return;
 		const ids = candidateIds(entry);
+		// Never open with zero candidates: the modal's Confirm stays permanently
+		// disabled (nothing to pick), so it would be a dead-end the user can only
+		// dismiss. An ambiguous entry with no candidates is a data anomaly we simply
+		// skip rather than surfacing an unusable modal.
+		if (ids.length === 0) return;
 		const candidates: CandidateItem[] = await Promise.all(
 			ids.map(async (id) => {
 				const mapping = await db.item_categories.get(id);
