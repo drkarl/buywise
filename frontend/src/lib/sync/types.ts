@@ -6,7 +6,8 @@
 // shapes the server returns (per docs/implementation-plan.md P1-T3/T4/T5 and
 // design §11) and `toLocalEntry` projects a server entry onto the local Dexie
 // `LocalListEntry` shape, dropping server-only columns the client doesn't store
-// (e.g. `added_by`, `effective_constraint_hash`, `resolution_candidates_json`).
+// (e.g. `added_by`, `effective_constraint_hash`). `resolution_candidates_json`
+// IS kept (P3-T3) — the disambiguation modal needs the candidate ids.
 
 import { db, type LocalListEntry } from '$lib/db/dexie';
 
@@ -77,6 +78,10 @@ export function toLocalEntry(entity: ServerListEntry): LocalListEntry {
     list_id: entity.list_id,
     canonical_item_id: entity.canonical_item_id ?? undefined,
     resolution_status: entity.resolution_status,
+    // Carried for the P3-T3 disambiguation modal: the candidate ids the user
+    // chooses between. Only `ambiguous` entries have it; normalise SQL `null` to
+    // `undefined` (how `LocalListEntry` represents "absent").
+    resolution_candidates_json: entity.resolution_candidates_json ?? undefined,
     raw_text: entity.raw_text,
     display_name: entity.display_name,
     quantity: entity.quantity,

@@ -28,6 +28,7 @@ import {
 interface ItemsResponseItem {
   id: string;
   category_id: string;
+  name_en: string;
 }
 
 /** One category row in the `GET /api/items` envelope. */
@@ -120,7 +121,8 @@ async function writeCatalogue(body: ItemsResponse): Promise<void> {
   }));
   const itemCategories: LocalItemCategory[] = body.items.map((i) => ({
     canonical_item_id: i.id,
-    category_id: i.category_id
+    category_id: i.category_id,
+    name_en: i.name_en
   }));
 
   const tables = [db.categories, db.store_category_orders, db.item_categories] as const;

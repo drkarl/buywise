@@ -19,8 +19,13 @@ import {
 import { getDeviceId } from '$lib/db/device';
 import { notifyMutationEnqueued } from '$lib/sync/enqueueSignal';
 
-/** Operation types in scope for P2-T3 (subset of the canonical enum). */
-type OperationType = 'add_item' | 'mark_bought' | 'mark_skipped' | 'delete_item';
+/** Operation types in scope for P2-T3 + P3-T3 (subset of the canonical enum). */
+type OperationType =
+  | 'add_item'
+  | 'mark_bought'
+  | 'mark_skipped'
+  | 'delete_item'
+  | 'resolve_alias';
 
 /**
  * Bridges a Dexie `liveQuery` Observable to a Svelte store. The query re-runs
@@ -186,6 +191,57 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
     if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'skipped',
+      updated_at: now
+    });
+    await db.mutation_queue.add(mutation);
+    return true;
+  });
+  if (enqueued) notifyMutationEnqueued(listId);
+}
+
+/**
+ * Confirms an `ambiguous` entry against the candidate the user chose (P3-T3).
+ * Optimistically binds `canonical_item_id`, flips the entry to `resolved`, and
+ * clears its candidates, then enqueues a `resolve_alias` mutation — both in one
+ * Dexie transaction. The server persists the confirmed `raw_text` → canonical
+ * mapping as an `accepted_match` alias.
+ *
+ * No-op (returns without enqueuing) unless the entry exists, is on `listId`, and
+ * is still `ambiguous` — so a stale or double confirm never spams the server,
+ * matching the backend's guarded bind.
+ */
+export async function resolveAlias(
+  listId: string,
+  entryId: string,
+  chosenCanonicalItemId: string
+): Promise<void> {
+  if (!chosenCanonicalItemId) throw new Error('resolveAlias: chosen id must not be empty');
+  const now = new Date().toISOString();
+
+  // Read + build the mutation BEFORE the write transaction: `buildMutation`
+  // touches `list_meta` (for base_revision), which is not in the tx table set
+  // below, and Dexie forbids touching tables outside the declared scope. The
+  // optimistic update then re-reads the entry inside the tx and re-checks the
+  // `ambiguous` guard, so a concurrent change between read and write still no-ops.
+  const existing = await db.list_entries.get(entryId);
+  if (!existing || existing.list_id !== listId || existing.resolution_status !== 'ambiguous') {
+    return;
+  }
+  // `raw_text` is the term the alias is learned for; the server normalises it.
+  const mutation = await buildMutation(listId, entryId, 'resolve_alias', {
+    chosen_canonical_item_id: chosenCanonicalItemId,
+    raw_text: existing.raw_text
+  });
+
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+    const entry = await db.list_entries.get(entryId);
+    if (!entry || entry.list_id !== listId || entry.resolution_status !== 'ambiguous') {
+      return false;
+    }
+    await db.list_entries.update(entryId, {
+      resolution_status: 'resolved',
+      canonical_item_id: chosenCanonicalItemId,
+      resolution_candidates_json: undefined,
       updated_at: now
     });
     await db.mutation_queue.add(mutation);
