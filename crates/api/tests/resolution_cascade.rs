@@ -937,6 +937,10 @@ struct FakeLlm {
 
 #[async_trait::async_trait]
 impl LlmClient for FakeLlm {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     async fn resolve_item(
         &self,
         _raw_text: &str,
@@ -955,6 +959,10 @@ struct FailingLlm {
 
 #[async_trait::async_trait]
 impl LlmClient for FailingLlm {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     async fn resolve_item(
         &self,
         _raw_text: &str,
@@ -962,6 +970,30 @@ impl LlmClient for FailingLlm {
     ) -> Result<Option<String>, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(LlmError::Status(429))
+    }
+}
+
+/// A fake LLM client that reports DISABLED: `is_enabled` is `false` and any call
+/// returns [`LlmError::Disabled`]. Lets a test prove the disabled gate without
+/// relying on ambient env. Counts invocations so a test can assert it was NEVER
+/// asked to resolve (the gate short-circuits before `resolve_item`).
+struct DisabledLlm {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for DisabledLlm {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
+    async fn resolve_item(
+        &self,
+        _raw_text: &str,
+        _candidate_names: &[String],
+    ) -> Result<Option<String>, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(LlmError::Disabled)
     }
 }
 
@@ -1130,15 +1162,122 @@ async fn llm_failure_leaves_entry_unresolved_without_retry() {
     );
 }
 
-/// With the fallback DISABLED (the default env-built client returns `Disabled`),
-/// a NoMatch term stays `unresolved` and the LLM is never consulted.
+/// A HALLUCINATED answer — a name the LLM returns that is NOT in the candidate
+/// catalogue — is a DISTINCT path from the `"none"` sentinel: the call DID go out
+/// (so usage is recorded), but the exact-match against `name_en` finds zero
+/// candidates, so the entry stays `unresolved` and NO alias is written.
+#[tokio::test]
+async fn llm_hallucinated_name_does_not_resolve_but_records_usage() {
+    let pool = setup_pool().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Answer with a plausible-looking name that is NOT a seeded canonical item.
+    let llm = Arc::new(FakeLlm {
+        answer: Some("Definitely Not A Catalogue Item".to_string()),
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Sentinel proves the cascade ran for entry-1.
+    let sentinel = post_mutation(&state, &s, add_item("cm-2", "sentinel", "leche")).await;
+    assert_eq!(sentinel.status(), StatusCode::CREATED);
+    poll_entry(&pool, "sentinel", |e| e.resolution_status == "resolved").await;
+
+    let entry = entry_state(&pool, "entry-1").await.unwrap();
+    assert_eq!(
+        entry.resolution_status, "unresolved",
+        "a hallucinated name binds nothing; the entry stays unresolved"
+    );
+    assert!(entry.canonical_item_id.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the LLM was called once");
+    // The call went out, so usage IS recorded even though nothing resolved.
+    assert_eq!(
+        llm_usage_count(&pool).await,
+        1,
+        "a call that went out is recorded for cost tracking regardless of the answer"
+    );
+    // No alias written, since no canonical item was bound.
+    let alias_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases WHERE source = 'llm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        alias_rows, 0,
+        "no alias is written for a hallucinated answer"
+    );
+}
+
+/// An AMBIGUOUS answer — one that exact-matches MORE THAN ONE canonical item
+/// (duplicate `name_en` in the household) — must NOT bind a wrong item: the >1
+/// match branch falls through to user clarification, leaving the entry unresolved.
+#[tokio::test]
+async fn llm_answer_matching_duplicate_canonical_names_does_not_resolve() {
+    let pool = setup_pool().await;
+
+    // Seed a SECOND canonical item with the same name_en as an existing one so the
+    // LLM answer exact-matches two ids (there is no UNIQUE on name_en).
+    let dup_id = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES (?1, ?2, ?3, 'Jugo de manzana', 'c1000000-0000-0000-0000-000000000008', 'any', ?4)",
+    )
+    .bind(dup_id)
+    .bind(SEED_HOUSEHOLD)
+    .bind(LLM_TARGET_NAME)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .expect("insert duplicate-named canonical item");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm = Arc::new(FakeLlm {
+        answer: Some(LLM_TARGET_NAME.to_string()),
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let sentinel = post_mutation(&state, &s, add_item("cm-2", "sentinel", "leche")).await;
+    assert_eq!(sentinel.status(), StatusCode::CREATED);
+    poll_entry(&pool, "sentinel", |e| e.resolution_status == "resolved").await;
+
+    let entry = entry_state(&pool, "entry-1").await.unwrap();
+    assert_eq!(
+        entry.resolution_status, "unresolved",
+        "an answer matching >1 canonical item must not bind either; entry stays unresolved"
+    );
+    assert!(entry.canonical_item_id.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the LLM was called once");
+    let alias_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases WHERE source = 'llm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(alias_rows, 0, "no alias is written for an ambiguous match");
+}
+
+/// With the fallback DISABLED, a NoMatch term stays `unresolved` and the LLM is
+/// never consulted. An explicitly-disabled fake is injected so the test does NOT
+/// depend on ambient env (`LLM_FALLBACK_ENABLED`) and can never make a real call.
 /// (Acceptance criterion 5.)
 #[tokio::test]
 async fn disabled_fallback_skips_llm_entirely() {
     let pool = setup_pool().await;
-    // AppState::new builds the env-configured client. In the test environment
-    // LLM_FALLBACK_ENABLED is unset → disabled → resolve_item returns Disabled.
-    let state = AppState::new(pool.clone());
+    // Inject a disabled fake (is_enabled == false) instead of relying on the
+    // env-built client: the cascade's gate must short-circuit before resolve_item.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm = Arc::new(DisabledLlm {
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
     let s = seed_seed_household_user_and_list(&pool).await;
 
     let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM)).await;
@@ -1155,6 +1294,11 @@ async fn disabled_fallback_skips_llm_entirely() {
         "a disabled fallback leaves the NoMatch entry unresolved"
     );
     assert!(entry.canonical_item_id.is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the disabled gate short-circuits before resolve_item is ever called"
+    );
     assert_eq!(
         llm_usage_count(&pool).await,
         0,
