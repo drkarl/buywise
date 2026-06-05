@@ -140,6 +140,87 @@ describe('list page', () => {
 		}
 	});
 
+	describe('ambiguity confirmation flow (P3-T3)', () => {
+		/** Seed an ambiguous entry + its candidate catalogue names, as sync would. */
+		async function seedAmbiguous() {
+			await db.list_entries.add({
+				id: 'amb-1',
+				list_id: LIST,
+				resolution_status: 'ambiguous',
+				resolution_candidates_json: JSON.stringify(['ci-single', 'ci-double']),
+				raw_text: 'cream',
+				display_name: 'cream',
+				quantity: 1,
+				status: 'active',
+				last_updated_revision: 1,
+				updated_at: '2026-06-05T00:00:00.000Z'
+			});
+			await db.item_categories.bulkPut([
+				{ canonical_item_id: 'ci-single', category_id: 'dairy', name_en: 'Single cream' },
+				{ canonical_item_id: 'ci-double', category_id: 'dairy', name_en: 'Double cream' }
+			]);
+		}
+
+		it('shows the "? Tap to clarify" indicator and opens a modal with the candidate labels', async () => {
+			await seedAmbiguous();
+			render(Page);
+
+			const clarify = await screen.findByRole('button', { name: 'Clarify cream' });
+			expect(clarify.textContent).toMatch(/clarify/i);
+
+			await fireEvent.click(clarify);
+
+			// Modal lists the candidate items by their cached catalogue names.
+			await screen.findByRole('dialog');
+			expect(screen.getByText('Single cream')).toBeTruthy();
+			expect(screen.getByText('Double cream')).toBeTruthy();
+		});
+
+		it('confirming a candidate resolves the entry and queues a resolve_alias mutation', async () => {
+			await seedAmbiguous();
+			render(Page);
+
+			await fireEvent.click(await screen.findByRole('button', { name: 'Clarify cream' }));
+			await screen.findByRole('dialog');
+			await fireEvent.click(screen.getByRole('radio', { name: 'Double cream' }));
+			await fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+			// Entry flips to resolved with the chosen item; the modal closes.
+			await waitFor(async () => {
+				const entry = await db.list_entries.get('amb-1');
+				expect(entry?.resolution_status).toBe('resolved');
+				expect(entry?.canonical_item_id).toBe('ci-double');
+			});
+			await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+			const muts = await db.mutation_queue.toArray();
+			const resolveMut = muts.find((m) => m.operation_type === 'resolve_alias');
+			expect(resolveMut).toMatchObject({
+				entity_id: 'amb-1',
+				status: 'pending',
+				payload: { chosen_canonical_item_id: 'ci-double', raw_text: 'cream' }
+			});
+		});
+
+		it('"Keep as-is" closes the modal and leaves the entry ambiguous (no mutation)', async () => {
+			await seedAmbiguous();
+			render(Page);
+
+			await fireEvent.click(await screen.findByRole('button', { name: 'Clarify cream' }));
+			await screen.findByRole('dialog');
+			await fireEvent.click(screen.getByRole('button', { name: 'Keep as-is' }));
+
+			await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+			const entry = await db.list_entries.get('amb-1');
+			expect(entry?.resolution_status).toBe('ambiguous');
+			const resolveMut = (await db.mutation_queue.toArray()).find(
+				(m) => m.operation_type === 'resolve_alias'
+			);
+			expect(resolveMut).toBeUndefined();
+		});
+	});
+
 	it('bought and skipped items both group under "In basket"', async () => {
 		render(Page);
 		const input = screen.getByLabelText('Add an item');

@@ -12,11 +12,21 @@
 		onbought: (id: string) => void;
 		onskipped: (id: string) => void;
 		ondelete: (id: string) => void;
+		/**
+		 * Open the disambiguation flow for an `ambiguous` entry (P3-T3). Optional so
+		 * existing call sites that don't surface clarification still type-check; when
+		 * absent the "?" indicator is not shown.
+		 */
+		onclarify?: (id: string) => void;
 	}
 
-	let { entry, onbought, onskipped, ondelete }: Props = $props();
+	let { entry, onbought, onskipped, ondelete, onclarify }: Props = $props();
 
 	const inBasket = $derived(entry.status === 'bought' || entry.status === 'skipped');
+	// An active, ambiguous entry the parent can disambiguate.
+	const isAmbiguous = $derived(
+		entry.resolution_status === 'ambiguous' && !inBasket && onclarify !== undefined
+	);
 
 	// Swipe-to-delete state.
 	const SWIPE_THRESHOLD = 80;
@@ -83,6 +93,15 @@
 		{/if}
 
 		<span class="name">{entry.display_name}</span>
+
+		{#if isAmbiguous}
+			<button
+				type="button"
+				class="clarify"
+				aria-label={`Clarify ${entry.display_name}`}
+				onclick={() => onclarify?.(entry.id)}>? Tap to clarify</button
+			>
+		{/if}
 
 		{#if entry.quantity > 1}
 			<span class="qty-value">×{entry.quantity}</span>
@@ -156,6 +175,16 @@
 		border-radius: 0.4rem;
 		background: #f8fafc;
 		cursor: pointer;
+	}
+	.clarify {
+		padding: 0.25rem 0.55rem;
+		border: 1px solid #f59e0b;
+		border-radius: 0.4rem;
+		background: #fffbeb;
+		color: #b45309;
+		font-size: 0.8rem;
+		cursor: pointer;
+		white-space: nowrap;
 	}
 	.status-tag {
 		font-size: 0.85rem;
