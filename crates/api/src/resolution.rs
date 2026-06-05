@@ -93,7 +93,8 @@ async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx
 
     match outcome {
         ResolutionOutcome::SingleMatch { canonical_item_id } => {
-            resolve_single_match(state, job, &canonical_item_id).await
+            // Steps 1 & 2 (alias / token-fuzzy): no LLM alias to persist.
+            resolve_single_match(state, job, &canonical_item_id, false).await
         }
         ResolutionOutcome::MultipleCandidates { candidates } => {
             resolve_ambiguous(state, job, &candidates).await
@@ -122,9 +123,12 @@ async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx
 ///   5. Map the answer to a canonical id by EXACT `name_en` match. A hallucinated
 ///      or ambiguous answer (zero or >1 matches) falls through to user
 ///      clarification rather than binding a wrong item.
-///   6. Persist the `raw_text` → item mapping as a `source='llm'` alias (so a
-///      second add of the same term resolves via step 1 with no LLM call), then
-///      resolve via [`resolve_single_match`] for the shared dedup/merge/SSE path.
+///   6. Resolve via [`resolve_single_match`] with `persist_llm_alias = true`: the
+///      `raw_text` → item mapping is persisted as a `source='llm'` alias (so a
+///      second add of the same term resolves via step 1 with no LLM call) INSIDE the
+///      resolve transaction, committed atomically with the proven-current bind/merge
+///      and never on a no-op — closing the stale-alias TOCTOU window an out-of-band
+///      insert left open. This is also the shared dedup/merge/SSE path.
 async fn resolve_no_match_via_llm(
     state: &AppState,
     job: &ResolutionJob,
@@ -215,41 +219,17 @@ async fn resolve_no_match_via_llm(
     };
     let canonical_item_id = canonical_item_id.to_string();
 
-    // Revalidate the row BEFORE persisting an alias: the LLM call is slow and the
-    // user may have renamed this still-unresolved/active row mid-flight
-    // (`update_item` changing `raw_text`). If the current text no longer equals the
-    // text we asked the LLM about, the answer is stale — bail without persisting a
-    // `old_text -> canonical` alias for a term the user already moved away from. A
-    // small residual TOCTOU between this read and the UPDATE is acceptable: the
-    // `raw_text` guard on the `resolve_single_match` UPDATE is the real safety net.
-    let current_raw_text: Option<String> = sqlx::query_scalar(
-        "SELECT raw_text FROM list_entries \
-         WHERE id = ?1 AND list_id = ?2 \
-           AND resolution_status = 'unresolved' AND status = 'active'",
-    )
-    .bind(&job.entry_id)
-    .bind(&job.list_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    if current_raw_text.as_deref() != Some(job.raw_text.as_str()) {
-        // Row was renamed, resolved, or removed while the LLM call was in flight.
-        tracing::info!(
-            entry_id = %job.entry_id,
-            raw_text = %job.raw_text,
-            "resolution: row changed during LLM call; skipping stale alias + bind"
-        );
-        return Ok(());
-    }
-
-    // Persist the learned mapping as a `source='llm'` alias FIRST, so a later add
-    // of the same term resolves via step 1 (alias lookup) without another LLM call.
-    // INSERT OR IGNORE respects the unique (household, lower(alias), language)
-    // index: a concurrent/repeat insert is a harmless no-op.
-    insert_llm_alias(&state.pool, job, &canonical_item_id).await?;
-
     // Resolve through the shared SingleMatch path for identical dedup/merge/SSE
-    // behaviour to steps 1 and 2.
-    resolve_single_match(state, job, &canonical_item_id).await
+    // behaviour to steps 1 and 2, passing `persist_llm_alias = true` so the learned
+    // `raw_text -> canonical` alias is written INSIDE the same transaction as — and
+    // only if — the guarded bind (or merge) actually lands. The alias is therefore
+    // committed atomically with the proven-current bind and never on a no-op: if the
+    // row was renamed / resolved / deleted while the slow LLM call was in flight, the
+    // `raw_text`-guarded UPDATE matches 0 rows, the transaction rolls back, and no
+    // stale alias survives (this closes the TOCTOU window an out-of-band insert left
+    // open). On the merge path the guard already matched a current row before hitting
+    // the dedup index, so the alias is still valid and is persisted there too.
+    resolve_single_match(state, job, &canonical_item_id, true).await
 }
 
 /// Persist a `raw_text` → canonical-item mapping discovered by the LLM as an
@@ -259,8 +239,13 @@ async fn resolve_no_match_via_llm(
 /// the next add of the same term is an exact normalised hit. Language defaults to
 /// `'en'` (the design's "default en if unclear"). `INSERT OR IGNORE` makes the
 /// write idempotent against the `uq_item_aliases_household_alias_lang` index.
+///
+/// Runs on the caller's transaction (`&mut Transaction`) rather than its own pool
+/// connection, so the alias commits atomically with the guarded resolve/merge UPDATE
+/// that proved the entry's `raw_text` was still current. The learned mapping is thus
+/// written iff the bind/merge it justifies also commits — never on a stale no-op.
 async fn insert_llm_alias(
-    pool: &sqlx::SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     job: &ResolutionJob,
     canonical_item_id: &str,
 ) -> Result<(), sqlx::Error> {
@@ -280,7 +265,7 @@ async fn insert_llm_alias(
     .bind(canonical_item_id)
     .bind(&normalised)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -325,10 +310,17 @@ async fn record_llm_usage(pool: &sqlx::SqlitePool) {
 /// a concurrent resolution could otherwise slip a survivor in between the check
 /// and the write. Everything runs in one transaction so a half-applied merge is
 /// impossible.
+///
+/// `persist_llm_alias` is set by the step-3 LLM fallback caller (steps 1 and 2 pass
+/// `false`). When `true`, the learned `raw_text -> canonical` alias is written INSIDE
+/// this transaction — on the clean-resolve branch and the merge branch, both of which
+/// have proven the row's `raw_text` was current via the guarded UPDATE — so the alias
+/// commits atomically with the bind/merge and is never persisted on a no-op.
 async fn resolve_single_match(
     state: &AppState,
     job: &ResolutionJob,
     canonical_item_id: &str,
+    persist_llm_alias: bool,
 ) -> Result<(), sqlx::Error> {
     let hash = effective_constraint_hash(
         &job.entry_id,
@@ -372,9 +364,15 @@ async fn resolve_single_match(
                 tx.rollback().await?;
                 return Ok(());
             }
-            // Resolved cleanly: bump the revision, stamp, persist a replayable
-            // `mutations` row (so a client that reconnects via `?since=` after the
-            // async resolution still receives this outcome), then broadcast.
+            // Resolved cleanly. The guarded UPDATE matched (raw_text still current),
+            // so for the LLM path persist the learned alias INSIDE this transaction —
+            // it commits with the bind, atomically, never on a stale no-op.
+            if persist_llm_alias {
+                insert_llm_alias(&mut tx, job, canonical_item_id).await?;
+            }
+            // Bump the revision, stamp, persist a replayable `mutations` row (so a
+            // client that reconnects via `?since=` after the async resolution still
+            // receives this outcome), then broadcast.
             let revision = increment_revision(&mut tx, &job.list_id).await?;
             stamp_entry_revision(&mut tx, &job.entry_id, &job.list_id, revision).await?;
             let payload = serde_json::json!({
@@ -401,7 +399,16 @@ async fn resolve_single_match(
         // The partial dedup index fired: a resolved active row for the same
         // (list, canonical item, hash) already exists. Merge this entry into it.
         Err(e) if crate::mutations::is_dedup_index_violation(&e) => {
-            merge_into_survivor(state, job, canonical_item_id, &hash, &now, tx).await
+            merge_into_survivor(
+                state,
+                job,
+                canonical_item_id,
+                &hash,
+                &now,
+                tx,
+                persist_llm_alias,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -440,6 +447,7 @@ async fn merge_into_survivor(
     hash: &str,
     now: &str,
     mut tx: Transaction<'_, Sqlite>,
+    persist_llm_alias: bool,
 ) -> Result<(), sqlx::Error> {
     // 1. Increment the survivor's quantity by this entry's quantity and return
     //    its id. The survivor is the existing active row on the dedup key.
@@ -472,6 +480,15 @@ async fn merge_into_survivor(
         );
         return Ok(());
     };
+
+    // The dedup index only fired because the guarded resolve UPDATE first matched a
+    // current row (its `WHERE ... AND raw_text = ?` clause proved `raw_text` had not
+    // changed) and only THEN hit the unique index. The LLM answer is therefore valid
+    // for the term still on the row, so persist the learned alias INSIDE this
+    // transaction — it commits with the merge, atomically, never on a stale no-op.
+    if persist_llm_alias {
+        insert_llm_alias(&mut tx, job, canonical_item_id).await?;
+    }
 
     // 2. Mark this entry deleted (it loses to the survivor).
     sqlx::query(
