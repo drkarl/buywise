@@ -219,6 +219,29 @@ describe('list page', () => {
 			);
 			expect(resolveMut).toBeUndefined();
 		});
+
+		it('does not open the modal for an ambiguous entry with zero candidates (no dead-end)', async () => {
+			// An ambiguous entry whose candidate list is empty would open a modal whose
+			// Confirm is permanently disabled — a dead-end. The clarify tap must no-op.
+			await db.list_entries.add({
+				id: 'amb-empty',
+				list_id: LIST,
+				resolution_status: 'ambiguous',
+				resolution_candidates_json: JSON.stringify([]),
+				raw_text: 'mystery',
+				display_name: 'mystery',
+				quantity: 1,
+				status: 'active',
+				last_updated_revision: 1,
+				updated_at: '2026-06-05T00:00:00.000Z'
+			});
+			render(Page);
+
+			await fireEvent.click(await screen.findByRole('button', { name: 'Clarify mystery' }));
+
+			// No modal opens (the guard skipped a candidate-less entry).
+			expect(screen.queryByRole('dialog')).toBeNull();
+		});
 	});
 
 	it('bought and skipped items both group under "In basket"', async () => {
