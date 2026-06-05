@@ -16,8 +16,8 @@ beforeEach(async () => {
 function itemsEnvelope() {
   return {
     items: [
-      { id: 'ci-milk', category_id: 'dairy' },
-      { id: 'ci-apple', category_id: 'produce' }
+      { id: 'ci-milk', category_id: 'dairy', name_en: 'Milk' },
+      { id: 'ci-apple', category_id: 'produce', name_en: 'Apple' }
     ],
     categories: [
       { id: 'produce', name_en: 'Produce', name_es: 'Frutas', icon: 'apple', default_order: 1 },
@@ -65,6 +65,9 @@ describe('fetchCatalogue', () => {
     expect(await db.store_category_orders.count()).toBe(2);
     expect(await db.item_categories.count()).toBe(2);
     expect((await db.item_categories.get('ci-milk'))?.category_id).toBe('dairy');
+    // The item's English name is cached too, so the P3-T3 ambiguity modal can
+    // label candidate ids offline.
+    expect((await db.item_categories.get('ci-milk'))?.name_en).toBe('Milk');
   });
 
   it('returns false and keeps the cache when offline', async () => {

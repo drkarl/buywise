@@ -6,11 +6,34 @@ import {
 	markBought,
 	markSkipped,
 	deleteItem,
+	resolveAlias,
 	activeEntries,
 	basketEntries
 } from './list';
+import type { LocalListEntry } from '$lib/db/dexie';
 
 const LIST = 'list-1';
+
+/** Seed an ambiguous active entry directly (as the sync apply path would). */
+async function seedAmbiguous(
+	id: string,
+	rawText: string,
+	candidates: string[]
+): Promise<void> {
+	const entry: LocalListEntry = {
+		id,
+		list_id: LIST,
+		resolution_status: 'ambiguous',
+		resolution_candidates_json: JSON.stringify(candidates),
+		raw_text: rawText,
+		display_name: rawText,
+		quantity: 1,
+		status: 'active',
+		last_updated_revision: 0,
+		updated_at: '2026-06-05T00:00:00.000Z'
+	};
+	await db.list_entries.add(entry);
+}
 
 /** Resolves once a derived live store satisfies `predicate` (or times out). */
 async function until<T>(
@@ -253,5 +276,69 @@ describe('live stores / reactivity', () => {
 		await deleteItem(LIST, id);
 		await until(active, (e) => e.length === 0);
 		expect(get(basket)).toHaveLength(0);
+	});
+});
+
+describe('resolveAlias', () => {
+	it('binds the chosen item, resolves the entry, clears candidates, and queues a resolve_alias mutation', async () => {
+		await seedAmbiguous('e1', 'cream', ['ci-single', 'ci-double']);
+
+		await resolveAlias(LIST, 'e1', 'ci-double');
+
+		const entry = await db.list_entries.get('e1');
+		expect(entry?.resolution_status).toBe('resolved');
+		expect(entry?.canonical_item_id).toBe('ci-double');
+		expect(entry?.resolution_candidates_json).toBeUndefined();
+
+		const muts = await db.mutation_queue.toArray();
+		expect(muts).toHaveLength(1);
+		expect(muts[0]).toMatchObject({
+			operation_type: 'resolve_alias',
+			entity_id: 'e1',
+			status: 'pending',
+			payload: { chosen_canonical_item_id: 'ci-double', raw_text: 'cream' }
+		});
+	});
+
+	it('is a no-op when the entry is not ambiguous (does not spam the server)', async () => {
+		// A resolved entry must not re-enqueue a confirmation.
+		await db.list_entries.add({
+			id: 'e2',
+			list_id: LIST,
+			resolution_status: 'resolved',
+			canonical_item_id: 'ci-x',
+			raw_text: 'milk',
+			display_name: 'Milk',
+			quantity: 1,
+			status: 'active',
+			last_updated_revision: 0,
+			updated_at: '2026-06-05T00:00:00.000Z'
+		});
+
+		await resolveAlias(LIST, 'e2', 'ci-y');
+
+		const entry = await db.list_entries.get('e2');
+		expect(entry?.canonical_item_id).toBe('ci-x'); // untouched
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+
+	it('is a no-op for an entry on a different list', async () => {
+		await db.list_entries.add({
+			id: 'e3',
+			list_id: 'other-list',
+			resolution_status: 'ambiguous',
+			resolution_candidates_json: JSON.stringify(['ci-a']),
+			raw_text: 'cream',
+			display_name: 'cream',
+			quantity: 1,
+			status: 'active',
+			last_updated_revision: 0,
+			updated_at: '2026-06-05T00:00:00.000Z'
+		});
+
+		await resolveAlias(LIST, 'e3', 'ci-a');
+
+		expect(await db.mutation_queue.count()).toBe(0);
+		expect((await db.list_entries.get('e3'))?.resolution_status).toBe('ambiguous');
 	});
 });

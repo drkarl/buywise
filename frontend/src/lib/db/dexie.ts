@@ -5,6 +5,11 @@ export interface LocalListEntry {
   list_id: string;
   canonical_item_id?: string;
   resolution_status: 'unresolved' | 'resolved' | 'ambiguous';
+  // Candidate canonical_item_ids for an `ambiguous` entry, as the raw JSON array
+  // string the server sends (e.g. '["ci-a","ci-b"]'). Present only while
+  // `resolution_status === 'ambiguous'`; cleared once resolved. Drives the P3-T3
+  // disambiguation modal. Not indexed (Dexie stores it as a plain field).
+  resolution_candidates_json?: string;
   raw_text: string;
   display_name: string;
   quantity: number;
@@ -76,6 +81,11 @@ export interface LocalStoreCategoryOrder {
 export interface LocalItemCategory {
   canonical_item_id: string;     // canonical_items.id (the lookup key)
   category_id: string;           // canonical_items.category_id
+  // The canonical item's English display name, cached so the P3-T3 ambiguity
+  // modal can label candidate ids (which are all the local entry carries).
+  // Optional: entries cached before this field existed simply have no name and
+  // fall back to the id. Not indexed.
+  name_en?: string;
 }
 
 export class BuyWiseDB extends Dexie {
