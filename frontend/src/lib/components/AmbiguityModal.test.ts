@@ -68,4 +68,33 @@ describe('AmbiguityModal', () => {
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
 		expect(onconfirm).not.toHaveBeenCalled();
 	});
+
+	it('Escape dismisses via onkeep without resolving', async () => {
+		const { onconfirm, onkeep } = renderModal();
+
+		await fireEvent.keyDown(window, { key: 'Escape' });
+
+		expect(onkeep).toHaveBeenCalledTimes(1);
+		expect(onconfirm).not.toHaveBeenCalled();
+	});
+
+	it('a backdrop click (outside the modal) dismisses via onkeep without resolving', async () => {
+		const { onconfirm, onkeep } = renderModal();
+
+		// Click the backdrop element itself (the dialog), not its inner content.
+		await fireEvent.click(screen.getByRole('dialog'));
+
+		expect(onkeep).toHaveBeenCalledTimes(1);
+		expect(onconfirm).not.toHaveBeenCalled();
+	});
+
+	it('a click inside the modal content does NOT dismiss', async () => {
+		const { onkeep } = renderModal();
+
+		// Clicking a candidate label bubbles to the backdrop, but the handler only
+		// dismisses when the click target IS the backdrop — so this must not close.
+		await fireEvent.click(screen.getByText('Double cream'));
+
+		expect(onkeep).not.toHaveBeenCalled();
+	});
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import { db } from '$lib/db/dexie';
 import {
@@ -340,5 +340,32 @@ describe('resolveAlias', () => {
 
 		expect(await db.mutation_queue.count()).toBe(0);
 		expect((await db.list_entries.get('e3'))?.resolution_status).toBe('ambiguous');
+	});
+
+	it('is a no-op when the entry was renamed between the pre-read and the tx (stale raw_text)', async () => {
+		// The real stored row already carries the NEW term ("creme"); the payload's
+		// raw_text is captured from the pre-read. Simulate the rename by having ONLY
+		// the first `get` (the pre-read) return the stale "cream" snapshot, so the
+		// payload would carry "cream" while the tx re-read sees "creme".
+		await seedAmbiguous('e4', 'creme', ['ci-a', 'ci-b']);
+		const realGet = db.list_entries.get.bind(db.list_entries);
+		// Dexie's `get` has overloads, so the mock impl is typed loosely; the runtime
+		// behaviour (return the real row with a stale raw_text on the FIRST call) is
+		// what the guard is being exercised against.
+		const spy = vi.spyOn(db.list_entries, 'get').mockImplementationOnce((async (key: string) => {
+			const row = await realGet(key);
+			return row ? { ...row, raw_text: 'cream' } : row;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		}) as any);
+
+		await resolveAlias(LIST, 'e4', 'ci-a');
+
+		// The tx-read sees raw_text "creme" ≠ payload's "cream" → guarded no-op: no
+		// mutation queued and the entry stays ambiguous (never bound to a stale term).
+		expect(await db.mutation_queue.count()).toBe(0);
+		const entry = await db.list_entries.get('e4');
+		expect(entry?.resolution_status).toBe('ambiguous');
+		expect(entry?.canonical_item_id).toBeUndefined();
+		spy.mockRestore();
 	});
 });
