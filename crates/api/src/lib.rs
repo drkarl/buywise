@@ -33,6 +33,7 @@ pub const FRONTEND_BUILD_DIR: &str = "frontend/build";
 
 pub mod auth;
 pub mod lists;
+pub mod llm;
 pub mod middleware;
 pub mod mutations;
 pub mod optimise;
@@ -63,16 +64,23 @@ pub struct AppState {
     /// tests override the heartbeat interval / broadcast buffer / retention
     /// cutoff to exercise timing- and capacity-dependent paths deterministically.
     pub sse_config: sse::SseConfig,
+    /// LLM client for the resolution cascade's step-3 fallback (P3-T2). Built from
+    /// the environment by [`AppState::new`] (disabled by default — see
+    /// [`llm::LlmConfig::from_env`]); integration tests inject a fake via
+    /// [`AppState::with_llm_client`] so they never touch the network.
+    pub llm_client: Arc<dyn llm::LlmClient>,
 }
 
 impl AppState {
-    /// Build state for a ready pool with an empty SSE channel registry and the
-    /// production [`sse::SseConfig`] defaults.
+    /// Build state for a ready pool with an empty SSE channel registry, the
+    /// production [`sse::SseConfig`] defaults, and an env-configured LLM client
+    /// (disabled unless `LLM_FALLBACK_ENABLED=true`).
     pub fn new(pool: SqlitePool) -> Self {
         AppState {
             pool,
             sse_channels: Arc::new(DashMap::new()),
             sse_config: sse::SseConfig::default(),
+            llm_client: llm::client_from_env(),
         }
     }
 
@@ -80,6 +88,13 @@ impl AppState {
     /// paths without waiting for real-world intervals).
     pub fn with_sse_config(mut self, config: sse::SseConfig) -> Self {
         self.sse_config = config;
+        self
+    }
+
+    /// Override the LLM client (used by tests to inject a fake transport so the
+    /// step-3 fallback runs deterministically without a network call).
+    pub fn with_llm_client(mut self, client: Arc<dyn llm::LlmClient>) -> Self {
+        self.llm_client = client;
         self
     }
 }

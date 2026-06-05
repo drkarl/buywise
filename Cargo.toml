@@ -34,6 +34,10 @@ unicode-normalization = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
+# Dyn-compatible async trait methods (the LLM client seam, P3-T2): native
+# `async fn` in traits is not object-safe, so the `Arc<dyn LlmClient>` injection
+# point on `AppState` needs the boxed-future desugaring `async-trait` provides.
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 # Minimal feature set: drops default http2 and gzip/brotli decompression. Re-add
