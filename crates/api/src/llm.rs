@@ -57,8 +57,10 @@ pub struct LlmConfig {
     /// Master switch. `LLM_FALLBACK_ENABLED=true` (case-insensitive) turns the
     /// fallback on; anything else (including unset) leaves it off.
     pub enabled: bool,
-    /// Provider identifier (`LLM_PROVIDER`). Currently only steers the default
-    /// base URL for the OpenAI-compatible endpoint; kept generic on purpose.
+    /// Provider identifier (`LLM_PROVIDER`). Currently unused at runtime: every
+    /// provider is assumed OpenAI-chat-completions-compatible, so the default base
+    /// URL ignores it (see [`default_base_url`]). Kept on purpose so per-provider
+    /// defaults can be added later without touching call sites or the env contract.
     pub provider: Option<String>,
     /// API key (`LLM_API_KEY`) sent as a bearer token.
     pub api_key: Option<String>,
@@ -146,6 +148,14 @@ pub enum LlmError {
 /// `Arc<dyn LlmClient>` and tests can swap in a fake.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// Whether this client can actually make a call — i.e. the fallback is enabled
+    /// AND fully configured. A cheap, synchronous, side-effect-free check the caller
+    /// uses to short-circuit BEFORE doing any work (e.g. loading candidates / a DB
+    /// round-trip) when the fallback is off (the production default). When this
+    /// returns `false`, [`resolve_item`](Self::resolve_item) is guaranteed to return
+    /// [`LlmError::Disabled`].
+    fn is_enabled(&self) -> bool;
+
     /// Ask the model which of `candidate_names` `raw_text` most likely refers to.
     ///
     /// Returns `Ok(Some(name))` for a chosen candidate, `Ok(None)` for the "none"
@@ -162,18 +172,34 @@ pub trait LlmClient: Send + Sync {
 /// `/chat/completions` endpoint.
 pub struct ReqwestLlmClient {
     config: LlmConfig,
-    http: reqwest::Client,
+    /// The HTTP client carrying [`LLM_REQUEST_TIMEOUT`]. `None` when the builder
+    /// failed: we fail CLOSED (disable the fallback) rather than fall back to a
+    /// default client WITHOUT the configured timeout, which could hang calls.
+    http: Option<reqwest::Client>,
 }
 
 impl ReqwestLlmClient {
     /// Build a client from `config`. The underlying `reqwest::Client` carries the
-    /// short [`LLM_REQUEST_TIMEOUT`]; if it cannot be constructed, every call
-    /// returns [`LlmError::Disabled`] rather than failing startup.
+    /// short [`LLM_REQUEST_TIMEOUT`]; if it cannot be constructed we fail CLOSED —
+    /// the fallback is disabled (logged once) so every call short-circuits to
+    /// [`LlmError::Disabled`] rather than running with an un-timed-out client.
     pub fn new(config: LlmConfig) -> Self {
-        let http = reqwest::Client::builder()
+        let http = match reqwest::Client::builder()
             .timeout(LLM_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => Some(client),
+            Err(e) => {
+                // Fail closed: a client without the timeout could hang the
+                // resolution task indefinitely. Log once at startup; every call
+                // then returns Disabled.
+                tracing::warn!(
+                    error = %e,
+                    "llm: reqwest client build failed; disabling the LLM fallback"
+                );
+                None
+            }
+        };
         ReqwestLlmClient { config, http }
     }
 
@@ -214,18 +240,25 @@ struct ChatMessage {
 
 #[async_trait]
 impl LlmClient for ReqwestLlmClient {
+    fn is_enabled(&self) -> bool {
+        // Operational config AND a successfully-built HTTP client (we fail closed
+        // when the builder failed, see [`ReqwestLlmClient::new`]).
+        self.config.is_operational() && self.http.is_some()
+    }
+
     async fn resolve_item(
         &self,
         raw_text: &str,
         candidate_names: &[String],
     ) -> Result<Option<String>, LlmError> {
-        if !self.config.is_operational() {
+        if !self.is_enabled() {
             return Err(LlmError::Disabled);
         }
         // No candidates → nothing the model could pick; skip the call entirely.
         if candidate_names.is_empty() {
             return Ok(None);
         }
+        let http = self.http.as_ref().ok_or(LlmError::Disabled)?;
         let api_key = self.config.api_key.as_deref().ok_or(LlmError::Disabled)?;
         let model = self.config.model.as_deref().ok_or(LlmError::Disabled)?;
 
@@ -242,8 +275,7 @@ impl LlmClient for ReqwestLlmClient {
             ]
         });
 
-        let resp = self
-            .http
+        let resp = http
             .post(&self.config.base_url)
             .bearer_auth(api_key)
             .json(&body)

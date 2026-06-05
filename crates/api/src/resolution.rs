@@ -109,9 +109,10 @@ async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx
 /// [`resolve_single_match`].
 ///
 /// Flow:
-///   1. Skip entirely unless the LLM fallback is enabled+configured; a disabled
-///      client returns [`crate::llm::LlmError::Disabled`], which we treat as a
-///      no-op (the entry stays `unresolved`). No `api_usage_events` row is written
+///   1. Short-circuit BEFORE any work unless the LLM fallback is enabled+configured
+///      (the cheap `LlmClient::is_enabled` gate). When off — the production default
+///      — the entry stays `unresolved` and we skip the candidate DB query entirely,
+///      so a disabled fallback costs nothing. No `api_usage_events` row is written
 ///      for a call that never went out.
 ///   2. Load the household's `canonical_items.name_en` list as the candidate set.
 ///   3. Call the LLM. On any error, log and leave the entry unresolved — never
@@ -128,8 +129,16 @@ async fn resolve_no_match_via_llm(
     state: &AppState,
     job: &ResolutionJob,
 ) -> Result<(), sqlx::Error> {
-    // Candidate set: every canonical item name_en in the household. Loaded up
-    // front so a disabled client costs us nothing extra (it short-circuits below).
+    // Gate FIRST, before any work: when the fallback is disabled or unconfigured
+    // (the production default) we must not pay for the candidate DB round-trip. The
+    // client's cheap `is_enabled()` is the authoritative gate; if it is off,
+    // `resolve_item` would only return `Disabled` anyway.
+    if !state.llm_client.is_enabled() {
+        return Ok(());
+    }
+
+    // Candidate set: every canonical item name_en in the household. Only loaded once
+    // the gate above confirmed the fallback can actually make a call.
     let candidates: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, name_en FROM canonical_items WHERE household_id = ?1 ORDER BY name_en",
     )
@@ -161,7 +170,14 @@ async fn resolve_no_match_via_llm(
         }
     };
 
-    // A call went out (the client was operational): record it for cost tracking.
+    // Record the call for cost tracking ONLY after a successful provider response.
+    // Deliberate decision: we count calls we KNOW the provider answered (and so
+    // billed). A request that errored mid-flight (timeout, transport, non-2xx) took
+    // the early-return paths above and is intentionally NOT counted — those mostly
+    // correspond to calls that were rejected/unbilled, and double-guessing provider
+    // billing for partial failures would over-report. The slim residual risk (a
+    // metered call that failed AFTER the provider received it) is accepted as
+    // negligible versus the simpler, predictable "count answered calls" rule.
     // Best-effort — a bookkeeping write failure must not abort an otherwise
     // successful resolution, so it is logged, not propagated.
     record_llm_usage(&state.pool).await;
@@ -171,6 +187,10 @@ async fn resolve_no_match_via_llm(
     let Some(answer) = answer else {
         return Ok(());
     };
+    // Match the LLM answer to a canonical name case-insensitively. `name_en` is the
+    // English catalogue name and is overwhelmingly ASCII, so ASCII-only case folding
+    // is adequate here; a full Unicode case fold would need a new dependency for a
+    // negligible gain, so we deliberately stay with `eq_ignore_ascii_case`.
     let matched: Vec<&str> = candidates
         .iter()
         .filter(|(_, name)| name.eq_ignore_ascii_case(answer.trim()))
