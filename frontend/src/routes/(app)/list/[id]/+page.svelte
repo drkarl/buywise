@@ -9,14 +9,19 @@
 	import { page } from '$app/state';
 	import AddItemInput from '$lib/components/AddItemInput.svelte';
 	import ListItem from '$lib/components/ListItem.svelte';
+	import AmbiguityModal, {
+		type CandidateItem
+	} from '$lib/components/AmbiguityModal.svelte';
 	import {
 		activeEntries,
 		basketEntries,
 		addItem,
 		markBought,
 		markSkipped,
-		deleteItem
+		deleteItem,
+		resolveAlias
 	} from '$lib/stores/list';
+	import { db, type LocalListEntry } from '$lib/db/dexie';
 	import { startSync, type SyncHandle, type FailedMutation } from '$lib/sync';
 
 	const listId = $derived(page.params.id ?? '');
@@ -51,6 +56,49 @@
 
 	function dismissFailure(clientMutationId: string) {
 		failures = failures.filter((f) => f.client_mutation_id !== clientMutationId);
+	}
+
+	// Disambiguation flow (P3-T3). The active entry being clarified and its
+	// candidate items (resolved to labels off the cached catalogue), or null when
+	// the modal is closed.
+	let clarifying = $state<{ entryId: string; rawText: string; candidates: CandidateItem[] } | null>(
+		null
+	);
+
+	/** Parse an entry's candidate ids from its server-sent JSON array, robustly. */
+	function candidateIds(entry: LocalListEntry): string[] {
+		if (!entry.resolution_candidates_json) return [];
+		try {
+			const parsed = JSON.parse(entry.resolution_candidates_json);
+			return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * Open the disambiguation modal for an ambiguous entry. Resolves each candidate
+	 * id to a label from the cached catalogue (`item_categories.name_en`); a cache
+	 * miss falls back to the id so the user can still pick. Reads the entry fresh
+	 * from Dexie to avoid acting on a stale snapshot.
+	 */
+	async function openClarify(entryId: string) {
+		const entry = await db.list_entries.get(entryId);
+		if (!entry || entry.resolution_status !== 'ambiguous') return;
+		const ids = candidateIds(entry);
+		const candidates: CandidateItem[] = await Promise.all(
+			ids.map(async (id) => {
+				const mapping = await db.item_categories.get(id);
+				return { id, label: mapping?.name_en ?? id };
+			})
+		);
+		clarifying = { entryId, rawText: entry.raw_text, candidates };
+	}
+
+	async function confirmClarify(chosenCanonicalItemId: string) {
+		if (!clarifying) return;
+		await resolveAlias(listId, clarifying.entryId, chosenCanonicalItemId);
+		clarifying = null;
 	}
 
 	// Start the sync engine (queue drain + live SSE) for the current list and
@@ -132,6 +180,7 @@
 				onbought={(id) => markBought(listId, id)}
 				onskipped={(id) => markSkipped(listId, id)}
 				ondelete={(id) => deleteItem(listId, id)}
+				onclarify={(id) => openClarify(id)}
 			/>
 		{:else}
 			<li class="empty">Nothing here yet — add your first item above.</li>
@@ -160,6 +209,15 @@
 				</ul>
 			{/if}
 		</section>
+	{/if}
+
+	{#if clarifying}
+		<AmbiguityModal
+			rawText={clarifying.rawText}
+			candidates={clarifying.candidates}
+			onconfirm={confirmClarify}
+			onkeep={() => (clarifying = null)}
+		/>
 	{/if}
 </main>
 
