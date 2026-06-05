@@ -1077,6 +1077,75 @@ async fn llm_fallback_resolves_unknown_term_and_persists_alias() {
     );
 }
 
+/// MERGE path: when the LLM answer maps to a canonical whose resolved active row
+/// already exists on the same dedup key, the entry merges into the survivor AND the
+/// learned `source='llm'` alias is STILL persisted — because the guarded resolve
+/// UPDATE first matched the current `raw_text` (proving the answer is not stale) and
+/// only then hit the dedup index. The alias is written inside the merge transaction,
+/// so it commits atomically with the merge.
+#[tokio::test]
+async fn llm_fallback_merge_path_persists_alias() {
+    let pool = setup_pool().await;
+    let apple_juice_id = id_by_name_en(&pool, LLM_TARGET_NAME).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm = Arc::new(FakeLlm {
+        answer: Some(LLM_TARGET_NAME.to_string()),
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    // Survivor: "apple juice" hits the seeded step-1 alias → resolves to apple_juice
+    // with default (no-constraint) effective_constraint_hash. No LLM call.
+    let survivor = post_mutation(&state, &s, add_item("cm-1", "survivor", "apple juice")).await;
+    assert_eq!(survivor.status(), StatusCode::CREATED);
+    poll_entry(&pool, "survivor", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the survivor resolved via the step-1 alias, not the LLM"
+    );
+
+    // Loser: a novel term with no alias/fuzzy hit → NoMatch → LLM → apple_juice. With
+    // no constraints it computes the SAME dedup key as the survivor, so the resolve
+    // UPDATE hits the unique index and merges into the survivor.
+    let loser = post_mutation(&state, &s, add_item("cm-2", "loser", UNKNOWN_TERM)).await;
+    assert_eq!(loser.status(), StatusCode::CREATED);
+
+    // Wait for the merge: the loser is deleted and the survivor carries quantity 2.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let loser_state = entry_state(&pool, "loser").await.unwrap();
+        let survivor_state = entry_state(&pool, "survivor").await.unwrap();
+        if loser_state.status == "deleted" && survivor_state.quantity == 2 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "LLM answer did not merge into survivor within 500ms (loser={:?}, survivor_qty={})",
+                loser_state.status, survivor_state.quantity
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the LLM was called once");
+
+    // The learned alias for the novel term IS persisted on the merge path: a later
+    // add of the same term must resolve via step 1 without another LLM call.
+    let (canonical, source): (String, String) = sqlx::query_as(
+        "SELECT canonical_item_id, source FROM item_aliases \
+         WHERE household_id = ?1 AND lower(alias) = ?2",
+    )
+    .bind(SEED_HOUSEHOLD)
+    .bind(UNKNOWN_TERM)
+    .fetch_one(&pool)
+    .await
+    .expect("an llm alias row exists even though the entry merged into a survivor");
+    assert_eq!(canonical, apple_juice_id);
+    assert_eq!(source, "llm");
+}
+
 /// A second add of the same term resolves via step 1 (alias lookup) with NO second
 /// LLM call — the persisted `source='llm'` alias short-circuits the cascade.
 /// (Acceptance criterion 3.)
@@ -1394,8 +1463,11 @@ impl LlmClient for RenamingLlm {
 
 /// Stale-answer guard: if the row's `raw_text` is renamed while the LLM call is in
 /// flight, the OLD term's answer must NOT bind the renamed row and NO stale
-/// `old_text -> canonical` alias may be persisted. The pre-alias revalidation plus
-/// the `raw_text` guard on the resolve UPDATE together enforce this.
+/// `old_text -> canonical` alias may be persisted. The `raw_text` guard on the
+/// resolve UPDATE enforces both atomically: the guarded UPDATE matches 0 rows, the
+/// transaction rolls back, and the in-transaction alias insert rolls back with it —
+/// so the alias is absent precisely because the bind was a no-op (no out-of-band
+/// alias write can survive a rolled-back bind).
 #[tokio::test]
 async fn in_flight_rename_does_not_bind_stale_llm_answer() {
     let pool = setup_pool().await;
