@@ -280,7 +280,13 @@ async fn adding_cream_becomes_ambiguous_with_candidates() {
 #[tokio::test]
 async fn adding_unknown_term_stays_unresolved() {
     let pool = setup_pool().await;
-    let state = AppState::new(pool.clone());
+    // Inject an explicitly-disabled fake so this test is deterministic regardless of
+    // ambient env: with `LLM_FALLBACK_ENABLED=true` + credentials present (CI or a
+    // dev shell) the default env-built client would otherwise make a real LLM call.
+    let llm = Arc::new(DisabledLlm {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
     let s = seed_seed_household_user_and_list(&pool).await;
 
     // The unknown term we expect to stay unresolved.
@@ -1303,5 +1309,155 @@ async fn disabled_fallback_skips_llm_entirely() {
         llm_usage_count(&pool).await,
         0,
         "a disabled fallback records no usage event"
+    );
+}
+
+/// With NO candidate items in the household, the LLM step is skipped entirely:
+/// there is nothing for the model to match against, so `resolve_item` is never
+/// called and NO `api_usage_events` row is written for a call that never happened.
+#[tokio::test]
+async fn empty_candidate_household_records_no_usage() {
+    let pool = setup_pool().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm = Arc::new(FakeLlm {
+        answer: Some(LLM_TARGET_NAME.to_string()),
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    // Strip the household's catalogue so the candidate set is empty. Aliases must go
+    // too, otherwise the term could resolve at step 1 and never reach the fallback.
+    sqlx::query("DELETE FROM item_aliases WHERE household_id = ?1")
+        .bind(SEED_HOUSEHOLD)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM canonical_items WHERE household_id = ?1")
+        .bind(SEED_HOUSEHOLD)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Poll the unknown entry itself: with an empty catalogue it can only ever stay
+    // `unresolved`, and reaching that committed state proves the cascade ran.
+    poll_entry(&pool, "entry-1", |e| e.resolution_status == "unresolved").await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no candidates → the LLM is never asked to resolve"
+    );
+    assert_eq!(
+        llm_usage_count(&pool).await,
+        0,
+        "an empty-candidate household records no usage event"
+    );
+}
+
+/// A fake LLM client that, mid-call (before returning), RENAMES the still-unresolved
+/// row's `raw_text` to simulate a concurrent `update_item` landing while the slow
+/// LLM call is in flight, then answers for the ORIGINAL term. It lets us drive the
+/// stale-answer codepath deterministically without racing real timing.
+struct RenamingLlm {
+    pool: SqlitePool,
+    entry_id: String,
+    new_raw_text: String,
+    answer: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for RenamingLlm {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    async fn resolve_item(
+        &self,
+        _raw_text: &str,
+        _candidate_names: &[String],
+    ) -> Result<Option<String>, LlmError> {
+        // Simulate the user renaming the unresolved row WHILE the LLM call is in
+        // flight (an `update_item` mutation changing `raw_text`).
+        sqlx::query("UPDATE list_entries SET raw_text = ?2 WHERE id = ?1")
+            .bind(&self.entry_id)
+            .bind(&self.new_raw_text)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        Ok(self.answer.clone())
+    }
+}
+
+/// Stale-answer guard: if the row's `raw_text` is renamed while the LLM call is in
+/// flight, the OLD term's answer must NOT bind the renamed row and NO stale
+/// `old_text -> canonical` alias may be persisted. The pre-alias revalidation plus
+/// the `raw_text` guard on the resolve UPDATE together enforce this.
+#[tokio::test]
+async fn in_flight_rename_does_not_bind_stale_llm_answer() {
+    let pool = setup_pool().await;
+    let apple_juice_id = id_by_name_en(&pool, LLM_TARGET_NAME).await;
+
+    let renamed_to = "totally different term";
+    let llm = Arc::new(RenamingLlm {
+        pool: pool.clone(),
+        entry_id: "entry-1".to_string(),
+        new_raw_text: renamed_to.to_string(),
+        answer: Some(LLM_TARGET_NAME.to_string()),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The rename lands inside resolve_item; poll the row's raw_text until it flips to
+    // the new value, proving the cascade actually ran past the LLM call.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let raw: String = sqlx::query_scalar("SELECT raw_text FROM list_entries WHERE id = ?1")
+            .bind("entry-1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if raw == renamed_to {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("in-flight rename never took effect; raw_text still {raw:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give any (incorrect) resolution a chance to land before asserting the negative.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The renamed row must NOT have been bound to the old term's answer.
+    let entry = entry_state(&pool, "entry-1").await.unwrap();
+    assert_eq!(
+        entry.resolution_status, "unresolved",
+        "a renamed row must not be resolved by the OLD term's stale LLM answer"
+    );
+    assert_ne!(
+        entry.canonical_item_id.as_deref(),
+        Some(apple_juice_id.as_str()),
+        "the stale answer's canonical item must not be bound to the renamed row"
+    );
+
+    // No stale `old_text -> canonical` alias may be persisted.
+    let alias_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases \
+         WHERE household_id = ?1 AND lower(alias) = ?2",
+    )
+    .bind(SEED_HOUSEHOLD)
+    .bind(UNKNOWN_TERM)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        alias_count, 0,
+        "no stale alias for the renamed-away term may be persisted"
     );
 }
