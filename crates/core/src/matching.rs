@@ -17,13 +17,15 @@
 //! that same normalised form, so a `lower(alias) = normalize(input)` comparison
 //! is an exact normalised match.
 //!
-//! ## Bilingual / dual-language seed
+//! ## Bilingual seed
 //!
 //! `item_aliases.language` is an input-locale *matching bucket*, not a
-//! linguistic assertion: the seed inserts the same variant under BOTH `'en'`
-//! and `'es'` for one item. Language is therefore treated as a ranking hint
-//! only — never a filter — and every query groups by `canonical_item_id` so the
-//! dual-inserted rows of one item count once.
+//! linguistic assertion: the seed may store the same item's variants under both
+//! `'en'` and `'es'` (it does so for some terms but NOT all — e.g. "leche" and
+//! "jamon" are seeded `'es'`-only; see `migrations/002_seed.sql`). Language is
+//! therefore treated as a ranking hint only — never a filter — and every query
+//! groups/`DISTINCT`s by `canonical_item_id` so an item that does have rows in
+//! both buckets still counts once.
 //!
 //! ## Thresholds (ported from Shoppy `src/lib/matching/fuzzy.ts`)
 //!
@@ -65,10 +67,9 @@ pub enum ResolutionOutcome {
 /// Returns the `canonical_item_id` whose normalised alias equals
 /// `normalize(alias)`, or `None` if there is no match.
 ///
-/// The query selects `DISTINCT canonical_item_id`, so the dual-language seed
-/// (the same alias stored under both `'en'` and `'es'` for one item) collapses
-/// to a single row and is never double-counted. Language is not used as a
-/// filter.
+/// The query selects `DISTINCT canonical_item_id`, so when one item DOES have the
+/// same normalised alias under both `'en'` and `'es'`, those rows collapse to a
+/// single id and are never double-counted. Language is not used as a filter.
 ///
 /// If MORE THAN ONE distinct canonical item shares the exact normalised alias
 /// (possible across languages, since the seed's collision guard was
@@ -286,6 +287,14 @@ impl AliasSource {
 ///
 /// `normalised` is the already-normalised alias; `canonical_item_id` is the item
 /// it is being learned for. Runs on the caller's connection/transaction.
+///
+/// NOTE: the unique index key includes `language`, so the bucketing chosen here
+/// interacts with dedup. If the same normalised term is learned for item A as
+/// `'en'` and later for item B (whose `name_es` matches) as `'es'`, BOTH rows
+/// insert — and [`alias_lookup`]'s `DISTINCT canonical_item_id` then sees two ids
+/// and returns `None`, disabling the step-1 short-circuit for that term. Inherent
+/// to the pre-existing per-language index; an unlikely corner, noted so a future
+/// reader knows the two interact.
 async fn infer_alias_language(
     conn: &mut SqliteConnection,
     canonical_item_id: &str,
@@ -304,8 +313,10 @@ async fn infer_alias_language(
     }
 
     // Any existing `'es'`-bucket alias for the item whose normalised form equals
-    // this term also places it in the Spanish bucket. (The seed inserts each
-    // variant under both buckets, so a Spanish term reliably has an `'es'` row.)
+    // this term also places it in the Spanish bucket. (The seed buckets Spanish
+    // variants under `'es'` — e.g. "leche"/"jamon" are `'es'`-only — so a Spanish
+    // term that was seeded typically has an `'es'` row to match here. The seed does
+    // NOT dual-insert every variant under both buckets; see migrations/002_seed.sql.)
     let es_alias_hit: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM item_aliases \
          WHERE canonical_item_id = ?1 AND language = 'es' AND lower(alias) = ?2 \
