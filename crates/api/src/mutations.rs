@@ -1083,14 +1083,16 @@ fn candidate_list_contains(candidates_json: Option<&str>, candidate_id: &str) ->
 }
 
 /// Persist a confirmed `raw_text` → canonical-item mapping as an `item_aliases`
-/// row with `source='accepted_match'` (P3-T3 / P3-T4 step 4).
+/// row with `source='accepted_match'` (P3-T3 / P3-T4 step 4), via the shared
+/// [`buywise_core::matching::commit_alias`] write path used by every resolution
+/// path (steps 2/3/4) so normalisation, language inference, and dedup semantics
+/// are identical.
 ///
-/// The alias is stored NORMALISED (matching how step-1 alias lookup compares),
-/// so the next add of the same term is an exact normalised hit. Language defaults
-/// to `'en'` (the design's "default en if unclear"). `INSERT OR IGNORE` makes the
-/// write idempotent against the `uq_item_aliases_household_alias_lang` unique
-/// index, exactly like the LLM-alias write in [`crate::resolution`] — confirming
-/// the same term twice is a harmless no-op rather than a constraint error.
+/// `commit_alias` stores the term NORMALISED (matching how step-1 alias lookup
+/// compares), infers the language bucket (`'es'` for a Spanish term, else `'en'`),
+/// and uses `INSERT OR IGNORE` against `uq_item_aliases_household_alias_lang` so
+/// confirming the same term twice is a harmless no-op rather than a constraint
+/// error.
 ///
 /// Runs on the caller's transaction so it commits atomically with the guarded
 /// bind/merge UPDATE that proved the entry was current. A blank/absent `raw_text`
@@ -1104,25 +1106,18 @@ async fn insert_accepted_alias(
     let Some(raw_text) = raw_text else {
         return Ok(());
     };
-    let normalised = buywise_core::normalise::normalize(raw_text);
-    if normalised.is_empty() {
-        return Ok(());
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = buywise_core::db::now_iso();
-    sqlx::query(
-        "INSERT OR IGNORE INTO item_aliases \
-             (id, household_id, canonical_item_id, alias, language, source, created_at) \
-         VALUES (?1, ?2, ?3, ?4, 'en', 'accepted_match', ?5)",
+    buywise_core::matching::commit_alias(
+        tx,
+        household_id,
+        canonical_item_id,
+        raw_text,
+        buywise_core::matching::AliasSource::AcceptedMatch,
     )
-    .bind(&id)
-    .bind(household_id)
-    .bind(canonical_item_id)
-    .bind(&normalised)
-    .bind(&now)
-    .execute(&mut **tx)
     .await
-    .map_err(db_error("apply_resolve_alias.insert_alias"))?;
+    .map_err(|e| {
+        tracing::error!(error = %e, "apply_resolve_alias.insert_alias");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(())
 }
 
