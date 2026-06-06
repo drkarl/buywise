@@ -388,7 +388,14 @@ async fn post_mutation(
             let _ = tx.rollback().await;
             return Err(StatusCode::NOT_FOUND);
         }
-        insert_loser_replay_row(&mut tx, &req, &user, loser_id, loser_revision)
+        // The survivor the loser merged into is the op's primary `entry_id` (set by
+        // the dedup-merge branch). Record it in the loser's `merged_into` audit
+        // payload so the row never points at itself.
+        let survivor_id = outcome.entry_id.as_deref().ok_or_else(|| {
+            tracing::error!("mutations: dedup-merge loser without a survivor entry_id");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        insert_loser_replay_row(&mut tx, &req, &user, loser_id, survivor_id, loser_revision)
             .await
             .map_err(db_error("post_mutation.loser_replay_row"))?;
         Some(loser_revision)
@@ -1411,6 +1418,7 @@ async fn insert_loser_replay_row(
     req: &MutationRequest,
     user: &AuthenticatedUser,
     loser_entry_id: &str,
+    survivor_entry_id: &str,
     revision: i64,
 ) -> Result<(), sqlx::Error> {
     let entity = load_entry_view_tx(tx, loser_entry_id, &req.list_id).await?;
@@ -1424,7 +1432,10 @@ async fn insert_loser_replay_row(
         .map(|v| v.to_string())
         .map_err(|e| sqlx::Error::Protocol(format!("loser replay serialise failed: {e}")))?;
 
-    let payload = serde_json::json!({ "merged_into": req.entity_id }).to_string();
+    // `merged_into` points at the SURVIVOR (not `req.entity_id`, which in this merge
+    // branch IS the loser — recording that would say the entry merged into itself).
+    // This matches the cascade's loser payload (`{ "merged_into": survivor_id }`).
+    let payload = serde_json::json!({ "merged_into": survivor_entry_id }).to_string();
     let now = buywise_core::db::now_iso();
     sqlx::query(
         "INSERT INTO mutations \

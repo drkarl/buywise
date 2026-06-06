@@ -513,6 +513,22 @@ async fn resolve_alias_dedup_merge_broadcasts_loser_deletion_with_distinct_revis
         })
         .count();
     assert_eq!(in_merge, 2, "?since=R-1 replays both merge events");
+
+    // The loser's replay `mutations` row records `merged_into = survivor` in its
+    // audit payload — NOT the loser itself (a merge-into-self would be nonsense).
+    let loser_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM mutations \
+         WHERE entity_id = 'entry-1' AND device_id = 'server' AND server_revision = ?1",
+    )
+    .bind(rev_loser)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let loser_payload: serde_json::Value = serde_json::from_str(&loser_payload).unwrap();
+    assert_eq!(
+        loser_payload["merged_into"], "survivor-1",
+        "loser replay payload references the survivor, not itself"
+    );
 }
 
 /// Bind-but-no-alias branch (`insert_accepted_alias` early return): a blank/absent
