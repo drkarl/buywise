@@ -368,4 +368,31 @@ describe('resolveAlias', () => {
 		expect(entry?.canonical_item_id).toBeUndefined();
 		spy.mockRestore();
 	});
+
+	it('is a no-op when the entry is no longer active (bought/skipped/deleted)', async () => {
+		// The modal went stale: an SSE update marked the ambiguous entry `bought`
+		// before Confirm. Resolving it would optimistically resurrect it and queue a
+		// mutation the backend can only no-op, so the client must not enqueue at all.
+		await db.list_entries.add({
+			id: 'e5',
+			list_id: LIST,
+			resolution_status: 'ambiguous',
+			resolution_candidates_json: JSON.stringify(['ci-a', 'ci-b']),
+			raw_text: 'cream',
+			display_name: 'cream',
+			quantity: 1,
+			status: 'bought',
+			last_updated_revision: 0,
+			updated_at: '2026-06-05T00:00:00.000Z'
+		});
+
+		await resolveAlias(LIST, 'e5', 'ci-a');
+
+		expect(await db.mutation_queue.count()).toBe(0);
+		const entry = await db.list_entries.get('e5');
+		// Untouched: still ambiguous + bought, never bound.
+		expect(entry?.resolution_status).toBe('ambiguous');
+		expect(entry?.status).toBe('bought');
+		expect(entry?.canonical_item_id).toBeUndefined();
+	});
 });

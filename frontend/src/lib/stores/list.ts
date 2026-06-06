@@ -224,7 +224,12 @@ export async function resolveAlias(
   // optimistic update then re-reads the entry inside the tx and re-checks the
   // `ambiguous` guard, so a concurrent change between read and write still no-ops.
   const existing = await db.list_entries.get(entryId);
-  if (!existing || existing.list_id !== listId || existing.resolution_status !== 'ambiguous') {
+  if (
+    !existing ||
+    existing.list_id !== listId ||
+    existing.resolution_status !== 'ambiguous' ||
+    existing.status !== 'active'
+  ) {
     return;
   }
   // `raw_text` is the term the alias is learned for; the server normalises it.
@@ -235,15 +240,19 @@ export async function resolveAlias(
 
   const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
     const entry = await db.list_entries.get(entryId);
-    // Re-check the guard inside the tx, INCLUDING `raw_text`: the mutation payload
-    // captured `existing.raw_text` before the tx, so if the entry was renamed
-    // between the pre-read and here, the queued `resolve_alias` would carry a stale
-    // term. Bail in that case rather than learning an alias for text the row no
-    // longer holds (the server applies the same raw_text-guarded bind).
+    // Re-check the guard inside the tx, INCLUDING `raw_text` and `status`: the
+    // mutation payload captured `existing.raw_text` before the tx, so if the entry
+    // was renamed between the pre-read and here, the queued `resolve_alias` would
+    // carry a stale term. Likewise, if an SSE update marked the entry
+    // bought/skipped/deleted while the modal sat open, it is no longer `active` and
+    // confirming would optimistically resurrect it and queue a mutation the backend
+    // can only no-op. Bail in either case (the server applies the same
+    // ambiguous+active+raw_text-guarded bind).
     if (
       !entry ||
       entry.list_id !== listId ||
       entry.resolution_status !== 'ambiguous' ||
+      entry.status !== 'active' ||
       entry.raw_text !== existing.raw_text
     ) {
       return false;
