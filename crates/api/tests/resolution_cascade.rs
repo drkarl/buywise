@@ -1533,3 +1533,307 @@ async fn in_flight_rename_does_not_bind_stale_llm_answer() {
         "no stale alias for the renamed-away term may be persisted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P3-T4: item_aliases feedback persistence (issue #28)
+//
+// One regression test per resolution path verifying the alias row written to
+// `item_aliases` (source + language) after the path runs, plus the "re-adding the
+// same term resolves via step 1 (no fuzzy/LLM)" criterion. Language inference
+// (en/es/default en) is unit-tested deterministically in
+// `buywise_core::matching` (commit_alias_*); here we assert the end-to-end
+// `source` written by each cascade path against the real catalogue.
+//
+// A typo that uniquely fuzzy-matches one seeded item, exercising step 2 (fuzzy →
+// SingleMatch). "broccolli" is within edit distance of "Broccoli" and matches no
+// other catalogue string.
+// ---------------------------------------------------------------------------
+
+/// A fuzzy typo that resolves to exactly one seeded item (Broccoli) via step 2.
+const FUZZY_TERM: &str = "broccolli";
+
+/// The full alias row state we assert on after a resolution path.
+#[derive(Debug)]
+struct AliasRow {
+    canonical_item_id: String,
+    source: String,
+    language: String,
+}
+
+/// The single `item_aliases` row for `normalised_term` in the seed household, or
+/// `None` if absent. `normalised_term` must already be in normalised form (the
+/// stored alias form).
+async fn alias_row(pool: &SqlitePool, normalised_term: &str) -> Option<AliasRow> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT canonical_item_id, source, language FROM item_aliases \
+         WHERE household_id = ?1 AND lower(alias) = ?2",
+    )
+    .bind(SEED_HOUSEHOLD)
+    .bind(normalised_term)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.map(|(canonical_item_id, source, language)| AliasRow {
+        canonical_item_id,
+        source,
+        language,
+    })
+}
+
+/// Total alias-row count for a normalised term in the seed household (for dedup
+/// assertions across the unique index).
+async fn alias_count(pool: &SqlitePool, normalised_term: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases WHERE household_id = ?1 AND lower(alias) = ?2",
+    )
+    .bind(SEED_HOUSEHOLD)
+    .bind(normalised_term)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Step 2 (fuzzy → SingleMatch): a typo that uniquely fuzzy-matches one seeded
+/// item is learned as a `source='accepted_match'` alias, language `'en'` (a typo
+/// equals neither name_en nor name_es, so it falls to the default bucket).
+#[tokio::test]
+async fn step2_fuzzy_single_match_persists_accepted_match_alias() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+    let broccoli_id = id_by_name_en(&pool, "Broccoli").await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", FUZZY_TERM)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resolved = poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        resolved.canonical_item_id.as_deref(),
+        Some(broccoli_id.as_str()),
+        "the fuzzy typo binds the single matched canonical item"
+    );
+
+    let alias = alias_row(&pool, FUZZY_TERM)
+        .await
+        .expect("step 2 persists an accepted_match alias for the fuzzy term");
+    assert_eq!(alias.canonical_item_id, broccoli_id);
+    assert_eq!(
+        alias.source, "accepted_match",
+        "fuzzy single-match → accepted_match"
+    );
+    assert_eq!(alias.language, "en", "a typo defaults to the en bucket");
+}
+
+/// Re-adding the same fuzzy term resolves via step 1 (alias lookup): the typo now
+/// has an `accepted_match` alias, so the second add binds the same item with no
+/// fuzzy work. (We add the second with a distinct constraint set so it resolves
+/// standalone rather than merging into the first, keeping the focus on step 1.)
+#[tokio::test]
+async fn re_adding_fuzzy_term_resolves_via_step1_alias() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+    let broccoli_id = id_by_name_en(&pool, "Broccoli").await;
+
+    // First add learns the alias via step 2.
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", FUZZY_TERM))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(alias_count(&pool, FUZZY_TERM).await, 1);
+
+    // Second add of the SAME term, with a distinct constraint set (different dedup
+    // key → no merge). It must resolve to the same item — now via step-1 alias
+    // lookup — and must NOT create a second alias row (the unique index dedups it).
+    let constraints = serde_json::json!({ "brand": "Distinct" });
+    assert_eq!(
+        post_mutation(
+            &state,
+            &s,
+            add_item_with_constraints("cm-2", "entry-2", FUZZY_TERM, Some(constraints)),
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    let resolved = poll_entry(&pool, "entry-2", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        resolved.canonical_item_id.as_deref(),
+        Some(broccoli_id.as_str()),
+        "the re-added term resolves to the same item via the learned alias"
+    );
+    assert_eq!(
+        alias_count(&pool, FUZZY_TERM).await,
+        1,
+        "re-adding the same term writes no duplicate alias (unique-index dedup)"
+    );
+}
+
+/// Step 3 (LLM → SingleMatch): a NoMatch term resolved by the LLM is learned as a
+/// `source='llm'` alias. (The broader LLM coverage lives above; this is the
+/// P3-T4-focused source assertion alongside its siblings.)
+#[tokio::test]
+async fn step3_llm_single_match_persists_llm_alias() {
+    let pool = setup_pool().await;
+    let apple_juice_id = id_by_name_en(&pool, LLM_TARGET_NAME).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm = Arc::new(FakeLlm {
+        answer: Some(LLM_TARGET_NAME.to_string()),
+        calls: calls.clone(),
+    });
+    let state = AppState::new(pool.clone()).with_llm_client(llm);
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", UNKNOWN_TERM))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+
+    let alias = alias_row(&pool, UNKNOWN_TERM)
+        .await
+        .expect("step 3 persists an llm alias for the resolved term");
+    assert_eq!(alias.canonical_item_id, apple_juice_id);
+    assert_eq!(alias.source, "llm", "LLM single-match → llm");
+    assert_eq!(alias.language, "en");
+
+    // Re-adding the same term resolves via step 1 with NO second LLM call.
+    let constraints = serde_json::json!({ "brand": "Distinct" });
+    assert_eq!(
+        post_mutation(
+            &state,
+            &s,
+            add_item_with_constraints("cm-2", "entry-2", UNKNOWN_TERM, Some(constraints)),
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    poll_entry(&pool, "entry-2", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second add resolved via the learned alias, not a second LLM call"
+    );
+    assert_eq!(
+        alias_count(&pool, UNKNOWN_TERM).await,
+        1,
+        "no duplicate alias"
+    );
+}
+
+/// Step 4 (user `resolve_alias`): confirming an ambiguous entry persists the
+/// chosen mapping as a `source='accepted_match'` alias, and a later add of the
+/// term then resolves via step 1. "cream" is genuinely ambiguous against the
+/// seed, so the cascade marks the entry `ambiguous`; the user then confirms it.
+#[tokio::test]
+async fn step4_user_resolve_alias_persists_accepted_match_alias() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    // Add "cream" → the cascade makes it ambiguous with several candidates.
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", "cream"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let ambiguous = poll_entry(&pool, "entry-1", |e| e.resolution_status == "ambiguous").await;
+    let candidates: Vec<String> =
+        serde_json::from_str(ambiguous.resolution_candidates_json.as_deref().unwrap()).unwrap();
+    // The user picks the first offered candidate (membership is validated server-side).
+    let chosen = candidates
+        .first()
+        .expect("ambiguous entry has candidates")
+        .clone();
+
+    // Confirm via the real resolve_alias mutation (step 4).
+    let envelope = serde_json::json!({
+        "client_mutation_id": "cm-2",
+        "device_id": "device-1",
+        "list_id": "list-a",
+        "base_revision": 0,
+        "entity_type": "list_entry",
+        "entity_id": "entry-1",
+        "operation_type": "resolve_alias",
+        "payload": { "chosen_canonical_item_id": chosen, "raw_text": "cream" },
+        "created_at_client": "2026-06-05T00:00:00.000Z",
+    });
+    let resp = post_mutation(&state, &s, envelope).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The entry is now resolved to the chosen item.
+    let resolved = entry_state(&pool, "entry-1").await.unwrap();
+    assert_eq!(resolved.resolution_status, "resolved");
+    assert_eq!(resolved.canonical_item_id.as_deref(), Some(chosen.as_str()));
+
+    // The confirmed mapping is persisted as an accepted_match alias.
+    let alias = alias_row(&pool, "cream")
+        .await
+        .expect("step 4 persists an accepted_match alias for the confirmed term");
+    assert_eq!(alias.canonical_item_id, chosen);
+    assert_eq!(
+        alias.source, "accepted_match",
+        "user confirmation → accepted_match"
+    );
+
+    // A later add of "cream" now resolves via step 1 to the confirmed item (no
+    // longer ambiguous), proving the feedback loop closed. A distinct constraint
+    // set gives it a different dedup key so it resolves standalone (no merge into
+    // entry-1), keeping the assertion on the resolved state itself.
+    let constraints = serde_json::json!({ "brand": "Distinct" });
+    assert_eq!(
+        post_mutation(
+            &state,
+            &s,
+            add_item_with_constraints("cm-3", "entry-2", "cream", Some(constraints)),
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    let second = poll_entry(&pool, "entry-2", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        second.resolution_status, "resolved",
+        "after confirmation, the same term resolves via step 1 instead of going ambiguous"
+    );
+    assert_eq!(second.canonical_item_id.as_deref(), Some(chosen.as_str()));
+    assert_eq!(
+        alias_count(&pool, "cream").await,
+        1,
+        "the second add does not duplicate the alias"
+    );
+}
+
+/// Step 1 (alias lookup): re-resolving a seeded alias term writes no NEW alias row
+/// — the mapping already exists, and the `INSERT OR IGNORE` learn is a dedup no-op.
+/// ("leche" is a seeded Milk alias under both buckets.)
+#[tokio::test]
+async fn step1_existing_alias_writes_no_duplicate() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let before = alias_count(&pool, "leche").await;
+    assert!(before >= 1, "leche is a seeded alias");
+
+    assert_eq!(
+        post_mutation(&state, &s, add_item("cm-1", "entry-1", "leche"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+
+    assert_eq!(
+        alias_count(&pool, "leche").await,
+        before,
+        "step 1 (alias already present) learns no new alias row"
+    );
+}
