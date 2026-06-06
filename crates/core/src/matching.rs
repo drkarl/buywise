@@ -35,7 +35,7 @@
 
 use std::collections::BTreeSet;
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqliteConnection, SqlitePool};
 use strsim::levenshtein;
 
 use crate::db::DbError;
@@ -248,6 +248,134 @@ pub async fn resolve(
         return Ok(ResolutionOutcome::SingleMatch { canonical_item_id });
     }
     fuzzy_match(raw_text, household_id, db).await
+}
+
+/// The `source` of a learned alias, mirroring the `item_aliases.source` CHECK
+/// (`manual` | `accepted_match` | `llm`). Step 1 of the cascade never learns an
+/// alias (it already exists), so only the two automatic / confirmed sources that
+/// the feedback loop writes are modelled here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasSource {
+    /// A mapping confirmed by a fuzzy single-match (step 2) or a user
+    /// confirmation (step 4) — both persist as `source='accepted_match'`.
+    AcceptedMatch,
+    /// A mapping discovered by the LLM fallback (step 3) — `source='llm'`.
+    Llm,
+}
+
+impl AliasSource {
+    /// The literal `item_aliases.source` text for this source.
+    fn as_str(self) -> &'static str {
+        match self {
+            AliasSource::AcceptedMatch => "accepted_match",
+            AliasSource::Llm => "llm",
+        }
+    }
+}
+
+/// Infer the input-locale matching bucket (`'en'` | `'es'`) for a learned alias.
+///
+/// `item_aliases.language` is an input-locale bucket, not a linguistic assertion
+/// (see the module docs and `migrations/002_seed.sql`). We bucket a learned term
+/// as `'es'` when it matches the canonical item's Spanish face — its `name_es` or
+/// any of its existing `'es'`-bucket aliases — by normalised equality, and as
+/// `'en'` otherwise. This keeps the default `'en'` for an English term or any
+/// term we cannot confidently place (the design's "default `en` if unclear"),
+/// while a clearly-Spanish confirmation (e.g. "leche") lands in the `'es'`
+/// bucket so a later Spanish add hits step 1 directly.
+///
+/// `normalised` is the already-normalised alias; `canonical_item_id` is the item
+/// it is being learned for. Runs on the caller's connection/transaction.
+async fn infer_alias_language(
+    conn: &mut SqliteConnection,
+    canonical_item_id: &str,
+    normalised: &str,
+) -> Result<&'static str, DbError> {
+    // The item's Spanish catalogue name. A normalised match → Spanish bucket.
+    let name_es: Option<String> =
+        sqlx::query_scalar("SELECT name_es FROM canonical_items WHERE id = ?1")
+            .bind(canonical_item_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if let Some(name_es) = name_es {
+        if normalize(&name_es) == normalised {
+            return Ok("es");
+        }
+    }
+
+    // Any existing `'es'`-bucket alias for the item whose normalised form equals
+    // this term also places it in the Spanish bucket. (The seed inserts each
+    // variant under both buckets, so a Spanish term reliably has an `'es'` row.)
+    let es_alias_hit: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM item_aliases \
+         WHERE canonical_item_id = ?1 AND language = 'es' AND lower(alias) = ?2 \
+         LIMIT 1",
+    )
+    .bind(canonical_item_id)
+    .bind(normalised)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if es_alias_hit.is_some() {
+        return Ok("es");
+    }
+
+    // English term, or one we cannot confidently place: default to `'en'`.
+    Ok("en")
+}
+
+/// Persist a confirmed/learned `raw_text` → canonical-item mapping into
+/// `item_aliases`, the single write path for the resolution feedback loop
+/// (P3-T4). Steps 2 (fuzzy single-match), 3 (LLM), and 4 (user confirmation) all
+/// funnel through here so the `source`, normalisation, language inference, and
+/// dedup semantics are identical across paths.
+///
+/// Behaviour:
+///   * The alias is stored NORMALISED via [`normalize`] (the same form step-1
+///     [`alias_lookup`] compares against), so the next add of the same term is an
+///     exact normalised hit and resolves via step 1 with no fuzzy/LLM work. A
+///     term that normalises to empty learns nothing and is a no-op.
+///   * `language` is inferred by [`infer_alias_language`] (`'es'` for a Spanish
+///     term, else `'en'` — the design's "default `en` if unclear").
+///   * `source` is the supplied [`AliasSource`] (`accepted_match` or `llm`).
+///   * `INSERT OR IGNORE` makes the write idempotent against the unique index
+///     `uq_item_aliases_household_alias_lang` on
+///     `(household_id, lower(alias), language)`: confirming the same term twice
+///     is a harmless no-op rather than a constraint error.
+///
+/// Runs on the caller's connection (a `&mut SqliteConnection`, reachable from a
+/// transaction via `&mut **tx`) so the alias commits atomically with the guarded
+/// bind/merge UPDATE that proved the entry's `raw_text` was still current — the
+/// mapping is written iff the bind it justifies also commits, never on a stale
+/// no-op.
+pub async fn commit_alias(
+    conn: &mut SqliteConnection,
+    household_id: &str,
+    canonical_item_id: &str,
+    raw_text: &str,
+    source: AliasSource,
+) -> Result<(), DbError> {
+    let normalised = normalize(raw_text);
+    if normalised.is_empty() {
+        return Ok(());
+    }
+    let language = infer_alias_language(conn, canonical_item_id, &normalised).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::db::now_iso();
+    sqlx::query(
+        "INSERT OR IGNORE INTO item_aliases \
+             (id, household_id, canonical_item_id, alias, language, source, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&id)
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .bind(&normalised)
+    .bind(language)
+    .bind(source.as_str())
+    .bind(&now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -538,5 +666,177 @@ mod tests {
             single(resolve("Jamón", HOUSEHOLD, &pool).await.unwrap()),
             HAM_ID
         );
+    }
+
+    // ---- commit_alias: the P3-T4 feedback-loop write path -------------------
+
+    /// Fetch the `(language, source)` of the alias for `normalised_term` pointing
+    /// at `canonical_item_id`, scoped to the seed household. Panics if absent.
+    async fn alias_lang_source(
+        pool: &SqlitePool,
+        canonical_item_id: &str,
+        normalised_term: &str,
+    ) -> (String, String) {
+        sqlx::query_as(
+            "SELECT language, source FROM item_aliases \
+             WHERE household_id = ?1 AND canonical_item_id = ?2 AND lower(alias) = ?3",
+        )
+        .bind(HOUSEHOLD)
+        .bind(canonical_item_id)
+        .bind(normalised_term)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|_| panic!("alias {normalised_term:?} → {canonical_item_id} exists"))
+    }
+
+    async fn commit_via_conn(
+        pool: &SqlitePool,
+        canonical_item_id: &str,
+        raw_text: &str,
+        source: AliasSource,
+    ) {
+        let mut conn = pool.acquire().await.expect("acquire");
+        commit_alias(&mut conn, HOUSEHOLD, canonical_item_id, raw_text, source)
+            .await
+            .expect("commit_alias");
+    }
+
+    #[tokio::test]
+    async fn commit_alias_persists_source_and_normalises() {
+        let pool = pool().await;
+        // A novel English term for Milk, learned as an accepted_match. It is stored
+        // NORMALISED ("My  Special-Milk!" → "my special milk") and resolves via the
+        // step-1 alias lookup on the next add (the feedback-loop guarantee).
+        commit_via_conn(
+            &pool,
+            MILK_ID,
+            "My  Special-Milk!",
+            AliasSource::AcceptedMatch,
+        )
+        .await;
+        let (language, source) = alias_lang_source(&pool, MILK_ID, "my special milk").await;
+        assert_eq!(source, "accepted_match");
+        assert_eq!(
+            language, "en",
+            "an unknown English-looking term defaults to en"
+        );
+
+        // The normalised term now resolves at step 1, no fuzzy needed.
+        assert_eq!(
+            alias_lookup("MY special   milk", HOUSEHOLD, &pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(MILK_ID)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_alias_infers_spanish_from_name_es() {
+        let pool = pool().await;
+        // A fresh canonical item with a Spanish name that is NOT already a seeded
+        // alias, so the only thing that can bucket a matching term as 'es' is the
+        // `name_es` inference path (not a pre-existing seed row). Committing a term
+        // equal to its name_es must land in the 'es' bucket with our source.
+        let new_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        sqlx::query(
+            "INSERT INTO canonical_items \
+                 (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+             VALUES (?1, ?2, 'Quince paste', 'Dulce de membrillo', \
+                     'c1000000-0000-0000-0000-000000000005', 'any', '2024-01-01T00:00:00Z')",
+        )
+        .bind(new_id)
+        .bind(HOUSEHOLD)
+        .execute(&pool)
+        .await
+        .expect("insert canonical item");
+
+        commit_via_conn(&pool, new_id, "Dulce de Membrillo", AliasSource::Llm).await;
+        let (language, source) = alias_lang_source(&pool, new_id, "dulce de membrillo").await;
+        assert_eq!(language, "es", "a term equal to name_es buckets as Spanish");
+        assert_eq!(source, "llm", "inference is independent of the source");
+    }
+
+    #[tokio::test]
+    async fn commit_alias_infers_english_from_name_en() {
+        let pool = pool().await;
+        // A fresh canonical item: a term equal to its English name_en (and not its
+        // Spanish name_es) buckets as 'en'. Self-contained so it tests the inference
+        // path rather than reading back a pre-seeded row.
+        let new_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        sqlx::query(
+            "INSERT INTO canonical_items \
+                 (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+             VALUES (?1, ?2, 'Marshmallow fluff', 'Crema de malvavisco', \
+                     'c1000000-0000-0000-0000-000000000005', 'any', '2024-01-01T00:00:00Z')",
+        )
+        .bind(new_id)
+        .bind(HOUSEHOLD)
+        .execute(&pool)
+        .await
+        .expect("insert canonical item");
+
+        commit_via_conn(
+            &pool,
+            new_id,
+            "Marshmallow Fluff",
+            AliasSource::AcceptedMatch,
+        )
+        .await;
+        let (language, source) = alias_lang_source(&pool, new_id, "marshmallow fluff").await;
+        assert_eq!(language, "en");
+        assert_eq!(source, "accepted_match");
+    }
+
+    #[tokio::test]
+    async fn commit_alias_infers_spanish_from_existing_es_alias() {
+        let pool = pool().await;
+        // "jamon" is a seeded 'es'-bucket alias for Ham (its name_es is "Jamón",
+        // which also normalises to "jamon"). Re-committing it must reuse the 'es'
+        // bucket rather than inserting a fresh 'en' duplicate.
+        commit_via_conn(&pool, HAM_ID, "Jamón", AliasSource::AcceptedMatch).await;
+        let (language, _) = alias_lang_source(&pool, HAM_ID, "jamon").await;
+        assert_eq!(language, "es");
+    }
+
+    #[tokio::test]
+    async fn commit_alias_dedups_via_unique_index() {
+        let pool = pool().await;
+        let before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases WHERE household_id = ?1")
+                .bind(HOUSEHOLD)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Committing the same (household, alias, language) twice is a harmless
+        // INSERT OR IGNORE no-op — the unique index dedups it.
+        commit_via_conn(&pool, MILK_ID, "myuniquemilk", AliasSource::AcceptedMatch).await;
+        commit_via_conn(&pool, MILK_ID, "myuniquemilk", AliasSource::Llm).await;
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases WHERE household_id = ?1")
+                .bind(HOUSEHOLD)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, before + 1, "the second commit is a dedup no-op");
+        // The first write wins (source stays accepted_match, not the later llm).
+        let (_, source) = alias_lang_source(&pool, MILK_ID, "myuniquemilk").await;
+        assert_eq!(source, "accepted_match");
+    }
+
+    #[tokio::test]
+    async fn commit_alias_skips_empty_normalised_term() {
+        let pool = pool().await;
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // A term that normalises to empty (only punctuation/emoji) learns nothing.
+        commit_via_conn(&pool, MILK_ID, "  !!!  ", AliasSource::AcceptedMatch).await;
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_aliases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "an empty normalised term writes no alias");
     }
 }
