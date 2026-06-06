@@ -915,6 +915,37 @@ async fn apply_resolve_alias(
     // transition). `None` here means "do not guard on raw_text".
     let raw_text_guard = raw_text.as_deref().filter(|s| !s.trim().is_empty());
 
+    // Candidate-membership validation (review Medium): the chosen item must be one
+    // of the candidates the resolver offered for THIS row. But the no-op precedence
+    // comes FIRST — we only enforce membership when the row is a LIVE, bindable
+    // ambiguous row (active + ambiguous + raw_text still current, i.e. exactly the
+    // rows the guarded UPDATE below would actually bind). For any other row
+    // (already resolved, deleted, cross-list, renamed/stale, or a repeat confirm)
+    // we skip validation entirely and let the UPDATE fall through to its existing
+    // no-op accept — a stale/repeat confirm must never become a noisy 422.
+    let current: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT resolution_status, status, resolution_candidates_json \
+         FROM list_entries \
+         WHERE id = ?1 AND list_id = ?2 \
+           AND resolution_status = 'ambiguous' AND status = 'active' \
+           AND (?3 IS NULL OR raw_text = ?3)",
+    )
+    .bind(&entry_id)
+    .bind(&req.list_id)
+    .bind(raw_text_guard)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error("apply_resolve_alias.candidate_lookup"))?;
+
+    if let Some((_, _, candidates_json)) = current {
+        // A live ambiguous row: the chosen id MUST be in its candidate list.
+        // `resolution_candidates_json` is a flat JSON array of canonical-item-id
+        // strings (see `resolution::resolve_ambiguous`); parse it the same way.
+        if !candidate_list_contains(candidates_json.as_deref(), &canonical_item_id) {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
     // Guarded bind: only an `ambiguous`, still-`active` entry on this list
     // transitions. A row already resolved/deleted (e.g. a concurrent confirm or a
     // stale replay that slipped past idempotency) matches 0 rows — a no-op accept,
@@ -1031,6 +1062,23 @@ async fn apply_resolve_alias(
             })
         }
         Err(e) => Err(db_error("apply_resolve_alias.bind")(e)),
+    }
+}
+
+/// True if `candidate_id` appears in the row's `resolution_candidates_json` — a
+/// flat JSON array of canonical-item-id strings (the shape
+/// `resolution::resolve_ambiguous` writes via `serde_json::json!(&[String])`, and
+/// the frontend parses the same way). A NULL/absent or unparseable value, or one
+/// that is not a JSON array, contains nothing (so the chosen id is rejected): an
+/// ambiguous row always carries a candidate array, and a malformed one is treated
+/// conservatively rather than waved through.
+fn candidate_list_contains(candidates_json: Option<&str>, candidate_id: &str) -> bool {
+    let Some(raw) = candidates_json else {
+        return false;
+    };
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(ids) => ids.iter().any(|id| id == candidate_id),
+        Err(_) => false,
     }
 }
 
@@ -1604,6 +1652,21 @@ mod tests {
         // A non-string field is not a string.
         assert_eq!(string_field(&payload, "quantity"), None);
         assert_eq!(string_field(&payload, "missing"), None);
+    }
+
+    #[test]
+    fn candidate_list_contains_matches_only_array_members() {
+        let json = r#"["ci-single","ci-double"]"#;
+        assert!(candidate_list_contains(Some(json), "ci-double"));
+        assert!(candidate_list_contains(Some(json), "ci-single"));
+        // Not a member.
+        assert!(!candidate_list_contains(Some(json), "ci-sour"));
+        // NULL/absent candidates contain nothing.
+        assert!(!candidate_list_contains(None, "ci-double"));
+        // Malformed / non-array JSON is treated conservatively (contains nothing).
+        assert!(!candidate_list_contains(Some("not json"), "ci-double"));
+        assert!(!candidate_list_contains(Some(r#"{"a":1}"#), "ci-double"));
+        assert!(!candidate_list_contains(Some("[]"), "ci-double"));
     }
 
     fn sample_request() -> MutationRequest {
