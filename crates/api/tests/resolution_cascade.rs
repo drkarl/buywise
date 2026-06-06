@@ -1811,9 +1811,11 @@ async fn step4_user_resolve_alias_persists_accepted_match_alias() {
     );
 }
 
-/// Step 1 (alias lookup): re-resolving a seeded alias term writes no NEW alias row
-/// — the mapping already exists, and the `INSERT OR IGNORE` learn is a dedup no-op.
-/// ("leche" is a seeded Milk alias under both buckets.)
+/// Step 1 (alias lookup): re-resolving an existing alias term writes no NEW alias
+/// row and attempts no alias write at all — the mapping already exists, so the
+/// cascade passes `None` and skips `commit_alias` (and its language-inference
+/// SELECTs) entirely on this hot path. ("leche" is a seeded Milk alias; it is
+/// stored under the `'es'` bucket only — see migrations/002_seed.sql.)
 #[tokio::test]
 async fn step1_existing_alias_writes_no_duplicate() {
     let pool = setup_pool().await;
@@ -1835,5 +1837,21 @@ async fn step1_existing_alias_writes_no_duplicate() {
         alias_count(&pool, "leche").await,
         before,
         "step 1 (alias already present) learns no new alias row"
+    );
+    // The seeded "leche" alias is `source='manual'`. A step-1 hit must not write a
+    // learned alias of any kind, so no `accepted_match` row may appear for the term
+    // — this proves the write was skipped (None), not merely deduplicated.
+    let learned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases \
+         WHERE household_id = ?1 AND lower(alias) = ?2 AND source = 'accepted_match'",
+    )
+    .bind(SEED_HOUSEHOLD)
+    .bind("leche")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        learned, 0,
+        "a step-1 alias hit must not attempt an accepted_match learn write"
     );
 }

@@ -87,19 +87,33 @@ pub fn spawn_resolution(state: AppState, job: ResolutionJob) {
 /// Split out from [`spawn_resolution`] so the fallible body is a single
 /// `Result`-returning function (clean `?` propagation); the spawn wrapper logs.
 async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx::Error> {
-    let outcome = matching::resolve(&job.raw_text, &job.household_id, &state.pool)
+    // Run the cascade's two steps EXPLICITLY (rather than via `matching::resolve`)
+    // so a step-1 alias hit can be distinguished from a step-2 fuzzy single-match.
+    // The distinction matters for the feedback loop: a step-1 hit ALREADY has its
+    // alias, so re-learning it would add two `infer_alias_language` SELECTs plus an
+    // always-no-op `INSERT OR IGNORE` to the single most frequent path (re-adding a
+    // known term). Passing `None` for the step-1 case skips that redundant write
+    // entirely; only the step-2 fuzzy match — which genuinely learns a NEW mapping —
+    // passes `Some(AcceptedMatch)`.
+    if let Some(canonical_item_id) =
+        matching::alias_lookup(&job.raw_text, &job.household_id, &state.pool)
+            .await
+            .map_err(into_sqlx_error)?
+    {
+        // Step 1: exact alias already exists — bind it, but learn nothing (the
+        // mapping is already persisted; an INSERT OR IGNORE here would be a no-op).
+        return resolve_single_match(state, job, &canonical_item_id, None).await;
+    }
+
+    // Step 2: token/fuzzy match. A single-match is a genuinely new confirmed mapping,
+    // so persist it as `source='accepted_match'` (P3-T4 rule 2) — the next add of the
+    // same term then resolves via step 1 with no fuzzy/LLM work.
+    let outcome = matching::fuzzy_match(&job.raw_text, &job.household_id, &state.pool)
         .await
         .map_err(into_sqlx_error)?;
 
     match outcome {
         ResolutionOutcome::SingleMatch { canonical_item_id } => {
-            // Steps 1 & 2 (alias / token-fuzzy). A step-1 hit already has its alias
-            // and re-learning it is a harmless `INSERT OR IGNORE` no-op (the unique
-            // index dedups it); a step-2 fuzzy single-match learns the confirmed
-            // `raw_text` → canonical mapping with `source='accepted_match'` so the
-            // next add of the same term resolves via step 1 (P3-T4 rule 2). The two
-            // are indistinguishable at this point, so both pass `AcceptedMatch` and
-            // rely on the index to make the step-1 case a no-op.
             resolve_single_match(
                 state,
                 job,
