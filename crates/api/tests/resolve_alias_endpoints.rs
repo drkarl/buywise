@@ -616,3 +616,127 @@ async fn resolve_alias_with_stale_raw_text_does_not_bind_or_alias() {
     .unwrap();
     assert_eq!(alias_count, 0, "no alias learned for a stale raw_text");
 }
+
+/// Candidate-membership validation (review Medium): confirming a same-household
+/// item that is NOT one of the current ambiguous row's candidates is a 422. The
+/// entry stays `ambiguous`, no alias is written, and no revision is bumped.
+#[tokio::test]
+async fn resolve_alias_rejects_non_candidate_same_household_item() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+    // A same-household item the resolver did NOT offer for this row (candidates are
+    // ci-single / ci-double).
+    seed_canonical_item(&pool, "ci-sour", "Sour cream", "hh-a", "cat-dairy").await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-sour", "cream"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Entry untouched (still ambiguous), no alias, no revision bump/broadcast.
+    let (status, canonical): (String, Option<String>) = sqlx::query_as(
+        "SELECT resolution_status, canonical_item_id FROM list_entries WHERE id = 'entry-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "ambiguous");
+    assert!(canonical.is_none());
+
+    let alias_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_aliases WHERE household_id = 'hh-a' AND source = 'accepted_match'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(alias_count, 0, "a non-candidate 422 writes no alias");
+
+    let revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        revision, 0,
+        "a rejected non-candidate confirm bumps no revision"
+    );
+}
+
+/// Candidate validation must NOT regress the happy path: a chosen id that IS one of
+/// the row's candidates still resolves and writes the accepted_match alias.
+#[tokio::test]
+async fn resolve_alias_accepts_candidate_member_and_writes_alias() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        // ci-single IS a candidate (alongside ci-double).
+        resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-single", "cream"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    assert_eq!(v["status"], "accepted");
+    assert_eq!(v["entity"]["resolution_status"], "resolved");
+    assert_eq!(v["entity"]["canonical_item_id"], "ci-single");
+
+    let aliases: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT alias, canonical_item_id, source FROM item_aliases WHERE household_id = 'hh-a'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].0, "cream");
+    assert_eq!(aliases[0].1, "ci-single");
+    assert_eq!(aliases[0].2, "accepted_match");
+}
+
+/// No-op precedence (the user's explicit nuance): candidate validation only applies
+/// while the row is the CURRENT ambiguous row. A stale/already-resolved row must
+/// keep its no-op accept-and-log behavior — NOT 422 — even if the chosen id would
+/// not be a candidate. The ambiguous-current-row check runs first.
+#[tokio::test]
+async fn resolve_alias_stale_resolved_row_no_ops_even_for_non_candidate() {
+    let pool = setup_pool().await;
+    let s = seed_cream_scenario(&pool).await;
+    seed_canonical_item(&pool, "ci-sour", "Sour cream", "hh-a", "cat-dairy").await;
+
+    // First confirm resolves entry-1 into a valid candidate (ci-double).
+    let first = post_mutation(
+        &pool,
+        &s,
+        resolve_alias_envelope("cm-1", "list-a", "entry-1", "ci-double", "cream"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // A second, stale confirm targets the now-resolved row with a NON-candidate id.
+    // Because the row is no longer ambiguous, it must no-op (accept), never 422.
+    let second = post_mutation(
+        &pool,
+        &s,
+        resolve_alias_envelope("cm-2", "list-a", "entry-1", "ci-sour", "cream"),
+    )
+    .await;
+    assert_eq!(
+        second.status(),
+        StatusCode::CREATED,
+        "a stale confirm on a resolved row no-ops, never 422"
+    );
+    let v = json(second).await;
+    assert_eq!(v["status"], "accepted");
+
+    // The first resolution stands; the stale non-candidate confirm changed nothing.
+    let canonical: Option<String> =
+        sqlx::query_scalar("SELECT canonical_item_id FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canonical.as_deref(), Some("ci-double"), "binding unchanged");
+}
