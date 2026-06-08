@@ -8,6 +8,7 @@
 // `RETAILERS` in `$lib/stores/shopping`.
 
 import { RETAILERS, type RetailerId } from '$lib/stores/shopping';
+import { jsonMutationHeaders } from '$lib/api/csrf';
 
 /** Freshness confidence for a matched offer line (lowercase, as serialized). */
 export type FreshnessConfidence = 'high' | 'low' | 'unknown';
@@ -16,6 +17,13 @@ export type FreshnessConfidence = 'high' | 'low' | 'unknown';
 export interface PlanLine {
 	item_index: number;
 	display_text: string;
+	/**
+	 * The resolved canonical item id this line prices. Always present for a priced
+	 * line (unresolved items never appear in a plan); paired with
+	 * `retailer_product_id` to accept/reject the underlying product match via
+	 * `POST /api/match-feedback` (P5-T1).
+	 */
+	canonical_item_id: string | null;
 	retailer: RetailerId;
 	retailer_product_id: string;
 	offer_id: string;
@@ -102,4 +110,31 @@ export function formatEuros(cents: number): string {
 	const sign = cents < 0 ? '-' : '';
 	const euros = (Math.abs(cents) / 100).toFixed(2);
 	return `${sign}€${euros}`;
+}
+
+/** A user's feedback on a product match, mirroring the API's `action` field. */
+export type MatchFeedbackAction = 'accept' | 'reject' | 'prefer';
+
+/**
+ * POST a user's accept/reject/prefer decision on a product match to
+ * `POST /api/match-feedback` (P5-T1). Stamps the `X-CSRF-Token` header (the
+ * backend 403s mutating calls without it) and resolves to the response's OK flag
+ * so callers can surface a failure without coupling to the (non-stable) error
+ * body. Throws only on a network/transport failure, which callers catch.
+ */
+export async function sendMatchFeedback(args: {
+	canonicalItemId: string;
+	retailerProductId: string;
+	action: MatchFeedbackAction;
+}): Promise<{ ok: boolean }> {
+	const res = await fetch('/api/match-feedback', {
+		method: 'POST',
+		headers: jsonMutationHeaders(),
+		body: JSON.stringify({
+			canonical_item_id: args.canonicalItemId,
+			retailer_product_id: args.retailerProductId,
+			action: args.action
+		})
+	});
+	return { ok: res.ok };
 }

@@ -12,7 +12,7 @@
 
 	import type { StorePlan } from '$lib/api/optimise';
 	import { formatEuros, retailerLabel } from '$lib/api/optimise';
-	import ConfidenceIndicator from './ConfidenceIndicator.svelte';
+	import PlanItem from './PlanItem.svelte';
 
 	interface Props {
 		/** The plan to display. */
@@ -89,19 +89,7 @@
 
 	<ul class="lines">
 		{#each plan.lines as line (line.item_index)}
-			<li class="line">
-				<span class="line-name">
-					{line.display_text}
-					<ConfidenceIndicator confidence={line.freshness_confidence} />
-				</span>
-				<span class="line-meta">
-					<span class="line-store">{retailerLabel(line.retailer)}</span>
-					{#if line.loyalty_applied}
-						<span class="loyalty" title="Loyalty price applied">loyalty</span>
-					{/if}
-					<span class="line-price">{formatEuros(line.line_total_cents)}</span>
-				</span>
-			</li>
+			<PlanItem {line} />
 		{/each}
 	</ul>
 
@@ -198,41 +186,6 @@
 		gap: 0.4rem;
 		border-top: 1px solid #f1f5f9;
 		padding-top: 0.6rem;
-	}
-	.line {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.75rem;
-		font-size: 0.92rem;
-	}
-	.line-name {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.4rem;
-	}
-	.line-meta {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.5rem;
-		color: #64748b;
-		flex-shrink: 0;
-	}
-	.line-store {
-		font-size: 0.8rem;
-	}
-	.loyalty {
-		font-size: 0.7rem;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-		color: #0f766e;
-		background: #ccfbf1;
-		border-radius: 0.3rem;
-		padding: 0.05rem 0.35rem;
-	}
-	.line-price {
-		color: #0f172a;
-		font-variant-numeric: tabular-nums;
 	}
 	.missing {
 		margin: 0;
