@@ -7,6 +7,19 @@
 //! the household is derived from the caller's `household_members` membership,
 //! exactly as the collection list endpoints do.
 //!
+//! # Single-household assumption (known limitation)
+//!
+//! These endpoints assume the caller belongs to exactly one household. With no
+//! `household_id` parameter in the P4-T2 contract, [`caller_household`] picks the
+//! caller's first membership (`ORDER BY household_id LIMIT 1`). `POST
+//! /api/optimise`, by contrast, resolves the household from the *list* being
+//! optimised. So for a user in more than one household these two can diverge: a
+//! `PATCH /api/settings` could update household A's thresholds while an optimise
+//! run on a household-B list reads B's stored values. This is an accepted
+//! limitation of the parameter-less contract, not a bug — the MVP household model
+//! is single-household. Adding an explicit `household_id` parameter (and the
+//! membership check it implies) is the forward fix when multi-household lands.
+//!
 //! Storage: the `household_settings` table (migration 005) holds at most one row
 //! per household, back-filled with the documented defaults (€10 / €25) for every
 //! household at migration time. A row therefore normally always exists; `GET`
@@ -29,10 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use buywise_core::db;
 use buywise_core::domain::Cents;
-use buywise_core::optimiser::DEFAULT_THRESHOLD_2_CENTS;
+use buywise_core::optimiser::DEFAULT_THRESHOLDS;
 
 use crate::middleware::AuthenticatedUser;
-use crate::optimise::DEFAULT_THRESHOLD_3_CENTS;
 use crate::AppState;
 
 /// Build the settings routes as a `Router<AppState>`, merged by [`crate::app`].
@@ -62,6 +74,10 @@ pub struct SettingsResponse {
 /// Both fields are optional so a client can update one threshold without
 /// restating the other; an absent field leaves the stored value unchanged. At
 /// least one field must be present (an empty body is a no-op 422).
+///
+/// An explicit JSON `null` is treated identically to an omitted field (serde maps
+/// both to `None` for an `Option`), i.e. "leave unchanged" — there is no
+/// "clear to default" semantic, since the thresholds are non-nullable in storage.
 #[derive(Debug, Deserialize)]
 pub struct PatchSettingsRequest {
     /// New second-store threshold (cents) when present.
@@ -92,11 +108,6 @@ pub async fn stored_thresholds(
     .fetch_optional(pool)
     .await
 }
-
-/// The default thresholds when no `household_settings` row exists: the documented
-/// €10 / €25 core constants. Centralised so `GET` and the optimise fallback agree.
-pub const DEFAULT_THRESHOLDS: (Cents, Cents) =
-    (DEFAULT_THRESHOLD_2_CENTS, DEFAULT_THRESHOLD_3_CENTS);
 
 // ---------------------------------------------------------------------------
 // Authorization helper

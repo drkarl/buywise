@@ -59,6 +59,21 @@ use sqlx::sqlite::SqlitePool;
 /// exactly €10 = 1000 cents. Callers may override it per run.
 pub const DEFAULT_THRESHOLD_2_CENTS: Cents = 1000;
 
+/// Default third-store convenience threshold (cents): €25.00.
+///
+/// Phase-0/Phase-4 plans are single- and two-store only, so threshold-3 never
+/// changes a plan today; it is accepted, validated, and persisted for
+/// forward-compatibility. €25 is the documented default
+/// (`docs/implementation-plan.md`, P4-T2: "€25 (2500 cents) for threshold_3").
+/// Lives here, alongside [`DEFAULT_THRESHOLD_2_CENTS`], so both the settings
+/// endpoint and the optimise endpoint import the pair from one canonical place.
+pub const DEFAULT_THRESHOLD_3_CENTS: Cents = 2500;
+
+/// The default `(threshold_2, threshold_3)` pair in cents (€10 / €25), used when
+/// a household has no stored settings row. Centralised so every caller agrees.
+pub const DEFAULT_THRESHOLDS: (Cents, Cents) =
+    (DEFAULT_THRESHOLD_2_CENTS, DEFAULT_THRESHOLD_3_CENTS);
+
 /// Tolerance band for size matching: a product's size must be within ±20% of the
 /// constrained size (and on the same [`SizeBasis`]) to qualify. Phase-0 scope
 /// (the issue): size and brand are the only enforced constraints.
