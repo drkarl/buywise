@@ -38,6 +38,7 @@ pub mod middleware;
 pub mod mutations;
 pub mod optimise;
 pub mod resolution;
+pub mod settings;
 pub mod sse;
 
 /// Registry of per-list SSE broadcast senders, keyed by `list_id`.
@@ -119,9 +120,11 @@ pub fn api_router(state: AppState) -> Router {
         .merge(mutations::router())
         // `sse::router` carries the absolute `/api/sse/{list_id}` path (P1-T5).
         .merge(sse::router())
-        // `optimise::router` carries the absolute `/api/optimise` path; a Phase-4
-        // placeholder for now (P4-T1).
+        // `optimise::router` carries the absolute `/api/optimise` path (P4-T1).
         .merge(optimise::router())
+        // `settings::router` carries the absolute `/api/settings` path: the
+        // household's configurable convenience thresholds (P4-T2).
+        .merge(settings::router())
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,
