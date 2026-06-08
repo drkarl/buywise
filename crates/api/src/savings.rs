@@ -225,18 +225,31 @@ pub struct SavingsSummaryResponse {
     pub lists: Vec<ListOutcome>,
 }
 
-/// `GET /api/savings/summary` — the authenticated household's savings dashboard
-/// data: monthly aggregates, a cumulative net figure, and per-list outcomes.
+/// `GET /api/savings/summary` — the caller's household savings dashboard data:
+/// monthly aggregates, a cumulative net figure, and per-list outcomes.
 ///
-/// Scoping: every figure is restricted to lists in households the caller belongs
-/// to (`savings_events` → `shopping_lists.household_id` → `household_members`),
-/// so one household never sees another's savings. 401 without a session (the
-/// extractor); 500 (logged) on a database error. A household with no archived
-/// lists yields empty `monthly`/`lists` and a `0` cumulative — never an error.
+/// Scoping: a user may belong to more than one household, but this endpoint has
+/// no `household_id` parameter, so it resolves the caller's single household the
+/// same deterministic way `GET /api/settings` does (`caller_household`:
+/// `ORDER BY household_id LIMIT 1`) and restricts every figure to that one
+/// household. This keeps the dashboard a single household's view rather than a
+/// blend across all of the caller's memberships, and one household never sees
+/// another's savings. 404 if the caller belongs to no household (mirrors
+/// `GET /api/settings`); 401 without a session (the extractor); 500 (logged) on
+/// a database error. A household with no archived lists yields empty
+/// `monthly`/`lists` and a `0` cumulative — never an error.
 async fn savings_summary(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<SavingsSummaryResponse>, StatusCode> {
+    // Resolve the caller's single household deterministically, mirroring the
+    // `GET /api/settings` precedent (`settings::caller_household`). No household
+    // membership is a 404, consistent with that sibling endpoint.
+    let household_id = caller_household(&state.pool, &user.user_id)
+        .await
+        .map_err(db_error("savings_summary.household"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
     // Per-month aggregates. NULL accepted/net are coalesced to 0 so an
     // un-reconciled month reads as €0 net rather than skewing the total; gross is
     // NOT NULL in the schema. strftime works on the ISO-8601 text `created_at`.
@@ -248,12 +261,11 @@ async fn savings_summary(
                 COUNT(*)                                AS lists \
          FROM savings_events se \
          JOIN shopping_lists sl ON sl.id = se.list_id \
-         WHERE sl.household_id IN \
-               (SELECT household_id FROM household_members WHERE user_id = ?1) \
+         WHERE sl.household_id = ?1 \
          GROUP BY month \
          ORDER BY month",
     )
-    .bind(&user.user_id)
+    .bind(&household_id)
     .fetch_all(&state.pool)
     .await
     .map_err(db_error("savings_summary.monthly"))?
@@ -275,10 +287,9 @@ async fn savings_summary(
         "SELECT COALESCE(SUM(se.net_saving_cents), 0) \
          FROM savings_events se \
          JOIN shopping_lists sl ON sl.id = se.list_id \
-         WHERE sl.household_id IN \
-               (SELECT household_id FROM household_members WHERE user_id = ?1)",
+         WHERE sl.household_id = ?1",
     )
-    .bind(&user.user_id)
+    .bind(&household_id)
     .fetch_one(&state.pool)
     .await
     .map_err(db_error("savings_summary.cumulative"))?;
@@ -300,11 +311,10 @@ async fn savings_summary(
                 se.chosen_basket_cost_cents, se.net_saving_cents \
          FROM savings_events se \
          JOIN shopping_lists sl ON sl.id = se.list_id \
-         WHERE sl.household_id IN \
-               (SELECT household_id FROM household_members WHERE user_id = ?1) \
+         WHERE sl.household_id = ?1 \
          ORDER BY se.created_at DESC, se.id DESC",
     )
-    .bind(&user.user_id)
+    .bind(&household_id)
     .fetch_all(&state.pool)
     .await
     .map_err(db_error("savings_summary.lists"))?
@@ -337,6 +347,27 @@ async fn savings_summary(
         cumulative_net_cents,
         lists,
     }))
+}
+
+/// The (single) household the caller belongs to, or `None` if they belong to no
+/// household.
+///
+/// Mirrors `settings::caller_household`: a user may belong to several households,
+/// but the savings summary has no `household_id` parameter, so it resolves the
+/// caller's first membership deterministically (`ORDER BY household_id LIMIT 1`).
+/// Kept local to match the established `GET /api/settings` precedent without
+/// coupling the two modules.
+async fn caller_household(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT household_id FROM household_members WHERE user_id = ?1 \
+         ORDER BY household_id LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Map a DB error to a logged 500, so a transient failure never fails open.

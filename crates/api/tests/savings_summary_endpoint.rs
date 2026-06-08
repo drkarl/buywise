@@ -367,6 +367,78 @@ async fn summary_is_scoped_to_caller_household() {
     assert_eq!(lists[0]["list_id"], "list-1");
 }
 
+/// Determinism: a user who belongs to TWO households (each with its own savings
+/// events) gets ONLY the figures of the single household resolved by
+/// `ORDER BY household_id LIMIT 1` — never a blend across both memberships. This
+/// pins the single-household scoping that mirrors `GET /api/settings`.
+#[tokio::test]
+async fn summary_picks_single_household_for_multi_household_user() {
+    let pool = setup_pool().await;
+    // Lower-id household is the one `ORDER BY household_id LIMIT 1` selects.
+    let lower = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let higher = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    // Seed the user + first membership via the helper (creates the lower
+    // household), then add a second membership to the higher household directly.
+    let session = seed_household_and_user(&pool, lower, "user-a", "a@example.test").await;
+    sqlx::query("INSERT INTO households (id, name, created_at) VALUES (?1, 'Other HH', ?2)")
+        .bind(higher)
+        .bind(db::now_iso())
+        .execute(&pool)
+        .await
+        .expect("insert second household");
+    sqlx::query(
+        "INSERT INTO household_members (household_id, user_id, role, joined_at) \
+         VALUES (?1, 'user-a', 'owner', ?2)",
+    )
+    .bind(higher)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .expect("insert second membership");
+
+    // A modest saving in the selected (lower-id) household.
+    seed_list(&pool, lower, "list-lower", "Selected").await;
+    seed_event(
+        &pool,
+        "ev-lower",
+        "list-lower",
+        "2026-05-03T10:00:00Z",
+        3000,
+        Some(2800),
+        Some(4500),
+        Some(2500),
+    )
+    .await;
+    // A much larger saving in the OTHER (higher-id) household that must be excluded.
+    seed_list(&pool, higher, "list-higher", "Excluded").await;
+    seed_event(
+        &pool,
+        "ev-higher",
+        "list-higher",
+        "2026-05-04T10:00:00Z",
+        99999,
+        Some(99999),
+        Some(1),
+        Some(99999),
+    )
+    .await;
+
+    let resp = get_summary(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    // Only the lower-id household's single event is reflected — not the blend.
+    assert_eq!(body["cumulative_net_cents"], 2500);
+    let monthly = body["monthly"].as_array().unwrap();
+    assert_eq!(monthly.len(), 1);
+    assert_eq!(monthly[0]["gross_cents"], 3000);
+    assert_eq!(monthly[0]["lists"], 1);
+    let lists = body["lists"].as_array().unwrap();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0]["list_id"], "list-lower");
+}
+
 /// An empty household (no savings events) gets an empty summary, not an error.
 #[tokio::test]
 async fn summary_empty_household_is_zeroes() {
