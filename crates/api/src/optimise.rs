@@ -31,10 +31,11 @@
 //! # Thresholds
 //!
 //! `convenience_threshold_2`/`convenience_threshold_3` are cents and OPTIONAL in
-//! the request. There is no `household_settings` table yet (that lands in P4-T2),
-//! so an absent value falls back to the core default
-//! ([`DEFAULT_THRESHOLD_2_CENTS`]) for threshold-2 and the documented €25/2500
-//! default ([`DEFAULT_THRESHOLD_3_CENTS`]) for threshold-3. Phase-0/Phase-4 plans
+//! the request. An absent value falls back to the household's stored
+//! `household_settings` row (P4-T2, see [`crate::settings`]); only if that
+//! household has no settings row do the documented core defaults apply
+//! ([`buywise_core::optimiser::DEFAULT_THRESHOLD_2_CENTS`] for threshold-2 and the
+//! €25/2500 [`DEFAULT_THRESHOLD_3_CENTS`] for threshold-3). Phase-0/Phase-4 plans
 //! are single- and two-store only, so threshold-3 has no effect on the plans
 //! today; it is accepted and persisted for forward-compatibility (and validated:
 //! a third store can never be easier to justify than a second).
@@ -51,7 +52,7 @@ use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
     optimise, BasketItem, NoValidOfferItem, OptimiserInput, OptimiserOutput, Recommendation,
-    RecommendedKind, StorePlan, UnresolvedItem, DEFAULT_THRESHOLD_2_CENTS,
+    RecommendedKind, StorePlan, UnresolvedItem,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -59,11 +60,13 @@ use crate::AppState;
 
 /// Documented default third-store convenience threshold (cents): €25.00.
 ///
-/// The core exposes a threshold-2 default ([`DEFAULT_THRESHOLD_2_CENTS`]) but no
-/// threshold-3 constant (Phase-0/Phase-4 produce no three-store plans). Until the
-/// `household_settings` table (P4-T2) supplies a stored value, an absent request
-/// value falls back to this documented default (`docs/implementation-plan.md`,
-/// P4-T2 acceptance criteria: "€25 (2500 cents) for threshold_3").
+/// The core exposes a threshold-2 default
+/// ([`buywise_core::optimiser::DEFAULT_THRESHOLD_2_CENTS`]) but no threshold-3
+/// constant (Phase-0/Phase-4 produce no three-store plans). When neither the
+/// request nor the household's `household_settings` row (P4-T2) supplies a
+/// threshold-3, it falls back to this documented default
+/// (`docs/implementation-plan.md`, P4-T2 acceptance criteria: "€25 (2500 cents)
+/// for threshold_3").
 pub const DEFAULT_THRESHOLD_3_CENTS: Cents = 2500;
 
 /// Build the optimise route as a `Router<AppState>`, merged by [`crate::app`].
@@ -137,25 +140,10 @@ async fn optimise_list(
 ) -> Result<Json<OptimiseResponse>, StatusCode> {
     let pool = &state.pool;
 
-    // Effective thresholds: request value, else household default. There is no
-    // household_settings table yet (P4-T2), so the defaults are the constants.
-    let threshold_2 = body
-        .convenience_threshold_2
-        .unwrap_or(DEFAULT_THRESHOLD_2_CENTS);
-    let threshold_3 = body
-        .convenience_threshold_3
-        .unwrap_or(DEFAULT_THRESHOLD_3_CENTS);
-
-    // A third-store threshold can never be easier to justify than a second.
-    // Validate the *effective* thresholds (post-default), not just the explicit
-    // pair: a default filling one side (e.g. `{convenience_threshold_3: 500}`
-    // with implicit threshold_2 = €10) must not bypass the ordering guard.
-    if threshold_3 < threshold_2 {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
     // Look the list up first: a missing list is 404, an existing list the caller
-    // is not a member of is 403 (deliberately distinct, as in `get_list`).
+    // is not a member of is 403 (deliberately distinct, as in `get_list`). The
+    // household must be known before the effective thresholds are resolved, since
+    // an omitted threshold falls back to that household's stored settings (P4-T2).
     let household_id = load_list_household(pool, &body.list_id)
         .await
         .map_err(db_error("optimise_list.load_list"))?
@@ -166,6 +154,27 @@ async fn optimise_list(
         .map_err(db_error("optimise_list.is_member"))?
     {
         return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Effective thresholds: the request value, else the household's stored
+    // settings (P4-T2), else the documented core defaults if no settings row
+    // exists. The household_settings row is back-filled for every household by
+    // migration 005, so the constant fallback only fires for a household created
+    // after the back-fill without its own settings row.
+    let (stored_2, stored_3) = crate::settings::stored_thresholds(pool, &household_id)
+        .await
+        .map_err(db_error("optimise_list.settings"))?
+        .unwrap_or(crate::settings::DEFAULT_THRESHOLDS);
+    let threshold_2 = body.convenience_threshold_2.unwrap_or(stored_2);
+    let threshold_3 = body.convenience_threshold_3.unwrap_or(stored_3);
+
+    // A third-store threshold can never be easier to justify than a second.
+    // Validate the *effective* thresholds (post-fallback), not just the explicit
+    // pair: a fallback filling one side (e.g. `{convenience_threshold_3: 500}`
+    // with an implicit stored threshold_2 = €10) must not bypass the ordering
+    // guard.
+    if threshold_3 < threshold_2 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     let input = build_input_from_list(pool, &household_id, &body.list_id, threshold_2)
