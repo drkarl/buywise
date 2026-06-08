@@ -453,6 +453,10 @@ async fn item_constraints_by_canonical_ids(
 /// The plan lines carry `offer_id`; the snapshot date lives on `product_offers`
 /// and is not echoed onto [`buywise_core::optimiser::PlanLine`], so it is fetched
 /// here. ISO-8601 dates sort lexicographically, so `MAX(...)` returns the latest.
+///
+/// Scope note: the date is derived *only* from the offers backing the recommended
+/// plan, not from every offer the optimiser considered. It is `None` when there is
+/// no recommended plan or none of its offers carry a snapshot date.
 async fn latest_offer_snapshot_date(
     pool: &sqlx::SqlitePool,
     output: &OptimiserOutput,
@@ -464,17 +468,26 @@ async fn latest_offer_snapshot_date(
         return Ok(None);
     }
 
-    // One small chunked IN(...) query over the plan's offer ids.
+    // Chunk the IN(...) by IN_CHUNK_SIZE so a plan with more offer ids than
+    // SQLite's bound-parameter limit cannot turn a valid call into a 500. ISO-8601
+    // dates sort lexicographically, so the overall latest is the max of the
+    // per-chunk maxima.
     let offer_ids: Vec<&str> = plan.lines.iter().map(|l| l.offer_id.as_str()).collect();
-    let placeholders = sql_placeholders(offer_ids.len());
-    let sql = format!(
-        "SELECT MAX(source_snapshot_date) FROM product_offers WHERE id IN ({placeholders})"
-    );
-    let mut query = sqlx::query_scalar::<_, Option<String>>(&sql);
-    for id in &offer_ids {
-        query = query.bind(*id);
+    let mut latest: Option<String> = None;
+    for chunk in offer_ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT MAX(source_snapshot_date) FROM product_offers WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, Option<String>>(&sql);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        let chunk_max: Option<String> = query.fetch_one(pool).await?;
+        if chunk_max > latest {
+            latest = chunk_max;
+        }
     }
-    let latest: Option<String> = query.fetch_one(pool).await?;
     Ok(latest)
 }
 
