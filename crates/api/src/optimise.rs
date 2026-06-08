@@ -16,7 +16,12 @@
 //!    as priceable only when `resolution_status = 'resolved'` (anything else is
 //!    surfaced as unresolved). For each resolved entry we load its
 //!    `default_constraint_policy` and `item_constraints` row exactly as the CLI's
-//!    `build_optimiser_input` does, so the HTTP path produces identical baskets.
+//!    `build_optimiser_input` does. The one deliberate difference: the CLI also
+//!    runs `merge_requested_size` to fold a per-line size parsed from raw text
+//!    (e.g. `"milk 2L"`) into the constraints. The API has no such input —
+//!    `list_entries` persists no per-line requested size, only the resolved
+//!    `canonical_item_id` and `quantity` — so that step is a no-op here and the
+//!    resulting baskets match the CLI for already-resolved entries.
 //! 3. Run [`optimise`] against the pool.
 //! 4. Derive `offer_snapshot_date` (latest `source_snapshot_date` among the
 //!    offers backing the recommended plan's lines) and a deterministic
@@ -121,8 +126,10 @@ pub struct OptimiseResponse {
 /// Status discipline mirrors the sibling handlers (`lists.rs`): 401 without a
 /// live session (the extractor), 403 if CSRF is missing/invalid (the extractor)
 /// or the caller is not a member of the list's household, 404 if the list does
-/// not exist, 422 for a malformed body or `threshold_3 < threshold_2`, and 500
-/// (logged, never failing open) on a database error.
+/// not exist, 422 when the *effective* (post-default) `threshold_3 < threshold_2`,
+/// and 500 (logged, never failing open) on a database error. The body itself is
+/// validated by the `Json` extractor: a malformed JSON body is rejected as 400,
+/// a well-formed body of the wrong shape (e.g. missing `list_id`) as 422.
 async fn optimise_list(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -256,10 +263,12 @@ fn db_error<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> Status
 ///
 /// The list entries are already resolved (P1/P3), so — unlike the CLI's
 /// `build_optimiser_input`, which resolves raw fixture text — this reads
-/// `resolution_status` + `canonical_item_id` straight off each entry. The
-/// constraint-loading half is identical to the CLI: for a resolved entry, load
-/// its `default_constraint_policy` and `item_constraints` row so the produced
-/// `BasketItem` is byte-for-byte what the CLI would build for the same item.
+/// `resolution_status` + `canonical_item_id` straight off each entry. For a
+/// resolved entry it loads the same `default_constraint_policy` and
+/// `item_constraints` row the CLI loads. The CLI then merges a per-line requested
+/// size (`merge_requested_size`) parsed from raw text; the API has no per-line
+/// size to merge (`list_entries` stores none), so that step is a no-op here and
+/// the produced `BasketItem` matches the CLI's for an already-resolved item.
 ///
 /// An entry whose `resolution_status != 'resolved'` (unresolved or ambiguous)
 /// carries no `canonical_item_id`, so the optimiser routes it to
