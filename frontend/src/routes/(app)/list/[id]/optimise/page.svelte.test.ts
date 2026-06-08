@@ -21,6 +21,7 @@ function fullResponse(): OptimiseResponse {
 				{
 					item_index: 0,
 					display_text: 'Milk 2L',
+					canonical_item_id: 'ci-1',
 					retailer: 'tesco',
 					retailer_product_id: 'rp-1',
 					offer_id: 'of-1',
@@ -40,6 +41,7 @@ function fullResponse(): OptimiseResponse {
 				{
 					item_index: 0,
 					display_text: 'Milk 2L',
+					canonical_item_id: 'ci-1',
 					retailer: 'aldi',
 					retailer_product_id: 'rp-9',
 					offer_id: 'of-9',
