@@ -34,8 +34,7 @@
 //! the request. An absent value falls back to the household's stored
 //! `household_settings` row (P4-T2, see [`crate::settings`]); only if that
 //! household has no settings row do the documented core defaults apply
-//! ([`buywise_core::optimiser::DEFAULT_THRESHOLD_2_CENTS`] for threshold-2 and the
-//! €25/2500 [`DEFAULT_THRESHOLD_3_CENTS`] for threshold-3). Phase-0/Phase-4 plans
+//! ([`buywise_core::optimiser::DEFAULT_THRESHOLDS`] — €10 / €25). Phase-0/Phase-4 plans
 //! are single- and two-store only, so threshold-3 has no effect on the plans
 //! today; it is accepted and persisted for forward-compatibility (and validated:
 //! a third store can never be easier to justify than a second).
@@ -52,22 +51,11 @@ use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
     optimise, BasketItem, NoValidOfferItem, OptimiserInput, OptimiserOutput, Recommendation,
-    RecommendedKind, StorePlan, UnresolvedItem,
+    RecommendedKind, StorePlan, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
-
-/// Documented default third-store convenience threshold (cents): €25.00.
-///
-/// The core exposes a threshold-2 default
-/// ([`buywise_core::optimiser::DEFAULT_THRESHOLD_2_CENTS`]) but no threshold-3
-/// constant (Phase-0/Phase-4 produce no three-store plans). When neither the
-/// request nor the household's `household_settings` row (P4-T2) supplies a
-/// threshold-3, it falls back to this documented default
-/// (`docs/implementation-plan.md`, P4-T2 acceptance criteria: "€25 (2500 cents)
-/// for threshold_3").
-pub const DEFAULT_THRESHOLD_3_CENTS: Cents = 2500;
 
 /// Build the optimise route as a `Router<AppState>`, merged by [`crate::app`].
 pub fn router() -> Router<AppState> {
@@ -164,7 +152,7 @@ async fn optimise_list(
     let (stored_2, stored_3) = crate::settings::stored_thresholds(pool, &household_id)
         .await
         .map_err(db_error("optimise_list.settings"))?
-        .unwrap_or(crate::settings::DEFAULT_THRESHOLDS);
+        .unwrap_or(DEFAULT_THRESHOLDS);
     let threshold_2 = body.convenience_threshold_2.unwrap_or(stored_2);
     let threshold_3 = body.convenience_threshold_3.unwrap_or(stored_3);
 
