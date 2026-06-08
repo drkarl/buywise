@@ -161,14 +161,17 @@ describe('optimise page', () => {
 		await screen.findByText(/Splitting between Tesco and Aldi/);
 	});
 
-	it('lists unresolved items separately with a clarify link to the list view', async () => {
+	it('lists unresolved items separately with a review link to the list view', async () => {
 		stubOptimise(fullResponse());
 		render(Page);
 
-		// The unresolved item is named and linked back to the list's clarify flow.
+		// The unresolved item is named and linked back to the list view. The link
+		// says "Review" (not "Clarify") because the response carries no
+		// resolution_status, so we can't promise a clarify control for a row that
+		// may be plain `unresolved` rather than `ambiguous`.
 		await screen.findByText(/cream — needs clarifying/);
-		const clarify = screen.getByRole('link', { name: /clarify on your list/i });
-		expect(clarify.getAttribute('href')).toBe('/list/list-42');
+		const review = screen.getAllByRole('link', { name: /review on your list/i })[0];
+		expect(review.getAttribute('href')).toBe('/list/list-42');
 
 		// The no-valid-offer item appears with its reason in the same section.
 		expect(screen.getByText(/truffle oil — no matching product found/)).toBeTruthy();

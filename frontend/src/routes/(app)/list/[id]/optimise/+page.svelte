@@ -18,8 +18,11 @@
 	// theoretical minimum, and a routed recommendation); any may be null. We render
 	// only the non-null ones and visually highlight `recommended`. Items the
 	// optimiser couldn't price are surfaced separately so they never silently skew
-	// a total — unresolved items link back to the list view's existing clarify
-	// flow (there is no separate clarify route).
+	// a total — they link back to the list view (there is no separate clarify
+	// route). The link says "Review on your list" rather than promising a clarify
+	// control: the response carries no resolution_status, so we can't tell an
+	// `ambiguous` row (which has a clarify control) from a plain `unresolved` one
+	// (which doesn't).
 
 	import { page } from '$app/state';
 	import { jsonMutationHeaders } from '$lib/api/csrf';
@@ -195,12 +198,13 @@
 				<h2>Items excluded from totals</h2>
 				<p class="unresolved-note">
 					These items couldn’t be priced, so they’re not included in any plan total.
+					Open your list to clarify or edit these items.
 				</p>
 				<ul>
 					{#each result.unresolved_items as item (item.item_index)}
 						<li>
 							<span>{item.display_text} — needs clarifying</span>
-							<a class="clarify" href="/list/{listId}">Clarify on your list</a>
+							<a class="clarify" href="/list/{listId}">Review on your list</a>
 						</li>
 					{/each}
 					{#each result.no_valid_offer_items as item (item.item_index)}
