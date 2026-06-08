@@ -69,7 +69,7 @@ describe('PlanCard', () => {
 	it('renders a confidence indicator for the `unknown` line only', () => {
 		render(PlanCard, { plan: mockPlan(), title: 'Best single store' });
 		// Two lines, one `high` (no badge) + one `unknown` (badge) → exactly one.
-		const badges = screen.getAllByRole('status');
+		const badges = screen.getAllByRole('img');
 		expect(badges).toHaveLength(1);
 		expect(badges[0].getAttribute('aria-label')).toMatch(/unknown/i);
 	});

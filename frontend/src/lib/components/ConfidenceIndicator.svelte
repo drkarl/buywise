@@ -6,8 +6,10 @@
 	// which is the common case for a fresh offer.
 	//
 	// The badge carries a `title` + accessible `aria-label` so the meaning is
-	// reachable by hover and by assistive tech, and exposes role="status" so tests
-	// (and screen readers) can find it by its accessible name.
+	// reachable by hover and by assistive tech, and exposes role="img" so it reads
+	// as a static graphical annotation. It is NOT a live region: the badge is a
+	// persistent per-line marker, so role="status" would wrongly make screen
+	// readers announce it as a dynamic update.
 
 	import type { FreshnessConfidence } from '$lib/api/optimise';
 
@@ -31,7 +33,7 @@
 {#if show}
 	<span
 		class="confidence {confidence}"
-		role="status"
+		role="img"
 		aria-label={label}
 		title={label}
 	>
