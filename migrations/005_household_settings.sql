@@ -30,12 +30,17 @@ CREATE TABLE household_settings (
     convenience_threshold_2_cents INTEGER NOT NULL DEFAULT 1000,   -- €10.00
     convenience_threshold_3_cents INTEGER NOT NULL DEFAULT 2500,   -- €25.00
     updated_at                    TEXT NOT NULL,
-    -- A third-store threshold can never be easier to justify than a second, so a
-    -- stored pair must be ordered. Enforced at the schema level (not just in the
-    -- API handlers) so an out-of-band write cannot persist an invalid pair that
-    -- would make /api/optimise and /api/settings 422 for that household until
-    -- repaired. Mirrors the 422 guard in settings.rs / optimise.rs.
-    CHECK (convenience_threshold_3_cents >= convenience_threshold_2_cents)
+    -- Thresholds are cents, so they must be non-negative (a negative threshold
+    -- would let an equally-complete, more-expensive split clear the core's
+    -- `saving > threshold_2` test), and a third-store threshold can never be
+    -- easier to justify than a second, so a stored pair must be ordered. Enforced
+    -- at the schema level (not just in the API handlers) so an out-of-band write
+    -- cannot persist an invalid pair that would make /api/optimise and
+    -- /api/settings 422 for that household until repaired. Mirrors the 422 guard
+    -- in settings.rs / optimise.rs (`threshold_2 >= 0` plus the ordering check
+    -- implies `threshold_3 >= 0`).
+    CHECK (convenience_threshold_2_cents >= 0
+           AND convenience_threshold_3_cents >= convenience_threshold_2_cents)
 );
 
 -- Back-fill a default settings row for every existing household. A fixed

@@ -156,12 +156,15 @@ async fn optimise_list(
     let threshold_2 = body.convenience_threshold_2.unwrap_or(stored_2);
     let threshold_3 = body.convenience_threshold_3.unwrap_or(stored_3);
 
-    // A third-store threshold can never be easier to justify than a second.
     // Validate the *effective* thresholds (post-fallback), not just the explicit
     // pair: a fallback filling one side (e.g. `{convenience_threshold_3: 500}`
-    // with an implicit stored threshold_2 = €10) must not bypass the ordering
-    // guard.
-    if threshold_3 < threshold_2 {
+    // with an implicit stored threshold_2 = €10) must not bypass these guards.
+    // Thresholds are cents, so they must be non-negative — a negative explicit
+    // threshold would let an equally-complete, MORE-expensive two-store split
+    // clear the core's `saving > threshold_2` test — and a third-store threshold
+    // can never be easier to justify than a second. `threshold_2 >= 0` plus the
+    // ordering guard implies `threshold_3 >= 0`.
+    if threshold_2 < 0 || threshold_3 < threshold_2 {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
