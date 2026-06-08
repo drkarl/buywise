@@ -350,8 +350,11 @@ struct RecommendedView {
 ///     (e.g. nothing priceable, `recommended_plan = 'none'`) cannot produce a
 ///     complete row, so we skip rather than insert a zeroed/partial one.
 ///   * **Idempotency / re-archive.** A list can be archived → reactivated →
-///     archived again. We insert only if no `savings_events` row already exists
-///     for the list, so re-archiving never duplicates the row (and never errors).
+///     archived again, possibly concurrently. The INSERT uses
+///     `ON CONFLICT(list_id) DO NOTHING` against the UNIQUE index on
+///     `savings_events(list_id)` (migration 006), so re-archiving never
+///     duplicates the row and never errors even under a concurrent race. A cheap
+///     pre-check short-circuits the common re-archive path before the run lookup.
 ///
 /// Cost mapping (docs/design.md §savings): `baseline_cost_cents` = best single
 /// store total (the comparison anchor), `recommended_cost_cents` = recommended
@@ -411,13 +414,19 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = db::now_iso();
 
+    // `ON CONFLICT(list_id) DO NOTHING` is the structural idempotency guard: the
+    // UNIQUE index on savings_events(list_id) (migration 006) makes a concurrent
+    // double-archive race a no-op rather than a duplicate row. The cheap pre-check
+    // above stays as an early-out so the common re-archive path skips the run
+    // lookup + JSON parse entirely.
     sqlx::query(
         "INSERT INTO savings_events \
              (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
               theoretical_minimum_cost_cents, chosen_basket_cost_cents, chosen_plan, \
               chosen_stores, gross_saving_cents, accepted_savings_cents, rejected_savings_cents, \
               travel_cost_cents, subscription_cost_alloc_cents, net_saving_cents, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL, NULL, NULL, NULL, NULL, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL, NULL, NULL, NULL, NULL, ?8) \
+         ON CONFLICT(list_id) DO NOTHING",
     )
     .bind(&id)
     .bind(list_id)
