@@ -148,6 +148,10 @@
 		<h1>Shopping list</h1>
 		<div class="header-meta">
 			<span class="count" aria-live="polite">{$active.length} item{$active.length === 1 ? '' : 's'}</span>
+			<!-- Navigate to the optimise route, which fires POST /api/optimise on
+			     mount and renders the plan cards. Kept as a plain link so the list
+			     view stays offline-first (no network work happens here). -->
+			<a class="optimise" href="/list/{listId}/optimise">Optimise basket</a>
 			<button class="refresh" onclick={onRefresh} disabled={refreshing} aria-label="Refresh"
 				>{refreshing ? '…' : '↻'}</button
 			>
@@ -252,6 +256,15 @@
 	.count {
 		color: #64748b;
 		font-size: 0.9rem;
+	}
+	.optimise {
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: #0f766e;
+		border: 1px solid #0f766e;
+		border-radius: 0.4rem;
+		padding: 0.3rem 0.6rem;
+		text-decoration: none;
 	}
 	.refresh {
 		border: 1px solid #cbd5e1;
