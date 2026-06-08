@@ -39,6 +39,7 @@ pub mod middleware;
 pub mod mutations;
 pub mod optimise;
 pub mod resolution;
+pub mod savings;
 pub mod settings;
 pub mod sse;
 
@@ -129,6 +130,9 @@ pub fn api_router(state: AppState) -> Router {
         // `match_feedback::router` carries the absolute `/api/match-feedback`
         // path: the accept/reject/prefer write path for product matches (P5-T1).
         .merge(match_feedback::router())
+        // `savings::router` carries the absolute `/api/list/{id}/actual-spend`
+        // path: record post-shop actual spend and compute the net saving (P5-T3).
+        .merge(savings::router())
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,
