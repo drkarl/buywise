@@ -238,6 +238,32 @@ async fn seed_ambiguous_entry(
     .expect("insert ambiguous entry");
 }
 
+/// Seed one UNRESOLVED entry (no canonical id, no candidate JSON).
+async fn seed_unresolved_entry(
+    pool: &SqlitePool,
+    id: &str,
+    list_id: &str,
+    display: &str,
+    added_by: &str,
+) {
+    sqlx::query(
+        "INSERT INTO list_entries \
+             (id, list_id, resolution_status, raw_text, display_name, \
+              added_by, quantity, status, effective_constraint_hash, last_updated_revision, \
+              created_at, updated_at) \
+         VALUES (?1, ?2, 'unresolved', ?3, ?3, ?4, 1, 'active', ?5, 0, ?6, ?6)",
+    )
+    .bind(id)
+    .bind(list_id)
+    .bind(display)
+    .bind(added_by)
+    .bind(format!("unresolved:{id}"))
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert unresolved entry");
+}
+
 async fn login(pool: &SqlitePool, email: &str) -> Session {
     let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
     let resp = app(AppState::new(pool.clone()))
@@ -384,6 +410,30 @@ async fn optimise_returns_four_plans_persists_run_and_explains() {
         persisted.0
     );
 
+    // The persisted plans_json deserialises and carries the four plan keys.
+    let plans_json: String =
+        sqlx::query_scalar("SELECT plans_json FROM recommendation_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("plans_json persisted");
+    let plans: Value = serde_json::from_str(&plans_json).expect("plans_json is valid JSON");
+    for key in [
+        "best_single",
+        "best_two_store",
+        "theoretical_minimum",
+        "recommended",
+    ] {
+        assert!(
+            plans.get(key).is_some(),
+            "plans_json missing key {key}: {plans_json}"
+        );
+    }
+    assert!(
+        plans["recommended"].is_object(),
+        "recommended plan should be persisted non-null"
+    );
+
     // The ambiguous entry is the only unresolved item.
     let unresolved = body["unresolved_items"]
         .as_array()
@@ -496,4 +546,109 @@ async fn optimise_threshold3_below_threshold2_is_422() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// An explicit threshold_3 below the *default* threshold_2 (€10) must 422: the
+/// ordering guard validates the effective thresholds, not just the explicit pair.
+#[tokio::test]
+async fn optimise_explicit_threshold3_below_default_threshold2_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_list(&pool, "list-1").await;
+
+    // threshold_3 = €5 (500) < implicit threshold_2 default = €10 (1000).
+    let resp = post_optimise(
+        &pool,
+        &session,
+        serde_json::json!({ "list_id": "list-1", "convenience_threshold_3": 500 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// An explicit threshold_2 above the *default* threshold_3 (€25) must 422 too.
+#[tokio::test]
+async fn optimise_explicit_threshold2_above_default_threshold3_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_list(&pool, "list-1").await;
+
+    // threshold_2 = €50 (5000) > implicit threshold_3 default = €25 (2500).
+    let resp = post_optimise(
+        &pool,
+        &session,
+        serde_json::json!({ "list_id": "list-1", "convenience_threshold_2": 5000 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// An empty list (nothing resolved, nothing priceable) returns 200 with all-null
+/// plans and persists a row with `recommended_plan = "none"`.
+#[tokio::test]
+async fn optimise_empty_list_persists_recommended_plan_none() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+    seed_list(&pool, "list-1").await;
+    // No entries at all.
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert!(body["best_single"].is_null(), "no single plan");
+    assert!(body["recommended"].is_null(), "no recommended plan");
+    assert!(
+        body["offer_snapshot_date"].is_null(),
+        "no snapshot date without a plan"
+    );
+
+    let run_id = body["run_id"].as_str().expect("run_id string");
+    let (recommended_plan, plans_json): (String, String) = sqlx::query_as(
+        "SELECT recommended_plan, plans_json FROM recommendation_runs WHERE id = ?1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recommendation_runs row persisted");
+    assert_eq!(
+        recommended_plan, "none",
+        "empty list persists recommended_plan = none"
+    );
+    // plans_json still deserialises with the four (null) plan keys.
+    let plans: Value = serde_json::from_str(&plans_json).expect("plans_json is valid JSON");
+    assert!(plans["recommended"].is_null(), "recommended persisted null");
+}
+
+/// An `unresolved`-status entry (not just `ambiguous`) surfaces in
+/// `unresolved_items`; the criterion is `resolution_status != 'resolved'`.
+#[tokio::test]
+async fn optimise_unresolved_status_entry_is_unresolved_item() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+    seed_priced_match(
+        &pool,
+        "p-milk-aldi",
+        "aldi",
+        MILK_ID,
+        100,
+        Some("2026-06-01"),
+    )
+    .await;
+
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
+    seed_unresolved_entry(&pool, "e-unres", "list-1", "mystery item", "user-a").await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    let unresolved = body["unresolved_items"]
+        .as_array()
+        .expect("unresolved array");
+    assert_eq!(unresolved.len(), 1, "exactly one unresolved item");
+    assert_eq!(unresolved[0]["display_text"], "mystery item");
 }
