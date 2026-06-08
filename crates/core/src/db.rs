@@ -735,6 +735,8 @@ mod tests {
             "recommendation_runs",
             "savings_events",
             "match_feedback",
+            // Phase 4 (005)
+            "household_settings",
         ];
 
         for name in expected {
@@ -742,8 +744,8 @@ mod tests {
             assert!(sql.is_some(), "table `{name}` should exist after migration");
         }
 
-        // Exactly the 9 Phase-0 + 12 Phase-1 application tables (excluding sqlx
-        // bookkeeping).
+        // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 application tables
+        // (excluding sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -987,8 +989,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 21,
-            "9 Phase-0 + 12 Phase-1 tables in the file-backed database"
+            count, 22,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 tables in the file-backed database"
         );
 
         pool.close().await;

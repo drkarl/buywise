@@ -91,6 +91,24 @@ async fn all_migrations_apply_and_seed_55_store_category_orders() {
     assert_eq!(household, 1);
 }
 
+/// Migration 005 back-fills one `household_settings` row per existing household
+/// with the documented €10 / €25 defaults (P4-T2).
+#[tokio::test]
+async fn migration_005_backfills_household_settings_defaults() {
+    let pool = migrated_pool().await;
+
+    let (threshold_2, threshold_3): (i64, i64) = sqlx::query_as(
+        "SELECT convenience_threshold_2_cents, convenience_threshold_3_cents \
+         FROM household_settings WHERE household_id = ?",
+    )
+    .bind(HOUSEHOLD)
+    .fetch_one(&pool)
+    .await
+    .expect("seed household has a back-filled settings row");
+    assert_eq!(threshold_2, 1000, "default threshold_2 is €10.00");
+    assert_eq!(threshold_3, 2500, "default threshold_3 is €25.00");
+}
+
 /// Helper: a `list_entries` INSERT with the given (resolution_status,
 /// canonical_item_id, resolution_candidates_json) triple must be rejected by a
 /// CHECK constraint. All other columns are filled with valid values so the only
