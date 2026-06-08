@@ -491,6 +491,33 @@ async fn patch_settings_partial_threshold2_above_stored_threshold3_is_422() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// A `PATCH` with a negative threshold is 422: thresholds are cents and must be
+/// non-negative (a negative threshold_2 would let an equally-complete, more
+/// expensive split clear the optimiser's `saving > threshold_2` test). The
+/// rejection leaves the stored row unchanged.
+#[tokio::test]
+async fn patch_settings_negative_threshold_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    // threshold_2 = -€10 (-1000), threshold_3 = 0: ordered, but negative.
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({
+            "convenience_threshold_2_cents": -1000,
+            "convenience_threshold_3_cents": 0
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The stored row is untouched (still the seeded €10 / €25).
+    let body = json_body(get_settings(&pool, &session).await).await;
+    assert_eq!(body["convenience_threshold_2_cents"], 1000);
+    assert_eq!(body["convenience_threshold_3_cents"], 2500);
+}
+
 /// The acceptance test: update the household's threshold via `PATCH`, run the
 /// optimiser WITHOUT an explicit threshold, and verify the recommendation flips
 /// at the convenience boundary.
