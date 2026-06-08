@@ -282,24 +282,35 @@ async fn build_input_from_list(
     .fetch_all(pool)
     .await?;
 
-    let mut items = Vec::with_capacity(rows.len());
-    for (resolution_status, canonical_item_id, display_name, quantity) in rows {
-        // Only a fully resolved entry is priceable. Ambiguous/unresolved entries
-        // drop their canonical id so the optimiser surfaces them as unresolved.
-        let canonical_item_id = if resolution_status == "resolved" {
-            canonical_item_id
-        } else {
-            None
-        };
+    // Normalise each entry to its priceable canonical id up front. Only a fully
+    // resolved entry is priceable; ambiguous/unresolved entries drop their
+    // canonical id so the optimiser surfaces them as unresolved.
+    let entries: Vec<(Option<String>, String, i64)> = rows
+        .into_iter()
+        .map(|(status, canonical_item_id, display_name, quantity)| {
+            let canonical_item_id = (status == "resolved")
+                .then_some(canonical_item_id)
+                .flatten();
+            (canonical_item_id, display_name, quantity)
+        })
+        .collect();
 
+    // Bulk-load policies + constraints for every distinct resolved id in 1-2
+    // chunked IN(...) queries each, avoiding a per-entry N+1 round-trip.
+    let ids: Vec<&str> = entries
+        .iter()
+        .filter_map(|(id, _, _)| id.as_deref())
+        .collect();
+    let policies = canonical_item_policies(pool, &ids).await?;
+    let constraints_by_id = item_constraints_by_canonical_ids(pool, &ids).await?;
+
+    let mut items = Vec::with_capacity(entries.len());
+    for (canonical_item_id, display_name, quantity) in entries {
         let (policy, constraints) = match canonical_item_id.as_deref() {
-            Some(id) => {
-                let policy = db::canonical_item_policy(pool, id)
-                    .await?
-                    .unwrap_or(ConstraintPolicy::Any);
-                let constraints = db::item_constraints_by_canonical_id(pool, id).await?;
-                (policy, constraints)
-            }
+            Some(id) => (
+                policies.get(id).copied().unwrap_or(ConstraintPolicy::Any),
+                constraints_by_id.get(id).cloned(),
+            ),
             None => (ConstraintPolicy::Any, None),
         };
 
@@ -307,8 +318,10 @@ async fn build_input_from_list(
             // Display the stored entry text so the household recognises the line.
             display_text: display_name,
             canonical_item_id,
-            // `quantity` is a positive count in the schema; clamp defensively.
-            count: quantity.max(0) as u32,
+            // `quantity` is a positive count in the schema; clamp to at least 1
+            // (matching `apply_add_item`). A count of 0 would let a resolved item
+            // look fulfilled while contributing €0 — an incorrect optimisation.
+            count: quantity.max(1) as u32,
             constraint_policy: policy,
             constraints,
         });
@@ -321,6 +334,113 @@ async fn build_input_from_list(
     let mut input = OptimiserInput::new(household_id, current_run, items);
     input.threshold_2_cents = threshold_2_cents;
     Ok(input)
+}
+
+/// Bulk-load `default_constraint_policy` for every given canonical item id, keyed
+/// by id, in chunked `IN (...)` queries.
+///
+/// The map omits unknown ids; callers fall back to [`ConstraintPolicy::Any`] for a
+/// missing key, exactly as the single-row `db::canonical_item_policy` does.
+async fn canonical_item_policies(
+    pool: &sqlx::SqlitePool,
+    ids: &[&str],
+) -> Result<std::collections::HashMap<String, ConstraintPolicy>, DbError> {
+    let mut by_id = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(by_id);
+    }
+    for chunk in ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, default_constraint_policy FROM canonical_items WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, (String, ConstraintPolicy)>(&sql);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        for (id, policy) in query.fetch_all(pool).await? {
+            by_id.insert(id, policy);
+        }
+    }
+    Ok(by_id)
+}
+
+/// Bulk-load the Phase-0-enforced [`ItemConstraints`] for every given canonical
+/// item id, keyed by id, in chunked `IN (...)` queries.
+///
+/// Reads and parses exactly the columns `db::item_constraints_by_canonical_id`
+/// does (`brand`, `preferred_size_value`/`preferred_size_basis`,
+/// `substitution_policy`), so a `BasketItem` built from this map is byte-for-byte
+/// what the single-row helper would produce. Ids without a row are simply absent.
+async fn item_constraints_by_canonical_ids(
+    pool: &sqlx::SqlitePool,
+    ids: &[&str],
+) -> Result<std::collections::HashMap<String, buywise_core::domain::ItemConstraints>, DbError> {
+    use buywise_core::domain::{ItemConstraints, SizeBasis, SubstitutionPolicy};
+
+    // (canonical_item_id, id, brand, preferred_size_value, preferred_size_basis,
+    // substitution_policy, updated_at) — the keyed analogue of the single-row read.
+    type KeyedConstraintsRow = (
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        String,
+        String,
+    );
+
+    let mut by_id = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(by_id);
+    }
+    for chunk in ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT canonical_item_id, id, brand, preferred_size_value, preferred_size_basis, \
+                    substitution_policy, updated_at \
+             FROM item_constraints WHERE canonical_item_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, KeyedConstraintsRow>(&sql);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        for (canonical_item_id, id, brand, size_value, size_basis, sub_policy, updated_at) in
+            query.fetch_all(pool).await?
+        {
+            // Parse the enum TEXT columns leniently, matching the single-row helper:
+            // an unparseable size basis is treated as absent, an unparseable
+            // substitution policy falls back to the permissive default.
+            let preferred_size_basis = size_basis
+                .as_deref()
+                .and_then(|s| SizeBasis::from_db_str(s).ok());
+            let substitution_policy =
+                SubstitutionPolicy::from_db_str(&sub_policy).unwrap_or(SubstitutionPolicy::Any);
+
+            by_id.insert(
+                canonical_item_id.clone(),
+                ItemConstraints {
+                    id,
+                    canonical_item_id,
+                    brand,
+                    allowed_brands: None,
+                    excluded_brands: None,
+                    preferred_size_value: size_value,
+                    preferred_size_basis,
+                    min_size_value: None,
+                    min_size_basis: None,
+                    max_size_value: None,
+                    max_size_basis: None,
+                    pack_count: None,
+                    form_factor: None,
+                    dietary_flags: None,
+                    substitution_policy,
+                    updated_at,
+                },
+            );
+        }
+    }
+    Ok(by_id)
 }
 
 // ---------------------------------------------------------------------------
