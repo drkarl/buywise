@@ -197,6 +197,11 @@ pub struct PlanLine {
     pub item_index: usize,
     /// The item's display text (copied for convenience).
     pub display_text: String,
+    /// The resolved canonical item id this line prices. Always `Some` for a
+    /// priced line (an unpriced/unresolved item never produces a `PlanLine`), so
+    /// the UI can pair it with `retailer_product_id` to accept/reject the
+    /// underlying product match (P5-T1, `POST /api/match-feedback`).
+    pub canonical_item_id: Option<String>,
     /// The retailer this line is fulfilled at.
     pub retailer: Retailer,
     /// The chosen retailer product id.
@@ -540,6 +545,7 @@ fn plan_line(input: &OptimiserInput, cand: &Candidate) -> PlanLine {
     PlanLine {
         item_index: cand.item_index,
         display_text: item.display_text.clone(),
+        canonical_item_id: item.canonical_item_id.clone(),
         retailer: cand.retailer,
         retailer_product_id: cand.product.id.clone(),
         offer_id: cand.offer.id.clone(),
