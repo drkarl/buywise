@@ -130,12 +130,21 @@ async fn optimise_list(
 ) -> Result<Json<OptimiseResponse>, StatusCode> {
     let pool = &state.pool;
 
-    // A third-store threshold can never be easier to justify than a second:
-    // validate at the boundary (both cents), matching the CLI's guard.
-    if let (Some(t2), Some(t3)) = (body.convenience_threshold_2, body.convenience_threshold_3) {
-        if t3 < t2 {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
-        }
+    // Effective thresholds: request value, else household default. There is no
+    // household_settings table yet (P4-T2), so the defaults are the constants.
+    let threshold_2 = body
+        .convenience_threshold_2
+        .unwrap_or(DEFAULT_THRESHOLD_2_CENTS);
+    let threshold_3 = body
+        .convenience_threshold_3
+        .unwrap_or(DEFAULT_THRESHOLD_3_CENTS);
+
+    // A third-store threshold can never be easier to justify than a second.
+    // Validate the *effective* thresholds (post-default), not just the explicit
+    // pair: a default filling one side (e.g. `{convenience_threshold_3: 500}`
+    // with implicit threshold_2 = €10) must not bypass the ordering guard.
+    if threshold_3 < threshold_2 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // Look the list up first: a missing list is 404, an existing list the caller
@@ -151,15 +160,6 @@ async fn optimise_list(
     {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    // Effective thresholds: request value, else household default. There is no
-    // household_settings table yet (P4-T2), so the defaults are the constants.
-    let threshold_2 = body
-        .convenience_threshold_2
-        .unwrap_or(DEFAULT_THRESHOLD_2_CENTS);
-    let threshold_3 = body
-        .convenience_threshold_3
-        .unwrap_or(DEFAULT_THRESHOLD_3_CENTS);
 
     let input = build_input_from_list(pool, &household_id, &body.list_id, threshold_2)
         .await
