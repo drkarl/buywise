@@ -357,7 +357,7 @@ struct RecommendedView {
 /// store total (the comparison anchor), `recommended_cost_cents` = recommended
 /// plan total, `theoretical_minimum_cost_cents` = theoretical minimum total,
 /// `gross_saving_cents` = baseline − recommended. `chosen_basket_cost_cents` and
-/// `net_saving_cents` stay NULL until the user posts actual spend (P5-T4 / the
+/// `net_saving_cents` stay NULL until the user posts actual spend (the P5-T3
 /// `/actual-spend` endpoint).
 async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<(), DbError> {
     // Idempotency guard: never create a second row for the same list.
