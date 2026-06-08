@@ -352,6 +352,52 @@ async fn get_settings_requires_authentication() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `GET /api/settings` falls back to the documented €10 / €25 defaults when the
+/// household has no `household_settings` row (the defensive no-row branch).
+#[tokio::test]
+async fn get_settings_no_row_returns_defaults() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    // Remove the seeded settings row so the household has none.
+    sqlx::query("DELETE FROM household_settings WHERE household_id = ?1")
+        .bind(HOUSEHOLD)
+        .execute(&pool)
+        .await
+        .expect("delete settings row");
+
+    let resp = get_settings(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["convenience_threshold_2_cents"], 1000);
+    assert_eq!(body["convenience_threshold_3_cents"], 2500);
+}
+
+/// `PATCH /api/settings` without an `X-CSRF-Token` header is 403 (the extractor
+/// enforces CSRF on mutating verbs), even with a valid session cookie.
+#[tokio::test]
+async fn patch_settings_without_csrf_is_forbidden() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={}", session.session))
+                // Deliberately NO X-CSRF-Token header.
+                .body(Body::from(
+                    serde_json::json!({ "convenience_threshold_2_cents": 1500 }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 /// `PATCH /api/settings` updates both thresholds, returns the new values, and
 /// persists them (a follow-up `GET` reflects the change).
 #[tokio::test]
