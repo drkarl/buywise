@@ -208,10 +208,14 @@ async fn patch_settings(
     let threshold_2 = body.convenience_threshold_2_cents.unwrap_or(current_2);
     let threshold_3 = body.convenience_threshold_3_cents.unwrap_or(current_3);
 
-    // A third-store threshold can never be easier to justify than a second.
     // Validate the *effective* (post-merge) pair, not just the provided fields,
-    // so updating one side cannot leave the stored pair out of order.
-    if threshold_3 < threshold_2 {
+    // so updating one side cannot leave a negative or out-of-order value stored.
+    // Thresholds are cents, so they must be non-negative (a negative threshold
+    // would let an equally-complete, MORE-expensive split clear `saving >
+    // threshold` in the core), and a third-store threshold can never be easier to
+    // justify than a second. `threshold_2 >= 0` plus the ordering guard implies
+    // `threshold_3 >= 0`.
+    if threshold_2 < 0 || threshold_3 < threshold_2 {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
