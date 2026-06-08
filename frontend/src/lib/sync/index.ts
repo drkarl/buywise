@@ -136,6 +136,35 @@ async function runSync(listId: string, options: SyncOptions): Promise<void> {
 }
 
 /**
+ * Drains the pending queue for `listId` once and reports whether every local
+ * edit reached the server. Reuses {@link runSync} so the drain, the 4xx
+ * reconcile, and the catalogue/snapshot seed all run exactly as they do on the
+ * list view (the extra catalogue/snapshot refresh before pricing is harmless).
+ *
+ * Returns `{ synced }` where `synced` is true iff no `status==='pending'`
+ * mutation remains for the list after the drain. A leftover `pending` row means
+ * transport/offline left an edit unconfirmed, so a caller (e.g. the optimise
+ * view) should refuse to act on the server's still-stale list. `failed` (4xx)
+ * mutations do NOT block: `runSync` has already reconciled them to server truth,
+ * so the server list is authoritative for those entries.
+ *
+ * `SyncOptions` is reused so `fetchFn`/`sleep`/`onFailed` stay injectable in
+ * tests, matching {@link startSync}.
+ */
+export async function flushPendingMutations(
+  listId: string,
+  options: SyncOptions = {}
+): Promise<{ synced: boolean }> {
+  await runSync(listId, options);
+  const stillPending = await db.mutation_queue
+    .where('list_id')
+    .equals(listId)
+    .filter((m) => m.status === 'pending')
+    .count();
+  return { synced: stillPending === 0 };
+}
+
+/**
  * Starts the sync engine for `listId`: drains the queue, opens the SSE stream,
  * and re-drains whenever the browser reports it is back online. Safe to call in
  * `onMount`; call the returned `stop()` in the component teardown.
