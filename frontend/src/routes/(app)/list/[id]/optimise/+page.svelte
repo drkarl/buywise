@@ -19,7 +19,7 @@
 	import { page } from '$app/state';
 	import { jsonMutationHeaders } from '$lib/api/csrf';
 	import PlanCard from '$lib/components/PlanCard.svelte';
-	import type { OptimiseResponse } from '$lib/api/optimise';
+	import type { NoValidOfferReason, OptimiseResponse } from '$lib/api/optimise';
 
 	const listId = $derived(page.params.id ?? '');
 
@@ -29,13 +29,21 @@
 	let result = $state<OptimiseResponse | null>(null);
 	let errorMessage = $state('');
 
-	/** The single-store baseline total used for every card's "saving vs" line. */
+	/**
+	 * The single-store baseline total used for the OTHER cards' "saving vs" line.
+	 * The best-single card itself is passed `null` so it doesn't self-compare and
+	 * render a redundant "Same price as best single store" line.
+	 */
 	const bestSingleTotal = $derived(result?.best_single?.total_cents ?? null);
 
 	/**
 	 * POST the current list to the optimiser. On a non-OK response we surface a
 	 * visible error rather than failing silently; the message stays generic (status
 	 * code only) because the endpoint's error bodies aren't a stable contract.
+	 *
+	 * Guards against a stale response: if `listId` changes mid-request (the route
+	 * id navigated to another list while the POST was in flight), we drop the
+	 * resolved response instead of rendering it against the wrong list.
 	 */
 	async function runOptimise(id: string) {
 		status = 'loading';
@@ -46,14 +54,20 @@
 				headers: jsonMutationHeaders(),
 				body: JSON.stringify({ list_id: id })
 			});
+			// Ignore a response for a list we're no longer viewing.
+			if (id !== listId) return;
 			if (!res.ok) {
 				errorMessage = `Couldn’t optimise your basket (error ${res.status}). Please try again.`;
 				status = 'error';
 				return;
 			}
-			result = (await res.json()) as OptimiseResponse;
+			const body = (await res.json()) as OptimiseResponse;
+			// Re-check after the async body read in case the id changed meanwhile.
+			if (id !== listId) return;
+			result = body;
 			status = 'ready';
 		} catch {
+			if (id !== listId) return;
 			errorMessage = 'Couldn’t reach the server. Check your connection and try again.';
 			status = 'error';
 		}
@@ -70,8 +84,12 @@
 		if (listId) runOptimise(listId);
 	}
 
-	/** Reason copy for an item that resolved but yielded no usable offer. */
-	function reasonText(reason: string): string {
+	/**
+	 * Reason copy for an item that resolved but yielded no usable offer. Typed to
+	 * the `NoValidOfferReason` union so the switch stays exhaustive if reasons are
+	 * added; the `default` is a defensive fallback for an unknown wire value.
+	 */
+	function reasonText(reason: NoValidOfferReason): string {
 		switch (reason) {
 			case 'no_matches':
 				return 'no matching product found';
@@ -120,7 +138,7 @@
 				<PlanCard
 					plan={result.best_single}
 					title="Best single store"
-					bestSingleTotalCents={bestSingleTotal}
+					bestSingleTotalCents={null}
 				/>
 			{/if}
 			{#if result.best_two_store}
