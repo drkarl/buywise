@@ -502,6 +502,119 @@ async fn actual_spend_defaults_travel_to_zero() {
     assert_eq!(body["net_saving_cents"], BASELINE - 4800);
 }
 
+/// Overspend: when actual + travel exceeds the baseline, net_saving_cents is
+/// allowed to go negative and is stored as a negative figure (not clamped).
+#[tokio::test]
+async fn actual_spend_overspend_stores_negative_net() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_list(&pool, "list-1").await;
+    seed_run(
+        &pool,
+        "run-1",
+        "list-1",
+        "2026-06-01T10:00:00Z",
+        Some(BASELINE),
+        Some(THEORETICAL),
+        Some(RECOMMENDED),
+    )
+    .await;
+    patch_list(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({ "status": "archived" }),
+    )
+    .await;
+
+    // Spend more than the baseline so the household overspent.
+    let actual = BASELINE + 700;
+    let travel = 200;
+    let resp = post_actual_spend(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({ "actual_spend_cents": actual, "travel_cost_cents": travel }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let expected_net = BASELINE - actual - travel;
+    assert!(expected_net < 0, "this fixture must model an overspend");
+    let body = json_body(resp).await;
+    assert_eq!(body["net_saving_cents"], expected_net);
+
+    // The negative net is persisted, not clamped.
+    let rows = savings_rows(&pool, "list-1").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].7, Some(expected_net));
+}
+
+/// Double-post: a second actual-spend POST overwrites the same row in place
+/// (no duplicate, figures reflect the latest submission).
+#[tokio::test]
+async fn actual_spend_double_post_updates_same_row() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_list(&pool, "list-1").await;
+    seed_run(
+        &pool,
+        "run-1",
+        "list-1",
+        "2026-06-01T10:00:00Z",
+        Some(BASELINE),
+        Some(THEORETICAL),
+        Some(RECOMMENDED),
+    )
+    .await;
+    patch_list(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({ "status": "archived" }),
+    )
+    .await;
+
+    // First submission.
+    let first = post_actual_spend(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({ "actual_spend_cents": 4500, "travel_cost_cents": 300 }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_id = json_body(first).await["id"].as_str().unwrap().to_string();
+
+    // Correction: re-post with different figures.
+    let second_actual = 4100;
+    let second_travel = 150;
+    let second = post_actual_spend(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({
+            "actual_spend_cents": second_actual,
+            "travel_cost_cents": second_travel,
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = json_body(second).await;
+    // Same row (same id), figures now reflect the second submission.
+    assert_eq!(second_body["id"].as_str().unwrap(), first_id);
+    let expected_net = BASELINE - second_actual - second_travel;
+    assert_eq!(second_body["chosen_basket_cost_cents"], second_actual);
+    assert_eq!(second_body["travel_cost_cents"], second_travel);
+    assert_eq!(second_body["net_saving_cents"], expected_net);
+
+    // Still exactly one row, carrying the latest figures.
+    let rows = savings_rows(&pool, "list-1").await;
+    assert_eq!(rows.len(), 1, "double-post must not duplicate the row");
+    assert_eq!(rows[0].5, Some(second_actual));
+    assert_eq!(rows[0].6, Some(second_travel));
+    assert_eq!(rows[0].7, Some(expected_net));
+}
+
 /// Edge: re-archive (archive → reactivate → archive) creates only ONE row.
 #[tokio::test]
 async fn re_archive_is_idempotent() {
