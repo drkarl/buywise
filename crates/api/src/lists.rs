@@ -358,7 +358,10 @@ struct RecommendedView {
 /// plan total, `theoretical_minimum_cost_cents` = theoretical minimum total,
 /// `gross_saving_cents` = baseline − recommended. `chosen_basket_cost_cents` and
 /// `net_saving_cents` stay NULL until the user posts actual spend (the P5-T3
-/// `/actual-spend` endpoint).
+/// `/actual-spend` endpoint). `chosen_plan`/`chosen_stores` describe what the
+/// household ACTUALLY shopped (post-shop, paired with `chosen_basket_cost_cents`
+/// per docs/design.md §savings); archive does not know that yet, so they stay
+/// NULL here. The recommendation linkage is preserved via `recommendation_run_id`.
 async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<(), DbError> {
     // Idempotency guard: never create a second row for the same list.
     let existing: Option<i64> =
@@ -371,14 +374,14 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
     }
 
     // Latest run for the list, if any. "No run" => silent no-op.
-    let run: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT id, plans_json, recommended_plan FROM recommendation_runs \
+    let run: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, plans_json FROM recommendation_runs \
          WHERE list_id = ?1 ORDER BY run_at DESC LIMIT 1",
     )
     .bind(list_id)
     .fetch_optional(pool)
     .await?;
-    let Some((run_id, plans_json, recommended_plan)) = run else {
+    let Some((run_id, plans_json)) = run else {
         return Ok(());
     };
 
@@ -414,7 +417,7 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
               theoretical_minimum_cost_cents, chosen_basket_cost_cents, chosen_plan, \
               chosen_stores, gross_saving_cents, accepted_savings_cents, rejected_savings_cents, \
               travel_cost_cents, subscription_cost_alloc_cents, net_saving_cents, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8, NULL, NULL, NULL, NULL, NULL, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL, NULL, NULL, NULL, NULL, ?8)",
     )
     .bind(&id)
     .bind(list_id)
@@ -422,8 +425,6 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
     .bind(baseline_cost_cents)
     .bind(recommended_cost_cents)
     .bind(theoretical_minimum_cost_cents)
-    // chosen_plan records which plan the recommendation chose, from the run.
-    .bind(&recommended_plan)
     .bind(gross_saving_cents)
     .bind(&created_at)
     .execute(pool)
