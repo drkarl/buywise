@@ -119,7 +119,8 @@ async fn record_actual_spend(
     // The savings_events row must already exist (created on archive). Read the
     // baseline so the net saving can be computed; a missing row is a clean 404.
     let row: Option<(String, Cents)> = sqlx::query_as(
-        "SELECT id, baseline_cost_cents FROM savings_events WHERE list_id = ?1 LIMIT 1",
+        "SELECT id, baseline_cost_cents FROM savings_events WHERE list_id = ?1 \
+         ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
