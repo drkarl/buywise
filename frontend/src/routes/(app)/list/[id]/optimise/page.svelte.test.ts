@@ -106,6 +106,24 @@ describe('optimise page', () => {
 		expect(JSON.parse(init?.body as string)).toEqual({ list_id: 'list-42' });
 	});
 
+	it('carries the CSRF header on the POST when a token cookie is present', async () => {
+		// The backend rejects mutating calls without X-CSRF-Token; the page builds
+		// headers via jsonMutationHeaders(), which reads the `csrf` cookie.
+		document.cookie = 'csrf=tok-abc123';
+		try {
+			const fetchMock = stubOptimise(fullResponse());
+			render(Page);
+
+			await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+			const [, init] = fetchMock.mock.calls[0];
+			const headers = init?.headers as Record<string, string>;
+			expect(headers['X-CSRF-Token']).toBe('tok-abc123');
+		} finally {
+			// Don't leak the cookie into other tests.
+			document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+		}
+	});
+
 	it('shows a loading state before results arrive', () => {
 		// Never-resolving fetch keeps the page in its loading state.
 		vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
@@ -164,5 +182,20 @@ describe('optimise page', () => {
 		stubOptimise(empty);
 		render(Page);
 		await screen.findByText(/no plans to show/i);
+	});
+
+	it('suppresses the saving line on other plans when best_single is null', async () => {
+		// No single-store baseline exists, so no card can show a "saving vs best
+		// single store" line — there is nothing to compare against.
+		const noBaseline = fullResponse();
+		noBaseline.best_single = null;
+		stubOptimise(noBaseline);
+		render(Page);
+
+		// The two-store and recommended plans still render…
+		await screen.findByText('Cheapest two-store split');
+		// …but with no baseline, no saving/comparison line appears anywhere.
+		expect(screen.queryByText(/best single store/i)).toBeNull();
+		expect(screen.queryByText(/Saves/)).toBeNull();
 	});
 });
