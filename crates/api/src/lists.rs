@@ -37,6 +37,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use buywise_core::db::{self, DbError};
+use buywise_core::domain::Cents;
+
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
 
@@ -272,7 +275,10 @@ pub struct StoreCategoryOrderView {
 ///
 /// A DB error is propagated so callers fail closed (500) rather than treating a
 /// transient failure as "not a member".
-async fn is_member(
+///
+/// `pub(crate)` so sibling modules (e.g. [`crate::savings`]) reuse the exact same
+/// membership check rather than re-implementing it.
+pub(crate) async fn is_member(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     household_id: &str,
@@ -289,11 +295,141 @@ async fn is_member(
 
 /// Map a DB error to a logged 500. Used by every handler so a transient failure
 /// never fails open.
-fn db_error(context: &'static str) -> impl Fn(sqlx::Error) -> StatusCode {
+///
+/// Generic over the error type so it covers both the raw `sqlx::Error` returned
+/// by the list queries and the [`DbError`] surfaced by [`record_savings_event`].
+fn db_error<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> StatusCode {
     move |e| {
         tracing::error!(error = %e, context, "lists: database error");
         StatusCode::INTERNAL_SERVER_ERROR
     }
+}
+
+// ---------------------------------------------------------------------------
+// savings_events recording on archive (P5-T3)
+// ---------------------------------------------------------------------------
+
+/// The subset of `recommendation_runs.plans_json` (written by
+/// `optimise::persist_run`) that the savings ledger needs. Only `total_cents` is
+/// read off each plan, so the other plan fields are deliberately ignored via
+/// `#[serde(default)]` + a minimal [`PlanTotal`] shape — this stays decoupled
+/// from the full optimiser `StorePlan`/`Recommendation` types and tolerant of
+/// extra keys, so a forward-compatible plan schema change does not break reads.
+#[derive(Debug, Deserialize)]
+struct PlansJsonView {
+    #[serde(default)]
+    best_single: Option<PlanTotal>,
+    #[serde(default)]
+    theoretical_minimum: Option<PlanTotal>,
+    #[serde(default)]
+    recommended: Option<RecommendedView>,
+}
+
+/// A plan reduced to its `total_cents` (the only figure the ledger needs).
+#[derive(Debug, Deserialize)]
+struct PlanTotal {
+    total_cents: Cents,
+}
+
+/// The recommended plan as stored: a `kind` plus a nested `plan` carrying the
+/// total. Mirrors `optimiser::Recommendation`'s serialised shape.
+#[derive(Debug, Deserialize)]
+struct RecommendedView {
+    plan: PlanTotal,
+}
+
+/// Record a `savings_events` row for a just-archived list, IF a usable
+/// recommendation run exists. Returns `Ok(())` in every non-error case.
+///
+/// Design decisions (issue #34 / P5-T3):
+///   * **Which run?** The LATEST run for the list (`ORDER BY run_at DESC LIMIT 1`).
+///   * **No run / no usable plan?** Silent no-op (not an error). The four NOT-NULL
+///     cost columns (`baseline`, `recommended`, `theoretical_minimum`,
+///     `gross_saving`) require a run whose `plans_json` carries `best_single`,
+///     `recommended`, and `theoretical_minimum`. A run with any of these missing
+///     (e.g. nothing priceable, `recommended_plan = 'none'`) cannot produce a
+///     complete row, so we skip rather than insert a zeroed/partial one.
+///   * **Idempotency / re-archive.** A list can be archived → reactivated →
+///     archived again. We insert only if no `savings_events` row already exists
+///     for the list, so re-archiving never duplicates the row (and never errors).
+///
+/// Cost mapping (docs/design.md §savings): `baseline_cost_cents` = best single
+/// store total (the comparison anchor), `recommended_cost_cents` = recommended
+/// plan total, `theoretical_minimum_cost_cents` = theoretical minimum total,
+/// `gross_saving_cents` = baseline − recommended. `chosen_basket_cost_cents` and
+/// `net_saving_cents` stay NULL until the user posts actual spend (P5-T4 / the
+/// `/actual-spend` endpoint).
+async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<(), DbError> {
+    // Idempotency guard: never create a second row for the same list.
+    let existing: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM savings_events WHERE list_id = ?1 LIMIT 1")
+            .bind(list_id)
+            .fetch_optional(pool)
+            .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    // Latest run for the list, if any. "No run" => silent no-op.
+    let run: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT id, plans_json, recommended_plan FROM recommendation_runs \
+         WHERE list_id = ?1 ORDER BY run_at DESC LIMIT 1",
+    )
+    .bind(list_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((run_id, plans_json, recommended_plan)) = run else {
+        return Ok(());
+    };
+
+    // A malformed plans_json is a genuine error (our own writer produced it), so
+    // surface it as a 500 via DbError rather than silently skipping.
+    let plans: PlansJsonView = serde_json::from_str(&plans_json).map_err(|e| {
+        DbError::from(sqlx::Error::Protocol(format!(
+            "deserialise plans_json for run {run_id}: {e}"
+        )))
+    })?;
+
+    // All three NOT-NULL cost figures must be present; otherwise the run is not
+    // usable for a complete savings row — skip silently.
+    let (Some(best_single), Some(theoretical_minimum), Some(recommended)) = (
+        plans.best_single,
+        plans.theoretical_minimum,
+        plans.recommended,
+    ) else {
+        return Ok(());
+    };
+
+    let baseline_cost_cents = best_single.total_cents;
+    let recommended_cost_cents = recommended.plan.total_cents;
+    let theoretical_minimum_cost_cents = theoretical_minimum.total_cents;
+    let gross_saving_cents = baseline_cost_cents - recommended_cost_cents;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = db::now_iso();
+
+    sqlx::query(
+        "INSERT INTO savings_events \
+             (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
+              theoretical_minimum_cost_cents, chosen_basket_cost_cents, chosen_plan, \
+              chosen_stores, gross_saving_cents, accepted_savings_cents, rejected_savings_cents, \
+              travel_cost_cents, subscription_cost_alloc_cents, net_saving_cents, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8, NULL, NULL, NULL, NULL, NULL, ?9)",
+    )
+    .bind(&id)
+    .bind(list_id)
+    .bind(&run_id)
+    .bind(baseline_cost_cents)
+    .bind(recommended_cost_cents)
+    .bind(theoretical_minimum_cost_cents)
+    // chosen_plan records which plan the recommendation chose, from the run.
+    .bind(&recommended_plan)
+    .bind(gross_saving_cents)
+    .bind(&created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +717,15 @@ async fn patch_list(
             .execute(&state.pool)
             .await
             .map_err(db_error("patch_list.archive"))?;
+
+            // P5-T3: record a savings_events row for this archive, IF the list has
+            // a usable recommendation run. "No run" / "no usable plan" / "row
+            // already exists" are silent no-ops (not errors); only a genuine DB
+            // failure is surfaced as 500. Done after the status flip commits so a
+            // savings bookkeeping failure never loses the archive's primary effect.
+            record_savings_event(&state.pool, &id)
+                .await
+                .map_err(db_error("patch_list.savings_event"))?;
         }
         Some("active") => {
             sqlx::query(
