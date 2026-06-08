@@ -12,7 +12,8 @@
 //!   * the SSE stream (`/api/sse/:list_id`) — checked for a `200 text/event-stream`
 //!     handshake only (the body never completes, so the request is dropped after
 //!     the headers arrive);
-//!   * the Phase-4 optimise stub (`/api/optimise` → `501 Not Implemented`);
+//!   * the optimise route is mounted behind auth (`/api/optimise` → `401` when
+//!     unauthenticated; full behaviour in `tests/optimise_endpoint.rs`);
 //!   * the static SPA fallback: `GET /` 404s with no `frontend/build`, and serves
 //!     the SPA shell (`200`) when a build directory exists.
 //!
@@ -301,9 +302,13 @@ async fn authenticated_routes_respond_with_expected_status() {
     );
 }
 
-/// The Phase-4 optimise route is wired as a 501 stub.
+/// The optimise route (P4-T1) is wired behind the `AuthenticatedUser` extractor,
+/// so an unauthenticated POST is rejected with `401 Unauthorized` (it no longer
+/// returns the Phase-1 `501` stub). The full behaviour is covered by
+/// `tests/optimise_endpoint.rs`; this only asserts the route is mounted and
+/// guarded, not bypassable as an anonymous endpoint.
 #[tokio::test]
-async fn optimise_stub_returns_not_implemented() {
+async fn optimise_route_requires_authentication() {
     let pool = setup_pool().await;
     let addr = spawn_app(app(AppState::new(pool))).await;
     let base = format!("http://{addr}");
@@ -311,14 +316,14 @@ async fn optimise_stub_returns_not_implemented() {
 
     let resp = client
         .post(format!("{base}/api/optimise"))
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "list_id": "whatever" }))
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        "POST /api/optimise stub"
+        reqwest::StatusCode::UNAUTHORIZED,
+        "POST /api/optimise without a session"
     );
 }
 
