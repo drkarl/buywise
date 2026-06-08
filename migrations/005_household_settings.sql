@@ -29,13 +29,21 @@ CREATE TABLE household_settings (
     household_id                  TEXT PRIMARY KEY REFERENCES households(id),
     convenience_threshold_2_cents INTEGER NOT NULL DEFAULT 1000,   -- €10.00
     convenience_threshold_3_cents INTEGER NOT NULL DEFAULT 2500,   -- €25.00
-    updated_at                    TEXT NOT NULL
+    updated_at                    TEXT NOT NULL,
+    -- A third-store threshold can never be easier to justify than a second, so a
+    -- stored pair must be ordered. Enforced at the schema level (not just in the
+    -- API handlers) so an out-of-band write cannot persist an invalid pair that
+    -- would make /api/optimise and /api/settings 422 for that household until
+    -- repaired. Mirrors the 422 guard in settings.rs / optimise.rs.
+    CHECK (convenience_threshold_3_cents >= convenience_threshold_2_cents)
 );
 
--- Back-fill a default settings row for every existing household. INSERT OR
--- IGNORE keeps re-application idempotent and skips any household that already
--- has a row. A fixed ISO-8601 literal is used (migrations must be deterministic,
--- not depend on wall-clock time); the column defaults supply the threshold cents.
+-- Back-fill a default settings row for every existing household. A fixed
+-- ISO-8601 literal is used (migrations must be deterministic, not depend on
+-- wall-clock time); the SELECT supplies the documented €10 / €25 defaults.
+-- (sqlx's _sqlx_migrations versioning never re-runs an applied migration, so
+-- this INSERT executes exactly once per database; INSERT OR IGNORE is belt-and-
+-- braces against a household that somehow already carries a settings row.)
 INSERT OR IGNORE INTO household_settings
     (household_id, convenience_threshold_2_cents, convenience_threshold_3_cents, updated_at)
 SELECT id, 1000, 2500, '2025-01-01T00:00:00Z'
