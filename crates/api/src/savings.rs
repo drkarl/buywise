@@ -1,8 +1,10 @@
-//! Savings-ledger routes for the BuyWise API (P5-T3, issue #34).
+//! Savings-ledger routes for the BuyWise API (P5-T3 #34, P5-T4 #35).
 //!
-//! One endpoint today: `POST /api/list/{id}/actual-spend`, which records the
+//! Two endpoints: `POST /api/list/{id}/actual-spend`, which records the
 //! household's actual post-shop spend against the list's `savings_events` row and
-//! computes the realised `net_saving_cents`.
+//! computes the realised `net_saving_cents`; and `GET /api/savings/summary`,
+//! which aggregates `savings_events` into the household's savings-dashboard data
+//! (monthly totals, a cumulative net figure, and per-list outcomes).
 //!
 //! The `savings_events` row itself is created when the list is archived (see
 //! `lists::record_savings_event`); this endpoint only *updates* an existing row.
@@ -21,7 +23,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +35,13 @@ use crate::AppState;
 
 /// Build the savings routes as a `Router<AppState>`, merged by [`crate::app`].
 ///
-/// The path is absolute (`/api/list/{id}/actual-spend`) so it merges alongside
-/// the other `/api/list/{id}` shapes in `lists::router` rather than nesting.
+/// Both paths are absolute so they merge alongside the other `/api/...` shapes
+/// rather than nesting: `/api/list/{id}/actual-spend` (record post-shop spend,
+/// P5-T3) and `/api/savings/summary` (the household savings dashboard, P5-T4).
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/list/{id}/actual-spend", post(record_actual_spend))
+    Router::new()
+        .route("/api/list/{id}/actual-spend", post(record_actual_spend))
+        .route("/api/savings/summary", get(savings_summary))
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +156,186 @@ async fn record_actual_spend(
         chosen_basket_cost_cents: body.actual_spend_cents,
         travel_cost_cents: body.travel_cost_cents,
         net_saving_cents,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/savings/summary (P5-T4)
+// ---------------------------------------------------------------------------
+
+/// One calendar month's aggregate savings, derived from `savings_events`.
+///
+/// `month` is `"YYYY-MM"` (UTC, off `created_at`). `gross_cents` is the sum of
+/// the always-present `gross_saving_cents`. `accepted_cents` and `net_cents` sum
+/// `accepted_savings_cents` / `net_saving_cents` treating NULL as 0 — those are
+/// only populated once the household enters their actual post-shop spend, so a
+/// month of un-reconciled lists shows €0 net (not a skewed total). `lists` is the
+/// count of savings events (= archived lists with a saving) in the month.
+#[derive(Debug, Serialize)]
+pub struct MonthlySummary {
+    /// Calendar month as `"YYYY-MM"`.
+    pub month: String,
+    /// Sum of `gross_saving_cents` (always present) for the month.
+    pub gross_cents: Cents,
+    /// Sum of `accepted_savings_cents` (NULL treated as 0) for the month.
+    pub accepted_cents: Cents,
+    /// Sum of `net_saving_cents` (NULL treated as 0) for the month.
+    pub net_cents: Cents,
+    /// Number of savings events (archived lists with a saving) in the month.
+    pub lists: i64,
+}
+
+/// One archived list's savings outcome, for the dashboard's per-list table.
+///
+/// `chosen_basket_cost_cents`/`net_saving_cents` are NULL until the household
+/// posts their actual spend; the UI uses a null `chosen_basket_cost_cents` to
+/// show the "Enter actual spend" prompt (AC3). Ordered newest-first.
+#[derive(Debug, Serialize)]
+pub struct ListOutcome {
+    /// `savings_events.id`.
+    pub id: String,
+    /// The owning list's id (for the actual-spend link).
+    pub list_id: String,
+    /// The list's display name.
+    pub list_name: String,
+    /// `savings_events.created_at` (ISO-8601 UTC) — when the list was archived.
+    pub created_at: String,
+    /// Always-present gross saving for the list.
+    pub gross_saving_cents: Cents,
+    /// Actual basket cost the household paid, NULL until actual-spend is posted.
+    pub chosen_basket_cost_cents: Option<Cents>,
+    /// Realised net saving, NULL until actual-spend is posted.
+    pub net_saving_cents: Option<Cents>,
+}
+
+/// Response for `GET /api/savings/summary`.
+///
+/// `monthly` and `cumulative_net_cents` are the issue's authoritative contract;
+/// `lists` is an additive per-list breakdown the dashboard renders as a table.
+/// Per the acceptance criteria, `cumulative_net_cents` is the SUM of
+/// `net_saving_cents` over the non-null rows only (un-reconciled lists don't
+/// count toward the cumulative figure).
+#[derive(Debug, Serialize)]
+pub struct SavingsSummaryResponse {
+    /// Per-month aggregates, ordered chronologically (oldest first).
+    pub monthly: Vec<MonthlySummary>,
+    /// Sum of `net_saving_cents` across all non-null rows.
+    pub cumulative_net_cents: Cents,
+    /// Per-archived-list outcomes, newest first.
+    pub lists: Vec<ListOutcome>,
+}
+
+/// `GET /api/savings/summary` — the authenticated household's savings dashboard
+/// data: monthly aggregates, a cumulative net figure, and per-list outcomes.
+///
+/// Scoping: every figure is restricted to lists in households the caller belongs
+/// to (`savings_events` → `shopping_lists.household_id` → `household_members`),
+/// so one household never sees another's savings. 401 without a session (the
+/// extractor); 500 (logged) on a database error. A household with no archived
+/// lists yields empty `monthly`/`lists` and a `0` cumulative — never an error.
+async fn savings_summary(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+) -> Result<Json<SavingsSummaryResponse>, StatusCode> {
+    // Per-month aggregates. NULL accepted/net are coalesced to 0 so an
+    // un-reconciled month reads as €0 net rather than skewing the total; gross is
+    // NOT NULL in the schema. strftime works on the ISO-8601 text `created_at`.
+    let monthly = sqlx::query_as::<_, (String, Cents, Cents, Cents, i64)>(
+        "SELECT strftime('%Y-%m', se.created_at)        AS month, \
+                SUM(se.gross_saving_cents)              AS gross_cents, \
+                SUM(COALESCE(se.accepted_savings_cents, 0)) AS accepted_cents, \
+                SUM(COALESCE(se.net_saving_cents, 0))   AS net_cents, \
+                COUNT(*)                                AS lists \
+         FROM savings_events se \
+         JOIN shopping_lists sl ON sl.id = se.list_id \
+         WHERE sl.household_id IN \
+               (SELECT household_id FROM household_members WHERE user_id = ?1) \
+         GROUP BY month \
+         ORDER BY month",
+    )
+    .bind(&user.user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(db_error("savings_summary.monthly"))?
+    .into_iter()
+    .map(
+        |(month, gross_cents, accepted_cents, net_cents, lists)| MonthlySummary {
+            month,
+            gross_cents,
+            accepted_cents,
+            net_cents,
+            lists,
+        },
+    )
+    .collect();
+
+    // Cumulative net: sum of net_saving_cents over NON-NULL rows only (AC2). A
+    // pure SUM already ignores NULLs; COALESCE wraps the all-NULL case to 0.
+    let cumulative_net_cents: Cents = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(se.net_saving_cents), 0) \
+         FROM savings_events se \
+         JOIN shopping_lists sl ON sl.id = se.list_id \
+         WHERE sl.household_id IN \
+               (SELECT household_id FROM household_members WHERE user_id = ?1)",
+    )
+    .bind(&user.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(db_error("savings_summary.cumulative"))?;
+
+    // Per-list outcomes, newest first, for the dashboard table.
+    let lists = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Cents,
+            Option<Cents>,
+            Option<Cents>,
+        ),
+    >(
+        "SELECT se.id, se.list_id, sl.name, se.created_at, se.gross_saving_cents, \
+                se.chosen_basket_cost_cents, se.net_saving_cents \
+         FROM savings_events se \
+         JOIN shopping_lists sl ON sl.id = se.list_id \
+         WHERE sl.household_id IN \
+               (SELECT household_id FROM household_members WHERE user_id = ?1) \
+         ORDER BY se.created_at DESC, se.id DESC",
+    )
+    .bind(&user.user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(db_error("savings_summary.lists"))?
+    .into_iter()
+    .map(
+        |(
+            id,
+            list_id,
+            list_name,
+            created_at,
+            gross_saving_cents,
+            chosen_basket_cost_cents,
+            net_saving_cents,
+        )| {
+            ListOutcome {
+                id,
+                list_id,
+                list_name,
+                created_at,
+                gross_saving_cents,
+                chosen_basket_cost_cents,
+                net_saving_cents,
+            }
+        },
+    )
+    .collect();
+
+    Ok(Json(SavingsSummaryResponse {
+        monthly,
+        cumulative_net_cents,
+        lists,
     }))
 }
 
