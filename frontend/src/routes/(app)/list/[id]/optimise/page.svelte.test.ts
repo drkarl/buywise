@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/svelte';
+import { db } from '$lib/db/dexie';
 import type { OptimiseResponse } from '$lib/api/optimise';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
@@ -90,18 +91,35 @@ function stubOptimise(response: OptimiseResponse, status = 200) {
 	return fetchMock;
 }
 
+// The page now flushes the pending mutation queue before pricing, which reads
+// Dexie. Reset the fake-indexeddb between tests so a seeded `pending` mutation
+// from one test can't leak into another (mirrors SyncQueue.test.ts).
+beforeEach(async () => {
+	await db.delete();
+	await db.open();
+});
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
 });
 
 describe('optimise page', () => {
+	/** The init of the first `POST /api/optimise` call recorded by the mock. */
+	function optimiseCallInit(fetchMock: ReturnType<typeof stubOptimise>): RequestInit | undefined {
+		const call = fetchMock.mock.calls.find(([input]) =>
+			(typeof input === 'string' ? input : input.toString()).includes('/api/optimise')
+		);
+		return call?.[1];
+	}
+
 	it('POSTs to /api/optimise on mount with the list id', async () => {
 		const fetchMock = stubOptimise(fullResponse());
 		render(Page);
 
-		await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-		const [, init] = fetchMock.mock.calls[0];
+		// With an empty queue the flush is a no-op, so the optimise POST fires.
+		await waitFor(() => expect(optimiseCallInit(fetchMock)).toBeDefined());
+		const init = optimiseCallInit(fetchMock);
 		expect(init?.method).toBe('POST');
 		expect(JSON.parse(init?.body as string)).toEqual({ list_id: 'list-42' });
 	});
@@ -114,9 +132,8 @@ describe('optimise page', () => {
 			const fetchMock = stubOptimise(fullResponse());
 			render(Page);
 
-			await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-			const [, init] = fetchMock.mock.calls[0];
-			const headers = init?.headers as Record<string, string>;
+			await waitFor(() => expect(optimiseCallInit(fetchMock)).toBeDefined());
+			const headers = optimiseCallInit(fetchMock)?.headers as Record<string, string>;
 			expect(headers['X-CSRF-Token']).toBe('tok-abc123');
 		} finally {
 			// Don't leak the cookie into other tests.
@@ -197,5 +214,103 @@ describe('optimise page', () => {
 		// …but with no baseline, no saving/comparison line appears anywhere.
 		expect(screen.queryByText(/best single store/i)).toBeNull();
 		expect(screen.queryByText(/Saves/)).toBeNull();
+	});
+
+	/** Seeds one `pending` mutation for list-42, mimicking an offline-first edit. */
+	async function seedPendingMutation() {
+		await db.mutation_queue.add({
+			client_mutation_id: 'cmid-pending-1',
+			device_id: 'dev-1',
+			list_id: 'list-42',
+			entity_type: 'list_entry',
+			entity_id: 'entry-1',
+			operation_type: 'add_item',
+			payload: {},
+			base_revision: 0,
+			created_at_client: '2026-06-07T00:00:00.000Z',
+			status: 'pending',
+			retry_count: 0
+		});
+	}
+
+	it('flushes pending edits before optimising and prices once they confirm', async () => {
+		await seedPendingMutation();
+
+		// Record call order so we can assert the drain ran before pricing.
+		const seen: string[] = [];
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/mutations')) {
+				seen.push('mutations');
+				const sent = JSON.parse(String(init?.body));
+				return new Response(
+					JSON.stringify({
+						client_mutation_id: sent.client_mutation_id,
+						status: 'accepted',
+						server_revision: 1,
+						entity: {
+							id: sent.entity_id,
+							list_id: 'list-42',
+							canonical_item_id: null,
+							resolution_status: 'unresolved',
+							raw_text: 'Milk',
+							display_name: 'Milk',
+							quantity: 1,
+							status: 'active',
+							bought_by: null,
+							bought_at: null,
+							category_id: null,
+							last_updated_revision: 1,
+							updated_at: '2026-06-07T00:01:00.000Z'
+						}
+					}),
+					{ status: 200 }
+				);
+			}
+			if (url.includes('/api/optimise')) {
+				seen.push('optimise');
+				return new Response(JSON.stringify(fullResponse()), { status: 200 });
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		render(Page);
+
+		// The plan renders, proving the pending edit was confirmed first.
+		await screen.findByText(/Splitting between Tesco and Aldi/);
+		// And the drain POST preceded the optimise POST.
+		expect(seen.indexOf('mutations')).toBeGreaterThanOrEqual(0);
+		expect(seen.indexOf('mutations')).toBeLessThan(seen.indexOf('optimise'));
+	});
+
+	it('blocks optimising when a pending edit cannot be confirmed (offline)', async () => {
+		await seedPendingMutation();
+
+		// The mutation POST keeps throwing (transport error → stays `pending`); the
+		// optimise endpoint must never be reached.
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/mutations')) {
+				throw new TypeError('Failed to fetch'); // offline
+			}
+			if (url.includes('/api/optimise')) {
+				return new Response(JSON.stringify(fullResponse()), { status: 200 });
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		render(Page);
+
+		// The page surfaces the unsynced-edits error… The drain exhausts its
+		// transport retries (MAX_RETRIES with 500/1000/2000ms backoff) before
+		// reporting `synced: false`, so allow a generous timeout for the real
+		// backoff to elapse (the page doesn't expose `sleep` for injection).
+		const alert = await screen.findByRole('alert', {}, { timeout: 6000 });
+		expect(alert.textContent).toMatch(/haven’t been saved to the server/i);
+		// …and never asked the optimiser to price the stale list.
+		const optimiseCalls = fetchMock.mock.calls.filter(([input]) =>
+			(typeof input === 'string' ? input : input.toString()).includes('/api/optimise')
+		);
+		expect(optimiseCalls).toHaveLength(0);
 	});
 });

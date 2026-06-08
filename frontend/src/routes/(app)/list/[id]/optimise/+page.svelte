@@ -1,9 +1,14 @@
 <script lang="ts">
 	// Basket optimisation view (P4-T3). Unlike the offline-first list/shopping
 	// views, this page is intrinsically online: it asks the server to cost the
-	// resolved basket across retailers. On mount it fires the CSRF-protected
-	// `POST /api/optimise` for the current list, shows a loading state while the
-	// server computes, then renders the returned plans.
+	// resolved basket across retailers. On mount it first flushes any pending
+	// local edits to the server (list edits are offline-first and only ENQUEUE
+	// locally — see lib/stores/list.ts + lib/sync), because navigating here can
+	// outrun the list view's enqueue-driven drain and we must not price a stale
+	// server list. If the flush can't confirm every edit (offline) we surface an
+	// error and skip pricing. Only once synced does it fire the CSRF-protected
+	// `POST /api/optimise`, show a loading state while the server computes, then
+	// render the returned plans.
 	//
 	// SSR/prerender are disabled globally in `src/routes/+layout.ts`, so this
 	// dynamic `[id]` route needs no per-route override; the on-mount fetch only
@@ -18,6 +23,7 @@
 
 	import { page } from '$app/state';
 	import { jsonMutationHeaders } from '$lib/api/csrf';
+	import { flushPendingMutations } from '$lib/sync';
 	import PlanCard from '$lib/components/PlanCard.svelte';
 	import type { NoValidOfferReason, OptimiseResponse } from '$lib/api/optimise';
 
@@ -44,11 +50,27 @@
 	 * Guards against a stale response: if `listId` changes mid-request (the route
 	 * id navigated to another list while the POST was in flight), we drop the
 	 * resolved response instead of rendering it against the wrong list.
+	 *
+	 * Pre-flush: list edits are enqueued locally and synced asynchronously, so we
+	 * flush the pending queue first and refuse to price unless every edit reached
+	 * the server (`synced`). An unconfirmed edit (offline) means the server list
+	 * is still stale; we error out rather than show a plan that omits it. `retry()`
+	 * re-runs this, so reconnect → retry covers recovery.
 	 */
 	async function runOptimise(id: string) {
 		status = 'loading';
 		errorMessage = '';
 		try {
+			const { synced } = await flushPendingMutations(id);
+			// Ignore a flush for a list we're no longer viewing.
+			if (id !== listId) return;
+			if (!synced) {
+				errorMessage =
+					'Some changes haven’t been saved to the server yet. Reconnect and try again so your plan covers your whole list.';
+				status = 'error';
+				return;
+			}
+
 			const res = await fetch('/api/optimise', {
 				method: 'POST',
 				headers: jsonMutationHeaders(),
