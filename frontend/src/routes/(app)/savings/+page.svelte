@@ -147,6 +147,8 @@
 								{#if l.chosen_basket_cost_cents === null}
 									<a class="enter-spend" href="/list/{l.list_id}">Enter actual spend</a>
 								{:else}
+									<!-- In this branch chosen is non-null; actual-spend writes chosen
+									     and net together, so net is non-null too (?? 0 unreachable). -->
 									<span class="outcome-net"
 										>Net {formatEuros(l.net_saving_cents ?? 0)}</span
 									>
