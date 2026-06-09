@@ -13,10 +13,13 @@
 		"prepare": "svelte-kit sync || echo ''",
 		"test": "vitest run",
 		"test:watch": "vitest",
+		"test:e2e": "playwright test",
+		"test:e2e:ui": "playwright test --ui",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.60.0",
 		"@sveltejs/adapter-static": "^3.0.10",
 		"@sveltejs/kit": "^2.57.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
