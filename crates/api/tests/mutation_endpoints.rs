@@ -769,7 +769,10 @@ async fn set_quantity_sets_absolute_value_and_survives_resnapshot() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v = json(resp).await;
     assert_eq!(v["status"], "accepted");
-    assert_eq!(v["entity"]["quantity"], 4, "response reflects the new quantity");
+    assert_eq!(
+        v["entity"]["quantity"], 4,
+        "response reflects the new quantity"
+    );
     // last_updated_revision stamped with this mutation's revision (2).
     assert_eq!(v["entity"]["last_updated_revision"], 2);
 
@@ -841,25 +844,33 @@ async fn set_quantity_below_one_is_rejected() {
     let missing = post_mutation(
         &pool,
         &s,
-        envelope("cm-3", "list-a", "entry-1", "set_quantity", serde_json::json!({})),
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({}),
+        ),
     )
     .await;
     assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     // The entry is untouched: still quantity 1, and the revision never advanced
     // past the original add (rejected mutations roll the transaction back).
-    let qty: i64 =
-        sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let qty: i64 = sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(qty, 1, "rejected set_quantity leaves the entry unchanged");
     let current: i64 =
         sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(current, 1, "a rejected mutation does not advance the revision");
+    assert_eq!(
+        current, 1,
+        "a rejected mutation does not advance the revision"
+    );
 }
 
 #[tokio::test]
@@ -896,7 +907,11 @@ async fn set_quantity_above_max_is_rejected() {
         ),
     )
     .await;
-    assert_eq!(at_ceiling.status(), StatusCode::CREATED, "9999 is the inclusive max");
+    assert_eq!(
+        at_ceiling.status(),
+        StatusCode::CREATED,
+        "9999 is the inclusive max"
+    );
 
     let over = post_mutation(
         &pool,
@@ -913,12 +928,14 @@ async fn set_quantity_above_max_is_rejected() {
     assert_eq!(over.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     // The over-the-ceiling reject rolled back: the entry keeps the accepted 9999.
-    let qty: i64 =
-        sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(qty, 9999, "a rejected over-max set_quantity leaves the prior value");
+    let qty: i64 = sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        qty, 9999,
+        "a rejected over-max set_quantity leaves the prior value"
+    );
 }
 
 #[tokio::test]
@@ -944,7 +961,13 @@ async fn set_quantity_does_not_resurrect_a_deleted_entry() {
     post_mutation(
         &pool,
         &s,
-        envelope("cm-2", "list-a", "entry-1", "delete_item", serde_json::json!({})),
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "delete_item",
+            serde_json::json!({}),
+        ),
     )
     .await;
 
@@ -966,7 +989,10 @@ async fn set_quantity_does_not_resurrect_a_deleted_entry() {
     assert_eq!(v["status"], "accepted");
     // Status stays deleted; quantity is NOT changed (no resurrection).
     assert_eq!(v["entity"]["status"], "deleted");
-    assert_eq!(v["entity"]["quantity"], 1, "deleted entry keeps its quantity");
+    assert_eq!(
+        v["entity"]["quantity"], 1,
+        "deleted entry keeps its quantity"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1747,4 +1773,94 @@ async fn concurrent_duplicate_add_item_all_replay_never_409() {
             .await
             .unwrap();
     assert_eq!(revision, 1, "revision advanced exactly once");
+}
+
+/// Issue #62 regression: after a drain that moves entries OUT of the active set
+/// (mark_bought / mark_skipped / delete_item), a fresh `GET /api/list/:id`
+/// snapshot must converge with the server's complete state over NON-active
+/// entries too — not just the active ones. Before #62 the snapshot was
+/// active-only, so a client falling below the SSE retention floor (forced onto a
+/// `full_snapshot`) could never reconcile its bought/skipped/deleted rows from
+/// the snapshot. This drives all four lifecycle transitions through the real
+/// mutation endpoint, then asserts the snapshot enumerates every entry with the
+/// authoritative status and a top-level revision matching the DB.
+#[tokio::test]
+async fn snapshot_converges_over_non_active_entries_after_drain() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Drain: add four items, then move three out of the active set.
+    for i in 1..=4 {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(
+                &format!("cm-add-{i}"),
+                "list-a",
+                &format!("entry-{i}"),
+                "add_item",
+                serde_json::json!({ "raw_text": format!("Item {i}"), "display_name": format!("Item {i}") }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    for (cm, entry, op) in [
+        ("cm-bought", "entry-2", "mark_bought"),
+        ("cm-skipped", "entry-3", "mark_skipped"),
+        ("cm-deleted", "entry-4", "delete_item"),
+    ] {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(cm, "list-a", entry, op, serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{op} accepted");
+    }
+
+    // The snapshot a fresh client would rehydrate from.
+    let snapshot = get_list_snapshot(&pool, &s, "list-a").await;
+    let entries = snapshot["entries"].as_array().expect("entries array");
+
+    // It must converge with the server's COMPLETE state — every entry, every
+    // status — not just the one remaining active row.
+    let by_id = |id: &str| {
+        entries
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from snapshot"))
+    };
+    assert_eq!(
+        entries.len(),
+        4,
+        "snapshot carries all entries, not active-only"
+    );
+    assert_eq!(by_id("entry-1")["status"], "active");
+    assert_eq!(by_id("entry-2")["status"], "bought");
+    assert_eq!(by_id("entry-3")["status"], "skipped");
+    assert_eq!(by_id("entry-4")["status"], "deleted");
+    // bought audit fields are carried so the basket section reconciles.
+    assert_eq!(by_id("entry-2")["bought_by"], "user-a");
+    assert!(by_id("entry-2")["bought_at"].is_string());
+    // Every entry carries list_id (mirrors the mutation `entity` shape).
+    for e in entries {
+        assert_eq!(e["list_id"], "list-a");
+    }
+
+    // Revision semantics intact: the snapshot's top-level current_revision equals
+    // the DB's, so a client resumes its SSE `?since=` from the right cursor.
+    let db_revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        snapshot["current_revision"].as_i64().unwrap(),
+        db_revision,
+        "snapshot revision matches the DB revision (resume cursor intact)"
+    );
 }

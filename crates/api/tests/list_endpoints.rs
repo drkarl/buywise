@@ -172,6 +172,45 @@ async fn seed_resolved_entry(
     .expect("insert resolved entry");
 }
 
+/// Seed one unresolved list entry with an explicit `status`
+/// (`active`|`bought`|`skipped`|`deleted`). For `bought` it also stamps
+/// `bought_by`/`bought_at`, so a snapshot test can assert those carry through.
+///
+/// Used by the issue-#62 snapshot tests to verify the detail / `full_snapshot`
+/// payload enumerates non-active entries (not active-only).
+async fn seed_entry_with_status(
+    pool: &SqlitePool,
+    id: &str,
+    list_id: &str,
+    added_by: &str,
+    status: &str,
+) {
+    let (bought_by, bought_at) = if status == "bought" {
+        (Some(added_by), Some(db::now_iso()))
+    } else {
+        (None, None)
+    };
+    sqlx::query(
+        "INSERT INTO list_entries \
+             (id, list_id, resolution_status, raw_text, display_name, added_by, quantity, \
+              status, bought_by, bought_at, effective_constraint_hash, last_updated_revision, \
+              created_at, updated_at) \
+         VALUES (?1, ?2, 'unresolved', ?3, ?3, ?4, 1, ?5, ?6, ?7, ?8, 0, ?9, ?9)",
+    )
+    .bind(id)
+    .bind(list_id)
+    .bind(format!("Item {id}"))
+    .bind(added_by)
+    .bind(status)
+    .bind(bought_by)
+    .bind(bought_at)
+    .bind(format!("unresolved:{id}"))
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert entry with status");
+}
+
 /// Log in and return the session + csrf tokens.
 async fn login(pool: &SqlitePool, email: &str) -> Session {
     let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
@@ -355,6 +394,79 @@ async fn get_list_includes_entry_resolution_and_constraint_hash() {
         "unresolved:entry-1"
     );
     assert_eq!(entries[0]["id"], "entry-1");
+}
+
+/// Issue #62: the snapshot (`GET /api/list/:id`, the same shape the SSE
+/// `full_snapshot` serialises) must carry the COMPLETE list state — every entry
+/// status, not active-only — and each entry must carry `list_id` so a client can
+/// use the snapshot as a faithful full replacement without stamping the id
+/// itself. Seeds one entry of each status and asserts all four come back with the
+/// right `status`, that `list_id` is present on every entry, and that a `bought`
+/// entry's `bought_by`/`bought_at` survive.
+#[tokio::test]
+async fn get_list_snapshot_includes_all_statuses_and_list_id() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_entry_with_status(&pool, "e-active", "list-a", "user-a", "active").await;
+    seed_entry_with_status(&pool, "e-bought", "list-a", "user-a", "bought").await;
+    seed_entry_with_status(&pool, "e-skipped", "list-a", "user-a", "skipped").await;
+    seed_entry_with_status(&pool, "e-deleted", "list-a", "user-a", "deleted").await;
+
+    let s = login(&pool, "a@example.test").await;
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .uri("/api/list/list-a")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = json(resp).await;
+    let entries = detail["entries"].as_array().unwrap();
+
+    // All four statuses are present, not just active.
+    assert_eq!(
+        entries.len(),
+        4,
+        "snapshot enumerates every status, not active-only"
+    );
+    let by_id = |id: &str| {
+        entries
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from snapshot"))
+    };
+    assert_eq!(by_id("e-active")["status"], "active");
+    assert_eq!(by_id("e-bought")["status"], "bought");
+    assert_eq!(by_id("e-skipped")["status"], "skipped");
+    assert_eq!(
+        by_id("e-deleted")["status"],
+        "deleted",
+        "deleted tombstone is carried"
+    );
+
+    // Every entry carries `list_id` (mirroring mutations::EntityView) so the
+    // client need not stamp it from the requested id.
+    for e in entries {
+        assert_eq!(e["list_id"], "list-a", "each entry carries list_id");
+    }
+
+    // A bought entry's audit fields survive the snapshot serialisation.
+    let bought = by_id("e-bought");
+    assert_eq!(bought["bought_by"], "user-a");
+    assert!(
+        bought["bought_at"].is_string(),
+        "bought_at is present for a bought entry"
+    );
+
+    // A non-bought entry leaves the audit fields null (not omitted).
+    assert!(by_id("e-active")["bought_by"].is_null());
+    assert!(by_id("e-active")["bought_at"].is_null());
 }
 
 #[tokio::test]
