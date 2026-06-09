@@ -76,6 +76,7 @@ function fullResponse(): OptimiseResponse {
 		},
 		unresolved_items: [{ item_index: 2, display_text: 'cream' }],
 		no_valid_offer_items: [{ item_index: 3, display_text: 'truffle oil', reason: 'no_matches' }],
+		needs_confirmation_items: [],
 		plain_language_explanation: 'Splitting between Tesco and Aldi saves you the most.',
 		offer_snapshot_date: '2026-06-07'
 	};
@@ -198,6 +199,7 @@ describe('optimise page', () => {
 			recommended: null,
 			unresolved_items: [],
 			no_valid_offer_items: [],
+			needs_confirmation_items: [],
 			plain_language_explanation: '',
 			offer_snapshot_date: null
 		};

@@ -50,8 +50,8 @@ use serde::{Deserialize, Serialize};
 use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
-    optimise, BasketItem, NoValidOfferItem, OptimiserInput, OptimiserOutput, Recommendation,
-    RecommendedKind, StorePlan, UnresolvedItem, DEFAULT_THRESHOLDS,
+    optimise, BasketItem, NeedsConfirmationItem, NoValidOfferItem, OptimiserInput, OptimiserOutput,
+    Recommendation, RecommendedKind, StorePlan, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -100,6 +100,10 @@ pub struct OptimiseResponse {
     pub unresolved_items: Vec<UnresolvedItem>,
     /// Resolved items that produced no priceable offer anywhere.
     pub no_valid_offer_items: Vec<NoValidOfferItem>,
+    /// Resolved, priceable items held back for household confirmation because
+    /// their `substitution_policy = 'ask'` (Backlog-T1). Excluded from every plan
+    /// and from all totals until the household chooses a product.
+    pub needs_confirmation_items: Vec<NeedsConfirmationItem>,
     /// Deterministic, human-readable summary naming which stores are cheaper for
     /// which categories (not produced by the core; generated here).
     pub plain_language_explanation: String,
@@ -205,6 +209,7 @@ async fn optimise_list(
         recommended: output.recommended,
         unresolved_items: output.unresolved_items,
         no_valid_offer_items: output.no_valid_offer_items,
+        needs_confirmation_items: output.needs_confirmation_items,
         plain_language_explanation: explanation,
         offer_snapshot_date,
     }))
@@ -374,30 +379,44 @@ async fn canonical_item_policies(
     Ok(by_id)
 }
 
-/// Bulk-load the Phase-0-enforced [`ItemConstraints`] for every given canonical
-/// item id, keyed by id, in chunked `IN (...)` queries.
+/// Bulk-load the full [`ItemConstraints`] for every given canonical item id,
+/// keyed by id, in chunked `IN (...)` queries.
 ///
-/// Reads and parses exactly the columns `db::item_constraints_by_canonical_id`
-/// does (`brand`, `preferred_size_value`/`preferred_size_basis`,
-/// `substitution_policy`), so a `BasketItem` built from this map is byte-for-byte
-/// what the single-row helper would produce. Ids without a row are simply absent.
+/// Backlog-T1: reads and parses exactly the columns
+/// `db::item_constraints_by_canonical_id` does (`brand`, the
+/// `allowed_brands`/`excluded_brands`/`dietary_flags` JSON lists, `pack_count`,
+/// `form_factor`, `preferred_size`, `substitution_policy`), so a `BasketItem`
+/// built from this map is byte-for-byte what the single-row helper would
+/// produce. Ids without a row are simply absent.
 async fn item_constraints_by_canonical_ids(
     pool: &sqlx::SqlitePool,
     ids: &[&str],
 ) -> Result<std::collections::HashMap<String, buywise_core::domain::ItemConstraints>, DbError> {
     use buywise_core::domain::{ItemConstraints, SizeBasis, SubstitutionPolicy};
 
-    // (canonical_item_id, id, brand, preferred_size_value, preferred_size_basis,
-    // substitution_policy, updated_at) — the keyed analogue of the single-row read.
+    // (canonical_item_id, id, brand, allowed_brands, excluded_brands,
+    // preferred_size_value, preferred_size_basis, pack_count, form_factor,
+    // dietary_flags, substitution_policy, updated_at) — the keyed analogue of the
+    // single-row read. JSON-list columns are read as raw TEXT and decoded below.
     type KeyedConstraintsRow = (
         String,
         String,
         Option<String>,
+        Option<String>,
+        Option<String>,
         Option<f64>,
+        Option<String>,
+        Option<i32>,
+        Option<String>,
         Option<String>,
         String,
         String,
     );
+
+    // Decode a JSON-array TEXT list leniently: NULL or unparseable → None.
+    fn parse_list(raw: Option<&str>) -> Option<Vec<String>> {
+        raw.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+    }
 
     let mut by_id = std::collections::HashMap::new();
     if ids.is_empty() {
@@ -406,16 +425,29 @@ async fn item_constraints_by_canonical_ids(
     for chunk in ids.chunks(IN_CHUNK_SIZE) {
         let placeholders = sql_placeholders(chunk.len());
         let sql = format!(
-            "SELECT canonical_item_id, id, brand, preferred_size_value, preferred_size_basis, \
-                    substitution_policy, updated_at \
+            "SELECT canonical_item_id, id, brand, allowed_brands, excluded_brands, \
+                    preferred_size_value, preferred_size_basis, pack_count, \
+                    form_factor, dietary_flags, substitution_policy, updated_at \
              FROM item_constraints WHERE canonical_item_id IN ({placeholders})"
         );
         let mut query = sqlx::query_as::<_, KeyedConstraintsRow>(&sql);
         for id in chunk {
             query = query.bind(*id);
         }
-        for (canonical_item_id, id, brand, size_value, size_basis, sub_policy, updated_at) in
-            query.fetch_all(pool).await?
+        for (
+            canonical_item_id,
+            id,
+            brand,
+            allowed_brands,
+            excluded_brands,
+            size_value,
+            size_basis,
+            pack_count,
+            form_factor,
+            dietary_flags,
+            sub_policy,
+            updated_at,
+        ) in query.fetch_all(pool).await?
         {
             // Parse the enum TEXT columns leniently, matching the single-row helper:
             // an unparseable size basis is treated as absent, an unparseable
@@ -432,17 +464,17 @@ async fn item_constraints_by_canonical_ids(
                     id,
                     canonical_item_id,
                     brand,
-                    allowed_brands: None,
-                    excluded_brands: None,
+                    allowed_brands: parse_list(allowed_brands.as_deref()),
+                    excluded_brands: parse_list(excluded_brands.as_deref()),
                     preferred_size_value: size_value,
                     preferred_size_basis,
                     min_size_value: None,
                     min_size_basis: None,
                     max_size_value: None,
                     max_size_basis: None,
-                    pack_count: None,
-                    form_factor: None,
-                    dietary_flags: None,
+                    pack_count,
+                    form_factor,
+                    dietary_flags: parse_list(dietary_flags.as_deref()),
                     substitution_policy,
                     updated_at,
                 },

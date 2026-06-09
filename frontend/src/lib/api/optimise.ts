@@ -65,13 +65,27 @@ export interface UnresolvedItem {
 export type NoValidOfferReason =
 	| 'no_matches'
 	| 'constraints_eliminated_all'
-	| 'brand_policy_missing_brand';
+	| 'brand_policy_missing_brand'
+	// Backlog-T1: substitution_policy=strict and the exact matched product has no
+	// qualifying offer, so the item is shown as missing rather than substituted.
+	| 'strict_no_exact_offer';
 
 /** A resolved item that produced no valid offer, with the reason. */
 export interface NoValidOfferItem {
 	item_index: number;
 	display_text: string;
 	reason: NoValidOfferReason;
+}
+
+/**
+ * Backlog-T1: a resolved, priceable item held back for household confirmation
+ * because its `substitution_policy = 'ask'`. Excluded from every plan until the
+ * household chooses a product.
+ */
+export interface NeedsConfirmationItem {
+	item_index: number;
+	display_text: string;
+	candidate_count: number;
 }
 
 /** The full `POST /api/optimise` 200 response body. */
@@ -83,6 +97,7 @@ export interface OptimiseResponse {
 	recommended: Recommendation | null;
 	unresolved_items: UnresolvedItem[];
 	no_valid_offer_items: NoValidOfferItem[];
+	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;
 }
