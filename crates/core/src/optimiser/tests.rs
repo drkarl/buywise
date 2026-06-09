@@ -39,6 +39,8 @@ fn product(id: &str, retailer: Retailer) -> RetailerProduct {
         size_value: None,
         size_unit: None,
         pack_count: Some(1),
+        form_factor: None,
+        dietary_flags: None,
         first_seen_at: "2026-05-01T00:00:00Z".into(),
         last_seen_at: "2026-05-29T00:00:00Z".into(),
     }
@@ -139,6 +141,37 @@ fn brand_constraints(brand: Option<&str>) -> ItemConstraints {
         dietary_flags: None,
         substitution_policy: SubstitutionPolicy::Any,
         updated_at: "2026-05-29T00:00:00Z".into(),
+    }
+}
+
+/// An empty `ItemConstraints` (all fields unset, `Any` substitution policy).
+/// Callers set just the field(s) under test, mirroring `brand_constraints`.
+fn empty_constraints() -> ItemConstraints {
+    ItemConstraints {
+        id: "ic-1".into(),
+        canonical_item_id: "ci-1".into(),
+        brand: None,
+        allowed_brands: None,
+        excluded_brands: None,
+        preferred_size_value: None,
+        preferred_size_basis: None,
+        min_size_value: None,
+        min_size_basis: None,
+        max_size_value: None,
+        max_size_basis: None,
+        pack_count: None,
+        form_factor: None,
+        dietary_flags: None,
+        substitution_policy: SubstitutionPolicy::Any,
+        updated_at: "2026-05-29T00:00:00Z".into(),
+    }
+}
+
+/// A retailer product carrying a brand only (no size), for brand-list filters.
+fn brand_only_product(id: &str, retailer: Retailer, brand: &str) -> RetailerProduct {
+    RetailerProduct {
+        brand: Some(brand.into()),
+        ..product(id, retailer)
     }
 }
 
@@ -610,6 +643,324 @@ fn brand_constraint_eliminating_all_is_no_valid_offer_not_unresolved() {
     assert_eq!(
         out.no_valid_offer_items[0].reason,
         NoOfferReason::ConstraintsEliminatedAll
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backlog-T1: full field constraints (allowed/excluded brands, pack_count,
+// form_factor, dietary_flags)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allowed_brands_excludes_products_not_in_allow_list() {
+    // allowed_brands = [Avonmore, Glenisk]. Avonmore survives; Generic is excluded.
+    let mut basket_item = item("milk", "ci-milk", 1);
+    let mut c = empty_constraints();
+    c.allowed_brands = Some(vec!["Avonmore".into(), "Glenisk".into()]);
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-a", "ci-milk", "p-avon", MatchStatus::Accepted),
+                brand_only_product("p-avon", Retailer::Tesco, "Avonmore"),
+                offer("o-a", "p-avon", 200, Some(5)),
+            ),
+            (
+                product_match("m-g", "ci-milk", "p-gen", MatchStatus::Suggested),
+                brand_only_product("p-gen", Retailer::Tesco, "Generic"),
+                offer("o-g", "p-gen", 100, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("Avonmore is allowed");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-avon");
+    assert_eq!(single.total_cents, 200, "cheaper Generic excluded");
+}
+
+#[test]
+fn excluded_brands_rejects_blocked_brand() {
+    // excluded_brands = [Generic]. Generic is rejected even though it is cheaper.
+    let mut basket_item = item("milk", "ci-milk", 1);
+    let mut c = empty_constraints();
+    c.excluded_brands = Some(vec!["Generic".into()]);
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-a", "ci-milk", "p-avon", MatchStatus::Accepted),
+                brand_only_product("p-avon", Retailer::Tesco, "Avonmore"),
+                offer("o-a", "p-avon", 200, Some(5)),
+            ),
+            (
+                product_match("m-g", "ci-milk", "p-gen", MatchStatus::Suggested),
+                brand_only_product("p-gen", Retailer::Tesco, "Generic"),
+                offer("o-g", "p-gen", 100, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("Avonmore survives the block-list");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-avon");
+    assert_eq!(single.total_cents, 200, "blocked Generic excluded");
+}
+
+#[test]
+fn pack_count_filters_to_exact_pack() {
+    // pack_count = 4. The 4-pack survives; the 6-pack is rejected.
+    let mut basket_item = item("yoghurt", "ci-yog", 1);
+    let mut c = empty_constraints();
+    c.pack_count = Some(4);
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let four = RetailerProduct {
+        pack_count: Some(4),
+        ..product("p4", Retailer::Tesco)
+    };
+    let six = RetailerProduct {
+        pack_count: Some(6),
+        ..product("p6", Retailer::Tesco)
+    };
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m4", "ci-yog", "p4", MatchStatus::Accepted),
+                four,
+                offer("o4", "p4", 300, Some(5)),
+            ),
+            (
+                product_match("m6", "ci-yog", "p6", MatchStatus::Suggested),
+                six,
+                offer("o6", "p6", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("the 4-pack qualifies");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p4");
+    assert_eq!(single.total_cents, 300, "cheaper 6-pack excluded");
+}
+
+#[test]
+fn form_factor_filters_case_insensitively() {
+    // form_factor = "can". The canned product (stored "Can") survives; the bottle
+    // is rejected.
+    let mut basket_item = item("beans", "ci-beans", 1);
+    let mut c = empty_constraints();
+    c.form_factor = Some("can".into());
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let can = RetailerProduct {
+        form_factor: Some("Can".into()), // different case on the product side
+        ..product("p-can", Retailer::Tesco)
+    };
+    let bottle = RetailerProduct {
+        form_factor: Some("bottle".into()),
+        ..product("p-bot", Retailer::Tesco)
+    };
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-c", "ci-beans", "p-can", MatchStatus::Accepted),
+                can,
+                offer("o-c", "p-can", 150, Some(5)),
+            ),
+            (
+                product_match("m-b", "ci-beans", "p-bot", MatchStatus::Suggested),
+                bottle,
+                offer("o-b", "p-bot", 100, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("the can qualifies");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-can");
+    assert_eq!(single.total_cents, 150, "cheaper bottle excluded");
+}
+
+#[test]
+fn dietary_flags_require_product_superset() {
+    // Required = [gluten_free, vegan]. A product carrying both (plus extras)
+    // qualifies; one carrying only gluten_free is rejected.
+    let mut basket_item = item("crackers", "ci-crk", 1);
+    let mut c = empty_constraints();
+    c.dietary_flags = Some(vec!["gluten_free".into(), "vegan".into()]);
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let superset = RetailerProduct {
+        dietary_flags: Some(vec!["gluten_free".into(), "vegan".into(), "organic".into()]),
+        ..product("p-ok", Retailer::Tesco)
+    };
+    let partial = RetailerProduct {
+        dietary_flags: Some(vec!["gluten_free".into()]),
+        ..product("p-no", Retailer::Tesco)
+    };
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-ok", "ci-crk", "p-ok", MatchStatus::Accepted),
+                superset,
+                offer("o-ok", "p-ok", 300, Some(5)),
+            ),
+            (
+                product_match("m-no", "ci-crk", "p-no", MatchStatus::Suggested),
+                partial,
+                offer("o-no", "p-no", 100, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("the superset product qualifies");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-ok");
+    assert_eq!(
+        single.total_cents, 300,
+        "the partial-flag product is excluded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backlog-T1: substitution policy (Strict / Ask)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strict_policy_shows_missing_when_exact_product_has_no_offer() {
+    // substitution_policy = Strict. The exact (accepted) product has no offer
+    // available; only a suggested substitute does. Strict must surface the item
+    // as missing (StrictNoExactOffer) rather than offering the substitute.
+    let mut basket_item = item("ketchup", "ci-k", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Strict;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    // Only a *suggested* substitute reaches the optimiser with an offer (the
+    // exact match's product had no current offer, so db.rs never emitted a row
+    // for it). Strict must not substitute it.
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-sub", "ci-k", "p-sub", MatchStatus::Suggested),
+            product("p-sub", Retailer::Tesco),
+            offer("o-sub", "p-sub", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    assert!(out.best_single.is_none(), "no plan: substitute not offered");
+    assert!(out.unresolved_items.is_empty());
+    assert!(out.needs_confirmation_items.is_empty());
+    assert_eq!(out.no_valid_offer_items.len(), 1);
+    assert_eq!(
+        out.no_valid_offer_items[0].reason,
+        NoOfferReason::StrictNoExactOffer
+    );
+}
+
+#[test]
+fn strict_policy_prices_the_exact_accepted_match() {
+    // substitution_policy = Strict and the exact (accepted) product DOES have an
+    // offer: it is priced normally, while a suggested substitute is dropped.
+    let mut basket_item = item("ketchup", "ci-k", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Strict;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-x", "ci-k", "p-exact", MatchStatus::Accepted),
+                product("p-exact", Retailer::Tesco),
+                offer("o-x", "p-exact", 250, Some(5)),
+            ),
+            (
+                product_match("m-sub", "ci-k", "p-sub", MatchStatus::Suggested),
+                product("p-sub", Retailer::Tesco),
+                offer("o-sub", "p-sub", 100, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("exact match is priceable");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-exact");
+    assert_eq!(single.total_cents, 250, "cheaper substitute dropped");
+    assert!(out.no_valid_offer_items.is_empty());
+}
+
+#[test]
+fn ask_policy_surfaces_item_for_confirmation() {
+    // substitution_policy = Ask. A qualifying candidate exists, but the item is
+    // held back for confirmation rather than auto-priced.
+    let mut basket_item = item("cereal", "ci-c", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-1", "ci-c", "p-1", MatchStatus::Accepted),
+                product("p-1", Retailer::Tesco),
+                offer("o-1", "p-1", 300, Some(5)),
+            ),
+            (
+                product_match("m-2", "ci-c", "p-2", MatchStatus::Suggested),
+                product("p-2", Retailer::Aldi),
+                offer("o-2", "p-2", 250, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    assert!(
+        out.best_single.is_none(),
+        "Ask items are not auto-priced into a plan"
+    );
+    assert!(out.no_valid_offer_items.is_empty());
+    assert_eq!(out.needs_confirmation_items.len(), 1);
+    assert_eq!(out.needs_confirmation_items[0].item_index, 0);
+    assert_eq!(out.needs_confirmation_items[0].display_text, "cereal");
+    assert_eq!(
+        out.needs_confirmation_items[0].candidate_count, 2,
+        "both qualifying candidates are counted"
     );
 }
 
