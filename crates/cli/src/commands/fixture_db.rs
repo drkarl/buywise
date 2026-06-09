@@ -76,6 +76,11 @@ pub async fn build_fixture_pool(root: &Path, household_id: &str) -> Result<Sqlit
         .context("connecting in-memory fixture database")?;
 
     apply_schema_001(&pool, root).await?;
+    // Backlog-T1 added retailer_products.form_factor / dietary_flags in 007.
+    // Fixture mode bootstraps only the Phase-0 schema, so apply that one
+    // additive migration too — otherwise upsert_retailer_product (which now
+    // writes the two columns) would fail against the older table shape.
+    apply_schema_file(&pool, root, "007_retailer_product_attributes.sql").await?;
     seed_categories_and_items(&pool, root, household_id).await?;
     seed_item_constraints(&pool, root).await?;
     seed_offers(&pool, root).await?;
@@ -91,7 +96,17 @@ pub async fn build_fixture_pool(root: &Path, household_id: &str) -> Result<Sqlit
 /// here — the schema's header comment contains semicolons — and would corrupt
 /// the DDL.
 async fn apply_schema_001(pool: &SqlitePool, root: &Path) -> Result<()> {
-    let path = root.join("migrations").join("001_phase0_schema.sql");
+    apply_schema_file(pool, root, "001_phase0_schema.sql").await
+}
+
+/// Apply a single migration file by name as one raw-SQL script.
+///
+/// Shared by [`apply_schema_001`] and the additive Backlog-T1 migration so
+/// fixture mode tracks the columns the optimiser and writers expect. The whole
+/// file runs on a single connection via [`sqlx::raw_sql`]; statements are never
+/// split on `;` (a header comment may contain one).
+async fn apply_schema_file(pool: &SqlitePool, root: &Path, file: &str) -> Result<()> {
+    let path = root.join("migrations").join(file);
     let sql =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     sqlx::raw_sql(&sql)

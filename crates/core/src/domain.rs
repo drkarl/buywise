@@ -406,8 +406,51 @@ pub struct ItemConstraints {
     pub updated_at: String,
 }
 
+/// Canonical `retailer_products.form_factor` vocabulary (Backlog-T1).
+///
+/// `form_factor` is the physical product form, stored as a single lowercase
+/// snake/kebab token in both `item_constraints.form_factor` (the constraint) and
+/// `retailer_products.form_factor` (the product attribute). Comparison in the
+/// optimiser is case-insensitive. Ingest populates the column best-effort from
+/// product name/category keywords; an unrecognised or absent form is `NULL`.
+///
+/// The vocabulary is intentionally small and closed so constraints and products
+/// agree on spelling:
+/// `can`, `bottle`, `carton`, `pouch`, `jar`, `tub`, `bar`, `spray`, `box`,
+/// `bag`, `tin`, `tetra`.
+pub const FORM_FACTORS: &[&str] = &[
+    "can", "bottle", "carton", "pouch", "jar", "tub", "bar", "spray", "box", "bag", "tin", "tetra",
+];
+
+/// Canonical `retailer_products.dietary_flags` vocabulary (Backlog-T1).
+///
+/// `dietary_flags` is a set of lowercase snake_case dietary attribute tokens,
+/// stored as a JSON array TEXT column on both `item_constraints.dietary_flags`
+/// (the required set) and `retailer_products.dietary_flags` (what the product
+/// satisfies). A product qualifies for a constraint only if its flag set is a
+/// **superset** of the required flags. Ingest populates the column best-effort
+/// from product attributes; products with no detectable flags get `NULL` (an
+/// empty/absent set satisfies only an empty/absent constraint).
+pub const DIETARY_FLAGS: &[&str] = &[
+    "gluten_free",
+    "dairy_free",
+    "lactose_free",
+    "vegan",
+    "vegetarian",
+    "nut_free",
+    "organic",
+    "sugar_free",
+];
+
 /// A product as seen at a retailer. Row of `retailer_products`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+///
+/// `dietary_flags` is stored as a JSON array TEXT column. A hand-written
+/// [`sqlx::FromRow`] (below) decodes it, because the derive cannot map a JSON
+/// TEXT column into `Option<Vec<String>>` without the sqlx `json` feature (not
+/// enabled in the workspace). `form_factor` is a plain TEXT token. All other
+/// columns decode by name exactly as the former derive did. See the
+/// [`FORM_FACTORS`] / [`DIETARY_FLAGS`] vocabularies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetailerProduct {
     pub id: String,
     pub source: Source,
@@ -421,8 +464,50 @@ pub struct RetailerProduct {
     pub size_value: Option<f64>,
     pub size_unit: Option<String>,
     pub pack_count: Option<i32>,
+    /// Physical form of the product (see [`FORM_FACTORS`]); `None` when unknown.
+    pub form_factor: Option<String>,
+    /// Dietary attributes the product satisfies (see [`DIETARY_FLAGS`]), decoded
+    /// from a JSON array TEXT column; `None` when unknown.
+    pub dietary_flags: Option<Vec<String>>,
     pub first_seen_at: String,
     pub last_seen_at: String,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for RetailerProduct {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        // `dietary_flags` is a JSON-array TEXT column; decode the raw TEXT then
+        // parse it. A NULL column → `None`; a present-but-unparseable value is a
+        // data error surfaced as a decode failure (never silently dropped).
+        let dietary_flags_raw: Option<String> = row.try_get("dietary_flags")?;
+        let dietary_flags = match dietary_flags_raw {
+            Some(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "dietary_flags".to_string(),
+                    source: Box::new(e),
+                }
+            })?),
+            None => None,
+        };
+        Ok(RetailerProduct {
+            id: row.try_get("id")?,
+            source: row.try_get("source")?,
+            retailer: row.try_get("retailer")?,
+            external_id: row.try_get("external_id")?,
+            url: row.try_get("url")?,
+            name: row.try_get("name")?,
+            brand: row.try_get("brand")?,
+            category: row.try_get("category")?,
+            pack_size_text: row.try_get("pack_size_text")?,
+            size_value: row.try_get("size_value")?,
+            size_unit: row.try_get("size_unit")?,
+            pack_count: row.try_get("pack_count")?,
+            form_factor: row.try_get("form_factor")?,
+            dietary_flags,
+            first_seen_at: row.try_get("first_seen_at")?,
+            last_seen_at: row.try_get("last_seen_at")?,
+        })
+    }
 }
 
 /// A point-in-time price/offer for a retailer product. Row of `product_offers`.
@@ -525,6 +610,8 @@ mod tests {
             size_value: Some(1000.0),
             size_unit: Some("ml".into()),
             pack_count: Some(1),
+            form_factor: Some("carton".into()),
+            dietary_flags: Some(vec!["lactose_free".into()]),
             first_seen_at: "2026-05-01T00:00:00Z".into(),
             last_seen_at: "2026-05-29T00:00:00Z".into(),
         };
