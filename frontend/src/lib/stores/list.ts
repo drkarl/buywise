@@ -25,7 +25,8 @@ type OperationType =
   | 'mark_bought'
   | 'mark_skipped'
   | 'delete_item'
-  | 'resolve_alias';
+  | 'resolve_alias'
+  | 'set_quantity';
 
 /**
  * Bridges a Dexie `liveQuery` Observable to a Svelte store. The query re-runs
@@ -191,6 +192,56 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
     if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'skipped',
+      updated_at: now
+    });
+    await db.mutation_queue.add(mutation);
+    return true;
+  });
+  if (enqueued) notifyMutationEnqueued(listId);
+}
+
+/**
+ * Sets an entry's quantity to an ABSOLUTE value (issue #60), the syncable form
+ * of the +/- controls. Optimistically updates the local entry and enqueues a
+ * `set_quantity` mutation, both in one `listId`-guarded Dexie transaction.
+ *
+ * The value is clamped to an integer `>= 1` (quantity can never go below 1); the
+ * `-` button is also disabled at 1 in the UI. An absolute value (not a delta)
+ * keeps retries/sync idempotent — replaying it can never double-count.
+ *
+ * No-op (queues nothing) unless the entry exists, is on `listId`, is not
+ * `deleted` (the backend's delete-wins rule never resurrects a deleted entry),
+ * and the quantity actually changes — so tapping `+`/`-` repeatedly or a stale
+ * row never spams the server with redundant mutations.
+ */
+export async function setQuantity(
+  listId: string,
+  entryId: string,
+  quantity: number
+): Promise<void> {
+  // Clamp to a positive integer; the UI never sends < 1, but a programmatic
+  // caller could, and a non-positive quantity is meaningless.
+  const safeQuantity = Math.max(1, Math.floor(quantity));
+  const now = new Date().toISOString();
+  const mutation = await buildMutation(listId, entryId, 'set_quantity', {
+    quantity: safeQuantity
+  });
+
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+    // Load + re-check inside the tx (mirrors markBought/markSkipped): bail unless
+    // the entry exists, belongs to `listId`, and is not deleted. Also bail when the
+    // quantity is unchanged so an idempotent re-tap enqueues nothing.
+    const entry = await db.list_entries.get(entryId);
+    if (
+      !entry ||
+      entry.list_id !== listId ||
+      entry.status === 'deleted' ||
+      entry.quantity === safeQuantity
+    ) {
+      return false;
+    }
+    await db.list_entries.update(entryId, {
+      quantity: safeQuantity,
       updated_at: now
     });
     await db.mutation_queue.add(mutation);

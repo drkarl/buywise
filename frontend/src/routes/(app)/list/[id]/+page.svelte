@@ -19,6 +19,7 @@
 		markBought,
 		markSkipped,
 		deleteItem,
+		setQuantity,
 		resolveAlias
 	} from '$lib/stores/list';
 	import { db, type LocalListEntry } from '$lib/db/dexie';
@@ -190,6 +191,7 @@
 				onskipped={(id) => markSkipped(listId, id)}
 				ondelete={(id) => deleteItem(listId, id)}
 				onclarify={(id) => openClarify(id)}
+				onquantity={(id, quantity) => setQuantity(listId, id, quantity)}
 			/>
 		{:else}
 			<li class="empty">Nothing here yet — add your first item above.</li>
