@@ -208,8 +208,9 @@ pub async fn upsert_retailer_product(
         "INSERT INTO retailer_products \
          (id, source, retailer, external_id, url, name, brand, category, \
           pack_size_text, size_value, size_unit, pack_count, \
+          form_factor, dietary_flags, \
           first_seen_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(source, retailer, external_id) \
              WHERE source != 'manual' AND external_id IS NOT NULL \
          DO UPDATE SET last_seen_at = excluded.last_seen_at",
@@ -226,6 +227,13 @@ pub async fn upsert_retailer_product(
     .bind(p.size_value)
     .bind(&p.size_unit)
     .bind(p.pack_count)
+    .bind(&p.form_factor)
+    // `dietary_flags` is a JSON-array TEXT column; serialise the Vec (or NULL).
+    .bind(
+        p.dietary_flags
+            .as_ref()
+            .map(|f| serde_json::to_string(f).expect("Vec<String> always serialises")),
+    )
     .bind(&p.first_seen_at)
     .bind(&p.last_seen_at)
     .execute(&mut *conn)
@@ -602,17 +610,16 @@ pub async fn canonical_item_policy(
     Ok(policy)
 }
 
-/// Fetch the Phase-0-enforced subset of an item's [`ItemConstraints`], or `None`
-/// if the item has no `item_constraints` row.
+/// Fetch an item's full [`ItemConstraints`], or `None` if the item has no
+/// `item_constraints` row.
 ///
-/// Only the columns the optimiser actually enforces in Phase 0 are read —
-/// `brand`, `preferred_size_value`/`preferred_size_basis`, and
-/// `substitution_policy` — plus the row `id`. The JSON TEXT columns
-/// (`allowed_brands`, `excluded_brands`, `dietary_flags`) are deliberately not
-/// decoded: [`ItemConstraints`] does not derive [`sqlx::FromRow`] (it would need
-/// the sqlx `json` feature, not enabled in the workspace), and no Phase-0 read
-/// path enforces them. The unread columns are returned as `None`/defaults, which
-/// is faithful for Phase-0 optimisation (see `optimiser::check_constraints`).
+/// Backlog-T1: every constraint the optimiser now enforces is read — `brand`,
+/// the `allowed_brands` / `excluded_brands` / `dietary_flags` JSON TEXT lists,
+/// `pack_count`, `form_factor`, `preferred_size`, and `substitution_policy`. The
+/// JSON TEXT list columns are decoded leniently: an unparseable value is treated
+/// as absent rather than aborting the optimiser over one bad row. The
+/// min/max-size band is still not enforced by the optimiser, so those columns
+/// are left unread (`None`).
 ///
 /// This is the seam the CLI uses to build `BasketItem::constraints` in live
 /// mode; fixture mode loads the same data from `fixtures/item_constraints.json`.
@@ -622,21 +629,28 @@ pub async fn item_constraints_by_canonical_id(
 ) -> Result<Option<crate::domain::ItemConstraints>, DbError> {
     use crate::domain::SizeBasis;
 
-    // The Phase-0-enforced columns of one item_constraints row, in SELECT order:
-    // (id, brand, preferred_size_value, preferred_size_basis, substitution_policy,
-    // updated_at). A named alias keeps the query_as signature readable.
+    // One item_constraints row, in SELECT order: (id, brand, allowed_brands,
+    // excluded_brands, preferred_size_value, preferred_size_basis, pack_count,
+    // form_factor, dietary_flags, substitution_policy, updated_at). The JSON-list
+    // columns are read as raw TEXT and decoded below.
     type ConstraintsRow = (
         String,
         Option<String>,
+        Option<String>,
+        Option<String>,
         Option<f64>,
+        Option<String>,
+        Option<i32>,
+        Option<String>,
         Option<String>,
         String,
         String,
     );
 
     let row: Option<ConstraintsRow> = sqlx::query_as(
-        "SELECT id, brand, preferred_size_value, preferred_size_basis, \
-                substitution_policy, updated_at \
+        "SELECT id, brand, allowed_brands, excluded_brands, \
+                preferred_size_value, preferred_size_basis, pack_count, \
+                form_factor, dietary_flags, substitution_policy, updated_at \
          FROM item_constraints WHERE canonical_item_id = ?1",
     )
     .bind(canonical_item_id)
@@ -646,8 +660,13 @@ pub async fn item_constraints_by_canonical_id(
     let Some((
         id,
         brand,
+        allowed_brands,
+        excluded_brands,
         preferred_size_value,
         preferred_size_basis,
+        pack_count,
+        form_factor,
+        dietary_flags,
         substitution_policy,
         updated_at,
     )) = row
@@ -668,20 +687,29 @@ pub async fn item_constraints_by_canonical_id(
         id,
         canonical_item_id: canonical_item_id.to_string(),
         brand,
-        allowed_brands: None,
-        excluded_brands: None,
+        allowed_brands: parse_json_string_list(allowed_brands.as_deref()),
+        excluded_brands: parse_json_string_list(excluded_brands.as_deref()),
         preferred_size_value,
         preferred_size_basis,
         min_size_value: None,
         min_size_basis: None,
         max_size_value: None,
         max_size_basis: None,
-        pack_count: None,
-        form_factor: None,
-        dietary_flags: None,
+        pack_count,
+        form_factor,
+        dietary_flags: parse_json_string_list(dietary_flags.as_deref()),
         substitution_policy,
         updated_at,
     }))
+}
+
+/// Decode a JSON-array TEXT column (`["a","b"]`) into `Option<Vec<String>>`.
+///
+/// A SQL `NULL` (`None` input) and an unparseable value both yield `None`:
+/// constraint list columns are advisory, so one malformed row must never abort
+/// the whole optimiser run. Mirrors the lenient enum-column handling above.
+pub(crate) fn parse_json_string_list(raw: Option<&str>) -> Option<Vec<String>> {
+    raw.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
 }
 
 #[cfg(test)]
