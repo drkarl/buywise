@@ -305,6 +305,13 @@ pub enum NoOfferReason {
     /// for an alternative (Backlog-T1). Distinct from
     /// [`NoOfferReason::ConstraintsEliminatedAll`]: the item is missing by
     /// *policy*, not because every candidate failed a field filter.
+    ///
+    /// Chosen semantic ("exact match"): under Strict, an *exact* offer is any
+    /// candidate whose underlying match status is `Accepted`. A merely
+    /// `Suggested` match is **not** exact, so an item with only suggested matches
+    /// (and no accepted one) is reported `StrictNoExactOffer` even though those
+    /// suggested candidates priced fine — Strict will not offer an unconfirmed
+    /// substitute. This mirrors [`SubstitutionPolicy::Strict`] in the filter.
     StrictNoExactOffer,
 }
 
@@ -1043,10 +1050,12 @@ fn classify_items(
                 candidates.append(&mut item_candidates);
             }
             SubstitutionPolicy::Strict => {
-                // Only the exact (accepted) match may be priced; a suggested
-                // substitute is never offered. Drop suggested candidates and, if
-                // no accepted candidate has a qualifying offer, the item is
-                // missing by policy rather than substituted.
+                // "Exact match" == any candidate from an `Accepted` match. Only
+                // those may be priced; a merely `Suggested` substitute is never
+                // offered, so an item whose matches are all suggested is reported
+                // StrictNoExactOffer (see `NoOfferReason::StrictNoExactOffer`).
+                // Drop non-accepted candidates and, if none remain with a
+                // qualifying offer, the item is missing by policy not substituted.
                 item_candidates.retain(|c| c.accepted);
                 if item_candidates.is_empty() {
                     no_valid_offer.push(NoValidOfferItem {
