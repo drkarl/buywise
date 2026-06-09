@@ -95,7 +95,7 @@
 		<section class="cumulative" aria-label="Cumulative saving">
 			<p class="cumulative-label">Saved since you started</p>
 			<p class="cumulative-amount">{formatEuros(summary.cumulative_net_cents)}</p>
-			<p class="cumulative-note">Net of travel and subscription costs.</p>
+			<p class="cumulative-note">Net of travel costs.</p>
 		</section>
 
 		<section class="monthly" aria-label="Monthly savings">
