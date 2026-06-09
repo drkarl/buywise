@@ -180,6 +180,31 @@ describe('optimise page', () => {
 		expect(screen.getByText(/truffle oil — no matching product found/)).toBeTruthy();
 	});
 
+	it('surfaces ask-gated items for confirmation and renders the strict no-offer reason', async () => {
+		const response = fullResponse();
+		response.needs_confirmation_items = [
+			{ item_index: 4, display_text: 'yoghurt', candidate_count: 3 }
+		];
+		response.no_valid_offer_items = [
+			{ item_index: 5, display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
+		];
+		stubOptimise(response);
+		render(Page);
+
+		// substitution_policy=ask items get their own confirmation section with a
+		// choose link and the candidate count, not silently dropped from the page.
+		const confirm = await screen.findByLabelText(/awaiting your confirmation/i);
+		// Normalise whitespace: textContent keeps the template's literal newlines
+		// the browser would otherwise collapse.
+		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/yoghurt — 3 options to choose from/);
+		const choose = screen.getByRole('link', { name: /choose on your list/i });
+		expect(choose.getAttribute('href')).toBe('/list/list-42');
+
+		// strict_no_exact_offer maps to human copy, never the raw wire value.
+		expect(screen.getByText(/San Pellegrino — the exact product has no current offer/)).toBeTruthy();
+		expect(screen.queryByText(/strict_no_exact_offer/)).toBeNull();
+	});
+
 	it('surfaces a visible error on a non-OK response', async () => {
 		stubOptimise(fullResponse(), 422);
 		render(Page);
