@@ -200,16 +200,16 @@
 				<h2>Waiting for your confirmation</h2>
 				<p class="needs-confirmation-note">
 					These items are set to ask before substituting, so they’re held out of every plan
-					total until you pick a product on your list.
+					total. Choosing a product for them is coming soon.
 				</p>
 				<ul>
 					{#each result.needs_confirmation_items as item (item.item_index)}
 						<li>
 							<span
 								>{item.display_text} — {item.candidate_count}
-								{item.candidate_count === 1 ? 'option' : 'options'} to choose from</span
+								{item.candidate_count === 1 ? 'option' : 'options'} found</span
 							>
-							<a class="clarify" href="/list/{listId}">Choose on your list</a>
+							<a class="clarify" href="/list/{listId}">Review on your list</a>
 						</li>
 					{/each}
 				</ul>

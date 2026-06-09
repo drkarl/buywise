@@ -191,14 +191,18 @@ describe('optimise page', () => {
 		stubOptimise(response);
 		render(Page);
 
-		// substitution_policy=ask items get their own confirmation section with a
-		// choose link and the candidate count, not silently dropped from the page.
+		// substitution_policy=ask items get their own confirmation section with the
+		// candidate count, not silently dropped from the page.
 		const confirm = await screen.findByLabelText(/awaiting your confirmation/i);
 		// Normalise whitespace: textContent keeps the template's literal newlines
 		// the browser would otherwise collapse.
-		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/yoghurt — 3 options to choose from/);
-		const choose = screen.getByRole('link', { name: /choose on your list/i });
-		expect(choose.getAttribute('href')).toBe('/list/list-42');
+		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/yoghurt — 3 options found/);
+		// The product-choice flow does not exist yet (#78), so the section must not
+		// promise a "choose" control — only an honest "coming soon" + review link.
+		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/coming soon/i);
+		expect(screen.queryByRole('link', { name: /choose on your list/i })).toBeNull();
+		const review = screen.getAllByRole('link', { name: /review on your list/i });
+		expect(review.some((a) => a.getAttribute('href') === '/list/list-42')).toBe(true);
 
 		// strict_no_exact_offer maps to human copy, never the raw wire value.
 		expect(screen.getByText(/San Pellegrino — the exact product has no current offer/)).toBeTruthy();

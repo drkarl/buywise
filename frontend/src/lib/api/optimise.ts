@@ -98,9 +98,11 @@ export interface OptimiseResponse {
 	unresolved_items: UnresolvedItem[];
 	no_valid_offer_items: NoValidOfferItem[];
 	// Backlog-T1: `substitution_policy = 'ask'` items, held out of every plan
-	// until the household confirms a product. Rendered in the optimise page's
+	// until the household confirms a product. Surfaced in the optimise page's
 	// "Waiting for your confirmation" section; the `strict_no_exact_offer` reason
-	// renders in the "excluded from totals" list via `reasonText`.
+	// renders in the "excluded from totals" list via `reasonText`. The actual
+	// product-choice flow (candidate offers in the payload + a selection action)
+	// is tracked in #78 — this payload only carries a count for now.
 	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;
