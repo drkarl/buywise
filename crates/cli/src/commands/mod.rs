@@ -20,6 +20,7 @@ pub mod fixture_db;
 pub mod ingest;
 pub mod optimise;
 pub mod seed_matches;
+pub mod set_password;
 pub mod validate;
 
 use serde::Deserialize;

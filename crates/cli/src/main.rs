@@ -14,11 +14,16 @@
 //!   `product_matches` rows from a CSV (idempotent; `ON CONFLICT … DO UPDATE`).
 //! * `generate-fixtures` — regenerate `fixtures/canonical_items.json` and
 //!   `migrations/002_seed.sql` from `fixtures/dictionary.json`.
+//!
+//! Plus one Phase-1 operator subcommand (issue #51):
+//!
+//! * `set-password <email> --db <db>` — read a new password without echoing it,
+//!   argon2id-hash it, and update `users.password_hash` for the matching user.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use buywise_cli::commands::{ingest, optimise, seed_matches, validate};
+use buywise_cli::commands::{ingest, optimise, seed_matches, set_password, validate};
 
 #[derive(Parser)]
 #[command(name = "buywise-cli", about = "BuyWise developer CLI")]
@@ -82,6 +87,21 @@ enum Command {
     /// Regenerate fixtures/canonical_items.json and migrations/002_seed.sql from
     /// fixtures/dictionary.json.
     GenerateFixtures,
+
+    /// Set (or rotate) a user's password in `users.password_hash`.
+    ///
+    /// Prompts for the new password without echoing it (twice, with
+    /// confirmation, on a TTY; once from stdin when piped, for scripting),
+    /// argon2id-hashes it, and updates the row matching <email>. The password is
+    /// never taken as a plaintext CLI argument. Exits non-zero if no user has
+    /// that email.
+    SetPassword {
+        /// The email of an existing user (matched against `users.email`).
+        email: String,
+        /// SQLite database path to update.
+        #[arg(long)]
+        db: String,
+    },
 }
 
 /// Validate `--household-id` parses as a UUID at parse time, so a malformed id
@@ -116,5 +136,6 @@ fn main() -> Result<()> {
             household_id,
         } => seed_matches::run(&from, &db, &household_id),
         Command::GenerateFixtures => buywise_cli::generate::run(),
+        Command::SetPassword { email, db } => set_password::run(&email, &db),
     }
 }

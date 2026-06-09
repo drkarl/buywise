@@ -61,5 +61,10 @@ argon2 = "0.5"
 # `SaltString::generate` expects a rand_core 0.6 RNG. Bumping to rand 0.9 would
 # pull a second rand_core (0.9) and break the api crate's password hashing.
 rand = "0.8"
+# Hidden password prompt for the `buywise-cli set-password` operator tool (issue
+# #51): reads the password from the TTY without echoing it. No equivalent was
+# already in the tree; this is the de-facto standard, dependency-light crate for
+# the job (used by cargo, rustup, etc.).
+rpassword = "7"
 # Test-only: temp dirs/files for CLI integration tests.
 tempfile = "3"
