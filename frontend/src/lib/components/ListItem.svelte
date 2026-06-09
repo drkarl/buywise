@@ -36,8 +36,12 @@
 	);
 	// Show the +/- stepper only for an active (not in-basket) entry when the parent
 	// wired `onquantity`. The `-` button is disabled at quantity 1 so it never goes
-	// below 1 (mirrors the backend's `quantity >= 1` rule).
+	// below 1, and `+` is disabled at MAX_QUANTITY so the UI never round-trips a
+	// value the server will reject (mirrors the backend's `1..=9999` rule).
 	const showStepper = $derived(!inBasket && onquantity !== undefined);
+	// Upper bound for the quantity stepper; mirrors the backend's MAX_QUANTITY
+	// (crates/api/src/mutations.rs). Keep the two in sync.
+	const MAX_QUANTITY = 9999;
 
 	// Swipe-to-delete state.
 	const SWIPE_THRESHOLD = 80;
@@ -128,6 +132,7 @@
 					type="button"
 					class="qty-btn"
 					aria-label="Increase quantity of {entry.display_name}"
+					disabled={entry.quantity >= MAX_QUANTITY}
 					onclick={() => onquantity?.(entry.id, entry.quantity + 1)}>+</button
 				>
 			</div>

@@ -863,6 +863,65 @@ async fn set_quantity_below_one_is_rejected() {
 }
 
 #[tokio::test]
+async fn set_quantity_above_max_is_rejected() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+
+    // The ceiling (9999) is accepted; one past it (10000) is rejected.
+    let at_ceiling = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 9999 }),
+        ),
+    )
+    .await;
+    assert_eq!(at_ceiling.status(), StatusCode::CREATED, "9999 is the inclusive max");
+
+    let over = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 10000 }),
+        ),
+    )
+    .await;
+    assert_eq!(over.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The over-the-ceiling reject rolled back: the entry keeps the accepted 9999.
+    let qty: i64 =
+        sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(qty, 9999, "a rejected over-max set_quantity leaves the prior value");
+}
+
+#[tokio::test]
 async fn set_quantity_does_not_resurrect_a_deleted_entry() {
     let pool = setup_pool().await;
     seed_household(&pool, "hh-a", "Household A").await;

@@ -855,16 +855,23 @@ async fn apply_rename_item(
     ))
 }
 
+/// Upper bound for a `set_quantity` payload. A realistic shopping quantity never
+/// approaches this; rejecting beyond it stops an absurd value (or a typo/overflow)
+/// from being persisted. Keep this in sync with the client's `+`-button ceiling.
+const MAX_QUANTITY: i64 = 9999;
+
 /// `set_quantity`: set the entry's `quantity` to an ABSOLUTE value (issue #60),
 /// last-write-wins. The payload carries the new value (`{ "quantity": <int >= 1> }`);
 /// an absolute value is idempotent-friendly under retries/LWW (a replayed or stale
 /// queued op can never double-count, unlike an `adjust_quantity` delta). The value
 /// is the single syncable representation of the list UI's +/- controls.
 ///
-/// Validation: `quantity` must be a present integer `>= 1`. A missing/non-integer
-/// payload or a value `< 1` is a 422 (reject, not clamp — a clear client error
-/// beats a silent correction the client never learns about). The client also
-/// disables the `-` button at 1, so a valid client never sends `< 1`.
+/// Validation: `quantity` must be a present integer in `1..=MAX_QUANTITY`. A
+/// missing/non-integer payload, a value `< 1`, or a value `> MAX_QUANTITY` is a
+/// 422 (reject, not clamp — a clear client error beats a silent correction the
+/// client never learns about). The client mirrors both bounds: it disables the
+/// `-` button at 1 and the `+` button at `MAX_QUANTITY`, so a valid client never
+/// sends an out-of-range value.
 ///
 /// Like the other field updates, a delete wins: a deleted entry is not resurrected
 /// (M1). The lookup and UPDATE are scoped to `(id, list_id)` so a cross-list id is
@@ -874,12 +881,13 @@ async fn apply_set_quantity(
     req: &MutationRequest,
 ) -> Result<ApplyOutcome, StatusCode> {
     let entry_id = require_entry(req)?;
-    // Absolute quantity, required and >= 1. `as_i64` rejects floats/strings/missing.
+    // Absolute quantity, required and within `1..=MAX_QUANTITY`. `as_i64` rejects
+    // floats/strings/missing; the range filter rejects `< 1` and absurd ceilings.
     let quantity = req
         .payload
         .get("quantity")
         .and_then(Value::as_i64)
-        .filter(|q| *q >= 1)
+        .filter(|q| (1..=MAX_QUANTITY).contains(q))
         .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
     let now = buywise_core::db::now_iso();
 
