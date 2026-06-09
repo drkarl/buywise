@@ -97,6 +97,11 @@ export interface OptimiseResponse {
 	recommended: Recommendation | null;
 	unresolved_items: UnresolvedItem[];
 	no_valid_offer_items: NoValidOfferItem[];
+	// NOTE (Backlog-T1 follow-up): `needs_confirmation_items` and the
+	// `strict_no_exact_offer` NoValidOfferItem reason are decoded here but not yet
+	// surfaced in the plan UI. Dedicated rendering (a confirm prompt / a
+	// "missing — exact product unavailable" badge) is intentionally deferred to a
+	// separate tracked issue; do not infer absence of UI as a decode bug.
 	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;
