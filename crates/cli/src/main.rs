@@ -92,7 +92,8 @@ enum Command {
     ///
     /// Prompts for the new password without echoing it (twice, with
     /// confirmation, on a TTY; once from stdin when piped, for scripting),
-    /// argon2id-hashes it, and updates the row matching <email>. The password is
+    /// argon2id-hashes it, and updates the row matching <email>. When piped,
+    /// only the first line of stdin is used as the password. The password is
     /// never taken as a plaintext CLI argument. Exits non-zero if no user has
     /// that email.
     SetPassword {
