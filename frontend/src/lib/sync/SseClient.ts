@@ -102,15 +102,19 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
  *
  * The snapshot now carries the COMPLETE list state — every status (active,
  * bought, skipped, deleted tombstones), not active-only (issue #62 fixed the
- * backend gap noted in the P2-T4 report). The active-scoped reconcile below is
- * therefore no longer load-bearing for preserving basket history, but it remains
- * correct and SAFE: it reconciles the local `status='active'` set to the
- * snapshot's active set (upsert present, delete local actives absent) while
- * `bulkPut`-ing ALL snapshot rows — so bought/skipped/deleted now arrive via the
- * snapshot and upsert cleanly, and any local non-active row not in the snapshot is
- * preserved. A future cleanup can simplify this to a straight wholesale reconcile
- * now that the endpoint is complete; that simplification is intentionally OUT OF
- * SCOPE here (this issue only fixes the backend shape).
+ * backend gap noted in the P2-T4 report). DESPITE the snapshot being complete
+ * and authoritative, the reconcile below is NOT a wholesale reconcile over all
+ * statuses: it is a deliberate BACKWARD-COMPAT WORKAROUND carried over from
+ * PR #61, scoped to the `status='active'` set only. It reconciles the local
+ * active set to the snapshot's active set (upsert present, delete local actives
+ * absent) while `bulkPut`-ing ALL snapshot rows — so bought/skipped/deleted now
+ * arrive via the snapshot and upsert cleanly. Crucially, a local non-active row
+ * MISSING from the snapshot is PRESERVED, not deleted. Now that the endpoint is
+ * authoritative this preservation can leave STALE basket history behind and
+ * prevents true convergence over non-active rows; properly reconciling them
+ * (deleting local non-active rows absent from the complete snapshot) is a TRACKED
+ * FOLLOW-UP, intentionally OUT OF SCOPE here (issue #62 only fixes the backend
+ * shape; the reconcile behavior is unchanged in this PR).
  *
  * One exception to the delete: an active row backing a not-yet-confirmed mutation
  * (`mutation_queue` status `pending` or `sent`) is an OPTIMISTIC local insert the
