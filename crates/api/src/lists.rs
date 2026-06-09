@@ -107,8 +107,8 @@ pub struct EntryView {
     pub added_by: String,
     /// `list_entries.quantity`.
     pub quantity: i64,
-    /// `list_entries.status` (`active`|`bought`|`skipped`|`deleted`) — the
-    /// snapshot enumerates every status, not just `active`.
+    /// `list_entries.status` (`active`|`bought`|`skipped`|`deleted`). See
+    /// [`ListDetail::entries`] for why every status is carried.
     pub status: String,
     /// `list_entries.bought_by` (set only for `bought` entries).
     pub bought_by: Option<String>,
@@ -623,9 +623,8 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
             String,
         ),
     >(
-        // Every entry status (active, bought, skipped, deleted): the snapshot is
-        // the complete list state, so a client can reconcile basket history and
-        // tombstones from it alone. `list_id`, `bought_by`, `bought_at` are
+        // No `WHERE status = 'active'` filter — every entry status is selected
+        // (see this fn's doc comment). `list_id`, `bought_by`, `bought_at` are
         // included to mirror `mutations::EntityView` field-for-field.
         "SELECT id, list_id, canonical_item_id, resolution_status, resolution_candidates_json, \
                 raw_text, display_name, added_by, quantity, status, bought_by, bought_at, \
