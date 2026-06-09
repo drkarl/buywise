@@ -1421,6 +1421,7 @@
     "size_value": 500.0,
     "size_unit": "g",
     "pack_count": 1,
+    "dietary_flags": ["organic", "vegetarian"],
     "price_cents": 219,
     "unit_price_eur_micros": null,
     "unit_price_basis": "per_kg",

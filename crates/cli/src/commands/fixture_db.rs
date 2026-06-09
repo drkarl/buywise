@@ -76,10 +76,16 @@ pub async fn build_fixture_pool(root: &Path, household_id: &str) -> Result<Sqlit
         .context("connecting in-memory fixture database")?;
 
     apply_schema_001(&pool, root).await?;
-    // Backlog-T1 added retailer_products.form_factor / dietary_flags in 007.
-    // Fixture mode bootstraps only the Phase-0 schema, so apply that one
-    // additive migration too — otherwise upsert_retailer_product (which now
-    // writes the two columns) would fail against the older table shape.
+    // Fixture mode deliberately applies only 001 + 007, skipping migrations
+    // 002–006. This works because every table/column the fixtures touch
+    // (canonical_items, item_constraints, retailer_products, product_offers,
+    // product_matches, source_runs, …) is created in 001_phase0_schema.sql;
+    // 002–006 are data seeds / unrelated feature tables the fixture path never
+    // reads. Backlog-T1 then adds retailer_products.form_factor / dietary_flags
+    // in 007, which we must apply too — otherwise upsert_retailer_product (which
+    // now writes the two columns) would fail against the older table shape. If a
+    // future migration moves any fixture-relevant DDL out of 001, this list must
+    // be revisited.
     apply_schema_file(&pool, root, "007_retailer_product_attributes.sql").await?;
     seed_categories_and_items(&pool, root, household_id).await?;
     seed_item_constraints(&pool, root).await?;

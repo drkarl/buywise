@@ -16,10 +16,10 @@
 --                           the required item_constraints.dietary_flags set.
 --
 -- item_constraints already carries form_factor (TEXT) and dietary_flags (JSON
--- TEXT) since 003_phase1_schema.sql; retailer_products had no matching columns,
+-- TEXT) since 001_phase0_schema.sql; retailer_products had no matching columns,
 -- so those constraints could not be enforced. This migration closes that gap.
 --
--- Conventions (match 001_phase0_schema.sql / 003_phase1_schema.sql):
+-- Conventions (match 001_phase0_schema.sql):
 --   * Timestamps are TEXT (ISO-8601 UTC).
 --   * JSON-array attributes are stored as TEXT (no sqlx json feature in-tree;
 --     decoded in domain::RetailerProduct's hand-written FromRow), mirroring how
