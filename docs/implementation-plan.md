@@ -2468,6 +2468,19 @@ Until this task is complete, recommendations for constrained items (nappies size
 
 **Dependencies:** Phase 5 complete; migrations for `retailer_products.form_factor` and `retailer_products.dietary_flags`; ingest adapter changes to populate those fields.
 
+**Canonical flag vocabulary (defined for this task; mirrored in `crates/core/src/domain.rs` as `FORM_FACTORS` / `DIETARY_FLAGS`):**
+
+- `form_factor` — a single lowercase token, compared case-insensitively between `item_constraints.form_factor` and `retailer_products.form_factor`:
+  `can`, `bottle`, `carton`, `pouch`, `jar`, `tub`, `bar`, `spray`, `box`, `bag`, `tin`, `tetra`.
+- `dietary_flags` — a JSON array of lowercase snake_case tokens; a product qualifies for a constraint only when its set is a **superset** of the required set:
+  `gluten_free`, `dairy_free`, `lactose_free`, `vegan`, `vegetarian`, `nut_free`, `organic`, `sugar_free`.
+
+**Enforcement semantics (optimiser `check_constraints`, brand comparisons normalised via `normalize()`):** `allowed_brands` — if set & non-empty the product brand must be in the list (missing brand → reject); `excluded_brands` — product brand in the list → reject; `pack_count` — exact match; `form_factor` — equal (case-insensitive); `dietary_flags` — product set ⊇ required set.
+
+**Substitution policy (classification, surfaced as distinct machine-readable statuses):** `strict` → if the exact (accepted) matched product has no qualifying offer, the item is shown as missing (`NoOfferReason::StrictNoExactOffer`) rather than substituted; `ask` → the item is held back in `OptimiserOutput::needs_confirmation_items` for the household to confirm rather than auto-selected.
+
+**Ingest population:** the BasketWatch/Lidl feeds carry no structured form/dietary fields. Ingest (`crates/ingest/src/attributes.rs`) populates the two columns best-effort from product name + category keywords, preferring any explicit feed-supplied value; an undetectable attribute is written as `NULL` (treated by the optimiser as "unknown", satisfying only an absent constraint). The columns are never silently dropped.
+
 ---
 
 ## Cross-Cutting Notes
