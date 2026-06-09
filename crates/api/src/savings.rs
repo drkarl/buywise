@@ -166,18 +166,25 @@ async fn record_actual_spend(
 /// One calendar month's aggregate savings, derived from `savings_events`.
 ///
 /// `month` is `"YYYY-MM"` (UTC, off `created_at`). `gross_cents` is the sum of
-/// the always-present `gross_saving_cents`. `accepted_cents` and `net_cents` sum
-/// `accepted_savings_cents` / `net_saving_cents` treating NULL as 0 — those are
-/// only populated once the household enters their actual post-shop spend, so a
-/// month of un-reconciled lists shows €0 net (not a skewed total). `lists` is the
+/// the always-present `gross_saving_cents`. `accepted_cents` is **derived** as
+/// `baseline_cost_cents − chosen_basket_cost_cents` summed over the month's
+/// reconciled rows only (those with a non-null `chosen_basket_cost_cents`);
+/// `net_cents` sums `net_saving_cents` treating NULL as 0. Both are only non-zero
+/// once the household enters their actual post-shop spend, so a month of
+/// un-reconciled lists shows €0 accepted/net (not a skewed total). `lists` is the
 /// count of savings events (= archived lists with a saving) in the month.
+///
+/// Note: the schema's `accepted_savings_cents` / `subscription_cost_alloc_cents`
+/// columns are not populated this phase, so accepted is derived from the stored
+/// baseline/chosen figures rather than read from that column.
 #[derive(Debug, Serialize)]
 pub struct MonthlySummary {
     /// Calendar month as `"YYYY-MM"`.
     pub month: String,
     /// Sum of `gross_saving_cents` (always present) for the month.
     pub gross_cents: Cents,
-    /// Sum of `accepted_savings_cents` (NULL treated as 0) for the month.
+    /// Derived accepted saving: sum of `baseline − chosen_basket` over the
+    /// month's reconciled (non-null `chosen_basket_cost_cents`) rows; 0 otherwise.
     pub accepted_cents: Cents,
     /// Sum of `net_saving_cents` (NULL treated as 0) for the month.
     pub net_cents: Cents,
@@ -250,13 +257,20 @@ async fn savings_summary(
         .map_err(db_error("savings_summary.household"))?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Per-month aggregates. NULL accepted/net are coalesced to 0 so an
-    // un-reconciled month reads as €0 net rather than skewing the total; gross is
-    // NOT NULL in the schema. strftime works on the ISO-8601 text `created_at`.
+    // Per-month aggregates. `accepted_cents` is DERIVED as baseline − chosen over
+    // reconciled rows only (the schema's `accepted_savings_cents` column is never
+    // populated this phase); an un-reconciled row (chosen NULL) contributes 0 to
+    // both accepted and net, so a month of un-reconciled lists reads as €0 rather
+    // than skewing the total. This keeps accepted internally consistent with the
+    // stored net (= baseline − chosen − travel): accepted = net + travel for
+    // reconciled rows. Gross is NOT NULL in the schema; strftime works on the
+    // ISO-8601 text `created_at`.
     let monthly = sqlx::query_as::<_, (String, Cents, Cents, Cents, i64)>(
         "SELECT strftime('%Y-%m', se.created_at)        AS month, \
                 SUM(se.gross_saving_cents)              AS gross_cents, \
-                SUM(COALESCE(se.accepted_savings_cents, 0)) AS accepted_cents, \
+                SUM(CASE WHEN se.chosen_basket_cost_cents IS NOT NULL \
+                         THEN se.baseline_cost_cents - se.chosen_basket_cost_cents \
+                         ELSE 0 END)                    AS accepted_cents, \
                 SUM(COALESCE(se.net_saving_cents, 0))   AS net_cents, \
                 COUNT(*)                                AS lists \
          FROM savings_events se \
