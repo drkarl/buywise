@@ -104,8 +104,10 @@ describe('event appliers', () => {
     expect((await db.list_entries.get('e1'))?.status).toBe('bought');
   });
 
-  // The server's snapshot EntryView OMITS `list_id` and is active-only, so the
-  // snapshot factory mirrors that: no `list_id` field; the applier stamps it.
+  // Backward-compat fixture: simulates an OLDER server whose snapshot entry omits
+  // `list_id` (pre issue #62), so the factory drops it and we assert the applier
+  // still stamps `listId` defensively. The current server DOES send `list_id`
+  // (mirroring EntityView), but the client tolerates both.
   function snapshotEntity(
     id: string,
     status: ServerListEntry['status'],

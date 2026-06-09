@@ -1392,13 +1392,15 @@ Implement list management routes:
 
 - `GET /api/lists` — return all active lists for the household
 - `POST /api/lists` — create a new list
-- `GET /api/list/:id` — return full list state (list metadata + all active entries with their resolution status and current revision)
+- `GET /api/list/:id` — return full list state (list metadata + the complete set of entries — every status: `active`, `bought`, `skipped`, and `deleted` tombstones — each with its resolution status, and the current revision)
 - `PATCH /api/list/:id` — rename or archive a list
 - `GET /api/items` — return the full canonical catalogue (for client-side resolution and category assignment)
 
 All routes require `AuthenticatedUser`. Household membership is checked: user must be a member of the list's household.
 
 The `GET /api/list/:id` response includes `current_revision` at the top level so the client knows the baseline for its next reconnect.
+
+`GET /api/list/:id` doubles as the offline-sync snapshot serialiser: it carries the COMPLETE list state (every entry status, not active-only) and includes `list_id` on each entry, mirroring the `POST /api/mutations` / SSE `mutation` `entity` shape. This lets a client use it (and the SSE `full_snapshot` it backs) as a faithful full replacement that reconciles bought/skipped/deleted rows, not just active ones (issue #62). The read UI buckets entries by `status` client-side (active list vs the "In basket" section), so carrying all statuses serves both consumers from one payload.
 
 **Files / Areas Touched:**
 - `crates/api/src/lists.rs` (create)
@@ -1407,7 +1409,7 @@ The `GET /api/list/:id` response includes `current_revision` at the top level so
 **Acceptance Criteria:**
 - [ ] `GET /api/lists` returns only lists belonging to the authenticated user's household
 - [ ] `GET /api/list/:id` response includes `current_revision` field
-- [ ] `GET /api/list/:id` response includes all `list_entries` with their `resolution_status` and `effective_constraint_hash`
+- [ ] `GET /api/list/:id` response includes all `list_entries` (every status, not active-only) with their `list_id`, `resolution_status`, and `effective_constraint_hash`
 - [ ] A user from household A cannot read a list belonging to household B → 403
 - [ ] `GET /api/items` returns all canonical items with their aliases and constraints
 

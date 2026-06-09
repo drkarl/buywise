@@ -94,21 +94,23 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
 /**
  * Applies a `full_snapshot` event (also reused by the initial `GET /api/list/:id`
  * fetch). `listId` is supplied by the caller — the SSE client knows its own list
- * id, and `fetchSnapshot` knows the id it requested — because the server's
- * `EntryView` rows OMIT `list_id` (see `EntryView` in crates/api/src/lists.rs),
- * so we cannot read it off each entry. We stamp `listId` onto every snapshot row
- * here.
+ * id, and `fetchSnapshot` knows the id it requested. As of issue #62 the server's
+ * snapshot entries DO carry `list_id` (see `EntryView` in crates/api/src/lists.rs,
+ * now mirroring `EntityView`), so the `list_id: listId` stamp below is redundant;
+ * it is kept defensively (and to tolerate an older server) and can be dropped in a
+ * follow-up.
  *
- * IMPORTANT — the snapshot is ACTIVE-ONLY. `GET /api/list/:id` / `full_snapshot`
- * serialise `WHERE status = 'active'` only (confirmed: `load_detail` /
- * `list_snapshot` in lists.rs); they do NOT enumerate bought/skipped/deleted
- * rows. A naive wholesale "delete all rows for this list, then bulkPut" would
- * therefore destroy local basket history (bought/skipped). So the destructive
- * replace is SCOPED TO ACTIVE ENTRIES: we reconcile the local `status='active'`
- * set to exactly the snapshot's active set (upsert present, delete local actives
- * absent from the snapshot) and PRESERVE local non-active rows untouched. This is
- * a deliberate workaround for the active-only endpoint (see the backend gap noted
- * in the P2-T4 report).
+ * The snapshot now carries the COMPLETE list state — every status (active,
+ * bought, skipped, deleted tombstones), not active-only (issue #62 fixed the
+ * backend gap noted in the P2-T4 report). The active-scoped reconcile below is
+ * therefore no longer load-bearing for preserving basket history, but it remains
+ * correct and SAFE: it reconciles the local `status='active'` set to the
+ * snapshot's active set (upsert present, delete local actives absent) while
+ * `bulkPut`-ing ALL snapshot rows — so bought/skipped/deleted now arrive via the
+ * snapshot and upsert cleanly, and any local non-active row not in the snapshot is
+ * preserved. A future cleanup can simplify this to a straight wholesale reconcile
+ * now that the endpoint is complete; that simplification is intentionally OUT OF
+ * SCOPE here (this issue only fixes the backend shape).
  *
  * One exception to the delete: an active row backing a not-yet-confirmed mutation
  * (`mutation_queue` status `pending` or `sent`) is an OPTIMISTIC local insert the
