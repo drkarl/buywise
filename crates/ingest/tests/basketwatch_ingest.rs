@@ -251,6 +251,8 @@ async fn write_error_rolls_back_then_marks_failed() {
         offer_valid_until: None,
         source_snapshot_date: None,
         cache_expires_at: None,
+        form_factor: None,
+        dietary_flags: None,
     };
 
     let result = basketwatch::run_ingest(&pool, "2026-05-30T10:00:00.000Z", move || async move {

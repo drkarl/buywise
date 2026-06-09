@@ -217,6 +217,11 @@ pub fn normalise(raw: Vec<RawLidlProduct>, fetched_at: &str) -> NormaliseResult 
 
         let id = stable_product_id(Source::LidlDirect, Retailer::Lidl, &external_id);
 
+        // Backlog-T1: the Lidl feed carries no structured form/dietary fields, so
+        // derive them best-effort from name + category rather than writing NULL.
+        let (form_factor, dietary_flags) =
+            crate::attributes::extract_attributes(&record.name, record.category.as_deref());
+
         result.products.push(RetailerProduct {
             id: id.clone(),
             source: Source::LidlDirect,
@@ -230,6 +235,8 @@ pub fn normalise(raw: Vec<RawLidlProduct>, fetched_at: &str) -> NormaliseResult 
             size_value: None,
             size_unit: None,
             pack_count: None,
+            form_factor,
+            dietary_flags,
             first_seen_at: fetched_at.to_string(),
             last_seen_at: fetched_at.to_string(),
         });
