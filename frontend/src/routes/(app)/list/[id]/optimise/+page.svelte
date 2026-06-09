@@ -122,6 +122,8 @@
 				return 'your constraints ruled out every option';
 			case 'brand_policy_missing_brand':
 				return 'a brand is required but none was set';
+			case 'strict_no_exact_offer':
+				return 'the exact product has no current offer, and substitutes aren’t allowed';
 			default:
 				return reason;
 		}
@@ -190,6 +192,27 @@
 			<section class="explanation" aria-label="Explanation">
 				<h2>What this means</h2>
 				<p>{result.plain_language_explanation}</p>
+			</section>
+		{/if}
+
+		{#if result.needs_confirmation_items.length > 0}
+			<section class="needs-confirmation" aria-label="Items awaiting your confirmation">
+				<h2>Waiting for your confirmation</h2>
+				<p class="needs-confirmation-note">
+					These items are set to ask before substituting, so they’re held out of every plan
+					total until you pick a product on your list.
+				</p>
+				<ul>
+					{#each result.needs_confirmation_items as item (item.item_index)}
+						<li>
+							<span
+								>{item.display_text} — {item.candidate_count}
+								{item.candidate_count === 1 ? 'option' : 'options'} to choose from</span
+							>
+							<a class="clarify" href="/list/{listId}">Choose on your list</a>
+						</li>
+					{/each}
+				</ul>
 			</section>
 		{/if}
 
@@ -279,13 +302,21 @@
 		gap: 0.75rem;
 	}
 	.explanation,
-	.unresolved {
+	.unresolved,
+	.needs-confirmation {
 		border: 1px solid #e2e8f0;
 		border-radius: 0.5rem;
 		padding: 1rem;
 	}
+	/* Actionable, not an error state: a warm accent sets it apart from the
+	   "excluded from totals" block below it. */
+	.needs-confirmation {
+		border-color: #fcd34d;
+		background: #fffbeb;
+	}
 	.explanation h2,
-	.unresolved h2 {
+	.unresolved h2,
+	.needs-confirmation h2 {
 		margin: 0 0 0.5rem;
 		font-size: 1.05rem;
 	}
@@ -294,12 +325,14 @@
 		color: #334155;
 		line-height: 1.5;
 	}
-	.unresolved-note {
+	.unresolved-note,
+	.needs-confirmation-note {
 		margin: 0 0 0.6rem;
 		color: #64748b;
 		font-size: 0.9rem;
 	}
-	.unresolved ul {
+	.unresolved ul,
+	.needs-confirmation ul {
 		list-style: none;
 		margin: 0;
 		padding: 0;
@@ -307,7 +340,8 @@
 		flex-direction: column;
 		gap: 0.5rem;
 	}
-	.unresolved li {
+	.unresolved li,
+	.needs-confirmation li {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
