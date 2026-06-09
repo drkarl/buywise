@@ -21,3 +21,12 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Playwright e2e (issue #63)
+/test-results
+/playwright-report
+/playwright/.cache
+# Throwaway SQLite DB seeded by e2e/run-server.sh
+/e2e.db
+/e2e.db-shm
+/e2e.db-wal
