@@ -433,21 +433,9 @@ async fn mutations_operation_type_check_rejects_unknown() {
 #[tokio::test]
 async fn mutations_operation_type_check_accepts_set_quantity() {
     let pool = migrated_pool().await;
-    sqlx::query(
-        "INSERT INTO users (id, email, password_hash, display_name, created_at)
-         VALUES ('user-1', 'a@b.c', 'argon2id$dummy', 'A', 't')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO shopping_lists (id, household_id, name, created_at)
-         VALUES ('list-1', ?, 'Test', 't')",
-    )
-    .bind(HOUSEHOLD)
-    .execute(&pool)
-    .await
-    .unwrap();
+    // Reuse the shared seed helper for the user-1/list-1 prerequisites the FK
+    // constraints need (it also seeds an unused canonical item, which is harmless).
+    seed_list_prereqs(&pool).await;
 
     let ok = sqlx::query(
         "INSERT INTO mutations
