@@ -1232,8 +1232,11 @@ CREATE TABLE mutations (
     entity_type       TEXT NOT NULL,
     entity_id         TEXT NOT NULL,
     operation_type    TEXT NOT NULL
+        -- `set_quantity` added by migration 008 (issue #60); the inline CHECK here
+        -- reflects the current canonical enum after all migrations.
         CHECK(operation_type IN ('add_item','mark_bought','mark_skipped','delete_item',
-                                  'rename_item','resolve_alias','reject_match','set_constraint')),
+                                  'rename_item','resolve_alias','reject_match','set_constraint',
+                                  'set_quantity')),
     payload           TEXT NOT NULL,    -- JSON
     base_revision     INTEGER NOT NULL,
     created_at_client TEXT NOT NULL,
@@ -1463,6 +1466,7 @@ Implement `POST /api/mutations`. This is the primary write path for all list cha
 
 - `add_item`: attempt insert into `list_entries`. On unique index conflict (`uq_list_entries_active_dedup` fires): increment `quantity` and return `status: 'merged'`. This applies only to resolved entries with the same `effective_constraint_hash`. Unresolved entries (which have `effective_constraint_hash = 'unresolved:<entry_id>'`) are never merged — the sentinel makes each row unique.
 - `delete_item` conflicts with a concurrent `mark_bought`: keep the delete; insert an event for the bought action in `list_entry_events`.
+- `set_quantity` (issue #60): set the entry's `quantity` to an **absolute** value (payload `{ "quantity": <int >= 1> }`), last-write-wins. Absolute (not a delta) so retries/LWW are idempotent: a replayed or stale-queued op can never double-count. The server rejects a missing/non-integer payload or a value `< 1` with 422 (reject, not clamp). Delete wins (a deleted entry is not resurrected). This is the syncable representation of the list UI's +/- controls; the client disables the `-` button at quantity 1. (Distinct from `add_item`'s merge path, which increments `quantity` only when a duplicate resolved item collides on the dedup index.)
 - Last-write-wins for all field updates: the server always accepts the mutation and assigns a new revision.
 
 **`effective_constraint_hash` for new entries:** When `operation_type = 'add_item'` and the entry has no constraints, the server sets `effective_constraint_hash = 'unresolved:<entry_id>'` if `canonical_item_id IS NULL`, or `'default'` if resolved with empty constraints. If constraints are present, the server computes SHA-256 of sorted-key JSON (see design §7 hash rule).
