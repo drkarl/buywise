@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{self, DbError};
 use crate::domain::{
     Cents, ConstraintPolicy, FreshnessConfidence, ItemConstraints, MatchStatus, ProductMatch,
-    ProductOffer, Retailer, RetailerProduct, SizeBasis,
+    ProductOffer, Retailer, RetailerProduct, SizeBasis, SubstitutionPolicy,
 };
 use crate::normalise::normalize;
 use sqlx::sqlite::SqlitePool;
@@ -299,6 +299,13 @@ pub enum NoOfferReason {
     /// `policy = 'brand'` but no brand is configured. A configuration error: we
     /// never silently fall back to `any`, so the item is rejected with a warning.
     BrandPolicyMissingBrand,
+    /// `substitution_policy = 'strict'` and the exact (accepted) matched product
+    /// has no current, constraint-passing offer. A substitute exists but Strict
+    /// forbids offering it, so the item is shown as missing rather than swapped
+    /// for an alternative (Backlog-T1). Distinct from
+    /// [`NoOfferReason::ConstraintsEliminatedAll`]: the item is missing by
+    /// *policy*, not because every candidate failed a field filter.
+    StrictNoExactOffer,
 }
 
 /// An item that resolved but yielded no valid offer. Carries a structured reason
@@ -311,6 +318,25 @@ pub struct NoValidOfferItem {
     pub display_text: String,
     /// Structured reason for the warning.
     pub reason: NoOfferReason,
+}
+
+/// A resolved item whose `substitution_policy = 'ask'` produced at least one
+/// qualifying offer, but which must be **confirmed by the household** before it
+/// is auto-selected (Backlog-T1).
+///
+/// Surfaced separately from priced plan lines and from
+/// [`NoValidOfferItem`]: the item is *priceable* (a candidate exists) but the
+/// optimiser deliberately does not commit it to a plan. Callers render it as a
+/// confirmation prompt. The carried `candidate_count` lets the UI say how many
+/// options await a choice without re-deriving them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeedsConfirmationItem {
+    /// Index into `OptimiserInput::items`.
+    pub item_index: usize,
+    /// The original display text.
+    pub display_text: String,
+    /// How many constraint-passing candidate offers were found for the item.
+    pub candidate_count: usize,
 }
 
 /// The full optimiser result.
@@ -331,6 +357,10 @@ pub struct OptimiserOutput {
     pub unresolved_items: Vec<UnresolvedItem>,
     /// Resolved items that nonetheless produced no valid offer.
     pub no_valid_offer_items: Vec<NoValidOfferItem>,
+    /// Resolved, priceable items held back for household confirmation because
+    /// their `substitution_policy = 'ask'` (Backlog-T1). Excluded from every
+    /// plan and from all totals until the household chooses.
+    pub needs_confirmation_items: Vec<NeedsConfirmationItem>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,12 +378,21 @@ enum ConstraintCheck {
     ConfigError,
 }
 
-/// Apply Phase-0 constraints (brand + size ±20%) to a single product.
+/// Apply an item's constraints to a single product (Backlog-T1: full
+/// enforcement).
 ///
-/// Phase-0 scope (the issue): only `brand` and `preferred_size` are enforced.
-/// `allowed_brands`, `form_factor`, and `dietary_flags` are stored but not
-/// enforced (Backlog-T1). The brand check runs only under `policy = 'brand'`;
-/// other policies do not gate on brand in Phase 0.
+/// The brand check runs only under `policy = 'brand'` (and is a config error if
+/// the policy is set but no brand is configured). Every other field filter —
+/// `allowed_brands`, `excluded_brands`, `pack_count`, `form_factor`,
+/// `dietary_flags`, and the preferred-size band — is enforced whenever the
+/// corresponding constraint is present, independent of `policy`. Brand
+/// comparisons (the `brand` policy plus the allow/block lists) are normalised
+/// via [`normalize`] so casing/punctuation differences do not leak products
+/// through.
+///
+/// Substitution policy (`Strict`/`Ask`) is **not** decided here: it is a
+/// per-item concern handled in [`classify_items`] after the per-product filter
+/// has produced the surviving candidates.
 fn check_constraints(
     policy: ConstraintPolicy,
     constraints: Option<&ItemConstraints>,
@@ -378,14 +417,73 @@ fn check_constraints(
         }
     }
 
-    // Size band: enforced whenever a preferred size is set, regardless of policy.
-    if let Some(c) = constraints {
-        if let (Some(pref_value), Some(pref_basis)) =
-            (c.preferred_size_value, c.preferred_size_basis)
-        {
-            if !size_within_band(product, pref_value, pref_basis) {
+    let Some(c) = constraints else {
+        // No constraints row ⇒ nothing further to enforce.
+        return ConstraintCheck::Pass;
+    };
+
+    // allowed_brands: if set & non-empty, the product's (normalised) brand must
+    // appear in the allow-list. A product with no brand cannot be matched against
+    // an allow-list, so it is rejected.
+    if let Some(allowed) = c.allowed_brands.as_ref().filter(|l| !l.is_empty()) {
+        let Some(brand) = product.brand.as_deref() else {
+            return ConstraintCheck::Reject;
+        };
+        let norm = normalize(brand);
+        if !allowed.iter().any(|a| normalize(a) == norm) {
+            return ConstraintCheck::Reject;
+        }
+    }
+
+    // excluded_brands: if the product's (normalised) brand is in the block-list,
+    // reject. A product with no brand cannot be on the block-list, so it passes
+    // this gate.
+    if let Some(excluded) = c.excluded_brands.as_ref() {
+        if let Some(brand) = product.brand.as_deref() {
+            let norm = normalize(brand);
+            if excluded.iter().any(|b| normalize(b) == norm) {
                 return ConstraintCheck::Reject;
             }
+        }
+    }
+
+    // pack_count: if set, the product's pack_count must match exactly. A product
+    // with no pack_count cannot satisfy an explicit pack requirement.
+    if let Some(wanted) = c.pack_count {
+        if product.pack_count != Some(wanted) {
+            return ConstraintCheck::Reject;
+        }
+    }
+
+    // form_factor: if set, the product's form must match (case-insensitive). A
+    // product with no form_factor cannot satisfy an explicit form requirement.
+    if let Some(wanted) = c.form_factor.as_deref() {
+        match product.form_factor.as_deref() {
+            Some(f) if f.eq_ignore_ascii_case(wanted) => {}
+            _ => return ConstraintCheck::Reject,
+        }
+    }
+
+    // dietary_flags: if set & non-empty, the product's flag set must be a
+    // SUPERSET — it must carry every required flag. A product with no flags
+    // satisfies only an empty requirement. Comparison is case-insensitive on the
+    // canonical lowercase tokens.
+    if let Some(required) = c.dietary_flags.as_ref().filter(|l| !l.is_empty()) {
+        let product_flags = product.dietary_flags.as_deref().unwrap_or(&[]);
+        let has_all = required.iter().all(|req| {
+            product_flags
+                .iter()
+                .any(|have| have.eq_ignore_ascii_case(req))
+        });
+        if !has_all {
+            return ConstraintCheck::Reject;
+        }
+    }
+
+    // Size band: enforced whenever a preferred size is set, regardless of policy.
+    if let (Some(pref_value), Some(pref_basis)) = (c.preferred_size_value, c.preferred_size_basis) {
+        if !size_within_band(product, pref_value, pref_basis) {
+            return ConstraintCheck::Reject;
         }
     }
 
@@ -835,13 +933,15 @@ fn recommend(
 // ---------------------------------------------------------------------------
 
 /// Per-item classification result, separating items that can be priced from
-/// those surfaced as unresolved or no-offer.
+/// those surfaced as unresolved, no-offer, or awaiting confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
     /// Items with no `canonical_item_id`.
     pub unresolved: Vec<UnresolvedItem>,
     /// Resolved items that produced no valid offer.
     pub no_valid_offer: Vec<NoValidOfferItem>,
+    /// Resolved, priceable items held back under `substitution_policy = 'ask'`.
+    pub needs_confirmation: Vec<NeedsConfirmationItem>,
 }
 
 /// Classify each basket item against its raw matches/offers, applying the
@@ -851,6 +951,16 @@ pub struct Classification {
 /// `priced_inputs` supplies, per item index, the `(match, product, offer)`
 /// triples already fetched from the DB (or hand-built in tests). The brand-config
 /// error short-circuits an item to `no_valid_offer` regardless of its candidates.
+///
+/// After the per-product field filter, the item's `substitution_policy`
+/// (Backlog-T1) decides how the surviving candidates are routed:
+/// * `Any` — all candidates are priceable (current behaviour).
+/// * `Strict` — only the exact (`accepted`) match's offer may be used; if that
+///   exact product has no qualifying offer the item is shown as missing
+///   ([`NoOfferReason::StrictNoExactOffer`]) rather than substituted.
+/// * `Ask` — any candidate exists, but the item is held back for household
+///   confirmation ([`Classification::needs_confirmation`]) instead of being
+///   auto-priced.
 fn classify_items(
     input: &OptimiserInput,
     priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
@@ -858,6 +968,7 @@ fn classify_items(
     let mut candidates = Vec::new();
     let mut unresolved = Vec::new();
     let mut no_valid_offer = Vec::new();
+    let mut needs_confirmation = Vec::new();
 
     for (item_index, item) in input.items.iter().enumerate() {
         // 1a. Unresolved: no canonical item id.
@@ -919,7 +1030,44 @@ fn classify_items(
             continue;
         }
 
-        candidates.append(&mut item_candidates);
+        // Substitution policy (Backlog-T1). Default to the permissive `Any` when
+        // the item has no constraints row.
+        let substitution_policy = item
+            .constraints
+            .as_ref()
+            .map(|c| c.substitution_policy)
+            .unwrap_or(SubstitutionPolicy::Any);
+
+        match substitution_policy {
+            SubstitutionPolicy::Any => {
+                candidates.append(&mut item_candidates);
+            }
+            SubstitutionPolicy::Strict => {
+                // Only the exact (accepted) match may be priced; a suggested
+                // substitute is never offered. Drop suggested candidates and, if
+                // no accepted candidate has a qualifying offer, the item is
+                // missing by policy rather than substituted.
+                item_candidates.retain(|c| c.accepted);
+                if item_candidates.is_empty() {
+                    no_valid_offer.push(NoValidOfferItem {
+                        item_index,
+                        display_text: item.display_text.clone(),
+                        reason: NoOfferReason::StrictNoExactOffer,
+                    });
+                } else {
+                    candidates.append(&mut item_candidates);
+                }
+            }
+            SubstitutionPolicy::Ask => {
+                // Priceable, but held back for the household to confirm. Excluded
+                // from every plan until then.
+                needs_confirmation.push(NeedsConfirmationItem {
+                    item_index,
+                    display_text: item.display_text.clone(),
+                    candidate_count: item_candidates.len(),
+                });
+            }
+        }
     }
 
     (
@@ -927,6 +1075,7 @@ fn classify_items(
         Classification {
             unresolved,
             no_valid_offer,
+            needs_confirmation,
         },
     )
 }
@@ -996,6 +1145,7 @@ fn build_output(
         recommended,
         unresolved_items: classification.unresolved,
         no_valid_offer_items: classification.no_valid_offer,
+        needs_confirmation_items: classification.needs_confirmation,
     }
 }
 
