@@ -106,6 +106,16 @@ pub struct RawBasketWatchProduct {
     pub source_snapshot_date: Option<String>,
     #[serde(default)]
     pub cache_expires_at: Option<String>,
+    /// Explicit physical form (Backlog-T1), one of
+    /// [`buywise_core::domain::FORM_FACTORS`]. When present it takes precedence
+    /// over the name/category keyword scan; absent ⇒ best-effort derivation.
+    #[serde(default)]
+    pub form_factor: Option<String>,
+    /// Explicit dietary flags (Backlog-T1), a subset of
+    /// [`buywise_core::domain::DIETARY_FLAGS`]. When present it takes precedence
+    /// over the keyword scan; absent ⇒ best-effort derivation.
+    #[serde(default)]
+    pub dietary_flags: Option<Vec<String>>,
 }
 
 /// An offer pending insertion: every `product_offers` field *except* the ones
@@ -254,6 +264,15 @@ pub fn normalise(raw: Vec<RawBasketWatchProduct>, fetched_at: &str) -> Normalise
 
         let id = stable_product_id(Source::BasketWatch, retailer, &external_id);
 
+        // Backlog-T1: prefer explicit feed form/dietary fields; otherwise derive
+        // them best-effort from name + category rather than writing NULL.
+        let (form_factor, dietary_flags) = crate::attributes::resolve_attributes(
+            &record.name,
+            record.category.as_deref(),
+            record.form_factor,
+            record.dietary_flags,
+        );
+
         result.products.push(RetailerProduct {
             id: id.clone(),
             source: Source::BasketWatch,
@@ -267,6 +286,8 @@ pub fn normalise(raw: Vec<RawBasketWatchProduct>, fetched_at: &str) -> Normalise
             size_value: record.size_value,
             size_unit: record.size_unit,
             pack_count: record.pack_count,
+            form_factor,
+            dietary_flags,
             first_seen_at: fetched_at.to_string(),
             last_seen_at: fetched_at.to_string(),
         });
@@ -680,6 +701,8 @@ mod tests {
             offer_valid_until: None,
             source_snapshot_date: None,
             cache_expires_at: None,
+            form_factor: None,
+            dietary_flags: None,
         }
     }
 

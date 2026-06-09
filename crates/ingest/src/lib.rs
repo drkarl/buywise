@@ -7,6 +7,7 @@
 //! [`product_id`]. The Lidl run is isolated from BasketWatch via
 //! [`lidl::spawn_ingest`], so a Lidl failure cannot fail the BasketWatch run.
 
+pub mod attributes;
 pub mod basketwatch;
 pub mod error;
 pub mod lidl;
