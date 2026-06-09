@@ -6,6 +6,7 @@
 	// accessible via the explicit Delete button it reveals).
 
 	import type { LocalListEntry } from '$lib/db/dexie';
+	import { MAX_QUANTITY } from '$lib/stores/list';
 
 	interface Props {
 		entry: LocalListEntry;
@@ -39,9 +40,6 @@
 	// below 1, and `+` is disabled at MAX_QUANTITY so the UI never round-trips a
 	// value the server will reject (mirrors the backend's `1..=9999` rule).
 	const showStepper = $derived(!inBasket && onquantity !== undefined);
-	// Upper bound for the quantity stepper; mirrors the backend's MAX_QUANTITY
-	// (crates/api/src/mutations.rs). Keep the two in sync.
-	const MAX_QUANTITY = 9999;
 
 	// Swipe-to-delete state.
 	const SWIPE_THRESHOLD = 80;
