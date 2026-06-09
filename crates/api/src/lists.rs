@@ -7,7 +7,9 @@
 //!   * `POST  /api/lists`     — create a new list (CSRF-protected; it is a POST
 //!     behind [`AuthenticatedUser`]).
 //!   * `GET   /api/list/:id`  — full list state: list metadata, a top-level
-//!     `current_revision`, and all ACTIVE `list_entries`.
+//!     `current_revision`, and ALL `list_entries` (every status — active,
+//!     bought, skipped, and deleted tombstones — so the payload doubles as a
+//!     faithful sync snapshot; see [`list_snapshot`] and issue #62).
 //!   * `PATCH /api/list/:id`  — rename or archive a list (CSRF-protected).
 //!   * `GET   /api/items`     — the full canonical catalogue (items + aliases +
 //!     constraints) plus the `categories` catalogue and the household's
@@ -77,10 +79,20 @@ pub struct ListSummary {
 }
 
 /// A single list entry as returned inside [`ListDetail`].
+///
+/// Mirrors `mutations::EntityView` field-for-field (same JSON shape) so a client
+/// decodes a snapshot entry and a `POST /api/mutations` / SSE `mutation` entity
+/// identically — including `list_id`, `bought_by`, and `bought_at`. The snapshot
+/// is the COMPLETE list state (every `status`: active, bought, skipped, and
+/// deleted tombstones), so these fields are all required for a client to
+/// reconcile basket history from a snapshot alone (issue #62).
 #[derive(Debug, Serialize)]
 pub struct EntryView {
     /// `list_entries.id`.
     pub id: String,
+    /// `list_entries.list_id`. Present so a client need not stamp it from the
+    /// requested id (mirrors `EntityView`).
+    pub list_id: String,
     /// `list_entries.canonical_item_id` (NULL until resolved).
     pub canonical_item_id: Option<String>,
     /// `list_entries.resolution_status` (`unresolved`|`resolved`|`ambiguous`).
@@ -95,8 +107,13 @@ pub struct EntryView {
     pub added_by: String,
     /// `list_entries.quantity`.
     pub quantity: i64,
-    /// `list_entries.status` (`active` here — detail returns active-only).
+    /// `list_entries.status` (`active`|`bought`|`skipped`|`deleted`) — the
+    /// snapshot enumerates every status, not just `active`.
     pub status: String,
+    /// `list_entries.bought_by` (set only for `bought` entries).
+    pub bought_by: Option<String>,
+    /// `list_entries.bought_at` (set only for `bought` entries).
+    pub bought_at: Option<String>,
     /// `list_entries.effective_constraint_hash`.
     pub effective_constraint_hash: String,
     /// `list_entries.last_updated_revision`.
@@ -108,7 +125,7 @@ pub struct EntryView {
 }
 
 /// Full state of a single list: metadata, a top-level `current_revision`, and
-/// all ACTIVE entries.
+/// every entry in the list (all statuses — see [`ListDetail::entries`]).
 #[derive(Debug, Serialize)]
 pub struct ListDetail {
     /// `shopping_lists.id`.
@@ -126,7 +143,11 @@ pub struct ListDetail {
     pub created_at: String,
     /// `shopping_lists.archived_at` (set only for archived lists).
     pub archived_at: Option<String>,
-    /// All ACTIVE list entries (`status = 'active'`).
+    /// The COMPLETE set of list entries — every `status` (`active`, `bought`,
+    /// `skipped`, and `deleted` tombstones), not active-only. A client uses this
+    /// as a faithful full replacement: it can reconcile basket history
+    /// (bought/skipped) and tombstones from the snapshot alone, which an
+    /// active-only payload could not (issue #62).
     pub entries: Vec<EntryView>,
 }
 
@@ -554,6 +575,13 @@ async fn load_list(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<ListRow>,
 /// [`load_list`] + [`load_detail`] so the snapshot is byte-identical in shape to
 /// `GET /api/list/:id`. The caller is responsible for the household-membership
 /// authorization check (the SSE handler performs it before calling this).
+///
+/// As of issue #62 this carries the COMPLETE list state — every entry status,
+/// not active-only — so a client can use a snapshot as a faithful full
+/// replacement and reconcile bought/skipped/deleted rows it would otherwise have
+/// to preserve from local state. The revision semantics are unchanged: the
+/// snapshot is keyed to `current_revision`, which the SSE handler uses as the
+/// high-water mark so the client resumes from the right `?since=`.
 pub async fn list_snapshot(
     pool: &sqlx::SqlitePool,
     list_id: &str,
@@ -565,7 +593,9 @@ pub async fn list_snapshot(
 }
 
 /// Render a [`ListDetail`] from an already-loaded `shopping_lists` row plus a
-/// single query for its ACTIVE entries.
+/// single query for ALL its entries (every `status`, not active-only — issue
+/// #62), so the result is a faithful full snapshot a client can reconcile
+/// against.
 ///
 /// Shared by [`get_list`] and [`patch_list`] so neither re-runs [`load_list`]
 /// nor a redundant [`is_member`] check after the row is already in hand.
@@ -576,6 +606,7 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
         _,
         (
             String,
+            String,
             Option<String>,
             String,
             Option<String>,
@@ -584,17 +615,23 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
             String,
             i64,
             String,
+            Option<String>,
+            Option<String>,
             String,
             i64,
             String,
             String,
         ),
     >(
-        "SELECT id, canonical_item_id, resolution_status, resolution_candidates_json, \
-                raw_text, display_name, added_by, quantity, status, \
+        // Every entry status (active, bought, skipped, deleted): the snapshot is
+        // the complete list state, so a client can reconcile basket history and
+        // tombstones from it alone. `list_id`, `bought_by`, `bought_at` are
+        // included to mirror `mutations::EntityView` field-for-field.
+        "SELECT id, list_id, canonical_item_id, resolution_status, resolution_candidates_json, \
+                raw_text, display_name, added_by, quantity, status, bought_by, bought_at, \
                 effective_constraint_hash, last_updated_revision, created_at, updated_at \
          FROM list_entries \
-         WHERE list_id = ?1 AND status = 'active' \
+         WHERE list_id = ?1 \
          ORDER BY created_at, id",
     )
     .bind(&id)
@@ -605,18 +642,21 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
         .into_iter()
         .map(|r| EntryView {
             id: r.0,
-            canonical_item_id: r.1,
-            resolution_status: r.2,
-            resolution_candidates_json: r.3,
-            raw_text: r.4,
-            display_name: r.5,
-            added_by: r.6,
-            quantity: r.7,
-            status: r.8,
-            effective_constraint_hash: r.9,
-            last_updated_revision: r.10,
-            created_at: r.11,
-            updated_at: r.12,
+            list_id: r.1,
+            canonical_item_id: r.2,
+            resolution_status: r.3,
+            resolution_candidates_json: r.4,
+            raw_text: r.5,
+            display_name: r.6,
+            added_by: r.7,
+            quantity: r.8,
+            status: r.9,
+            bought_by: r.10,
+            bought_at: r.11,
+            effective_constraint_hash: r.12,
+            last_updated_revision: r.13,
+            created_at: r.14,
+            updated_at: r.15,
         })
         .collect();
 
@@ -633,7 +673,11 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
 }
 
 /// `GET /api/list/:id` — full list state with a top-level `current_revision`
-/// and all ACTIVE entries.
+/// and ALL entries (every status, not active-only — issue #62). The read UI
+/// buckets entries by `status` client-side (active vs the "In basket"
+/// bought/skipped section), and the offline-sync client uses the same payload as
+/// a faithful full snapshot, so the endpoint carries the complete set rather than
+/// filtering server-side.
 ///
 /// 404 if the list does not exist; **403** if it exists but belongs to a
 /// household the caller is not a member of (deliberately distinct from 404).
