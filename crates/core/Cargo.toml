@@ -9,6 +9,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 strsim = { workspace = true }
+# argon2id password hashing for `users.password_hash`, shared by the API (login
+# verify) and the CLI `set-password` tool (issue #51). `rand` (pinned 0.8 to
+# match argon2 0.5 / password-hash 0.5's rand_core 0.6) provides the OS CSPRNG
+# salt source.
+argon2 = { workspace = true }
+rand = { workspace = true }
 unicode-normalization = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

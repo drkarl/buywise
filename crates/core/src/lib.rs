@@ -4,5 +4,6 @@ pub mod domain;
 pub mod matching;
 pub mod normalise;
 pub mod optimiser;
+pub mod password;
 
 pub use domain::*;
