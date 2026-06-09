@@ -18,15 +18,26 @@
 		 * absent the "?" indicator is not shown.
 		 */
 		onclarify?: (id: string) => void;
+		/**
+		 * Set the entry's quantity to an absolute value (issue #60). Optional so call
+		 * sites that don't allow quantity edits (e.g. the read-only basket section)
+		 * still type-check; when absent the +/- stepper is not shown and the static
+		 * `×N` is rendered instead.
+		 */
+		onquantity?: (id: string, quantity: number) => void;
 	}
 
-	let { entry, onbought, onskipped, ondelete, onclarify }: Props = $props();
+	let { entry, onbought, onskipped, ondelete, onclarify, onquantity }: Props = $props();
 
 	const inBasket = $derived(entry.status === 'bought' || entry.status === 'skipped');
 	// An active, ambiguous entry the parent can disambiguate.
 	const isAmbiguous = $derived(
 		entry.resolution_status === 'ambiguous' && !inBasket && onclarify !== undefined
 	);
+	// Show the +/- stepper only for an active (not in-basket) entry when the parent
+	// wired `onquantity`. The `-` button is disabled at quantity 1 so it never goes
+	// below 1 (mirrors the backend's `quantity >= 1` rule).
+	const showStepper = $derived(!inBasket && onquantity !== undefined);
 
 	// Swipe-to-delete state.
 	const SWIPE_THRESHOLD = 80;
@@ -103,7 +114,24 @@
 			>
 		{/if}
 
-		{#if entry.quantity > 1}
+		{#if showStepper}
+			<div class="qty" role="group" aria-label="Quantity for {entry.display_name}">
+				<button
+					type="button"
+					class="qty-btn"
+					aria-label="Decrease quantity of {entry.display_name}"
+					disabled={entry.quantity <= 1}
+					onclick={() => onquantity?.(entry.id, entry.quantity - 1)}>−</button
+				>
+				<span class="qty-value" aria-live="polite">{entry.quantity}</span>
+				<button
+					type="button"
+					class="qty-btn"
+					aria-label="Increase quantity of {entry.display_name}"
+					onclick={() => onquantity?.(entry.id, entry.quantity + 1)}>+</button
+				>
+			</div>
+		{:else if entry.quantity > 1}
 			<span class="qty-value">×{entry.quantity}</span>
 		{/if}
 
@@ -162,6 +190,26 @@
 	}
 	.check.done {
 		color: #0f766e;
+	}
+	.qty {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+	}
+	.qty-btn {
+		width: 1.6rem;
+		height: 1.6rem;
+		font-size: 1.1rem;
+		line-height: 1;
+		border: 1px solid #cbd5e1;
+		border-radius: 0.4rem;
+		background: #f8fafc;
+		color: #0f172a;
+		cursor: pointer;
+	}
+	.qty-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
 	}
 	.qty-value {
 		min-width: 1.25rem;

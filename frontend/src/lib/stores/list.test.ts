@@ -6,6 +6,7 @@ import {
 	markBought,
 	markSkipped,
 	deleteItem,
+	setQuantity,
 	resolveAlias,
 	activeEntries,
 	basketEntries
@@ -394,5 +395,83 @@ describe('resolveAlias', () => {
 		expect(entry?.resolution_status).toBe('ambiguous');
 		expect(entry?.status).toBe('bought');
 		expect(entry?.canonical_item_id).toBeUndefined();
+	});
+});
+
+describe('setQuantity', () => {
+	it('sets the absolute quantity locally and queues a set_quantity mutation', async () => {
+		const id = await addItem(LIST, 'Apples');
+
+		await setQuantity(LIST, id, 3);
+
+		expect((await db.list_entries.get(id))?.quantity).toBe(3);
+		const mut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'set_quantity'
+		);
+		expect(mut).toMatchObject({
+			entity_id: id,
+			status: 'pending',
+			payload: { quantity: 3 }
+		});
+	});
+
+	it('clamps below 1 to 1 (quantity never goes below 1)', async () => {
+		const id = await addItem(LIST, 'Bread', 2);
+
+		await setQuantity(LIST, id, 0);
+
+		expect((await db.list_entries.get(id))?.quantity).toBe(1);
+		const mut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'set_quantity'
+		);
+		expect(mut?.payload).toEqual({ quantity: 1 });
+	});
+
+	it('is a no-op when the quantity is unchanged (no redundant mutation)', async () => {
+		const id = await addItem(LIST, 'Eggs', 2);
+		const before = await db.mutation_queue.count();
+
+		await setQuantity(LIST, id, 2);
+
+		expect(await db.mutation_queue.count()).toBe(before);
+	});
+
+	it('is a no-op on an unknown id', async () => {
+		await setQuantity(LIST, 'does-not-exist', 5);
+		expect(await db.mutation_queue.count()).toBe(0);
+		expect(await db.list_entries.count()).toBe(0);
+	});
+
+	it('is a no-op for an entry on a different list', async () => {
+		await db.list_entries.add({
+			id: 'q1',
+			list_id: 'other-list',
+			resolution_status: 'unresolved',
+			raw_text: 'milk',
+			display_name: 'Milk',
+			quantity: 1,
+			status: 'active',
+			last_updated_revision: 0,
+			updated_at: '2026-06-05T00:00:00.000Z'
+		});
+
+		await setQuantity(LIST, 'q1', 4);
+
+		expect(await db.mutation_queue.count()).toBe(0);
+		expect((await db.list_entries.get('q1'))?.quantity).toBe(1);
+	});
+
+	it('does not resurrect a deleted entry (delete wins)', async () => {
+		const id = await addItem(LIST, 'Cereal');
+		await deleteItem(LIST, id);
+		const before = await db.mutation_queue.count();
+
+		await setQuantity(LIST, id, 5);
+
+		// No quantity change, no extra mutation.
+		const entry = await db.list_entries.get(id);
+		expect(entry?.status).toBe('deleted');
+		expect(entry?.quantity).toBe(1);
+		expect(await db.mutation_queue.count()).toBe(before);
 	});
 });
