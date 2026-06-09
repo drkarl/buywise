@@ -17,8 +17,6 @@
 //!     stored (`sessions.token_hash`). The CSRF token is a separate random
 //!     32-byte value stored verbatim in `sessions.csrf_token`.
 
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
-use argon2::Argon2;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -211,15 +209,12 @@ async fn me(user: AuthenticatedUser) -> Json<UserResponse> {
 
 /// Verify a plaintext password against a stored argon2 PHC hash.
 ///
-/// Returns `false` for any malformed stored hash or verification failure; never
-/// panics and never compares plaintext directly.
+/// Thin wrapper over [`buywise_core::password::verify_password`]: the hashing
+/// helpers now live in `buywise-core` so the API and the `buywise-cli
+/// set-password` tool (issue #51) share one implementation without an
+/// `api ↔ cli` dependency.
 fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(stored_hash) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    buywise_core::password::verify_password(password, stored_hash)
 }
 
 /// Generate a fresh 32-byte random token as lowercase hex (64 chars).
@@ -258,18 +253,13 @@ fn append_cookie(headers: &mut HeaderMap, cookie: &str) -> Result<(), StatusCode
 /// Hash a plaintext password with argon2id, producing a PHC string suitable for
 /// storage in `users.password_hash`.
 ///
-/// The API only ever verifies passwords, never registers them; this helper
-/// exists for an out-of-band operator tool that seeds `users.password_hash`
-/// (tracked as a separate follow-up issue), and is used by the integration
-/// tests to seed a user.
-pub fn hash_password_for_storage(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    use rand::rngs::OsRng;
-
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default().hash_password(password.as_bytes(), &salt)?;
-    Ok(hash.to_string())
-}
+/// Re-exported from [`buywise_core::password`]: the implementation moved there
+/// (issue #51) so the API and the `buywise-cli set-password` operator tool —
+/// which seeds `users.password_hash` — share one hashing path without an
+/// `api ↔ cli` dependency. The API only ever verifies passwords; this re-export
+/// keeps the existing `buywise_api::auth::hash_password_for_storage` path that
+/// the integration tests use to seed a user.
+pub use buywise_core::password::hash_password_for_storage;
 
 #[cfg(test)]
 mod tests {
