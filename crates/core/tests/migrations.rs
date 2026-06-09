@@ -426,3 +426,38 @@ async fn mutations_operation_type_check_rejects_unknown() {
     .await;
     assert!(bad.is_err(), "unknown operation_type must be rejected");
 }
+
+/// Migration 008 widens the operation_type CHECK to include `set_quantity`
+/// (issue #60) by rebuilding the table; this asserts the new value is accepted
+/// after the rebuild (and so the constraint was recreated, not dropped).
+#[tokio::test]
+async fn mutations_operation_type_check_accepts_set_quantity() {
+    let pool = migrated_pool().await;
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, display_name, created_at)
+         VALUES ('user-1', 'a@b.c', 'argon2id$dummy', 'A', 't')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shopping_lists (id, household_id, name, created_at)
+         VALUES ('list-1', ?, 'Test', 't')",
+    )
+    .bind(HOUSEHOLD)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ok = sqlx::query(
+        "INSERT INTO mutations
+            (id, client_mutation_id, device_id, user_id, list_id,
+             entity_type, entity_id, operation_type, payload,
+             base_revision, created_at_client, received_at_server)
+         VALUES ('m1', 'cmid-q', 'dev-1', 'user-1', 'list-1',
+                 'list_entry', 'e-1', 'set_quantity', '{\"quantity\":3}', 0, 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(ok.is_ok(), "set_quantity must be accepted after migration 008");
+}

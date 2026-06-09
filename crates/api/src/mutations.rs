@@ -515,6 +515,7 @@ async fn apply_mutation(
         "mark_bought" => apply_mark_bought(tx, user, req).await,
         "mark_skipped" => apply_mark_skipped(tx, req).await,
         "rename_item" => apply_rename_item(tx, req).await,
+        "set_quantity" => apply_set_quantity(tx, req).await,
         // resolve_alias is the user-confirmation step of the resolution flow
         // (P3-T3): it binds the chosen canonical item to an `ambiguous` entry,
         // transitions it to `resolved`, and persists the confirmed raw-text →
@@ -847,6 +848,65 @@ async fn apply_rename_item(
     .execute(&mut **tx)
     .await
     .map_err(db_error("apply_rename_item.update"))?;
+
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
+}
+
+/// `set_quantity`: set the entry's `quantity` to an ABSOLUTE value (issue #60),
+/// last-write-wins. The payload carries the new value (`{ "quantity": <int >= 1> }`);
+/// an absolute value is idempotent-friendly under retries/LWW (a replayed or stale
+/// queued op can never double-count, unlike an `adjust_quantity` delta). The value
+/// is the single syncable representation of the list UI's +/- controls.
+///
+/// Validation: `quantity` must be a present integer `>= 1`. A missing/non-integer
+/// payload or a value `< 1` is a 422 (reject, not clamp — a clear client error
+/// beats a silent correction the client never learns about). The client also
+/// disables the `-` button at 1, so a valid client never sends `< 1`.
+///
+/// Like the other field updates, a delete wins: a deleted entry is not resurrected
+/// (M1). The lookup and UPDATE are scoped to `(id, list_id)` so a cross-list id is
+/// a 404 (H3).
+async fn apply_set_quantity(
+    tx: &mut Transaction<'_, Sqlite>,
+    req: &MutationRequest,
+) -> Result<ApplyOutcome, StatusCode> {
+    let entry_id = require_entry(req)?;
+    // Absolute quantity, required and >= 1. `as_i64` rejects floats/strings/missing.
+    let quantity = req
+        .payload
+        .get("quantity")
+        .and_then(Value::as_i64)
+        .filter(|q| *q >= 1)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let now = buywise_core::db::now_iso();
+
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
+        .await
+        .map_err(db_error("apply_set_quantity.lookup"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Delete wins: a deleted entry is not resurrected by a quantity change (M1).
+    // Record the mutation as a no-op accept, matching mark_bought/mark_skipped/rename.
+    if prior_status == "deleted" {
+        return Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE list_entries SET quantity = ?2, updated_at = ?3 WHERE id = ?1 AND list_id = ?4",
+    )
+    .bind(&entry_id)
+    .bind(quantity)
+    .bind(&now)
+    .bind(&req.list_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_set_quantity.update"))?;
 
     Ok(ApplyOutcome::touched(
         Some(entry_id),
@@ -1506,7 +1566,7 @@ async fn insert_loser_replay_row(
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// True for one of the eight `mutations.operation_type` CHECK values.
+/// True for one of the nine `mutations.operation_type` CHECK values.
 fn is_known_operation(op: &str) -> bool {
     matches!(
         op,
@@ -1518,6 +1578,7 @@ fn is_known_operation(op: &str) -> bool {
             | "resolve_alias"
             | "reject_match"
             | "set_constraint"
+            | "set_quantity"
     )
 }
 
@@ -1608,7 +1669,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_operations_are_exactly_the_eight_check_values() {
+    fn known_operations_are_exactly_the_nine_check_values() {
         for op in [
             "add_item",
             "mark_bought",
@@ -1618,6 +1679,7 @@ mod tests {
             "resolve_alias",
             "reject_match",
             "set_constraint",
+            "set_quantity",
         ] {
             assert!(is_known_operation(op), "{op} should be known");
         }

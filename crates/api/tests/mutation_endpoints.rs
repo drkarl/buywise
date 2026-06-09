@@ -202,6 +202,23 @@ async fn post_mutation(
         .unwrap()
 }
 
+/// GET the full list snapshot (`GET /api/list/:id`) — the resnapshot/sync path a
+/// fresh client uses to rehydrate. Returns the parsed JSON body.
+async fn get_list_snapshot(pool: &SqlitePool, s: &Session, list_id: &str) -> serde_json::Value {
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/list/{list_id}"))
+                .header(header::COOKIE, format!("session={}", s.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "snapshot fetch ok");
+    json(resp).await
+}
+
 /// A mutation envelope with the common fields filled in.
 fn envelope(
     client_mutation_id: &str,
@@ -708,6 +725,189 @@ async fn mark_bought_stamps_bought_fields_and_revision() {
     assert_eq!(v["entity"]["bought_at"], "2026-05-31T10:00:00Z");
     // last_updated_revision is stamped with the mutation's server revision (2).
     assert_eq!(v["entity"]["last_updated_revision"], 2);
+}
+
+// ---------------------------------------------------------------------------
+// set_quantity (issue #60)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_quantity_sets_absolute_value_and_survives_resnapshot() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Add an unresolved entry (quantity defaults to 1).
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+
+    // set_quantity to an absolute 4.
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 4 }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    assert_eq!(v["status"], "accepted");
+    assert_eq!(v["entity"]["quantity"], 4, "response reflects the new quantity");
+    // last_updated_revision stamped with this mutation's revision (2).
+    assert_eq!(v["entity"]["last_updated_revision"], 2);
+
+    // Idempotent under absolute semantics: a SECOND set_quantity to the same value
+    // (distinct client_mutation_id) leaves it at 4, never doubling.
+    let again = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 4 }),
+        ),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::CREATED);
+    assert_eq!(json(again).await["entity"]["quantity"], 4);
+
+    // Survives a full resnapshot/sync: a fresh GET /api/list/:id (the rehydrate
+    // path) returns quantity 4 — proving it is persisted, not local-only.
+    let snapshot = get_list_snapshot(&pool, &s, "list-a").await;
+    let entries = snapshot["entries"].as_array().expect("entries array");
+    let entry = entries
+        .iter()
+        .find(|e| e["id"] == "entry-1")
+        .expect("entry-1 in snapshot");
+    assert_eq!(entry["quantity"], 4, "quantity survives resnapshot");
+}
+
+#[tokio::test]
+async fn set_quantity_below_one_is_rejected() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+
+    // quantity 0 → 422 (reject, not clamp).
+    let zero = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 0 }),
+        ),
+    )
+    .await;
+    assert_eq!(zero.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A missing quantity is also rejected.
+    let missing = post_mutation(
+        &pool,
+        &s,
+        envelope("cm-3", "list-a", "entry-1", "set_quantity", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The entry is untouched: still quantity 1, and the revision never advanced
+    // past the original add (rejected mutations roll the transaction back).
+    let qty: i64 =
+        sqlx::query_scalar("SELECT quantity FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(qty, 1, "rejected set_quantity leaves the entry unchanged");
+    let current: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 1, "a rejected mutation does not advance the revision");
+}
+
+#[tokio::test]
+async fn set_quantity_does_not_resurrect_a_deleted_entry() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope("cm-2", "list-a", "entry-1", "delete_item", serde_json::json!({})),
+    )
+    .await;
+
+    // set_quantity on a deleted entry is accepted as a no-op (delete wins).
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "set_quantity",
+            serde_json::json!({ "quantity": 5 }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v = json(resp).await;
+    assert_eq!(v["status"], "accepted");
+    // Status stays deleted; quantity is NOT changed (no resurrection).
+    assert_eq!(v["entity"]["status"], "deleted");
+    assert_eq!(v["entity"]["quantity"], 1, "deleted entry keeps its quantity");
 }
 
 // ---------------------------------------------------------------------------

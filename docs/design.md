@@ -217,6 +217,7 @@ mutations           (id,                   -- server-assigned PK (auto-increment
                      entity_type, entity_id,
                      operation_type,  -- add_item | mark_bought | mark_skipped | delete_item
                                       -- rename_item | resolve_alias | reject_match | set_constraint
+                                      -- set_quantity
                      payload,         -- JSON
                      base_revision,   -- revision client was at when mutation was created
                      created_at_client,
@@ -507,6 +508,7 @@ The client maintains a local Dexie database mirroring the server's list state an
 | Item deleted by one, checked off by other | Keep deleted; surface notification |
 | Duplicate add — same device retry | Deduplicated by `client_mutation_id` (idempotency key) |
 | Duplicate add — different devices, same item | Canonical deduplication: partial unique index on `(list_id, canonical_item_id, effective_constraint_hash)` where `status = 'active' AND canonical_item_id IS NOT NULL`. Same hash → merge (increment `quantity`). Different hash → separate entry ("milk" and "lactose-free milk" share a canonical item but differ on `effective_constraint_hash` → two rows). Unresolved entries are excluded by the predicate and are never merged. |
+| Quantity changed by two clients (`set_quantity`) | Last server revision wins. `set_quantity` carries an **absolute** value (`payload.quantity`, int `>= 1`) so retries/LWW are idempotent — a replayed or stale-queued op can never double-count (unlike a delta). The server rejects `quantity < 1` (422). This is the syncable form of the list UI's +/- controls (the `-` button is disabled at 1). |
 
 SSE stream pushes `{ event: "mutation", server_revision: N, entity: {...} }` to all connected clients for the same list. On reconnect, client sends its last known `list_revision`; server streams all mutations since that revision, or returns a full snapshot if the client is beyond the retention window (see mutation retention in §7).
 
