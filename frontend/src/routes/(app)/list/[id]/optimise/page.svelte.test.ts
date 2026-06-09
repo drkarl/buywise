@@ -255,7 +255,7 @@ describe('optimise page', () => {
 		stubOptimise(allHeld);
 		render(Page);
 
-		await screen.findByText(/every item is waiting for your confirmation/i);
+		await screen.findByText(/some items need confirmation or review below/i);
 		expect(screen.queryByText(/add some items to your list/i)).toBeNull();
 	});
 
