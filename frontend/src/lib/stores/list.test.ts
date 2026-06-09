@@ -427,6 +427,28 @@ describe('setQuantity', () => {
 		expect(mut?.payload).toEqual({ quantity: 1 });
 	});
 
+	it('treats a non-finite quantity (NaN/Infinity) as 1, never persisting NaN', async () => {
+		// A non-finite input must fall back to 1 (not poison the entry with NaN,
+		// which would defeat the unchanged-value no-op check). On a quantity-2 entry
+		// that means a real change to 1, enqueuing a set_quantity payload of 1.
+		const id = await addItem(LIST, 'Olives', 2);
+
+		await setQuantity(LIST, id, Number.NaN);
+
+		expect((await db.list_entries.get(id))?.quantity).toBe(1);
+		const nanMut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'set_quantity'
+		);
+		expect(nanMut?.payload).toEqual({ quantity: 1 });
+
+		// Infinity on an already-1 entry clamps to 1 and is therefore a no-op:
+		// no NaN reaches Dexie and no redundant mutation is enqueued.
+		const before = await db.mutation_queue.count();
+		await setQuantity(LIST, id, Number.POSITIVE_INFINITY);
+		expect((await db.list_entries.get(id))?.quantity).toBe(1);
+		expect(await db.mutation_queue.count()).toBe(before);
+	});
+
 	it('is a no-op when the quantity is unchanged (no redundant mutation)', async () => {
 		const id = await addItem(LIST, 'Eggs', 2);
 		const before = await db.mutation_queue.count();

@@ -220,8 +220,12 @@ export async function setQuantity(
   quantity: number
 ): Promise<void> {
   // Clamp to a positive integer; the UI never sends < 1, but a programmatic
-  // caller could, and a non-positive quantity is meaningless.
-  const safeQuantity = Math.max(1, Math.floor(quantity));
+  // caller could, and a non-positive quantity is meaningless. A non-finite
+  // input (NaN/±Infinity) falls back to 1 rather than poisoning the entry —
+  // Math.floor(NaN) is NaN, which would otherwise defeat the unchanged-value
+  // no-op check and persist NaN to Dexie.
+  const floored = Math.floor(quantity);
+  const safeQuantity = Number.isFinite(floored) ? Math.max(1, floored) : 1;
   const now = new Date().toISOString();
   const mutation = await buildMutation(listId, entryId, 'set_quantity', {
     quantity: safeQuantity
