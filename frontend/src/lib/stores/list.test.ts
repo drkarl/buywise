@@ -9,7 +9,8 @@ import {
 	setQuantity,
 	resolveAlias,
 	activeEntries,
-	basketEntries
+	basketEntries,
+	MAX_QUANTITY
 } from './list';
 import type { LocalListEntry } from '$lib/db/dexie';
 
@@ -425,6 +426,21 @@ describe('setQuantity', () => {
 			(m) => m.operation_type === 'set_quantity'
 		);
 		expect(mut?.payload).toEqual({ quantity: 1 });
+	});
+
+	it('clamps above MAX_QUANTITY to the ceiling (never round-trips a value the server rejects)', async () => {
+		// The UI disables `+` at MAX_QUANTITY, but a programmatic caller could exceed
+		// it. Clamp locally so we never optimistically persist a value the backend
+		// rejects with 422 (which would otherwise roll back on the next sync).
+		const id = await addItem(LIST, 'Napkins', 2);
+
+		await setQuantity(LIST, id, MAX_QUANTITY + 1);
+
+		expect((await db.list_entries.get(id))?.quantity).toBe(MAX_QUANTITY);
+		const mut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'set_quantity'
+		);
+		expect(mut?.payload).toEqual({ quantity: MAX_QUANTITY });
 	});
 
 	it('treats a non-finite quantity (NaN/Infinity) as 1, never persisting NaN', async () => {

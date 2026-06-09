@@ -19,6 +19,14 @@ import {
 import { getDeviceId } from '$lib/db/device';
 import { notifyMutationEnqueued } from '$lib/sync/enqueueSignal';
 
+/**
+ * Upper bound for `set_quantity` (issue #60). Mirrors the backend's `MAX_QUANTITY`
+ * (`crates/api/src/mutations.rs`, `1..=9999`); the server rejects anything above it
+ * with 422. The single frontend source of truth — `ListItem.svelte` imports this to
+ * disable the `+` button at the ceiling. Keep in sync with the backend constant.
+ */
+export const MAX_QUANTITY = 9999;
+
 /** Operation types in scope for P2-T3 + P3-T3 (subset of the canonical enum). */
 type OperationType =
   | 'add_item'
@@ -205,9 +213,10 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
  * of the +/- controls. Optimistically updates the local entry and enqueues a
  * `set_quantity` mutation, both in one `listId`-guarded Dexie transaction.
  *
- * The value is clamped to an integer `>= 1` (quantity can never go below 1); the
- * `-` button is also disabled at 1 in the UI. An absolute value (not a delta)
- * keeps retries/sync idempotent — replaying it can never double-count.
+ * The value is clamped to an integer in `1..=MAX_QUANTITY` (quantity can never go
+ * below 1 nor above the server's ceiling); the `-`/`+` buttons are also disabled at
+ * those bounds in the UI. An absolute value (not a delta) keeps retries/sync
+ * idempotent — replaying it can never double-count.
  *
  * No-op (queues nothing) unless the entry exists, is on `listId`, is not
  * `deleted` (the backend's delete-wins rule never resurrects a deleted entry),
@@ -219,13 +228,17 @@ export async function setQuantity(
   entryId: string,
   quantity: number
 ): Promise<void> {
-  // Clamp to a positive integer; the UI never sends < 1, but a programmatic
-  // caller could, and a non-positive quantity is meaningless. A non-finite
-  // input (NaN/±Infinity) falls back to 1 rather than poisoning the entry —
-  // Math.floor(NaN) is NaN, which would otherwise defeat the unchanged-value
+  // Clamp to an integer in `1..=MAX_QUANTITY`. The UI keeps within those bounds
+  // (the `-`/`+` buttons disable at 1 and MAX_QUANTITY), but a programmatic caller
+  // could exceed them: a value < 1 is meaningless, and a value > MAX_QUANTITY would
+  // optimistically persist then fail server validation (422) and roll back later.
+  // A non-finite input (NaN/±Infinity) falls back to 1 rather than poisoning the
+  // entry — Math.floor(NaN) is NaN, which would otherwise defeat the unchanged-value
   // no-op check and persist NaN to Dexie.
   const floored = Math.floor(quantity);
-  const safeQuantity = Number.isFinite(floored) ? Math.max(1, floored) : 1;
+  const safeQuantity = Number.isFinite(floored)
+    ? Math.min(MAX_QUANTITY, Math.max(1, floored))
+    : 1;
   const now = new Date().toISOString();
   const mutation = await buildMutation(listId, entryId, 'set_quantity', {
     quantity: safeQuantity
