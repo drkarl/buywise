@@ -599,6 +599,88 @@ async fn patch_renames_and_archives_list() {
     );
 }
 
+/// `PATCH /api/list/:id` shares `load_detail` with `GET`/`list_snapshot`, so the
+/// complete-state contract (issue #62) applies to the PATCH response too: a
+/// rename or archive must echo back EVERY status (not active-only), each
+/// carrying `list_id`. This guards the shared-shape side-effect on the
+/// previously-untested PATCH path.
+#[tokio::test]
+async fn patch_response_carries_non_active_entries_with_list_id() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "Old name").await;
+    seed_entry_with_status(&pool, "e-active", "list-a", "user-a", "active").await;
+    seed_entry_with_status(&pool, "e-bought", "list-a", "user-a", "bought").await;
+    seed_entry_with_status(&pool, "e-skipped", "list-a", "user-a", "skipped").await;
+    seed_entry_with_status(&pool, "e-deleted", "list-a", "user-a", "deleted").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Rename — the PATCH response renders via load_detail, so it must carry the
+    // complete entry set, not just active.
+    let body = serde_json::json!({ "name": "New name" }).to_string();
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/list/list-a")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .header("X-CSRF-Token", &s.csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = json(resp).await;
+    assert_eq!(detail["name"], "New name");
+    let entries = detail["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        4,
+        "patch response enumerates every status, not active-only"
+    );
+    let statuses: std::collections::HashSet<&str> = entries
+        .iter()
+        .map(|e| e["status"].as_str().unwrap())
+        .collect();
+    for expected in ["active", "bought", "skipped", "deleted"] {
+        assert!(
+            statuses.contains(expected),
+            "patch response carries {expected} entry"
+        );
+    }
+    for e in entries {
+        assert_eq!(e["list_id"], "list-a", "each patched entry carries list_id");
+    }
+
+    // Archive — same load_detail path; the non-active entries must still come
+    // back on the archive PATCH too.
+    let body = serde_json::json!({ "status": "archived" }).to_string();
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/list/list-a")
+                .header(header::COOKIE, format!("session={}", s.session))
+                .header("X-CSRF-Token", &s.csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = json(resp).await;
+    assert_eq!(detail["status"], "archived");
+    assert_eq!(
+        detail["entries"].as_array().unwrap().len(),
+        4,
+        "archive patch response still carries non-active entries"
+    );
+}
+
 #[tokio::test]
 async fn patch_foreign_list_is_403() {
     let pool = setup_pool().await;
