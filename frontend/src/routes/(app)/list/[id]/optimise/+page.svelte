@@ -184,7 +184,13 @@
 				/>
 			{/if}
 			{#if !result.recommended && !result.best_single && !result.best_two_store && !result.theoretical_minimum}
-				<p class="empty">No plans to show — add some items to your list, then optimise again.</p>
+				{#if result.needs_confirmation_items.length > 0}
+					<p class="empty">
+						No plans yet — every item is waiting for your confirmation (see below).
+					</p>
+				{:else}
+					<p class="empty">No plans to show — add some items to your list, then optimise again.</p>
+				{/if}
 			{/if}
 		</section>
 

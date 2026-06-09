@@ -237,6 +237,28 @@ describe('optimise page', () => {
 		await screen.findByText(/no plans to show/i);
 	});
 
+	it('does not claim the list is empty when every item is ask-gated', async () => {
+		// All items held for confirmation → optimiser returns no plans, but the
+		// list is not empty. The generic "add some items" copy would be wrong.
+		const allHeld: OptimiseResponse = {
+			run_id: 'run-held',
+			best_single: null,
+			best_two_store: null,
+			theoretical_minimum: null,
+			recommended: null,
+			unresolved_items: [],
+			no_valid_offer_items: [],
+			needs_confirmation_items: [{ item_index: 0, display_text: 'yoghurt', candidate_count: 2 }],
+			plain_language_explanation: '',
+			offer_snapshot_date: null
+		};
+		stubOptimise(allHeld);
+		render(Page);
+
+		await screen.findByText(/every item is waiting for your confirmation/i);
+		expect(screen.queryByText(/add some items to your list/i)).toBeNull();
+	});
+
 	it('suppresses the saving line on other plans when best_single is null', async () => {
 		// No single-store baseline exists, so no card can show a "saving vs best
 		// single store" line — there is nothing to compare against.
