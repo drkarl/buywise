@@ -192,7 +192,8 @@ pub async fn max_successful_run_number(
     Ok(max)
 }
 
-/// Upsert a retailer product, refreshing only `last_seen_at` on conflict.
+/// Upsert a retailer product, refreshing `last_seen_at` and backfilling the
+/// `form_factor` / `dietary_flags` constraint columns on conflict.
 ///
 /// The conflict target mirrors the partial unique index defined in
 /// `migrations/001_phase0_schema.sql` exactly. **`INSERT OR REPLACE` is
@@ -200,6 +201,13 @@ pub async fn max_successful_run_number(
 /// mint a new rowid and cascade-break any `product_offers.retailer_product_id`
 /// foreign keys pointing at the old row. `ON CONFLICT … DO UPDATE` preserves the
 /// stable primary key.
+///
+/// On conflict the constraint columns are backfilled with
+/// `COALESCE(excluded.col, retailer_products.col)`: a freshly-scanned value fills
+/// a previously-NULL column (so existing rows gain attributes on re-ingest) but a
+/// later NULL never clears an attribute we already derived. Without this, rows
+/// ingested before Backlog-T1 would keep NULL attributes forever and the
+/// optimiser would wrongly reject otherwise-valid products.
 pub async fn upsert_retailer_product(
     conn: &mut SqliteConnection,
     p: &RetailerProduct,
@@ -213,7 +221,10 @@ pub async fn upsert_retailer_product(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(source, retailer, external_id) \
              WHERE source != 'manual' AND external_id IS NOT NULL \
-         DO UPDATE SET last_seen_at = excluded.last_seen_at",
+         DO UPDATE SET \
+             last_seen_at = excluded.last_seen_at, \
+             form_factor = COALESCE(excluded.form_factor, retailer_products.form_factor), \
+             dietary_flags = COALESCE(excluded.dietary_flags, retailer_products.dietary_flags)",
     )
     .bind(&p.id)
     .bind(p.source)
