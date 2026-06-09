@@ -4,8 +4,11 @@
 //! SQLite database with the full migrations applied. Seeds `savings_events` rows
 //! directly (one row per list) with known figures and asserts that
 //! `GET /api/savings/summary`:
-//!   * groups gross/accepted/net per `"YYYY-MM"` month (NULL net/accepted → 0),
-//!     ordered chronologically, with a per-month list count;
+//!   * groups gross/accepted/net per `"YYYY-MM"` month, ordered chronologically,
+//!     with a per-month list count. `accepted_cents` is DERIVED as
+//!     `baseline − chosen_basket` over reconciled rows (un-reconciled → 0), so
+//!     these tests seed `baseline`/`chosen` rather than the unused
+//!     `accepted_savings_cents` column; `net_saving_cents` NULL → 0;
 //!   * reports `cumulative_net_cents` as the SUM of `net_saving_cents` over the
 //!     NON-NULL rows only (the un-reconciled list contributes nothing);
 //!   * lists each archived list's outcome newest-first, exposing a null
@@ -96,14 +99,19 @@ async fn seed_list(pool: &SqlitePool, household_id: &str, list_id: &str, name: &
 
 /// Seed one `savings_events` row with explicit figures. `chosen`/`net` are
 /// nullable so a test can model a list still awaiting actual-spend entry.
+///
+/// `baseline` is parametrised because the summary derives `accepted_cents` as
+/// `baseline − chosen_basket` over reconciled rows; the unused
+/// `accepted_savings_cents` column is deliberately left NULL (no production path
+/// writes it this phase).
 #[allow(clippy::too_many_arguments)]
 async fn seed_event(
     pool: &SqlitePool,
     id: &str,
     list_id: &str,
     created_at: &str,
+    baseline: i64,
     gross: i64,
-    accepted: Option<i64>,
     chosen: Option<i64>,
     net: Option<i64>,
 ) {
@@ -111,14 +119,14 @@ async fn seed_event(
         "INSERT INTO savings_events \
              (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
               theoretical_minimum_cost_cents, chosen_basket_cost_cents, gross_saving_cents, \
-              accepted_savings_cents, net_saving_cents, created_at) \
-         VALUES (?1, ?2, NULL, 5000, 4200, 3900, ?3, ?4, ?5, ?6, ?7)",
+              net_saving_cents, created_at) \
+         VALUES (?1, ?2, NULL, ?3, 4200, 3900, ?4, ?5, ?6, ?7)",
     )
     .bind(id)
     .bind(list_id)
+    .bind(baseline)
     .bind(chosen)
     .bind(gross)
-    .bind(accepted)
     .bind(net)
     .bind(created_at)
     .execute(pool)
@@ -185,14 +193,14 @@ async fn json_body(resp: axum::response::Response) -> Value {
 /// Testing expectation: seed 3 savings events with known values, call the
 /// summary endpoint, and assert the monthly aggregates + cumulative figure.
 ///
-/// Fixtures (same household):
-///   * list-1, 2026-05: gross 3000, accepted 2800, chosen 4500, net 2500
-///   * list-2, 2026-05: gross 1000, accepted  900, chosen 4800, net  800
-///   * list-3, 2026-06: gross 2000, accepted NULL, chosen NULL, net NULL (no
-///     actual-spend yet)
+/// Fixtures (same household, all baseline 5000):
+///   * list-1, 2026-05: gross 3000, chosen 4500, net 2500 → accepted 5000−4500=500
+///   * list-2, 2026-05: gross 1000, chosen 4800, net  800 → accepted 5000−4800=200
+///   * list-3, 2026-06: gross 2000, chosen NULL, net NULL (no actual-spend yet) →
+///     accepted 0
 /// Expected:
-///   * monthly[2026-05] = gross 4000, accepted 3700, net 3300, lists 2
-///   * monthly[2026-06] = gross 2000, accepted    0, net    0, lists 1
+///   * monthly[2026-05] = gross 4000, accepted 700, net 3300, lists 2
+///   * monthly[2026-06] = gross 2000, accepted   0, net    0, lists 1
 ///   * cumulative_net   = 2500 + 800 = 3300 (the NULL-net June row is excluded)
 #[tokio::test]
 async fn summary_aggregates_three_events() {
@@ -207,8 +215,8 @@ async fn summary_aggregates_three_events() {
         "ev-1",
         "list-1",
         "2026-05-03T10:00:00Z",
+        5000,
         3000,
-        Some(2800),
         Some(4500),
         Some(2500),
     )
@@ -218,8 +226,8 @@ async fn summary_aggregates_three_events() {
         "ev-2",
         "list-2",
         "2026-05-20T10:00:00Z",
+        5000,
         1000,
-        Some(900),
         Some(4800),
         Some(800),
     )
@@ -229,8 +237,8 @@ async fn summary_aggregates_three_events() {
         "ev-3",
         "list-3",
         "2026-06-01T10:00:00Z",
+        5000,
         2000,
-        None,
         None,
         None,
     )
@@ -249,13 +257,14 @@ async fn summary_aggregates_three_events() {
 
     assert_eq!(monthly[0]["month"], "2026-05");
     assert_eq!(monthly[0]["gross_cents"], 4000);
-    assert_eq!(monthly[0]["accepted_cents"], 3700);
+    // Derived accepted = (5000−4500) + (5000−4800) = 500 + 200 = 700.
+    assert_eq!(monthly[0]["accepted_cents"], 700);
     assert_eq!(monthly[0]["net_cents"], 3300);
     assert_eq!(monthly[0]["lists"], 2);
 
     assert_eq!(monthly[1]["month"], "2026-06");
     assert_eq!(monthly[1]["gross_cents"], 2000);
-    // NULL accepted/net for June coalesce to 0, not skewing the month.
+    // The un-reconciled June row (chosen NULL) contributes 0 to accepted and net.
     assert_eq!(monthly[1]["accepted_cents"], 0);
     assert_eq!(monthly[1]["net_cents"], 0);
     assert_eq!(monthly[1]["lists"], 1);
@@ -277,8 +286,8 @@ async fn summary_lists_outcomes_newest_first_with_null_chosen() {
         "ev-1",
         "list-1",
         "2026-05-03T10:00:00Z",
+        5000,
         3000,
-        Some(2800),
         Some(4500),
         Some(2500),
     )
@@ -289,8 +298,8 @@ async fn summary_lists_outcomes_newest_first_with_null_chosen() {
         "ev-2",
         "list-2",
         "2026-06-01T10:00:00Z",
+        5000,
         2000,
-        None,
         None,
         None,
     )
@@ -330,8 +339,8 @@ async fn summary_is_scoped_to_caller_household() {
         "ev-1",
         "list-1",
         "2026-05-03T10:00:00Z",
+        5000,
         3000,
-        Some(2800),
         Some(4500),
         Some(2500),
     )
@@ -345,8 +354,8 @@ async fn summary_is_scoped_to_caller_household() {
         "ev-other",
         "list-other",
         "2026-05-04T10:00:00Z",
+        100000,
         99999,
-        Some(99999),
         Some(1),
         Some(99999),
     )
@@ -404,8 +413,8 @@ async fn summary_picks_single_household_for_multi_household_user() {
         "ev-lower",
         "list-lower",
         "2026-05-03T10:00:00Z",
+        5000,
         3000,
-        Some(2800),
         Some(4500),
         Some(2500),
     )
@@ -417,8 +426,8 @@ async fn summary_picks_single_household_for_multi_household_user() {
         "ev-higher",
         "list-higher",
         "2026-05-04T10:00:00Z",
+        100000,
         99999,
-        Some(99999),
         Some(1),
         Some(99999),
     )
@@ -468,4 +477,214 @@ async fn summary_without_session_is_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Real-flow test: archive → actual-spend → summary
+// ---------------------------------------------------------------------------
+//
+// The reviewer (P5-T4) asked for a test that exercises the real production path
+// rather than seeding figures directly, to prove `accepted_cents` is non-zero
+// through that path (it would always read 0 if it summed the never-written
+// `accepted_savings_cents` column). Integration test files are separate binaries
+// so we can't import the helpers in `savings_endpoints.rs`; the small ones we
+// need (seed an ACTIVE list, seed a recommendation run, login carrying CSRF,
+// archive via PATCH, POST actual-spend) are replicated below, mirroring the seed
+// shapes in that file.
+
+/// Known plan totals baked into the seeded run's plans_json (mirror
+/// `savings_endpoints.rs`).
+const FLOW_BASELINE: i64 = 5000; // best_single.total_cents
+const FLOW_RECOMMENDED: i64 = 4200; // recommended.plan.total_cents
+const FLOW_THEORETICAL: i64 = 3900; // theoretical_minimum.total_cents
+
+/// Log in and capture BOTH the session and CSRF cookies (the archive PATCH and
+/// actual-spend POST are mutations requiring CSRF).
+async fn login_with_csrf(pool: &SqlitePool, email: &str) -> (String, String) {
+    let body = serde_json::json!({ "email": email, "password": PASSWORD }).to_string();
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login should succeed");
+    (cookie(&resp, "session"), cookie(&resp, "csrf"))
+}
+
+/// Seed an empty ACTIVE list (archive will turn it into a savings event).
+async fn seed_active_list(pool: &SqlitePool, household_id: &str, list_id: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO shopping_lists (id, household_id, name, status, current_revision, created_at) \
+         VALUES (?1, ?2, ?3, 'active', 0, ?4)",
+    )
+    .bind(list_id)
+    .bind(household_id)
+    .bind(name)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert active list");
+}
+
+/// Seed one `recommendation_runs` row whose `plans_json` carries the three plan
+/// totals the ledger reads (mirrors `savings_endpoints.rs::seed_run`).
+async fn seed_recommendation_run(
+    pool: &SqlitePool,
+    household_id: &str,
+    run_id: &str,
+    list_id: &str,
+    run_at: &str,
+) {
+    let plan = |total: i64| {
+        serde_json::json!({ "stores": [], "lines": [], "total_cents": total,
+            "missing_count": 0, "dunnes_voucher_offer_text": null })
+    };
+    let plans_json = serde_json::json!({
+        "best_single": plan(FLOW_BASELINE),
+        "best_two_store": Value::Null,
+        "theoretical_minimum": plan(FLOW_THEORETICAL),
+        "recommended": {
+            "kind": "single_store",
+            "plan": plan(FLOW_RECOMMENDED),
+            "clears_convenience_threshold": false,
+            "two_store_saving_cents": 0,
+        },
+    })
+    .to_string();
+
+    sqlx::query(
+        "INSERT INTO recommendation_runs \
+             (id, list_id, household_id, run_at, offer_snapshot_date, plans_json, \
+              recommended_plan, convenience_threshold_2, convenience_threshold_3) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'single_store', 1000, 2500)",
+    )
+    .bind(run_id)
+    .bind(list_id)
+    .bind(household_id)
+    .bind(run_at)
+    .bind(&plans_json)
+    .execute(pool)
+    .await
+    .expect("insert recommendation run");
+}
+
+/// PATCH /api/list/{id} with session + CSRF (used to archive).
+async fn patch_list(
+    pool: &SqlitePool,
+    session: &str,
+    csrf: &str,
+    list_id: &str,
+    body: Value,
+) -> axum::response::Response {
+    app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/list/{list_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={session}"))
+                .header("X-CSRF-Token", csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// POST /api/list/{id}/actual-spend with session + CSRF.
+async fn post_actual_spend(
+    pool: &SqlitePool,
+    session: &str,
+    csrf: &str,
+    list_id: &str,
+    body: Value,
+) -> axum::response::Response {
+    app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/list/{list_id}/actual-spend"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={session}"))
+                .header("X-CSRF-Token", csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// End-to-end: seed a run, archive the list (creating the savings_events row),
+/// POST actual-spend, then GET the summary — and assert `accepted_cents` and
+/// `net_cents` are BOTH non-zero and equal the derived `baseline − chosen` and
+/// `baseline − chosen − travel`. This proves accepted no longer reads as 0
+/// through the real path (it would, if the query summed the never-written
+/// `accepted_savings_cents` column).
+#[tokio::test]
+async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
+    let pool = setup_pool().await;
+    // Reuse the read-only helper to seed the household, member, and a session;
+    // log in again to also capture the CSRF cookie the mutations need.
+    seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+    let (session, csrf) = login_with_csrf(&pool, "a@example.test").await;
+
+    seed_active_list(&pool, HOUSEHOLD, "list-1", "Weekly").await;
+    seed_recommendation_run(&pool, HOUSEHOLD, "run-1", "list-1", "2026-06-01T10:00:00Z").await;
+
+    // Archive → creates the savings_events row (chosen/net still NULL).
+    let archived = patch_list(
+        &pool,
+        &session,
+        &csrf,
+        "list-1",
+        serde_json::json!({ "status": "archived" }),
+    )
+    .await;
+    assert_eq!(archived.status(), StatusCode::OK);
+
+    // Post the household's actual spend + travel.
+    let chosen = 4500;
+    let travel = 300;
+    let spend = post_actual_spend(
+        &pool,
+        &session,
+        &csrf,
+        "list-1",
+        serde_json::json!({ "actual_spend_cents": chosen, "travel_cost_cents": travel }),
+    )
+    .await;
+    assert_eq!(spend.status(), StatusCode::OK);
+
+    // GET the summary and assert the DERIVED accepted + stored net are both > 0.
+    let resp = get_summary(
+        &pool,
+        &Session {
+            session: session.clone(),
+        },
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    let expected_accepted = FLOW_BASELINE - chosen; // 500
+    let expected_net = FLOW_BASELINE - chosen - travel; // 200
+    assert!(
+        expected_accepted > 0 && expected_net > 0,
+        "fixture must be positive"
+    );
+
+    let monthly = body["monthly"].as_array().expect("monthly array");
+    assert_eq!(monthly.len(), 1, "one month");
+    assert_eq!(monthly[0]["month"], "2026-06");
+    // The regression this guards: accepted is non-zero (would be 0 if the query
+    // summed the never-written accepted_savings_cents column).
+    assert_eq!(monthly[0]["accepted_cents"], expected_accepted);
+    assert_eq!(monthly[0]["net_cents"], expected_net);
+    assert_eq!(body["cumulative_net_cents"], expected_net);
 }
