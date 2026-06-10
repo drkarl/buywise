@@ -12,7 +12,9 @@
  */
 
 :root {
-	/* Brand + accents (teal already used across the list/optimise components). */
+	/* Brand + accents. Existing components currently hardcode these hexes (e.g.
+	 * the teal #0f766e); these tokens mirror them as the canonical source for new
+	 * code and future adoption — they are not yet referenced elsewhere. */
 	--color-accent: #0f766e;
 	--color-accent-strong: #115e59;
 	--color-accent-soft: #f0fdfa;
@@ -27,7 +29,7 @@
 	--color-border: #e2e8f0;
 	--color-border-strong: #cbd5e1;
 
-	/* Status tints (shared with ConfidenceIndicator / ListItem). */
+	/* Status tints — mirror the hexes ConfidenceIndicator / ListItem hardcode. */
 	--color-danger: #b91c1c;
 	--color-danger-soft: #fef2f2;
 
@@ -75,13 +77,11 @@ p {
 	margin: 0 0 1rem;
 }
 
+/* Keep the underline affordance on inline links by default (accessibility:
+ * links should not be distinguishable by colour alone). Components that render
+ * links as buttons/cards/tabs opt out via their own scoped classes. */
 a {
 	color: var(--color-accent);
-	text-decoration: none;
-}
-
-a:hover {
-	text-decoration: underline;
 }
 
 /* Base form/button defaults — component classes override where they style their

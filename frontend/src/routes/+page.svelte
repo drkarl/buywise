@@ -47,29 +47,45 @@
 	let creating = $state(false);
 	let createError = $state<string | null>(null);
 
+	/** Reset to the logged-out view, clearing any authenticated state. Called on a
+	 * fresh load with no session and whenever a request 401s mid-session (expiry,
+	 * or logout in another tab) so stale lists never linger in client state. */
+	function goAnon() {
+		user = null;
+		lists = [];
+		loginError = null;
+		view = 'anon';
+	}
+
 	/** Resolve the current session, then load lists, or fall back to the login form. */
 	async function bootstrap() {
 		view = 'loading';
 		try {
 			const meRes = await fetch('/api/auth/me');
 			if (meRes.status === 401) {
-				user = null;
-				view = 'anon';
+				goAnon();
 				return;
 			}
 			if (!meRes.ok) throw new Error(`me: ${meRes.status}`);
 			user = (await meRes.json()) as User;
-			await loadLists();
+			if (!(await loadLists())) return; // 401 → already routed to the login form
 			view = 'ready';
 		} catch {
 			view = 'error';
 		}
 	}
 
-	async function loadLists() {
+	/** Fetch the household's lists. Returns false (and routes to the login form) if
+	 * the session has expired; throws on any other failure for the caller to handle. */
+	async function loadLists(): Promise<boolean> {
 		const res = await fetch('/api/lists');
+		if (res.status === 401) {
+			goAnon();
+			return false;
+		}
 		if (!res.ok) throw new Error(`lists: ${res.status}`);
 		lists = (await res.json()) as ListSummary[];
+		return true;
 	}
 
 	async function login(event: SubmitEvent) {
@@ -83,6 +99,7 @@
 				body: JSON.stringify({ email, password })
 			});
 			if (res.status === 401) {
+				password = '';
 				loginError = 'Incorrect email or password.';
 				return;
 			}
@@ -103,9 +120,7 @@
 		try {
 			await fetch('/api/auth/logout', { method: 'POST', headers: jsonMutationHeaders() });
 		} finally {
-			user = null;
-			lists = [];
-			view = 'anon';
+			goAnon();
 		}
 	}
 
@@ -125,6 +140,10 @@
 				headers: jsonMutationHeaders(),
 				body: JSON.stringify({ name, household_id: householdId })
 			});
+			if (res.status === 401 || res.status === 403) {
+				goAnon(); // session expired (or CSRF lost with it) → back to the login form
+				return;
+			}
 			if (!res.ok) {
 				createError = 'Could not create the list.';
 				return;
@@ -150,7 +169,7 @@
 	</header>
 
 	{#if view === 'loading'}
-		<p class="status">Loading…</p>
+		<p class="status" aria-live="polite">Loading…</p>
 	{:else if view === 'error'}
 		<div class="panel">
 			<p class="status">Couldn't reach the server.</p>
@@ -232,7 +251,7 @@
 
 <style>
 	.home {
-		max-width: 32rem;
+		max-width: 40rem;
 		margin: 0 auto;
 		padding: 2rem 1rem 3rem;
 		display: flex;
