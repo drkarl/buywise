@@ -334,8 +334,10 @@ pub struct NoValidOfferItem {
 ///
 /// `price_cents` is the **effective** per-unit price (loyalty when present, else
 /// shelf), matching [`Candidate::effective_unit_price`] so the chooser shows the
-/// price the household would actually pay — the same number that would appear on
-/// a plan line once the candidate is confirmed.
+/// price the household would actually pay per pack. This is the candidate's
+/// [`PlanLine::unit_price_cents`], not its `line_total_cents`: once the candidate
+/// is confirmed, the plan line renders `price_cents × count`, so for an item with
+/// `count > 1` the line total is a multiple of this number.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateOffer {
     /// The retailer product id (paired with the item's `canonical_item_id` to
@@ -1255,14 +1257,24 @@ pub async fn optimise(
         }
         priced_inputs.insert(item_index, rows);
 
-        // The household's confirmed product for this item, if any (issue #78). Only
-        // consulted for ask-policy items in `classify_items`; recorded for every
-        // resolved item here so the classification stays a pure function of its
-        // inputs.
-        if let Some(preferred) =
-            db::preferred_product_for_item(pool, &input.household_id, canonical_item_id).await?
-        {
-            preferred_products.insert(item_index, preferred);
+        // The household's confirmed product for this item, if any (issue #78).
+        // `preferred_products` is only consulted by `classify_items` on the `Ask`
+        // branch, so gate the per-item SQL on that policy: a basket with no ask
+        // items must not pay one `preferred_product_for_item` round-trip per
+        // resolved line (the cost would scale linearly with basket size for a
+        // result that is then discarded). Default to the permissive `Any` when the
+        // item has no constraints row, mirroring `classify_items`.
+        let substitution_policy = item
+            .constraints
+            .as_ref()
+            .map(|c| c.substitution_policy)
+            .unwrap_or(SubstitutionPolicy::Any);
+        if substitution_policy == SubstitutionPolicy::Ask {
+            if let Some(preferred) =
+                db::preferred_product_for_item(pool, &input.household_id, canonical_item_id).await?
+            {
+                preferred_products.insert(item_index, preferred);
+            }
         }
     }
 
