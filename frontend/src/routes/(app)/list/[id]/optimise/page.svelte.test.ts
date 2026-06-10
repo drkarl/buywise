@@ -305,6 +305,140 @@ describe('optimise page', () => {
 		expect(optimiseCalls).toBe(2);
 	});
 
+	it('drops a stale re-optimise when a newer confirmation supersedes it', async () => {
+		// Race regression: with two ask items, the household can confirm A then B
+		// before A's re-optimise resolves (only the in-flight item's own buttons
+		// disable). Both runs target the same list, so the `id !== listId` guard
+		// can't catch it — if A's older response lands last it would clobber B's
+		// newer one and wrongly re-show a chooser. The request-sequence guard must
+		// drop the superseded run.
+		const { fireEvent } = await import('@testing-library/svelte');
+
+		function deferred<T>() {
+			let resolve!: (value: T) => void;
+			const promise = new Promise<T>((r) => {
+				resolve = r;
+			});
+			return { promise, resolve };
+		}
+
+		// Two ask items, one candidate each → two "Choose" buttons.
+		const twoAsk: OptimiseResponse = {
+			run_id: 'run-ask',
+			best_single: null,
+			best_two_store: null,
+			theoretical_minimum: null,
+			recommended: null,
+			unresolved_items: [],
+			no_valid_offer_items: [],
+			needs_confirmation_items: [
+				{
+					item_index: 0,
+					display_text: 'yoghurt',
+					canonical_item_id: 'ci-a',
+					candidate_count: 1,
+					candidates: [
+						{
+							retailer_product_id: 'rp-a',
+							name: 'Brooklea Natural',
+							brand: 'Brooklea',
+							size_text: '500g',
+							price_cents: 180,
+							retailer: 'aldi'
+						}
+					]
+				},
+				{
+					item_index: 1,
+					display_text: 'butter',
+					canonical_item_id: 'ci-b',
+					candidate_count: 1,
+					candidates: [
+						{
+							retailer_product_id: 'rp-b',
+							name: 'Kerrygold',
+							brand: 'Kerrygold',
+							size_text: '250g',
+							price_cents: 300,
+							retailer: 'tesco'
+						}
+					]
+				}
+			],
+			plain_language_explanation: '',
+			offer_snapshot_date: null
+		};
+
+		// A's re-optimise (older, seq 2): butter still ask. Tagged so we can detect
+		// it leaking into the DOM.
+		const staleAfterA: OptimiseResponse = {
+			...twoAsk,
+			run_id: 'run-stale-a',
+			needs_confirmation_items: [twoAsk.needs_confirmation_items[1]],
+			plain_language_explanation: 'STALE: only yoghurt confirmed'
+		};
+
+		// B's re-optimise (newer, seq 3): both confirmed → plans, no ask items.
+		const bothConfirmed = fullResponse();
+
+		let optimiseCall = 0;
+		let feedbackCall = 0;
+		const fbA = deferred<Response>();
+		const fbB = deferred<Response>();
+		const optA = deferred<Response>();
+		const optB = deferred<Response>();
+		const acceptedFeedback = () =>
+			new Response(JSON.stringify({ product_match_id: 'pm', status: 'accepted', action: 'prefer' }), {
+				status: 201
+			});
+
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/match-feedback')) {
+				feedbackCall += 1;
+				return feedbackCall === 1 ? fbA.promise : fbB.promise;
+			}
+			if (url.includes('/api/optimise')) {
+				optimiseCall += 1;
+				if (optimiseCall === 1) return new Response(JSON.stringify(twoAsk), { status: 200 });
+				return optimiseCall === 2 ? optA.promise : optB.promise;
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		render(Page);
+
+		// Both choosers render.
+		await waitFor(() => expect(screen.getAllByRole('button', { name: /choose/i })).toHaveLength(2));
+		const buttons = screen.getAllByRole('button', { name: /choose/i });
+
+		// Confirm A, then B, while A's prefer POST is still in flight.
+		await fireEvent.click(buttons[0]); // ci-a
+		await fireEvent.click(buttons[1]); // ci-b
+		await waitFor(() => expect(feedbackCall).toBe(2));
+
+		// A's prefer resolves first: its re-optimise reaches the network (seq 2) and
+		// stays in flight (deferred), so it is genuinely racing, not dropped early.
+		fbA.resolve(acceptedFeedback());
+		await waitFor(() => expect(optimiseCall).toBe(2));
+		// Then B's prefer resolves: a newer re-optimise starts (seq 3).
+		fbB.resolve(acceptedFeedback());
+		await waitFor(() => expect(optimiseCall).toBe(3));
+
+		// The newer run (B) resolves first and renders plans…
+		optB.resolve(new Response(JSON.stringify(bothConfirmed), { status: 200 }));
+		await screen.findByText(/Splitting between Tesco and Aldi/);
+
+		// …then the older run (A) lands last. The sequence guard must drop it, so
+		// the stale chooser/explanation never reappears.
+		optA.resolve(new Response(JSON.stringify(staleAfterA), { status: 200 }));
+		await new Promise((r) => setTimeout(r, 0));
+
+		expect(screen.queryByText(/STALE/)).toBeNull();
+		expect(screen.queryByRole('button', { name: /choose/i })).toBeNull();
+		expect(screen.getByText(/Splitting between Tesco and Aldi/)).toBeTruthy();
+	});
+
 	it('surfaces a visible error on a non-OK response', async () => {
 		stubOptimise(fullResponse(), 422);
 		render(Page);
