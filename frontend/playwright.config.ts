@@ -54,9 +54,11 @@ export default defineConfig({
     command: 'bash e2e/run-server.sh',
     // Probe the SPA shell at `/`: the Axum `ServeDir` fallback serves
     // `frontend/build/200.html` with a 200 once the build is on disk (see
-    // crates/api/src/lib.rs `app`). Playwright's readiness probe wants a
-    // reachable 2xx/3xx — the previous `/api/auth/me` returns 401 when
-    // unauthenticated, which is NOT a valid "ready" signal.
+    // crates/api/src/lib.rs `app`). A 2xx here is a TRUE go-signal because
+    // `run-server.sh` migrates + seeds the DB in a first phase on a SEPARATE
+    // port and only binds this PORT afterwards — so by the time `/` answers on
+    // PORT, the seed user/list already exist. (The previous `/api/auth/me`
+    // returned 401 unauthenticated, which is not a valid "ready" signal at all.)
     url: BASE_URL,
     ignoreHTTPSErrors: true,
     // A stale local server is reused as-is and is NOT re-seeded/wiped (only the
