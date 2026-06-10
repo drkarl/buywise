@@ -34,6 +34,8 @@ interface StubOpts {
 	loginStatus?: number;
 	/** Status for `POST /api/auth/logout` (204/401 end the session; 403/5xx don't). */
 	logoutStatus?: number;
+	/** Status for `POST /api/lists` (403 = CSRF/authz, not a logout). */
+	createStatus?: number;
 }
 
 /**
@@ -70,6 +72,10 @@ function stub(opts: StubOpts = {}) {
 			return authed
 				? new Response(JSON.stringify(lists), { status: 200 })
 				: new Response('unauthorized', { status: 401 });
+		}
+		if (url.endsWith('/api/lists') && method === 'POST') {
+			const status = opts.createStatus ?? 201;
+			return new Response(status < 400 ? JSON.stringify(weeklyShop()) : 'no', { status });
 		}
 		return new Response('not found', { status: 404 });
 	});
@@ -156,6 +162,22 @@ describe('home page (auth gate + list index)', () => {
 		// The HttpOnly session is still live server-side, so we must not claim to be
 		// logged out: the list index stays and the failure is surfaced.
 		expect(await screen.findByText('Could not sign out. Please try again.')).toBeTruthy();
+		expect(screen.getByText('Your lists')).toBeTruthy();
+	});
+
+	it('keeps the authenticated view and shows an error when create-list is forbidden (403)', async () => {
+		stub({ authed: true, lists: [weeklyShop()], createStatus: 403 });
+		render(Page);
+		await screen.findByText('Your lists');
+
+		await fireEvent.input(screen.getByLabelText('New list name'), {
+			target: { value: 'Party' }
+		});
+		await fireEvent.click(screen.getByRole('button', { name: 'Add list' }));
+
+		// A 403 is a CSRF or household-authorization failure, not a cleared session:
+		// the session is still live, so we stay authenticated and surface the error.
+		expect(await screen.findByText('Could not create the list.')).toBeTruthy();
 		expect(screen.getByText('Your lists')).toBeTruthy();
 	});
 });

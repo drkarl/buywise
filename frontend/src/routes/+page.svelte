@@ -165,11 +165,14 @@
 				headers: jsonMutationHeaders(),
 				body: JSON.stringify({ name, household_id: householdId })
 			});
-			if (res.status === 401 || res.status === 403) {
-				goAnon(); // session expired (or CSRF lost with it) → back to the login form
+			if (res.status === 401) {
+				goAnon(); // session expired → back to the login form
 				return;
 			}
 			if (!res.ok) {
+				// 403 (CSRF token or household authorization), 422 (validation) or a
+				// 5xx all leave the session live — stay on the list index and surface
+				// the failure rather than falsely dropping to the login form.
 				createError = 'Could not create the list.';
 				return;
 			}
