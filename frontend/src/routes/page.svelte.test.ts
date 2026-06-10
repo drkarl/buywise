@@ -180,4 +180,33 @@ describe('home page (auth gate + list index)', () => {
 		expect(await screen.findByText('Could not create the list.')).toBeTruthy();
 		expect(screen.getByText('Your lists')).toBeTruthy();
 	});
+
+	it('clears a stale create-list error after signing out and back in', async () => {
+		stub({ authed: true, lists: [weeklyShop()], createStatus: 403, logoutStatus: 204 });
+		render(Page);
+		await screen.findByText('Your lists');
+
+		// Provoke a create-list failure so the alert is showing.
+		await fireEvent.input(screen.getByLabelText('New list name'), {
+			target: { value: 'Party' }
+		});
+		await fireEvent.click(screen.getByRole('button', { name: 'Add list' }));
+		await screen.findByText('Could not create the list.');
+
+		// Sign out (204) → sign-in form.
+		await fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+		await screen.findByRole('heading', { name: 'Sign in' });
+
+		// Sign back in — the previous create error must not survive the cycle.
+		await fireEvent.input(screen.getByLabelText('Email'), {
+			target: { value: 'me@buywise.local' }
+		});
+		await fireEvent.input(screen.getByLabelText('Password'), {
+			target: { value: 'buywise123' }
+		});
+		await fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+
+		await screen.findByText('Your lists');
+		expect(screen.queryByText('Could not create the list.')).toBeNull();
+	});
 });
