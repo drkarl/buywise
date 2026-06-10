@@ -49,7 +49,8 @@
 	 * The `canonical_item_id` currently being confirmed (a `prefer` POST is in
 	 * flight), or null. Keyed by canonical id rather than item_index so the
 	 * spinner/disabled state survives the re-optimise that replaces `result`. Only
-	 * one confirmation runs at a time; the whole ask section is disabled while set.
+	 * one confirmation runs at a time, and only the in-flight item's own buttons
+	 * are disabled — other ask items stay choosable.
 	 */
 	let confirmingItemId = $state<string | null>(null);
 	/** A per-item confirmation error message, keyed by canonical id. */
@@ -277,7 +278,7 @@
 										<button
 											type="button"
 											class="choose"
-											disabled={confirmingItemId !== null}
+											disabled={confirmingItemId === item.canonical_item_id}
 											aria-busy={confirmingItemId === item.canonical_item_id}
 											onclick={() => chooseCandidate(item.canonical_item_id, candidate)}
 										>
@@ -437,73 +438,73 @@
 		text-align: center;
 		color: #94a3b8;
 	}
-		/* The ask-confirm chooser (issue #78): one block per item, each listing its
-		   candidate offers with a Choose button. Overrides the row layout the
-		   shared `.needs-confirmation li` rule sets for the old count-only view. */
-		.confirm-list .confirm-item {
-			display: flex;
-			flex-direction: column;
-			align-items: stretch;
-			gap: 0.5rem;
-		}
-		.confirm-item-name {
-			margin: 0;
-			font-weight: 600;
-			color: #1e293b;
-		}
-		.candidate-list {
-			list-style: none;
-			margin: 0;
-			padding: 0;
-			display: flex;
-			flex-direction: column;
-			gap: 0.4rem;
-		}
-		.confirm-list .candidate {
-			display: flex;
-			align-items: center;
-			justify-content: space-between;
-			gap: 0.75rem;
-			padding: 0.5rem 0.6rem;
-			background: #fff;
-			border: 1px solid #fde68a;
-			border-radius: 0.4rem;
-		}
-		.candidate-detail {
-			display: flex;
-			flex-wrap: wrap;
-			align-items: baseline;
-			gap: 0.5rem;
-		}
-		.candidate-name {
-			font-weight: 600;
-			color: #1e293b;
-		}
-		.candidate-meta {
-			color: #64748b;
-			font-size: 0.85rem;
-		}
-		.candidate-price {
-			font-weight: 600;
-			color: #0f766e;
-		}
-		.choose {
-			flex-shrink: 0;
-			padding: 0.35rem 0.85rem;
-			border: 1px solid #0f766e;
-			border-radius: 0.4rem;
-			background: #0f766e;
-			color: #fff;
-			font-size: 0.88rem;
-			cursor: pointer;
-		}
-		.choose:disabled {
-			opacity: 0.6;
-			cursor: progress;
-		}
-		.confirm-error {
-			margin: 0;
-			color: #b91c1c;
-			font-size: 0.85rem;
-		}
+	/* The ask-confirm chooser (issue #78): one block per item, each listing its
+	   candidate offers with a Choose button. Overrides the row layout the
+	   shared `.needs-confirmation li` rule sets for the old count-only view. */
+	.confirm-list .confirm-item {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 0.5rem;
+	}
+	.confirm-item-name {
+		margin: 0;
+		font-weight: 600;
+		color: #1e293b;
+	}
+	.candidate-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+	.confirm-list .candidate {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		padding: 0.5rem 0.6rem;
+		background: #fff;
+		border: 1px solid #fde68a;
+		border-radius: 0.4rem;
+	}
+	.candidate-detail {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.5rem;
+	}
+	.candidate-name {
+		font-weight: 600;
+		color: #1e293b;
+	}
+	.candidate-meta {
+		color: #64748b;
+		font-size: 0.85rem;
+	}
+	.candidate-price {
+		font-weight: 600;
+		color: #0f766e;
+	}
+	.choose {
+		flex-shrink: 0;
+		padding: 0.35rem 0.85rem;
+		border: 1px solid #0f766e;
+		border-radius: 0.4rem;
+		background: #0f766e;
+		color: #fff;
+		font-size: 0.88rem;
+		cursor: pointer;
+	}
+	.choose:disabled {
+		opacity: 0.6;
+		cursor: progress;
+	}
+	.confirm-error {
+		margin: 0;
+		color: #b91c1c;
+		font-size: 0.85rem;
+	}
 </style>
