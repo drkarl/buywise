@@ -44,20 +44,29 @@
 	// Swipe-to-delete state.
 	const SWIPE_THRESHOLD = 80;
 	const LONG_PRESS_MS = 500;
+	// Past this much horizontal movement we treat the gesture as a real drag and
+	// only then grab pointer capture (see captured / onpointermove below).
+	const DRAG_SLOP = 6;
 	let dragX = $state(0);
 	let startX = 0;
 	let dragging = false;
+	let captured = false;
+	let pointerId = -1;
 	let menuOpen = $state(false);
 	let longPressTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function onpointerdown(event: PointerEvent) {
+		// A tap that lands on an interactive child (Check off / Skip / quantity /
+		// clarify) must reach that button's own click. If we grabbed pointer capture
+		// here, capture would redirect the pointerup to the `.swipe` surface and the
+		// browser would dispatch the synthesized click there instead of the button,
+		// so the button handler would never fire (issue #84). Skip the gesture for
+		// such taps entirely — the button takes over.
+		if ((event.target as HTMLElement | null)?.closest('button')) return;
 		startX = event.clientX;
+		pointerId = event.pointerId;
 		dragging = true;
-		// Capture the pointer so we keep getting move/up events even if the pointer
-		// leaves the element mid-swipe (otherwise a fast drag can drop the gesture).
-		// Guarded: not all environments (e.g. jsdom) implement pointer capture.
-		const target = event.currentTarget as HTMLElement;
-		target.setPointerCapture?.(event.pointerId);
+		captured = false;
 		longPressTimer = setTimeout(() => {
 			menuOpen = true;
 			dragging = false;
@@ -67,13 +76,26 @@
 	function onpointermove(event: PointerEvent) {
 		if (!dragging) return;
 		const delta = event.clientX - startX;
-		if (Math.abs(delta) > 6) clearTimeout(longPressTimer);
+		if (Math.abs(delta) > DRAG_SLOP) {
+			clearTimeout(longPressTimer);
+			// Now that this is a genuine drag, capture the pointer so we keep getting
+			// move/up even if it leaves the element mid-swipe (a fast drag would
+			// otherwise drop the gesture). Deferring capture until here keeps a plain
+			// tap targeting whatever it landed on (issue #84). Capture once.
+			// Guarded: not all environments (e.g. jsdom) implement pointer capture.
+			if (!captured) {
+				(event.currentTarget as HTMLElement).setPointerCapture?.(pointerId);
+				captured = true;
+			}
+		}
 		dragX = Math.min(0, delta); // only allow left swipe
 	}
 
 	function onpointerup() {
 		clearTimeout(longPressTimer);
 		dragging = false;
+		captured = false;
+		pointerId = -1;
 		if (dragX <= -SWIPE_THRESHOLD) {
 			ondelete(entry.id);
 		}
