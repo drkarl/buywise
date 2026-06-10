@@ -87,6 +87,13 @@ pub async fn build_fixture_pool(root: &Path, household_id: &str) -> Result<Sqlit
     // future migration moves any fixture-relevant DDL out of 001, this list must
     // be revisited.
     apply_schema_file(&pool, root, "007_retailer_product_attributes.sql").await?;
+    // Issue #78: the optimiser now reads `match_feedback` (created in migration
+    // 003) to honour a household's confirmed `prefer` choice for ask-policy items.
+    // Fixture mode never seeds feedback, but the SELECT must find the table, so we
+    // create the minimal `match_feedback` shape here rather than applying all of
+    // 003 (which would pull in unrelated Phase-1 auth tables). The fixture catalogue
+    // has no ask-policy items today, so this table simply stays empty.
+    create_match_feedback_table(&pool).await?;
     seed_categories_and_items(&pool, root, household_id).await?;
     seed_item_constraints(&pool, root).await?;
     seed_offers(&pool, root).await?;
@@ -119,6 +126,30 @@ async fn apply_schema_file(pool: &SqlitePool, root: &Path, file: &str) -> Result
         .execute(pool)
         .await
         .with_context(|| format!("applying {}", path.display()))?;
+    Ok(())
+}
+
+/// Create the minimal `match_feedback` table the optimiser's `prefer`-resolution
+/// SELECT depends on (issue #78). This mirrors the DDL from
+/// `migrations/003_phase1_schema.sql` verbatim *except* it omits the
+/// `REFERENCES users(id)` clause: fixture mode never creates the `users` table
+/// (it lives in 003 alongside the rest of the Phase-1 auth schema the fixture
+/// path doesn't need), and the optimiser only ever reads this table — it inserts
+/// no rows — so the foreign key would only ever be checked against an empty table.
+/// If migration 003's `match_feedback` shape changes, update this to match.
+async fn create_match_feedback_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::raw_sql(
+        "CREATE TABLE match_feedback (\
+             id                TEXT PRIMARY KEY,\
+             product_match_id  TEXT NOT NULL REFERENCES product_matches(id),\
+             user_id           TEXT NOT NULL,\
+             action            TEXT NOT NULL CHECK(action IN ('accept', 'reject', 'prefer')),\
+             created_at        TEXT NOT NULL\
+         );",
+    )
+    .execute(pool)
+    .await
+    .context("creating fixture match_feedback table")?;
     Ok(())
 }
 
