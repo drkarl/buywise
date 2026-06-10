@@ -23,9 +23,12 @@ export const listPath = `/list/${SEED.listId}`;
 // and HOLDS an add behind an inline warning when the new text looks like an
 // existing item — so item names that share tokens (e.g. "Race 123-1" vs
 // "Race 123-2") trip the detector and never actually add. Using mutually
-// dissimilar real nouns keeps every add on the fast, no-prompt path. A unique
-// numeric suffix per call guarantees freshness across specs without making two
-// siblings look alike (each draws a different noun).
+// dissimilar real nouns keeps every add on the fast, no-prompt path. The
+// per-call suffix (see uniqueName) must NOT be a bare number: the duplicate
+// check runs `parseQuantityAndUnit`, which strips a trailing bare number as a
+// COUNT token — so "Quinoa 17" would normalise to "quinoa" and collide with a
+// later "Quinoa 23". We therefore make the suffix an ALPHA token so it survives
+// normalisation and keeps every name genuinely distinct.
 const NOUNS = [
   'Quinoa', 'Lentils', 'Paprika', 'Walnuts', 'Cinnamon', 'Oregano', 'Cashews',
   'Turmeric', 'Couscous', 'Chickpeas', 'Almonds', 'Saffron', 'Pistachios',
@@ -35,16 +38,22 @@ let nounCursor = 0;
 let nameSeq = 0;
 
 /**
- * Returns a fresh, duplicate-safe item name: a distinct grocery noun plus a
- * monotonic suffix. Successive calls draw different nouns so no two live items
- * look like duplicates to the client-side detector, and the suffix keeps names
- * unique across specs sharing the one seeded list.
+ * Returns a fresh, duplicate-safe item name: a distinct grocery noun plus an
+ * ALPHA suffix. Successive calls draw different nouns so no two live items look
+ * like duplicates to the client-side detector, and the suffix keeps names unique
+ * across specs sharing the one seeded list. The suffix is base-36 letters (no
+ * bare trailing number) so `parseQuantityAndUnit` does not strip it as a count
+ * token and collapse distinct names together (see the NOUNS comment above).
  */
 export function uniqueName(): string {
   const noun = NOUNS[nounCursor % NOUNS.length];
   nounCursor += 1;
   nameSeq += 1;
-  return `${noun} ${Date.now()}${nameSeq}`;
+  // Base-36 of a timestamp + counter, with digits mapped to letters so the whole
+  // token is alphabetic and survives count/size normalisation intact.
+  const raw = `${Date.now().toString(36)}${nameSeq.toString(36)}`;
+  const suffix = raw.replace(/[0-9]/g, (d) => String.fromCharCode(103 + Number(d))); // 0→g … 9→p
+  return `${noun} ${suffix}`;
 }
 
 /**
@@ -90,29 +99,35 @@ export function activeRow(page: Page, name: string) {
 
 // The check-off and skip buttons sit INSIDE the row's `.swipe` gesture surface,
 // whose `onpointerdown` calls `setPointerCapture`. A real Playwright `.click()`
-// dispatches a pointer sequence the swipe layer captures, so the synthetic click
-// never reaches the inner button (the item silently stays active). Dispatching a
-// `click` event directly on the button bypasses the gesture layer and invokes the
-// button's own handler — which is exactly the user-visible action we want to test.
+// does NOT fire the button's handler: pointer capture redirects the `pointerup`
+// to the `.swipe` div, so Chromium dispatches the synthesized `click` at the div
+// (the captured target), not the inner button — the item silently stays active.
+//
+// This is a CONFIRMED PRODUCT BUG, reproduced in this harness and tracked in
+// https://github.com/drkarl/buywise/issues/84 (a real tap is absorbed by the
+// swipe layer). Until that is fixed we dispatch a `click` straight on the button
+// to invoke its own handler — the same effect the *fixed* component will give a
+// tap. Re-evaluate / switch to a real `.click()` once #84 lands.
 // (The Add button is outside the swipe surface, so it uses a normal `.click()`.)
 
-/** Checks an active item off (enqueues `mark_bought`). */
+/** Checks an active item off (enqueues `mark_bought`). See issue #84 re: dispatch. */
 export async function markBought(page: Page, name: string): Promise<void> {
   await page.getByRole('button', { name: `Check off ${name}` }).dispatchEvent('click');
 }
 
-/** Skips an active item (enqueues `mark_skipped`). */
+/** Skips an active item (enqueues `mark_skipped`). See issue #84 re: dispatch. */
 export async function markSkipped(page: Page, name: string): Promise<void> {
   await page.getByRole('button', { name: `Skip ${name}` }).dispatchEvent('click');
 }
 
 /**
- * Deletes an active item via its long-press context menu. Rather than drive the
- * gesture with absolute mouse coordinates (flaky: the row can shift, and the
- * hold timing races layout), we dispatch a real `pointerdown` straight onto the
- * row's `.swipe` group. The component's handler starts a 500ms timer that opens
- * the menu; after holding past it we click the revealed Delete button (a sibling
- * of the swipe surface, so the click is not swallowed by pointer capture).
+ * Deletes an active item via its long-press context menu. We dispatch a real
+ * `pointerdown` on the row's `.swipe` group (driving the menu via absolute mouse
+ * coordinates is flaky: the row can shift and the hold timing races layout). The
+ * component's handler starts a 500ms timer that opens the menu; we wait on the
+ * revealed Delete button (no fixed sleep) and then click it — Delete is a SIBLING
+ * of the swipe surface, so its click is not affected by the issue #84 capture
+ * retargeting and a real `.click()` works here.
  */
 export async function deleteItem(page: Page, name: string): Promise<void> {
   const row = activeRow(page, name);
@@ -121,10 +136,11 @@ export async function deleteItem(page: Page, name: string): Promise<void> {
   // arms exactly as it does for a user. setPointerCapture is guarded in the
   // component, so a synthetic pointerId is safe.
   await row.dispatchEvent('pointerdown', { clientX: 10, clientY: 10, pointerId: 1, button: 0 });
-  await page.waitForTimeout(700); // hold past LONG_PRESS_MS (500ms) → menu opens
+  // Wait on the menu's Delete button appearing (driven by the 500ms LONG_PRESS_MS
+  // timer) rather than sleeping a fixed amount coupled to that constant.
   const del = page.getByRole('button', { name: 'Delete', exact: true });
-  await del.waitFor({ state: 'visible' });
-  await del.dispatchEvent('click');
+  await del.waitFor({ state: 'visible', timeout: 5_000 });
+  await del.click();
 }
 
 /** A Dexie list-entry as projected for assertions (subset of LocalListEntry). */
