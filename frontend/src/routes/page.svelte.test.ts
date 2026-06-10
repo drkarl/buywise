@@ -32,6 +32,8 @@ interface StubOpts {
 	lists?: ListSummary[];
 	/** Status for `POST /api/auth/login` (200 also flips the session to authed). */
 	loginStatus?: number;
+	/** Status for `POST /api/auth/logout` (204/401 end the session; 403/5xx don't). */
+	logoutStatus?: number;
 }
 
 /**
@@ -56,9 +58,13 @@ function stub(opts: StubOpts = {}) {
 			if (status === 200) authed = true;
 			return new Response(status === 200 ? JSON.stringify(USER) : 'no', { status });
 		}
-		if (url.includes('/api/auth/logout')) {
-			authed = false;
-			return new Response('', { status: 200 });
+		if (url.includes('/api/auth/logout') && method === 'POST') {
+			const status = opts.logoutStatus ?? 204;
+			// Mirror the backend: only a 204 (CSRF-valid) or a 401 (already gone)
+			// actually ends the session; a 403/5xx leaves it live.
+			if (status === 204 || status === 401) authed = false;
+			// A 204 must have a null body (the Response ctor throws otherwise).
+			return new Response(status === 204 ? null : 'no', { status });
 		}
 		if (url.endsWith('/api/lists') && method === 'GET') {
 			return authed
@@ -128,5 +134,28 @@ describe('home page (auth gate + list index)', () => {
 
 		expect(await screen.findByText('Your lists')).toBeTruthy();
 		expect(screen.getByText('Weekly Shop')).toBeTruthy();
+	});
+
+	it('signs out and returns to the sign-in form on a 204', async () => {
+		stub({ authed: true, lists: [weeklyShop()], logoutStatus: 204 });
+		render(Page);
+		await screen.findByText('Your lists');
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+
+		expect(await screen.findByRole('heading', { name: 'Sign in' })).toBeTruthy();
+	});
+
+	it('keeps the authenticated view and shows an error when sign-out fails (403)', async () => {
+		stub({ authed: true, lists: [weeklyShop()], logoutStatus: 403 });
+		render(Page);
+		await screen.findByText('Your lists');
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+
+		// The HttpOnly session is still live server-side, so we must not claim to be
+		// logged out: the list index stays and the failure is surfaced.
+		expect(await screen.findByText('Could not sign out. Please try again.')).toBeTruthy();
+		expect(screen.getByText('Your lists')).toBeTruthy();
 	});
 });
