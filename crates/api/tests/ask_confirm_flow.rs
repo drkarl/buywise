@@ -307,6 +307,41 @@ async fn prefer_match(
     assert_eq!(out["action"], "prefer");
 }
 
+/// POST /api/match-feedback with action `reject` (flips the match to `rejected`,
+/// which cancels any earlier `prefer` on that match).
+async fn reject_match(
+    pool: &SqlitePool,
+    session: &Session,
+    canonical_item_id: &str,
+    retailer_product_id: &str,
+) {
+    let body = serde_json::json!({
+        "canonical_item_id": canonical_item_id,
+        "retailer_product_id": retailer_product_id,
+        "action": "reject",
+    });
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/match-feedback")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={}", session.session))
+                .header("X-CSRF-Token", &session.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "reject via match-feedback should succeed"
+    );
+    let out = json_body(resp).await;
+    assert_eq!(out["status"], "rejected", "match status should be rejected");
+}
+
 async fn optimise(pool: &SqlitePool, session: &Session, list_id: &str) -> Value {
     let resp = app(AppState::new(pool.clone()))
         .oneshot(
@@ -469,4 +504,60 @@ async fn preferring_a_product_prices_it_and_clears_confirmation() {
             .is_empty(),
         "the confirmed item is priceable, so it is not a no-valid-offer item"
     );
+}
+
+/// Regression: a `reject` after a `prefer` on the SAME product cancels the
+/// confirmation. `preferred_product_for_item` only honours a `prefer` whose
+/// underlying match is still `accepted` (the `pm.status = 'accepted'` join clause),
+/// so flipping that match to `rejected` must drop the confirmation and the ask item
+/// must fall back to awaiting a choice — here it surfaces only the surviving Tesco
+/// candidate, with the rejected Aldi product excluded from both the plans and the
+/// chooser.
+#[tokio::test]
+async fn rejecting_a_preferred_product_falls_back_to_needs_confirmation() {
+    let pool = setup_pool().await;
+    let session = seed_ask_milk_household(&pool).await;
+
+    // Confirm Aldi (the dearer product): it is now priced into the plans.
+    prefer_match(&pool, &session, MILK_ID, MILK_ALDI).await;
+    let confirmed = optimise(&pool, &session, "list-a").await;
+    assert!(
+        confirmed["needs_confirmation_items"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "the confirmed item is priced, not awaiting confirmation"
+    );
+    assert_eq!(
+        confirmed["recommended"]["plan"]["lines"][0]["retailer_product_id"],
+        MILK_ALDI,
+    );
+
+    // The household then rejects that very product.
+    reject_match(&pool, &session, MILK_ID, MILK_ALDI).await;
+
+    // Re-optimise: the prefer no longer applies (its match is rejected), so the
+    // item falls back to needs-confirmation and is held out of every plan.
+    let after = optimise(&pool, &session, "list-a").await;
+    assert!(
+        after["best_single"].is_null(),
+        "the item is held back again, so no plan prices it"
+    );
+    assert!(after["recommended"].is_null(), "no recommendation");
+
+    let nc = after["needs_confirmation_items"]
+        .as_array()
+        .expect("needs_confirmation_items array");
+    assert_eq!(nc.len(), 1, "the ask item awaits a choice again");
+    assert_eq!(nc[0]["canonical_item_id"], MILK_ID);
+
+    // The rejected Aldi product is gone from the chooser; only Tesco survives.
+    let candidates = nc[0]["candidates"].as_array().expect("candidates array");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the rejected product is excluded from the chooser"
+    );
+    assert_eq!(candidates[0]["retailer_product_id"], MILK_TESCO);
+    assert_eq!(nc[0]["candidate_count"], 1);
 }
