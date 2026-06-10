@@ -56,13 +56,19 @@
 	let longPressTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function onpointerdown(event: PointerEvent) {
+		// One gesture at a time: a second pointerdown mid-drag (e.g. a second finger)
+		// must not re-arm the long-press timer or hijack the active pointer.
+		if (dragging) return;
 		// A tap that lands on an interactive child (Check off / Skip / quantity /
 		// clarify) must reach that button's own click. If we grabbed pointer capture
 		// here, capture would redirect the pointerup to the `.swipe` surface and the
 		// browser would dispatch the synthesized click there instead of the button,
 		// so the button handler would never fire (issue #84). Skip the gesture for
-		// such taps entirely — the button takes over.
-		if ((event.target as HTMLElement | null)?.closest('button')) return;
+		// such taps entirely — the button takes over. `event.target` is only an
+		// EventTarget and may be a non-Element (e.g. a Text node), so guard before
+		// calling `closest`.
+		const target = event.target;
+		if (target instanceof Element && target.closest('button')) return;
 		startX = event.clientX;
 		pointerId = event.pointerId;
 		dragging = true;
@@ -70,11 +76,16 @@
 		longPressTimer = setTimeout(() => {
 			menuOpen = true;
 			dragging = false;
+			// Zero any sub-slop nudge so the row doesn't stay visually offset once the
+			// long-press menu opens (dragX is assigned on every move, slop or not).
+			dragX = 0;
 		}, LONG_PRESS_MS);
 	}
 
 	function onpointermove(event: PointerEvent) {
-		if (!dragging) return;
+		// Ignore moves from a different pointer (multi-touch): only the pointer that
+		// started the gesture drives the swipe.
+		if (!dragging || event.pointerId !== pointerId) return;
 		const delta = event.clientX - startX;
 		if (Math.abs(delta) > DRAG_SLOP) {
 			clearTimeout(longPressTimer);
@@ -91,7 +102,10 @@
 		dragX = Math.min(0, delta); // only allow left swipe
 	}
 
-	function onpointerup() {
+	function onpointerup(event: PointerEvent) {
+		// Ignore an up/cancel from a different pointer so a second finger lifting
+		// can't reset an in-progress gesture started by the active pointer.
+		if (event.pointerId !== pointerId) return;
 		clearTimeout(longPressTimer);
 		dragging = false;
 		captured = false;
