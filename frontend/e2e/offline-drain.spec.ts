@@ -104,9 +104,9 @@ test.describe('offline → reconnect drain', () => {
       await expectDexieEntry(a, SEED.listId, toSkip, 'skipped');
       await expectDexieEntry(a, SEED.listId, toDelete, 'deleted');
 
-      // Ordering proof (DIRECT): collapse retries by keeping each mutation's
-      // FIRST send (by client_mutation_id), preserving order. The deduped stream
-      // is the true drain sequence the SyncQueue replayed.
+      // Ordering proof (DIRECT, EXACT): collapse retries by keeping each
+      // mutation's FIRST send (by client_mutation_id), preserving order. The
+      // deduped stream is the true drain sequence the SyncQueue replayed.
       const firstSends: typeof sends = [];
       const seen = new Set<string>();
       for (const s of sends) {
@@ -115,32 +115,33 @@ test.describe('offline → reconnect drain', () => {
           firstSends.push(s);
         }
       }
-      // Exactly the seven distinct mutations drained: four adds + bought + skipped
-      // + delete (no mutation dropped, none invented).
-      const adds = firstSends.filter((d) => d.op === 'add_item');
-      expect(adds.length).toBe(4);
-      expect(firstSends.length).toBe(7);
-      // SyncQueue replays by ascending id, so all four adds drain BEFORE any
-      // dependent op — the first four distinct sends are the adds, in order.
-      expect(firstSends.slice(0, 4).map((d) => d.op)).toEqual([
-        'add_item',
-        'add_item',
-        'add_item',
-        'add_item'
-      ]);
-      // Per-entity: each add's position in the drain stream precedes its dependent
-      // op (a dependent op draining first would 404 against a not-yet-created row).
-      const idx = (pred: (d: { op: string; entityId: string }) => boolean) =>
-        firstSends.findIndex(pred);
-      const addOf = (entityId: string) =>
-        idx((d) => d.op === 'add_item' && d.entityId === entityId);
-      const buyEntity = adds[0].entityId; // toBuy was added first
-      const deleteEntity = adds[2].entityId; // toDelete was added third
-      expect(addOf(buyEntity)).toBeLessThan(
-        idx((d) => d.op === 'mark_bought' && d.entityId === buyEntity)
-      );
-      expect(addOf(deleteEntity)).toBeLessThan(
-        idx((d) => d.op === 'delete_item' && d.entityId === deleteEntity)
+
+      // Resolve each item's entity id from A's Dexie so we can assert the drain
+      // sequence by (op → the SPECIFIC entity), not by op alone.
+      const localById = await dexieEntries(a, SEED.listId);
+      const idOf = (name: string) => {
+        const row = localById.find((e) => e.display_name === name);
+        if (!row) throw new Error(`no local entry for "${name}"`);
+        return row.id;
+      };
+
+      // The mutations were created in EXACTLY this order (four adds in creation
+      // order, then the dependent ops), and SyncQueue replays by ascending id, so
+      // the observed drain sequence must equal it field-for-field: same ops, same
+      // target entities, same order. A regression that reorders the adds among
+      // themselves, or moves a dependent op before/among the adds, fails here —
+      // not just the prefix/per-pair spot checks the looser version allowed.
+      const expectedSequence = [
+        { op: 'add_item', entityId: idOf(toBuy) },
+        { op: 'add_item', entityId: idOf(toSkip) },
+        { op: 'add_item', entityId: idOf(toDelete) },
+        { op: 'add_item', entityId: idOf(toKeep) },
+        { op: 'mark_bought', entityId: idOf(toBuy) },
+        { op: 'mark_skipped', entityId: idOf(toSkip) },
+        { op: 'delete_item', entityId: idOf(toDelete) }
+      ];
+      expect(firstSends.map((s) => ({ op: s.op, entityId: s.entityId }))).toEqual(
+        expectedSequence
       );
 
       // Convergence proof: confirm the server's final state for these four items
