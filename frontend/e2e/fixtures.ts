@@ -314,6 +314,63 @@ export async function waitForDrained(page: Page, listId: string): Promise<void> 
 }
 
 /**
+ * Counts `add_item` mutations for `name` currently sitting in the page's local
+ * `mutation_queue` (any status), matched on the mutation's `payload.display_name`
+ * — the text the add was enqueued with (see stores/list.ts `addItem`). Used by
+ * the duplicate-warning spec to prove an add is HELD (0 queued while the inline
+ * warning is up) versus ENQUEUED (1 queued after "Add anyway"), reading the real
+ * queue the sync engine drains rather than any UI proxy.
+ */
+export async function queuedAddCount(
+  page: Page,
+  listId: string,
+  name: string
+): Promise<number> {
+  return page.evaluate(
+    async ({ lid, wanted }) => {
+      function openDb(): Promise<IDBDatabase> {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open('buywise');
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+      const db = await openDb();
+      const count: number = await new Promise((resolve, reject) => {
+        const tx = db.transaction('mutation_queue', 'readonly');
+        const store = tx.objectStore('mutation_queue');
+        let matches = 0;
+        const cursorReq = store.openCursor();
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result;
+          if (cursor) {
+            const v = cursor.value as {
+              list_id: string;
+              operation_type: string;
+              payload?: { display_name?: string };
+            };
+            if (
+              v.list_id === lid &&
+              v.operation_type === 'add_item' &&
+              v.payload?.display_name === wanted
+            ) {
+              matches += 1;
+            }
+            cursor.continue();
+          } else {
+            resolve(matches);
+          }
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+      });
+      db.close();
+      return count;
+    },
+    { lid: listId, wanted: name }
+  );
+}
+
+/**
  * Polls until the page's Dexie has an entry named `name` in `status`. Used to
  * wait for an SSE-delivered or drained edit to land locally without sleeping.
  */
