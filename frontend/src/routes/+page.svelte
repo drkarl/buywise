@@ -47,6 +47,10 @@
 	let creating = $state(false);
 	let createError = $state<string | null>(null);
 
+	// Sign-out.
+	let loggingOut = $state(false);
+	let logoutError = $state<string | null>(null);
+
 	/** Reset to the logged-out view, clearing any authenticated state. Called on a
 	 * fresh load with no session and whenever a request 401s mid-session (expiry,
 	 * or logout in another tab) so stale lists never linger in client state. */
@@ -54,6 +58,7 @@
 		user = null;
 		lists = [];
 		loginError = null;
+		logoutError = null;
 		view = 'anon';
 	}
 
@@ -117,10 +122,30 @@
 	}
 
 	async function logout() {
+		// The session cookie is HttpOnly: only the server can clear it, and only on
+		// a CSRF-valid logout (204). So we must NOT drop to the logged-out view
+		// unless the server actually ended the session — otherwise we'd claim
+		// "signed out" while a reload or another tab stays authenticated.
+		logoutError = null;
+		loggingOut = true;
 		try {
-			await fetch('/api/auth/logout', { method: 'POST', headers: jsonMutationHeaders() });
+			const res = await fetch('/api/auth/logout', {
+				method: 'POST',
+				headers: jsonMutationHeaders()
+			});
+			// 204: server deleted the session + cleared cookies. 401: the session was
+			// already gone. Either way we are genuinely logged out.
+			if (res.status === 204 || res.status === 401) {
+				goAnon();
+				return;
+			}
+			// 403 (missing/stale CSRF) or 5xx: the session is still live server-side,
+			// so keep the authenticated view and surface the failure.
+			logoutError = 'Could not sign out. Please try again.';
+		} catch {
+			logoutError = 'Could not sign out. Please try again.';
 		} finally {
-			goAnon();
+			loggingOut = false;
 		}
 	}
 
@@ -202,8 +227,13 @@
 		<div class="panel">
 			<div class="who">
 				<span>Signed in as <strong>{user?.display_name}</strong></span>
-				<button class="btn btn-quiet" onclick={logout}>Sign out</button>
+				<button class="btn btn-quiet" onclick={logout} disabled={loggingOut}>
+					{loggingOut ? 'Signing out…' : 'Sign out'}
+				</button>
 			</div>
+			{#if logoutError}
+				<p class="error" role="alert">{logoutError}</p>
+			{/if}
 
 			<h2>Your lists</h2>
 			{#if lists.length === 0}
