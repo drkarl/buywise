@@ -97,27 +97,23 @@ export function activeRow(page: Page, name: string) {
   return page.getByRole('group', { name, exact: true });
 }
 
-// The check-off and skip buttons sit INSIDE the row's `.swipe` gesture surface,
-// whose `onpointerdown` calls `setPointerCapture`. A real Playwright `.click()`
-// does NOT fire the button's handler: pointer capture redirects the `pointerup`
-// to the `.swipe` div, so Chromium dispatches the synthesized `click` at the div
-// (the captured target), not the inner button — the item silently stays active.
-//
-// This is a CONFIRMED PRODUCT BUG, reproduced in this harness and tracked in
-// https://github.com/drkarl/buywise/issues/84 (a real tap is absorbed by the
-// swipe layer). Until that is fixed we dispatch a `click` straight on the button
-// to invoke its own handler — the same effect the *fixed* component will give a
-// tap. Re-evaluate / switch to a real `.click()` once #84 lands.
-// (The Add button is outside the swipe surface, so it uses a normal `.click()`.)
+// The check-off and skip buttons sit INSIDE the row's `.swipe` gesture surface.
+// The surface used to grab `setPointerCapture` unconditionally on pointerdown,
+// which retargeted a tap's pointerup/click onto the `.swipe` div so the inner
+// button's handler never fired (issue #84). That is now fixed: the component
+// defers capture until a real drag is detected and skips the gesture entirely
+// when the pointerdown lands on a child button, so a plain tap reaches the
+// button. These helpers therefore use a real `.click()`, exercising the same
+// pointer→click path a user's tap follows.
 
-/** Checks an active item off (enqueues `mark_bought`). See issue #84 re: dispatch. */
+/** Checks an active item off (enqueues `mark_bought`). */
 export async function markBought(page: Page, name: string): Promise<void> {
-  await page.getByRole('button', { name: `Check off ${name}` }).dispatchEvent('click');
+  await page.getByRole('button', { name: `Check off ${name}` }).click();
 }
 
-/** Skips an active item (enqueues `mark_skipped`). See issue #84 re: dispatch. */
+/** Skips an active item (enqueues `mark_skipped`). */
 export async function markSkipped(page: Page, name: string): Promise<void> {
-  await page.getByRole('button', { name: `Skip ${name}` }).dispatchEvent('click');
+  await page.getByRole('button', { name: `Skip ${name}` }).click();
 }
 
 /**
@@ -126,8 +122,8 @@ export async function markSkipped(page: Page, name: string): Promise<void> {
  * coordinates is flaky: the row can shift and the hold timing races layout). The
  * component's handler starts a 500ms timer that opens the menu; we wait on the
  * revealed Delete button (no fixed sleep) and then click it — Delete is a SIBLING
- * of the swipe surface, so its click is not affected by the issue #84 capture
- * retargeting and a real `.click()` works here.
+ * of the swipe surface (and the surface no longer captures the pointer on a tap,
+ * see issue #84), so a real `.click()` works here.
  */
 export async function deleteItem(page: Page, name: string): Promise<void> {
   const row = activeRow(page, name);
