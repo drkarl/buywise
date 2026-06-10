@@ -327,6 +327,32 @@ pub struct NoValidOfferItem {
     pub reason: NoOfferReason,
 }
 
+/// One constraint-passing candidate offer for an ask-gated item, carried on
+/// [`NeedsConfirmationItem`] so the UI can render a chooser (issue #78) instead
+/// of just a count. The fields are the minimum a household needs to pick:
+/// product identity (id/name/brand/size), price, and where it is sold.
+///
+/// `price_cents` is the **effective** per-unit price (loyalty when present, else
+/// shelf), matching [`Candidate::effective_unit_price`] so the chooser shows the
+/// price the household would actually pay — the same number that would appear on
+/// a plan line once the candidate is confirmed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateOffer {
+    /// The retailer product id (paired with the item's `canonical_item_id` to
+    /// confirm the choice via `POST /api/match-feedback` with action `prefer`).
+    pub retailer_product_id: String,
+    /// The retailer product name.
+    pub name: String,
+    /// The product brand, when known.
+    pub brand: Option<String>,
+    /// Human-readable pack/size text (e.g. "500ml"), when known.
+    pub size_text: Option<String>,
+    /// Effective per-unit price in cents (loyalty when applicable, else shelf).
+    pub price_cents: Cents,
+    /// The retailer this candidate is sold at.
+    pub retailer: Retailer,
+}
+
 /// A resolved item whose `substitution_policy = 'ask'` produced at least one
 /// qualifying offer, but which must be **confirmed by the household** before it
 /// is auto-selected (Backlog-T1).
@@ -335,15 +361,29 @@ pub struct NoValidOfferItem {
 /// [`NoValidOfferItem`]: the item is *priceable* (a candidate exists) but the
 /// optimiser deliberately does not commit it to a plan. Callers render it as a
 /// confirmation prompt. The carried `candidate_count` lets the UI say how many
-/// options await a choice without re-deriving them.
+/// options await a choice, while `candidates` (issue #78) carries the actual
+/// offers so the UI can render a chooser and submit a `prefer`; confirming one
+/// brings the item into the plans on the next optimise. `candidate_count` always
+/// equals `candidates.len()` (retained for back-compat with existing callers).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeedsConfirmationItem {
     /// Index into `OptimiserInput::items`.
     pub item_index: usize,
     /// The original display text.
     pub display_text: String,
+    /// The resolved canonical item id, so the UI can submit a `prefer` choice
+    /// (`POST /api/match-feedback` needs `canonical_item_id` + the chosen
+    /// `retailer_product_id`). Always present: an ask item is, by definition,
+    /// resolved (`classify_items` only reaches the policy branch for a resolved,
+    /// priceable item).
+    pub canonical_item_id: String,
     /// How many constraint-passing candidate offers were found for the item.
+    /// Equal to `candidates.len()`.
     pub candidate_count: usize,
+    /// The constraint-passing candidate offers the household chooses between
+    /// (issue #78). Cheapest-effective-price first, then by retailer then product
+    /// id, so the ordering is deterministic.
+    pub candidates: Vec<CandidateOffer>,
 }
 
 /// The full optimiser result.
@@ -951,6 +991,57 @@ pub struct Classification {
     pub needs_confirmation: Vec<NeedsConfirmationItem>,
 }
 
+/// Human-readable pack/size text for a candidate product. Prefers the retailer's
+/// own `pack_size_text` (such as `500ml` or `4 x 410g`) and falls back to a
+/// composed `size_value` + `size_unit` (so `500.0` + `ml` becomes `500ml`).
+/// Returns `None` when the product carries neither, so the UI omits the size
+/// rather than rendering an empty token.
+fn size_text(product: &RetailerProduct) -> Option<String> {
+    if let Some(text) = product.pack_size_text.as_deref() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    match (product.size_value, product.size_unit.as_deref()) {
+        (Some(value), Some(unit)) => {
+            // Drop a trailing ".0" so 500.0 reads "500ml", not "500.0ml".
+            let value = if value.fract() == 0.0 {
+                format!("{}", value as i64)
+            } else {
+                format!("{value}")
+            };
+            Some(format!("{value}{unit}"))
+        }
+        _ => None,
+    }
+}
+
+/// Project a list of priced [`Candidate`]s into the wire-facing [`CandidateOffer`]
+/// the household chooses between (issue #78). Sorted cheapest-effective-price
+/// first, then by retailer then product id, so the chooser ordering is
+/// deterministic (mirrors the optimiser's own per-retailer cheapest-first pick).
+fn candidate_offers(candidates: &[Candidate]) -> Vec<CandidateOffer> {
+    let mut offers: Vec<CandidateOffer> = candidates
+        .iter()
+        .map(|c| CandidateOffer {
+            retailer_product_id: c.product.id.clone(),
+            name: c.product.name.clone(),
+            brand: c.product.brand.clone(),
+            size_text: size_text(&c.product),
+            price_cents: c.effective_unit_price(),
+            retailer: c.retailer,
+        })
+        .collect();
+    offers.sort_by(|a, b| {
+        a.price_cents
+            .cmp(&b.price_cents)
+            .then_with(|| a.retailer.as_db_str().cmp(b.retailer.as_db_str()))
+            .then_with(|| a.retailer_product_id.cmp(&b.retailer_product_id))
+    });
+    offers
+}
+
 /// Classify each basket item against its raw matches/offers, applying the
 /// constraint filter, and emit the constraint-passing [`Candidate`]s plus the
 /// unresolved / no-offer classification.
@@ -967,10 +1058,16 @@ pub struct Classification {
 ///   ([`NoOfferReason::StrictNoExactOffer`]) rather than substituted.
 /// * `Ask` — any candidate exists, but the item is held back for household
 ///   confirmation ([`Classification::needs_confirmation`]) instead of being
-///   auto-priced.
+///   auto-priced, **unless** the household has already confirmed a product for
+///   it: `preferred_products[item_index]` names a chosen `retailer_product_id`
+///   (issue #78). When that chosen product is among the surviving candidates the
+///   item is priced (restricted to that single candidate) and enters the plans;
+///   when it is not (the choice no longer qualifies, e.g. its offer lapsed) the
+///   item falls back to the confirmation prompt.
 fn classify_items(
     input: &OptimiserInput,
     priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
+    preferred_products: &BTreeMap<usize, String>,
 ) -> (Vec<Candidate>, Classification) {
     let mut candidates = Vec::new();
     let mut unresolved = Vec::new();
@@ -1068,13 +1165,39 @@ fn classify_items(
                 }
             }
             SubstitutionPolicy::Ask => {
-                // Priceable, but held back for the household to confirm. Excluded
-                // from every plan until then.
-                needs_confirmation.push(NeedsConfirmationItem {
-                    item_index,
-                    display_text: item.display_text.clone(),
-                    candidate_count: item_candidates.len(),
+                // Issue #78: if the household has already confirmed a product for
+                // this item (a `prefer` recorded in match_feedback, surfaced here
+                // via `preferred_products`), and that product is still among the
+                // qualifying candidates, restrict to it and price the item into
+                // the plans. Otherwise hold the item back for confirmation,
+                // carrying the candidate offers so the UI can render a chooser.
+                let chosen = preferred_products.get(&item_index).and_then(|wanted| {
+                    item_candidates.iter().position(|c| &c.product.id == wanted)
                 });
+                match chosen {
+                    Some(pos) => {
+                        // Drop every other candidate: the household chose this one,
+                        // so it is the only option priced (deterministic, and it
+                        // never undercuts the household's explicit choice).
+                        let confirmed = item_candidates.swap_remove(pos);
+                        candidates.push(confirmed);
+                    }
+                    None => {
+                        // `canonical_item_id` is Some here: an unresolved item never
+                        // reaches the policy branch (it short-circuits at 1a above).
+                        let canonical_item_id = item
+                            .canonical_item_id
+                            .clone()
+                            .expect("resolved item has a canonical id");
+                        needs_confirmation.push(NeedsConfirmationItem {
+                            item_index,
+                            display_text: item.display_text.clone(),
+                            canonical_item_id,
+                            candidate_count: item_candidates.len(),
+                            candidates: candidate_offers(&item_candidates),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1099,6 +1222,10 @@ fn classify_items(
 /// product's row, and that product's latest offer. Applies the constraint filter
 /// and classification, runs the pure core, and layers the recommendation on top.
 ///
+/// For each resolved item it also reads the household's most-recent `prefer`
+/// choice (issue #78) so an ask-gated item the household has already confirmed is
+/// priced into the plans instead of being held back (see [`classify_items`]).
+///
 /// Reads run in autocommit on the pool; the optimiser never holds a write lock.
 pub async fn optimise(
     pool: &SqlitePool,
@@ -1106,6 +1233,7 @@ pub async fn optimise(
 ) -> Result<OptimiserOutput, DbError> {
     let mut priced_inputs: BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>> =
         BTreeMap::new();
+    let mut preferred_products: BTreeMap<usize, String> = BTreeMap::new();
 
     for (item_index, item) in input.items.iter().enumerate() {
         let Some(canonical_item_id) = item.canonical_item_id.as_deref() else {
@@ -1126,9 +1254,19 @@ pub async fn optimise(
             rows.push((m, product, offer));
         }
         priced_inputs.insert(item_index, rows);
+
+        // The household's confirmed product for this item, if any (issue #78). Only
+        // consulted for ask-policy items in `classify_items`; recorded for every
+        // resolved item here so the classification stays a pure function of its
+        // inputs.
+        if let Some(preferred) =
+            db::preferred_product_for_item(pool, &input.household_id, canonical_item_id).await?
+        {
+            preferred_products.insert(item_index, preferred);
+        }
     }
 
-    Ok(build_output(input, &priced_inputs))
+    Ok(build_output(input, &priced_inputs, &preferred_products))
 }
 
 /// Build the full [`OptimiserOutput`] from already-fetched per-item rows. Shared
@@ -1136,8 +1274,9 @@ pub async fn optimise(
 fn build_output(
     input: &OptimiserInput,
     priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
+    preferred_products: &BTreeMap<usize, String>,
 ) -> OptimiserOutput {
-    let (candidates, classification) = classify_items(input, priced_inputs);
+    let (candidates, classification) = classify_items(input, priced_inputs, preferred_products);
     // Resolved-but-unpriceable items are missing at every store, so they fold into
     // every plan's missing_count as a constant (see StorePlan::missing_count).
     let no_offer_count = classification.no_valid_offer.len();
