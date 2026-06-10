@@ -180,10 +180,33 @@ describe('optimise page', () => {
 		expect(screen.getByText(/truffle oil — no matching product found/)).toBeTruthy();
 	});
 
-	it('surfaces ask-gated items for confirmation and renders the strict no-offer reason', async () => {
+	it('renders a chooser for ask-gated items and the strict no-offer reason', async () => {
 		const response = fullResponse();
 		response.needs_confirmation_items = [
-			{ item_index: 4, display_text: 'yoghurt', candidate_count: 3 }
+			{
+				item_index: 4,
+				display_text: 'yoghurt',
+				canonical_item_id: 'ci-yoghurt',
+				candidate_count: 2,
+				candidates: [
+					{
+						retailer_product_id: 'rp-y-tesco',
+						name: 'Glenisk Natural',
+						brand: 'Glenisk',
+						size_text: '500g',
+						price_cents: 220,
+						retailer: 'tesco'
+					},
+					{
+						retailer_product_id: 'rp-y-aldi',
+						name: 'Brooklea Natural',
+						brand: 'Brooklea',
+						size_text: '500g',
+						price_cents: 180,
+						retailer: 'aldi'
+					}
+				]
+			}
 		];
 		response.no_valid_offer_items = [
 			{ item_index: 5, display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
@@ -191,22 +214,95 @@ describe('optimise page', () => {
 		stubOptimise(response);
 		render(Page);
 
-		// substitution_policy=ask items get their own confirmation section with the
-		// candidate count, not silently dropped from the page.
+		// substitution_policy=ask items get their own confirmation section that now
+		// renders a real chooser (issue #78): the item name, each candidate's
+		// details, and a Choose button per candidate.
 		const confirm = await screen.findByLabelText(/awaiting your confirmation/i);
-		// Normalise whitespace: textContent keeps the template's literal newlines
-		// the browser would otherwise collapse.
-		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/yoghurt — 3 options found/);
-		// The product-choice flow does not exist yet (#78), so the section must not
-		// promise a "choose" control — only an honest "coming soon" + review link.
-		expect(confirm.textContent?.replace(/\s+/g, ' ')).toMatch(/coming soon/i);
-		expect(screen.queryByRole('link', { name: /choose on your list/i })).toBeNull();
-		const review = screen.getAllByRole('link', { name: /review on your list/i });
-		expect(review.some((a) => a.getAttribute('href') === '/list/list-42')).toBe(true);
+		const text = confirm.textContent?.replace(/\s+/g, ' ') ?? '';
+		expect(text).toMatch(/yoghurt/);
+		expect(text).toMatch(/Glenisk Natural/);
+		expect(text).toMatch(/Brooklea Natural/);
+		expect(text).toMatch(/€2\.20/);
+		expect(text).toMatch(/€1\.80/);
+		// One Choose button per candidate; the old "coming soon" copy is gone.
+		expect(screen.getAllByRole('button', { name: /choose/i })).toHaveLength(2);
+		expect(text).not.toMatch(/coming soon/i);
 
 		// strict_no_exact_offer maps to human copy, never the raw wire value.
 		expect(screen.getByText(/San Pellegrino — the exact product has no current offer/)).toBeTruthy();
 		expect(screen.queryByText(/strict_no_exact_offer/)).toBeNull();
+	});
+
+	it('confirms a candidate via match-feedback prefer, then re-optimises', async () => {
+		const { fireEvent } = await import('@testing-library/svelte');
+
+		// First optimise returns one ask item; after the prefer it returns plans
+		// with no ask items left (the confirmed item is now priced).
+		const withAsk = fullResponse();
+		withAsk.recommended = null;
+		withAsk.best_single = null;
+		withAsk.best_two_store = null;
+		withAsk.theoretical_minimum = null;
+		withAsk.unresolved_items = [];
+		withAsk.no_valid_offer_items = [];
+		withAsk.needs_confirmation_items = [
+			{
+				item_index: 0,
+				display_text: 'yoghurt',
+				canonical_item_id: 'ci-yoghurt',
+				candidate_count: 1,
+				candidates: [
+					{
+						retailer_product_id: 'rp-y-aldi',
+						name: 'Brooklea Natural',
+						brand: 'Brooklea',
+						size_text: '500g',
+						price_cents: 180,
+						retailer: 'aldi'
+					}
+				]
+			}
+		];
+		const afterConfirm = fullResponse(); // plans present, no ask items
+
+		let optimiseCalls = 0;
+		const feedbackBodies: unknown[] = [];
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/match-feedback')) {
+				feedbackBodies.push(JSON.parse(String(init?.body)));
+				return new Response(
+					JSON.stringify({ product_match_id: 'pm-1', status: 'accepted', action: 'prefer' }),
+					{ status: 201 }
+				);
+			}
+			if (url.includes('/api/optimise')) {
+				optimiseCalls += 1;
+				const body = optimiseCalls === 1 ? withAsk : afterConfirm;
+				return new Response(JSON.stringify(body), { status: 200 });
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		render(Page);
+
+		// The chooser appears; click Choose on the only candidate.
+		const choose = await screen.findByRole('button', { name: /choose/i });
+		await fireEvent.click(choose);
+
+		// The prefer choice was POSTed with the item + chosen product.
+		await waitFor(() => expect(feedbackBodies).toHaveLength(1));
+		expect(feedbackBodies[0]).toEqual({
+			canonical_item_id: 'ci-yoghurt',
+			retailer_product_id: 'rp-y-aldi',
+			action: 'prefer'
+		});
+
+		// And the page re-optimised: the second response (with plans, no ask items)
+		// is rendered, so the explanation copy appears and the chooser is gone.
+		await screen.findByText(/Splitting between Tesco and Aldi/);
+		expect(screen.queryByRole('button', { name: /choose/i })).toBeNull();
+		expect(optimiseCalls).toBe(2);
 	});
 
 	it('surfaces a visible error on a non-OK response', async () => {
@@ -248,7 +344,32 @@ describe('optimise page', () => {
 			recommended: null,
 			unresolved_items: [],
 			no_valid_offer_items: [],
-			needs_confirmation_items: [{ item_index: 0, display_text: 'yoghurt', candidate_count: 2 }],
+			needs_confirmation_items: [
+				{
+					item_index: 0,
+					display_text: 'yoghurt',
+					canonical_item_id: 'ci-yoghurt',
+					candidate_count: 2,
+					candidates: [
+						{
+							retailer_product_id: 'rp-y-tesco',
+							name: 'Glenisk Natural',
+							brand: 'Glenisk',
+							size_text: '500g',
+							price_cents: 220,
+							retailer: 'tesco'
+						},
+						{
+							retailer_product_id: 'rp-y-aldi',
+							name: 'Brooklea Natural',
+							brand: 'Brooklea',
+							size_text: '500g',
+							price_cents: 180,
+							retailer: 'aldi'
+						}
+					]
+				}
+			],
 			plain_language_explanation: '',
 			offer_snapshot_date: null
 		};

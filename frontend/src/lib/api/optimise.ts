@@ -78,14 +78,34 @@ export interface NoValidOfferItem {
 }
 
 /**
+ * One constraint-passing candidate offer for an ask-gated item (issue #78). Mirrors
+ * `crates/core/src/optimiser.rs::CandidateOffer`. `price_cents` is the effective
+ * per-unit price (loyalty when applicable, else shelf) — the price the household
+ * would pay once this candidate is confirmed.
+ */
+export interface CandidateOffer {
+	retailer_product_id: string;
+	name: string;
+	brand: string | null;
+	size_text: string | null;
+	price_cents: number;
+	retailer: RetailerId;
+}
+
+/**
  * Backlog-T1: a resolved, priceable item held back for household confirmation
  * because its `substitution_policy = 'ask'`. Excluded from every plan until the
- * household chooses a product.
+ * household chooses a product. Issue #78 adds the `canonical_item_id` and the
+ * `candidates` to choose between (confirm one via `sendMatchFeedback('prefer')`,
+ * then re-optimise to pull the item into the plans). `candidate_count` always
+ * equals `candidates.length`.
  */
 export interface NeedsConfirmationItem {
 	item_index: number;
 	display_text: string;
+	canonical_item_id: string;
 	candidate_count: number;
+	candidates: CandidateOffer[];
 }
 
 /** The full `POST /api/optimise` 200 response body. */
@@ -100,9 +120,9 @@ export interface OptimiseResponse {
 	// Backlog-T1: `substitution_policy = 'ask'` items, held out of every plan
 	// until the household confirms a product. Surfaced in the optimise page's
 	// "Waiting for your confirmation" section; the `strict_no_exact_offer` reason
-	// renders in the "excluded from totals" list via `reasonText`. The actual
-	// product-choice flow (candidate offers in the payload + a selection action)
-	// is tracked in #78 — this payload only carries a count for now.
+	// renders in the "excluded from totals" list via `reasonText`. Issue #78: each
+	// item carries its candidate offers, which the page renders as a chooser; the
+	// household picks one (POST match-feedback `prefer`) and the page re-optimises.
 	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;

@@ -28,7 +28,14 @@
 	import { jsonMutationHeaders } from '$lib/api/csrf';
 	import { flushPendingMutations } from '$lib/sync';
 	import PlanCard from '$lib/components/PlanCard.svelte';
-	import type { NoValidOfferReason, OptimiseResponse } from '$lib/api/optimise';
+	import {
+		formatEuros,
+		retailerLabel,
+		sendMatchFeedback,
+		type CandidateOffer,
+		type NoValidOfferReason,
+		type OptimiseResponse
+	} from '$lib/api/optimise';
 
 	const listId = $derived(page.params.id ?? '');
 
@@ -37,6 +44,51 @@
 	let status = $state<Status>('loading');
 	let result = $state<OptimiseResponse | null>(null);
 	let errorMessage = $state('');
+
+	/**
+	 * The `canonical_item_id` currently being confirmed (a `prefer` POST is in
+	 * flight), or null. Keyed by canonical id rather than item_index so the
+	 * spinner/disabled state survives the re-optimise that replaces `result`. Only
+	 * one confirmation runs at a time; the whole ask section is disabled while set.
+	 */
+	let confirmingItemId = $state<string | null>(null);
+	/** A per-item confirmation error message, keyed by canonical id. */
+	let confirmError = $state<Record<string, string>>({});
+
+	/**
+	 * Confirm a candidate for an ask-gated item (issue #78): persist the choice via
+	 * `POST /api/match-feedback` with action `prefer`, then re-optimise so the now-
+	 * confirmed item enters the plans. On failure we surface an inline message and
+	 * leave the chooser in place so the household can retry; we never silently drop
+	 * the choice. `runOptimise` resets `status` to loading, so the chooser is
+	 * replaced by the recomputed plans on success.
+	 */
+	async function chooseCandidate(canonicalItemId: string, candidate: CandidateOffer) {
+		confirmingItemId = canonicalItemId;
+		confirmError = { ...confirmError, [canonicalItemId]: '' };
+		try {
+			const { ok } = await sendMatchFeedback({
+				canonicalItemId,
+				retailerProductId: candidate.retailer_product_id,
+				action: 'prefer'
+			});
+			if (!ok) {
+				confirmError = {
+					...confirmError,
+					[canonicalItemId]: 'Couldn’t save your choice. Please try again.'
+				};
+				return;
+			}
+			await runOptimise(listId);
+		} catch {
+			confirmError = {
+				...confirmError,
+				[canonicalItemId]: 'Couldn’t reach the server. Check your connection and try again.'
+			};
+		} finally {
+			confirmingItemId = null;
+		}
+	}
 
 	/**
 	 * The single-store baseline total used for the OTHER cards' "saving vs" line.
@@ -204,16 +256,39 @@
 				<h2>Waiting for your confirmation</h2>
 				<p class="needs-confirmation-note">
 					These items are set to ask before substituting, so they’re held out of every plan
-					total. Choosing a product for them is coming soon.
+					total. Choose a product to include it in your plan.
 				</p>
-				<ul>
+				<ul class="confirm-list">
 					{#each result.needs_confirmation_items as item (item.item_index)}
-						<li>
-							<span
-								>{item.display_text} — {item.candidate_count}
-								{item.candidate_count === 1 ? 'option' : 'options'} found</span
-							>
-							<a class="clarify" href="/list/{listId}">Review on your list</a>
+						<li class="confirm-item">
+							<p class="confirm-item-name">{item.display_text}</p>
+							<ul class="candidate-list">
+								{#each item.candidates as candidate (candidate.retailer_product_id)}
+									<li class="candidate">
+										<span class="candidate-detail">
+											<span class="candidate-name">{candidate.name}</span>
+											{#if candidate.brand}<span class="candidate-meta">{candidate.brand}</span>{/if}
+											{#if candidate.size_text}<span class="candidate-meta"
+													>{candidate.size_text}</span
+												>{/if}
+											<span class="candidate-meta">{retailerLabel(candidate.retailer)}</span>
+											<span class="candidate-price">{formatEuros(candidate.price_cents)}</span>
+										</span>
+										<button
+											type="button"
+											class="choose"
+											disabled={confirmingItemId !== null}
+											aria-busy={confirmingItemId === item.canonical_item_id}
+											onclick={() => chooseCandidate(item.canonical_item_id, candidate)}
+										>
+											Choose
+										</button>
+									</li>
+								{/each}
+							</ul>
+							{#if confirmError[item.canonical_item_id]}
+								<p class="confirm-error" role="alert">{confirmError[item.canonical_item_id]}</p>
+							{/if}
 						</li>
 					{/each}
 				</ul>
@@ -362,4 +437,73 @@
 		text-align: center;
 		color: #94a3b8;
 	}
+		/* The ask-confirm chooser (issue #78): one block per item, each listing its
+		   candidate offers with a Choose button. Overrides the row layout the
+		   shared `.needs-confirmation li` rule sets for the old count-only view. */
+		.confirm-list .confirm-item {
+			display: flex;
+			flex-direction: column;
+			align-items: stretch;
+			gap: 0.5rem;
+		}
+		.confirm-item-name {
+			margin: 0;
+			font-weight: 600;
+			color: #1e293b;
+		}
+		.candidate-list {
+			list-style: none;
+			margin: 0;
+			padding: 0;
+			display: flex;
+			flex-direction: column;
+			gap: 0.4rem;
+		}
+		.confirm-list .candidate {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 0.75rem;
+			padding: 0.5rem 0.6rem;
+			background: #fff;
+			border: 1px solid #fde68a;
+			border-radius: 0.4rem;
+		}
+		.candidate-detail {
+			display: flex;
+			flex-wrap: wrap;
+			align-items: baseline;
+			gap: 0.5rem;
+		}
+		.candidate-name {
+			font-weight: 600;
+			color: #1e293b;
+		}
+		.candidate-meta {
+			color: #64748b;
+			font-size: 0.85rem;
+		}
+		.candidate-price {
+			font-weight: 600;
+			color: #0f766e;
+		}
+		.choose {
+			flex-shrink: 0;
+			padding: 0.35rem 0.85rem;
+			border: 1px solid #0f766e;
+			border-radius: 0.4rem;
+			background: #0f766e;
+			color: #fff;
+			font-size: 0.88rem;
+			cursor: pointer;
+		}
+		.choose:disabled {
+			opacity: 0.6;
+			cursor: progress;
+		}
+		.confirm-error {
+			margin: 0;
+			color: #b91c1c;
+			font-size: 0.85rem;
+		}
 </style>
