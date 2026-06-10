@@ -46,13 +46,14 @@
 	let errorMessage = $state('');
 
 	/**
-	 * The `canonical_item_id` currently being confirmed (a `prefer` POST is in
-	 * flight), or null. Keyed by canonical id rather than item_index so the
-	 * spinner/disabled state survives the re-optimise that replaces `result`. Only
-	 * one confirmation runs at a time, and only the in-flight item's own buttons
-	 * are disabled — other ask items stay choosable.
+	 * The `canonical_item_id`s whose `prefer` POST is currently in flight. A set
+	 * (not a single id) because the UI lets several ask items be confirmed
+	 * concurrently — each item disables only its own buttons, so a second
+	 * confirmation must not overwrite or clear the first's busy state. Keyed by
+	 * canonical id rather than item_index so the disabled state survives the
+	 * re-optimise that replaces `result`.
 	 */
-	let confirmingItemId = $state<string | null>(null);
+	let confirmingItemIds = $state<Set<string>>(new Set());
 	/** A per-item confirmation error message, keyed by canonical id. */
 	let confirmError = $state<Record<string, string>>({});
 
@@ -63,9 +64,14 @@
 	 * leave the chooser in place so the household can retry; we never silently drop
 	 * the choice. `runOptimise` resets `status` to loading, so the chooser is
 	 * replaced by the recomputed plans on success.
+	 *
+	 * Re-entrancy: ignore a click for an item already in flight (its button is
+	 * disabled, but a stray double-fire must not send a duplicate `prefer`). The
+	 * busy set is reassigned rather than mutated in place so the `$state` tracks it.
 	 */
 	async function chooseCandidate(canonicalItemId: string, candidate: CandidateOffer) {
-		confirmingItemId = canonicalItemId;
+		if (confirmingItemIds.has(canonicalItemId)) return;
+		confirmingItemIds = new Set(confirmingItemIds).add(canonicalItemId);
 		confirmError = { ...confirmError, [canonicalItemId]: '' };
 		try {
 			const { ok } = await sendMatchFeedback({
@@ -87,7 +93,11 @@
 				[canonicalItemId]: 'Couldn’t reach the server. Check your connection and try again.'
 			};
 		} finally {
-			confirmingItemId = null;
+			// Clear only this item's busy flag, leaving any concurrent confirmation's
+			// flag intact.
+			const next = new Set(confirmingItemIds);
+			next.delete(canonicalItemId);
+			confirmingItemIds = next;
 		}
 	}
 
@@ -292,8 +302,8 @@
 										<button
 											type="button"
 											class="choose"
-											disabled={confirmingItemId === item.canonical_item_id}
-											aria-busy={confirmingItemId === item.canonical_item_id}
+											disabled={confirmingItemIds.has(item.canonical_item_id)}
+											aria-busy={confirmingItemIds.has(item.canonical_item_id)}
 											onclick={() => chooseCandidate(item.canonical_item_id, candidate)}
 										>
 											Choose
