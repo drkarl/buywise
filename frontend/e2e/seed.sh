@@ -47,7 +47,13 @@ NOW="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
 # Insert the household, user (placeholder hash — set below), membership, list.
 # OR IGNORE so a re-seed against the same file is a no-op rather than an error.
+#
+# The values interpolated into this heredoc come from FIXED, trusted dev-only
+# constants (the defaults above, or env overrides the harness sets) — never
+# untrusted input — so this is not an injection surface. busy_timeout pre-empts a
+# transient SQLITE_BUSY if the server is mid-write on the same WAL file as we seed.
 sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=5000;
 INSERT OR IGNORE INTO households (id, name, created_at)
   VALUES ('$HOUSEHOLD_ID', 'E2E Household', '$NOW');
 INSERT OR IGNORE INTO users (id, email, password_hash, display_name, created_at)
