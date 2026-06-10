@@ -177,9 +177,20 @@ fn brand_only_product(id: &str, retailer: Retailer, brand: &str) -> RetailerProd
 
 type Rows = Vec<(ProductMatch, RetailerProduct, ProductOffer)>;
 
-/// Run the in-memory path: classify + core + recommend.
+/// Run the in-memory path: classify + core + recommend. No confirmed `prefer`
+/// choices (the common case); use [`run_with_preferred`] to inject them.
 fn run(input: &OptimiserInput, priced: BTreeMap<usize, Rows>) -> OptimiserOutput {
-    build_output(input, &priced)
+    build_output(input, &priced, &BTreeMap::new())
+}
+
+/// Like [`run`], but with a per-item-index → confirmed `retailer_product_id` map
+/// (issue #78), mirroring what `optimise` derives from a persisted `prefer`.
+fn run_with_preferred(
+    input: &OptimiserInput,
+    priced: BTreeMap<usize, Rows>,
+    preferred: BTreeMap<usize, String>,
+) -> OptimiserOutput {
+    build_output(input, &priced, &preferred)
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,12 +1098,137 @@ fn ask_policy_surfaces_item_for_confirmation() {
     );
     assert!(out.no_valid_offer_items.is_empty());
     assert_eq!(out.needs_confirmation_items.len(), 1);
-    assert_eq!(out.needs_confirmation_items[0].item_index, 0);
-    assert_eq!(out.needs_confirmation_items[0].display_text, "cereal");
+    let nc = &out.needs_confirmation_items[0];
+    assert_eq!(nc.item_index, 0);
+    assert_eq!(nc.display_text, "cereal");
+    assert_eq!(nc.canonical_item_id, "ci-c");
     assert_eq!(
-        out.needs_confirmation_items[0].candidate_count, 2,
+        nc.candidate_count, 2,
         "both qualifying candidates are counted"
     );
+    // Issue #78: the candidate offers are carried so the UI can render a chooser,
+    // cheapest-effective-price first. p-2 (250) sorts before p-1 (300).
+    assert_eq!(nc.candidates.len(), 2);
+    assert_eq!(nc.candidate_count, nc.candidates.len());
+    assert_eq!(nc.candidates[0].retailer_product_id, "p-2");
+    assert_eq!(nc.candidates[0].price_cents, 250);
+    assert_eq!(nc.candidates[0].retailer, Retailer::Aldi);
+    assert_eq!(nc.candidates[1].retailer_product_id, "p-1");
+    assert_eq!(nc.candidates[1].price_cents, 300);
+}
+
+#[test]
+fn ask_policy_carries_product_details_on_each_candidate() {
+    // The chooser needs name/brand/size/price/retailer per candidate (issue #78).
+    let mut basket_item = item("dish soap", "ci-d", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-1", "ci-d", "p-fairy", MatchStatus::Suggested),
+            branded_product("p-fairy", Retailer::Tesco, "Fairy", 500.0, "ml"),
+            // Shelf 300, loyalty 250 → effective 250 surfaces on the candidate.
+            loyalty_offer("o-1", "p-fairy", 300, 250),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let nc = &out.needs_confirmation_items[0];
+    let cand = &nc.candidates[0];
+    assert_eq!(cand.retailer_product_id, "p-fairy");
+    assert_eq!(cand.name, "p-fairy");
+    assert_eq!(cand.brand.as_deref(), Some("Fairy"));
+    assert_eq!(cand.size_text.as_deref(), Some("500ml"));
+    assert_eq!(
+        cand.price_cents, 250,
+        "effective (loyalty) price is carried"
+    );
+    assert_eq!(cand.retailer, Retailer::Tesco);
+}
+
+#[test]
+fn ask_policy_confirmed_prefer_prices_chosen_candidate() {
+    // Issue #78: once the household confirms a product (a persisted `prefer`,
+    // here injected via the preferred map), the ask item enters the plan priced
+    // at the CHOSEN candidate — not the globally cheapest one — and leaves the
+    // confirmation list.
+    let mut basket_item = item("cereal", "ci-c", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-1", "ci-c", "p-1", MatchStatus::Accepted),
+                product("p-1", Retailer::Tesco),
+                offer("o-1", "p-1", 300, Some(5)),
+            ),
+            (
+                product_match("m-2", "ci-c", "p-2", MatchStatus::Suggested),
+                product("p-2", Retailer::Aldi),
+                offer("o-2", "p-2", 250, Some(5)),
+            ),
+        ],
+    );
+
+    // Household chose the dearer p-1; the optimiser must honour that exact pick.
+    let mut preferred = BTreeMap::new();
+    preferred.insert(0, "p-1".to_string());
+
+    let out = run_with_preferred(&input, priced, preferred);
+    assert!(
+        out.needs_confirmation_items.is_empty(),
+        "a confirmed ask item is no longer awaiting confirmation"
+    );
+    let single = out
+        .best_single
+        .expect("confirmed item is priced into a plan");
+    assert_eq!(single.lines.len(), 1);
+    assert_eq!(single.lines[0].retailer_product_id, "p-1");
+    assert_eq!(
+        single.total_cents, 300,
+        "priced at the chosen candidate, not the cheaper p-2"
+    );
+}
+
+#[test]
+fn ask_policy_stale_prefer_falls_back_to_confirmation() {
+    // A persisted `prefer` whose product is no longer among the qualifying
+    // candidates (e.g. its offer lapsed) must not crash or silently price; the
+    // item falls back to awaiting a fresh choice (issue #78).
+    let mut basket_item = item("cereal", "ci-c", 1);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-1", "ci-c", "p-1", MatchStatus::Accepted),
+            product("p-1", Retailer::Tesco),
+            offer("o-1", "p-1", 300, Some(5)),
+        )],
+    );
+
+    // Points at a product that isn't a current candidate.
+    let mut preferred = BTreeMap::new();
+    preferred.insert(0, "p-gone".to_string());
+
+    let out = run_with_preferred(&input, priced, preferred);
+    assert!(out.best_single.is_none(), "stale choice is not priced");
+    assert_eq!(out.needs_confirmation_items.len(), 1);
+    assert_eq!(out.needs_confirmation_items[0].candidates.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

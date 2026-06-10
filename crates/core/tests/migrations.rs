@@ -447,5 +447,8 @@ async fn mutations_operation_type_check_accepts_set_quantity() {
     )
     .execute(&pool)
     .await;
-    assert!(ok.is_ok(), "set_quantity must be accepted after migration 008");
+    assert!(
+        ok.is_ok(),
+        "set_quantity must be accepted after migration 008"
+    );
 }
