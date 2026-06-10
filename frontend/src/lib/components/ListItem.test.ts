@@ -80,3 +80,64 @@ describe('ListItem quantity stepper (issue #60)', () => {
 		expect(screen.queryByRole('button', { name: /increase quantity/i })).toBeNull();
 	});
 });
+
+describe('ListItem tap vs swipe gesture (issue #84)', () => {
+	// A real tap is pointerdown → pointerup → click. The swipe surface used to grab
+	// pointer capture on pointerdown, which retargeted the click off the inner
+	// button so onbought/onskipped never fired. These cases assert a tap on a child
+	// button still reaches that button's handler.
+
+	it('fires onbought when the Check off button receives a real pointer tap', async () => {
+		const onbought = vi.fn();
+		render(ListItem, props({ onbought }));
+
+		const check = screen.getByRole('button', { name: /check off/i });
+		await fireEvent.pointerDown(check, { pointerId: 1, clientX: 5 });
+		await fireEvent.pointerUp(check, { pointerId: 1, clientX: 5 });
+		await fireEvent.click(check);
+
+		expect(onbought).toHaveBeenCalledWith('e1');
+	});
+
+	it('fires onskipped when the Skip button receives a real pointer tap', async () => {
+		const onskipped = vi.fn();
+		render(ListItem, props({ onskipped }));
+
+		const skip = screen.getByRole('button', { name: /^skip/i });
+		await fireEvent.pointerDown(skip, { pointerId: 1, clientX: 5 });
+		await fireEvent.pointerUp(skip, { pointerId: 1, clientX: 5 });
+		await fireEvent.click(skip);
+
+		expect(onskipped).toHaveBeenCalledWith('e1');
+	});
+
+	it('does not arm swipe-to-delete for a pointerdown that lands on a child button', async () => {
+		const ondelete = vi.fn();
+		render(ListItem, props({ ondelete }));
+
+		// A pointerdown on the button followed by a large left drag must NOT trigger
+		// the delete gesture: the surface skips the gesture for taps on a child.
+		const check = screen.getByRole('button', { name: /check off/i });
+		const swipe = screen.getByRole('group', { name: 'Milk' });
+		await fireEvent.pointerDown(check, { pointerId: 1, clientX: 200 });
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 0 });
+		await fireEvent.pointerUp(swipe, { pointerId: 1, clientX: 0 });
+
+		expect(ondelete).not.toHaveBeenCalled();
+	});
+
+	it('still triggers swipe-to-delete when the drag starts on the row surface', async () => {
+		const ondelete = vi.fn();
+		render(ListItem, props({ ondelete }));
+
+		// Pointerdown on the bare name (not a button) then a left drag past the
+		// threshold must still delete — the gesture is preserved for real swipes.
+		const name = screen.getByText('Milk');
+		const swipe = screen.getByRole('group', { name: 'Milk' });
+		await fireEvent.pointerDown(name, { pointerId: 1, clientX: 200 });
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 0 });
+		await fireEvent.pointerUp(swipe, { pointerId: 1, clientX: 0 });
+
+		expect(ondelete).toHaveBeenCalledWith('e1');
+	});
+});
