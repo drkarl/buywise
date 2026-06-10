@@ -50,8 +50,11 @@ NOW="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 #
 # The values interpolated into this heredoc come from FIXED, trusted dev-only
 # constants (the defaults above, or env overrides the harness sets) — never
-# untrusted input — so this is not an injection surface. busy_timeout pre-empts a
-# transient SQLITE_BUSY if the server is mid-write on the same WAL file as we seed.
+# untrusted input — so this is not an injection surface. run-server.sh invokes
+# this with NO server running (it seeds between the migrate-only phase and the
+# real server start), so there is normally no contention; busy_timeout is cheap
+# insurance against a transient SQLITE_BUSY when seeding a file run-server.sh just
+# released, or when re-seeding a DB another process holds.
 sqlite3 "$DB" <<SQL
 PRAGMA busy_timeout=5000;
 INSERT OR IGNORE INTO households (id, name, created_at)
