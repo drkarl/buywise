@@ -30,6 +30,21 @@ function props(overrides: Record<string, unknown> = {}) {
 	};
 }
 
+/**
+ * jsdom doesn't implement Element.setPointerCapture, so it can't be spied on
+ * directly. Define it as a mock fn on the element and return the mock so tests
+ * can assert whether/when the component grabbed pointer capture.
+ */
+function stubPointerCapture(el: Element) {
+	const capture = vi.fn();
+	Object.defineProperty(el, 'setPointerCapture', {
+		value: capture,
+		configurable: true,
+		writable: true
+	});
+	return capture;
+}
+
 describe('ListItem quantity stepper (issue #60)', () => {
 	it('shows the +/- stepper for an active entry when onquantity is wired', () => {
 		const onquantity = vi.fn();
@@ -126,6 +141,24 @@ describe('ListItem tap vs swipe gesture (issue #84)', () => {
 		expect(ondelete).not.toHaveBeenCalled();
 	});
 
+	it('does not capture the pointer when the gesture starts on a child button', async () => {
+		// jsdom doesn't model pointer-capture click retargeting, so the click-based
+		// tests above can't catch a regression to unconditional capture. Spy on the
+		// surface's setPointerCapture and assert it is never called for a
+		// button-start pointerdown, even across a large drag.
+		render(ListItem, props());
+
+		const check = screen.getByRole('button', { name: /check off/i });
+		const swipe = screen.getByRole('group', { name: 'Milk' });
+		const capture = stubPointerCapture(swipe);
+
+		await fireEvent.pointerDown(check, { pointerId: 1, clientX: 200 });
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 0 });
+		await fireEvent.pointerUp(swipe, { pointerId: 1, clientX: 0 });
+
+		expect(capture).not.toHaveBeenCalled();
+	});
+
 	it('still triggers swipe-to-delete when the drag starts on the row surface', async () => {
 		const ondelete = vi.fn();
 		render(ListItem, props({ ondelete }));
@@ -139,5 +172,51 @@ describe('ListItem tap vs swipe gesture (issue #84)', () => {
 		await fireEvent.pointerUp(swipe, { pointerId: 1, clientX: 0 });
 
 		expect(ondelete).toHaveBeenCalledWith('e1');
+	});
+
+	it('defers setPointerCapture until a drag exceeds DRAG_SLOP', async () => {
+		// Capture must NOT be grabbed on pointerdown (that is what retargeted the tap
+		// in issue #84). It is acquired only once a real drag (> DRAG_SLOP, 6px) is
+		// detected on pointermove — and exactly once.
+		render(ListItem, props());
+
+		const name = screen.getByText('Milk');
+		const swipe = screen.getByRole('group', { name: 'Milk' });
+		const capture = stubPointerCapture(swipe);
+
+		await fireEvent.pointerDown(name, { pointerId: 1, clientX: 100 });
+		expect(capture).not.toHaveBeenCalled();
+
+		// A 4px move stays within the slop: still no capture.
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 96 });
+		expect(capture).not.toHaveBeenCalled();
+
+		// Past the slop: capture grabbed once with the active pointerId.
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 90 });
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(capture).toHaveBeenCalledWith(1);
+
+		// Further moves don't re-capture.
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 80 });
+		expect(capture).toHaveBeenCalledTimes(1);
+	});
+
+	it('a sub-DRAG_SLOP move neither deletes nor captures the pointer', async () => {
+		// Pinning DRAG_SLOP: a move smaller than 6px must not start a drag — no
+		// delete is fired and the pointer is never captured.
+		const ondelete = vi.fn();
+		render(ListItem, props({ ondelete }));
+
+		const name = screen.getByText('Milk');
+		const swipe = screen.getByRole('group', { name: 'Milk' });
+		const capture = stubPointerCapture(swipe);
+
+		await fireEvent.pointerDown(name, { pointerId: 1, clientX: 100 });
+		// 5px left — within the slop.
+		await fireEvent.pointerMove(swipe, { pointerId: 1, clientX: 95 });
+		await fireEvent.pointerUp(swipe, { pointerId: 1, clientX: 95 });
+
+		expect(capture).not.toHaveBeenCalled();
+		expect(ondelete).not.toHaveBeenCalled();
 	});
 });
