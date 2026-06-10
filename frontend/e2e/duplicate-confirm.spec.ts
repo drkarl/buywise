@@ -144,6 +144,11 @@ test.describe('duplicate-warning "Add anyway" enqueue path', () => {
       // the detector and hold the add behind the warning.
       await addItem(page, item);
       await expectDexieEntry(page, SEED.listId, item, 'active');
+      // Wait for the rendered active row, not just the Dexie write: the detector
+      // reads AddItemInput.activeItems from the `$active` Svelte live query, which
+      // lags the IndexedDB commit. Re-submitting before it updates would miss the
+      // duplicate and commit a second add instead of holding it (mirrors line 65).
+      await expect(activeRow(page, item)).toBeVisible();
       await submitItem(page, item);
 
       const warning = page.getByRole('alert');
