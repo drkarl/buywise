@@ -102,7 +102,10 @@ pub struct OptimiseResponse {
     pub no_valid_offer_items: Vec<NoValidOfferItem>,
     /// Resolved, priceable items held back for household confirmation because
     /// their `substitution_policy = 'ask'` (Backlog-T1). Excluded from every plan
-    /// and from all totals until the household chooses a product.
+    /// and from all totals until the household chooses a product. Each carries its
+    /// `canonical_item_id` and the constraint-passing `candidates` (issue #78) so
+    /// the UI can render a chooser and confirm one via `POST /api/match-feedback`
+    /// (`prefer`); the chosen product then enters the plans on the next optimise.
     pub needs_confirmation_items: Vec<NeedsConfirmationItem>,
     /// Deterministic, human-readable summary naming which stores are cheaper for
     /// which categories (not produced by the core; generated here).
