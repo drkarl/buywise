@@ -546,6 +546,40 @@ pub async fn accepted_or_suggested_matches(
     Ok(rows)
 }
 
+/// The retailer product the household has most recently **confirmed** for an
+/// item (issue #78), or `None` if it never confirmed one.
+///
+/// A confirmation is a `prefer` action in `match_feedback` (recorded by
+/// `POST /api/match-feedback`). The chosen product is the `retailer_product_id`
+/// of the most-recent `prefer` whose underlying `product_matches` row is still
+/// `accepted` — so a later `reject` on that match (which flips the status to
+/// `rejected`) cancels the confirmation and the ask item falls back to awaiting a
+/// choice. Joining through `product_matches` also scopes the lookup to the
+/// `(household_id, canonical_item_id)` pair and yields the product id directly.
+///
+/// "Most recent" is `ORDER BY mf.created_at DESC LIMIT 1`. The optimiser calls
+/// this per resolved item and only acts on it for ask-policy items
+/// ([`crate::optimiser::classify_items`]); other policies ignore the result.
+pub async fn preferred_product_for_item(
+    pool: &SqlitePool,
+    household_id: &str,
+    canonical_item_id: &str,
+) -> Result<Option<String>, DbError> {
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT pm.retailer_product_id \
+         FROM match_feedback mf \
+         JOIN product_matches pm ON pm.id = mf.product_match_id \
+         WHERE pm.household_id = ?1 AND pm.canonical_item_id = ?2 \
+           AND mf.action = 'prefer' AND pm.status = 'accepted' \
+         ORDER BY mf.created_at DESC LIMIT 1",
+    )
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Fetch a single `retailer_products` row by primary key, or `None` if it does
 /// not exist.
 pub async fn retailer_product_by_id(
