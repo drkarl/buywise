@@ -15,7 +15,7 @@
 // anyway keeps it as a separate entry" behaviour), which is exactly what the
 // sync path under test enqueues.
 
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import {
   SEED,
   openList,
@@ -28,13 +28,16 @@ import {
 } from './fixtures';
 
 /**
- * Submits `text` through the real Add input WITHOUT the no-prompt assertion the
- * shared `addItem` helper makes (that helper waits for the field to clear, which
- * also happens here, but it does not tolerate the warning staying up). The field
- * is cleared on submit whether or not the detector holds the add, so we just
- * fill + click and let the caller assert the held-vs-committed outcome.
+ * Submits `text` through the real Add input and returns once the field has
+ * cleared, making NO claim about whether the submit became an add. The shared
+ * `fixtures.addItem` helper does the same fill + click + "field cleared" assertion
+ * (the field clears on submit whether or not the detector holds the add), so it
+ * would NOT fail when the warning shows — but its name asserts an add happened,
+ * which is misleading here: this submit may be HELD behind the DuplicateWarning
+ * rather than committed. We keep this thin variant LOCAL to the spec so the caller
+ * can assert the held-vs-committed outcome itself.
  */
-async function submitItem(page: import('@playwright/test').Page, text: string): Promise<void> {
+async function submitItem(page: Page, text: string): Promise<void> {
   const input = page.getByRole('textbox', { name: 'Add an item' });
   await input.fill(text);
   await page.getByRole('button', { name: 'Add item' }).click();
@@ -77,6 +80,12 @@ test.describe('duplicate-warning "Add anyway" enqueue path', () => {
       //     original is still the only active row for this name) and NO add_item
       //     mutation has been enqueued for it (still exactly the one from step 1).
       await expect(activeRow(a, item)).toHaveCount(1);
+      // queuedAddCount is STATUS-AGNOSTIC: it counts add_item rows of any status,
+      // and a drained mutation is UPDATED to status 'confirmed' rather than deleted
+      // (SyncQueue.ts:179). So the original add from step 1 contributes exactly 1
+      // here whether it has drained yet or not — no prior waitForDrained is needed
+      // and this is not racy. If queuedAddCount is ever narrowed (e.g. to 'pending'
+      // only) this assertion would reintroduce a race and must be revisited.
       expect(await queuedAddCount(a, SEED.listId, item)).toBe(1);
       // The original add drained, so its queue row is no longer pending/sent; the
       // detector saw the live active entry, not a phantom. (Sanity: B already has it.)
