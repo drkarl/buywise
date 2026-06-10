@@ -60,12 +60,13 @@ SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# 3. Wait for readiness (any HTTP response from the API means it is listening;
-# /api/auth/me returns 401 unauthenticated, which is "up").
+# 3. Wait for readiness by probing the SPA shell at `/`: the ServeDir fallback
+# serves frontend/build/200.html with a 200 as soon as the server is listening
+# (independent of DB seeding), so a clean 2xx is a valid "up" signal — no need to
+# treat a 401 as ready.
 ready=""
 for _ in $(seq 1 60); do
-  if curl -fsS -o /dev/null "http://localhost:$PORT/api/auth/me" 2>/dev/null \
-     || [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/api/auth/me" 2>/dev/null)" == "401" ]]; then
+  if curl -fsS -o /dev/null "http://localhost:$PORT/" 2>/dev/null; then
     ready=1
     break
   fi

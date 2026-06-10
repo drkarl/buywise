@@ -52,10 +52,17 @@ export default defineConfig({
   ],
   webServer: {
     command: 'bash e2e/run-server.sh',
-    url: `${BASE_URL}/api/auth/me`,
-    // /api/auth/me returns 401 when unauthenticated — that is a healthy "up"
-    // signal, so accept any status rather than only 2xx.
+    // Probe the SPA shell at `/`: the Axum `ServeDir` fallback serves
+    // `frontend/build/200.html` with a 200 once the build is on disk (see
+    // crates/api/src/lib.rs `app`). Playwright's readiness probe wants a
+    // reachable 2xx/3xx — the previous `/api/auth/me` returns 401 when
+    // unauthenticated, which is NOT a valid "ready" signal.
+    url: BASE_URL,
     ignoreHTTPSErrors: true,
+    // A stale local server is reused as-is and is NOT re-seeded/wiped (only the
+    // fresh `run-server.sh` boot wipes + seeds the DB). Re-running locally with a
+    // server already up therefore tests against whatever state it holds; CI never
+    // reuses (reuseExistingServer is false there).
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
     env: {
