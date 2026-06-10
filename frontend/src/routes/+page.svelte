@@ -59,6 +59,8 @@
 		lists = [];
 		loginError = null;
 		logoutError = null;
+		createError = null;
+		newListName = '';
 		view = 'anon';
 	}
 
