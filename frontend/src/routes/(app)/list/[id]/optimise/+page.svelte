@@ -99,13 +99,25 @@
 	const bestSingleTotal = $derived(result?.best_single?.total_cents ?? null);
 
 	/**
+	 * Monotonic token for in-flight `runOptimise` calls. Each call captures the
+	 * latest value; after every await it bails if a newer call has since started.
+	 * This guards against overlapping *same-list* runs — e.g. confirming ask item A
+	 * then B before A's re-optimise resolves — where an older response could
+	 * otherwise land last and clobber the newer one (the `id !== listId` check only
+	 * catches navigation to a *different* list). Not reactive: a render never reads
+	 * it, it only gates which run is allowed to assign `result`/`status`.
+	 */
+	let optimiseRequestSeq = 0;
+
+	/**
 	 * POST the current list to the optimiser. On a non-OK response we surface a
 	 * visible error rather than failing silently; the message stays generic (status
 	 * code only) because the endpoint's error bodies aren't a stable contract.
 	 *
-	 * Guards against a stale response: if `listId` changes mid-request (the route
-	 * id navigated to another list while the POST was in flight), we drop the
-	 * resolved response instead of rendering it against the wrong list.
+	 * Guards against a stale response on two axes: if `listId` changes mid-request
+	 * (navigated to another list) OR a newer `runOptimise` started (`optimiseRequestSeq`
+	 * moved on, e.g. a second confirmation), we drop the resolved response instead of
+	 * rendering it — only the latest run for the current list may assign state.
 	 *
 	 * Pre-flush: list edits are enqueued locally and synced asynchronously, so we
 	 * flush the pending queue first and refuse to price unless every edit reached
@@ -114,12 +126,15 @@
 	 * re-runs this, so reconnect → retry covers recovery.
 	 */
 	async function runOptimise(id: string) {
+		const seq = ++optimiseRequestSeq;
 		status = 'loading';
 		errorMessage = '';
+		// True once a newer run has superseded this one or the route navigated away;
+		// such a run must not assign `result`/`status`.
+		const superseded = () => id !== listId || seq !== optimiseRequestSeq;
 		try {
 			const { synced } = await flushPendingMutations(id);
-			// Ignore a flush for a list we're no longer viewing.
-			if (id !== listId) return;
+			if (superseded()) return;
 			if (!synced) {
 				errorMessage =
 					'Some changes haven’t been saved to the server yet. Reconnect and try again so your plan covers your whole list.';
@@ -132,20 +147,19 @@
 				headers: jsonMutationHeaders(),
 				body: JSON.stringify({ list_id: id })
 			});
-			// Ignore a response for a list we're no longer viewing.
-			if (id !== listId) return;
+			if (superseded()) return;
 			if (!res.ok) {
 				errorMessage = `Couldn’t optimise your basket (error ${res.status}). Please try again.`;
 				status = 'error';
 				return;
 			}
 			const body = (await res.json()) as OptimiseResponse;
-			// Re-check after the async body read in case the id changed meanwhile.
-			if (id !== listId) return;
+			// Re-check after the async body read in case a newer run started meanwhile.
+			if (superseded()) return;
 			result = body;
 			status = 'ready';
 		} catch {
-			if (id !== listId) return;
+			if (superseded()) return;
 			errorMessage = 'Couldn’t reach the server. Check your connection and try again.';
 			status = 'error';
 		}
