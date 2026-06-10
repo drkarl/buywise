@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { pwaInfo } from 'virtual:pwa-info';
 	import favicon from '$lib/assets/favicon.svg';
+	import '../app.css';
 
 	let { children } = $props();
 
