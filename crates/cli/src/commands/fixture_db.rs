@@ -391,3 +391,69 @@ async fn seed_matches(pool: &SqlitePool, root: &Path, household_id: &str) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `match_feedback` column as reported by `PRAGMA table_info`: the optimiser's
+    /// `prefer`-resolution SELECT only reads columns, so the contract that must not
+    /// drift is each column's name, declared type, NOT NULL flag, and primary-key
+    /// flag. (FKs are intentionally not part of the comparison: the fixture omits the
+    /// `REFERENCES users(id)` clause and `table_info` never reports foreign keys.)
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Column {
+        name: String,
+        type_decl: String,
+        not_null: i64,
+        pk: i64,
+    }
+
+    async fn match_feedback_columns(pool: &SqlitePool) -> Vec<Column> {
+        let mut cols: Vec<Column> = sqlx::query_as::<
+            _,
+            (i64, String, String, i64, Option<String>, i64),
+        >("PRAGMA table_info(match_feedback)")
+        .fetch_all(pool)
+        .await
+        .expect("table_info(match_feedback)")
+        .into_iter()
+        .map(|(_cid, name, type_decl, not_null, _default, pk)| Column {
+            name,
+            type_decl,
+            not_null,
+            pk,
+        })
+        .collect();
+        cols.sort();
+        cols
+    }
+
+    /// Sync guard: the hand-written fixture `match_feedback` table must carry the
+    /// same columns (name/type/NOT NULL/PK) as the canonical table from migration
+    /// 003. If migration 003 changes the `match_feedback` shape, this fails so the
+    /// fixture DDL (and the optimiser SELECT that depends on it) is updated in step.
+    #[tokio::test]
+    async fn fixture_match_feedback_columns_match_migration_003() {
+        // Canonical table: a fully migrated DB (003 creates `match_feedback`).
+        let migrated = db::connect("sqlite::memory:").await.expect("connect");
+        db::run_migrations(&migrated).await.expect("migrate");
+        let expected = match_feedback_columns(&migrated).await;
+        assert!(
+            !expected.is_empty(),
+            "migration 003 must create a match_feedback table"
+        );
+
+        // Fixture table: built standalone by the fixture path.
+        let fixture = db::connect("sqlite::memory:").await.expect("connect");
+        create_match_feedback_table(&fixture)
+            .await
+            .expect("create fixture match_feedback");
+        let actual = match_feedback_columns(&fixture).await;
+
+        assert_eq!(
+            actual, expected,
+            "fixture match_feedback columns have drifted from migration 003"
+        );
+    }
+}
