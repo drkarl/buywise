@@ -316,10 +316,12 @@ export async function waitForDrained(page: Page, listId: string): Promise<void> 
 /**
  * Counts `add_item` mutations for `name` currently sitting in the page's local
  * `mutation_queue` (any status), matched on the mutation's `payload.display_name`
- * — the text the add was enqueued with (see stores/list.ts `addItem`). Used by
- * the duplicate-warning spec to prove an add is HELD (0 queued while the inline
- * warning is up) versus ENQUEUED (1 queued after "Add anyway"), reading the real
- * queue the sync engine drains rather than any UI proxy.
+ * — the text the add was enqueued with (see stores/list.ts `addItem`).
+ * The duplicate-warning spec seeds an initial add first, then re-adds the same
+ * text, so it asserts on the DELTA: the count does NOT increase while the inline
+ * warning is up (the re-add is HELD) and increases by one after "Add anyway" (the
+ * re-add is ENQUEUED), reading the real queue the sync engine drains rather than
+ * any UI proxy.
  */
 export async function queuedAddCount(
   page: Page,
