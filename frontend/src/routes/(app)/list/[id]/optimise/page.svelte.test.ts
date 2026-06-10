@@ -439,6 +439,94 @@ describe('optimise page', () => {
 		expect(screen.getByText(/Splitting between Tesco and Aldi/)).toBeTruthy();
 	});
 
+	it('tracks busy state per ask item so a second confirmation does not re-enable the first', async () => {
+		// Concurrency regression: each ask item disables only its own buttons, so the
+		// in-flight set must be keyed per canonical id. A single shared busy flag let
+		// starting item B re-enable item A's button (and A's completion clear B's),
+		// risking duplicate `prefer` POSTs. Hold both prefer POSTs so the chooser
+		// stays up and both items are concurrently in flight.
+		const { fireEvent } = await import('@testing-library/svelte');
+
+		const twoAsk: OptimiseResponse = {
+			run_id: 'run-ask',
+			best_single: null,
+			best_two_store: null,
+			theoretical_minimum: null,
+			recommended: null,
+			unresolved_items: [],
+			no_valid_offer_items: [],
+			needs_confirmation_items: [
+				{
+					item_index: 0,
+					display_text: 'yoghurt',
+					canonical_item_id: 'ci-a',
+					candidate_count: 1,
+					candidates: [
+						{
+							retailer_product_id: 'rp-a',
+							name: 'Brooklea Natural',
+							brand: 'Brooklea',
+							size_text: '500g',
+							price_cents: 180,
+							retailer: 'aldi'
+						}
+					]
+				},
+				{
+					item_index: 1,
+					display_text: 'butter',
+					canonical_item_id: 'ci-b',
+					candidate_count: 1,
+					candidates: [
+						{
+							retailer_product_id: 'rp-b',
+							name: 'Kerrygold',
+							brand: 'Kerrygold',
+							size_text: '250g',
+							price_cents: 300,
+							retailer: 'tesco'
+						}
+					]
+				}
+			],
+			plain_language_explanation: '',
+			offer_snapshot_date: null
+		};
+
+		let feedbackCalls = 0;
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			if (url.includes('/api/match-feedback')) {
+				feedbackCalls += 1;
+				return new Promise<Response>(() => {}); // never resolves → stays in flight
+			}
+			if (url.includes('/api/optimise')) {
+				return new Response(JSON.stringify(twoAsk), { status: 200 });
+			}
+			return new Response('not found', { status: 404 });
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		render(Page);
+
+		const buttons = (await screen.findAllByRole('button', {
+			name: /choose/i
+		})) as HTMLButtonElement[];
+		expect(buttons).toHaveLength(2);
+
+		// Confirm A: its button goes busy/disabled.
+		await fireEvent.click(buttons[0]);
+		await waitFor(() => expect(buttons[0].disabled).toBe(true));
+
+		// Confirm B: its button goes busy too…
+		await fireEvent.click(buttons[1]);
+		await waitFor(() => expect(buttons[1].disabled).toBe(true));
+
+		// …and A stays disabled (its POST is still in flight). The old single-id flag
+		// would have re-enabled A here.
+		expect(buttons[0].disabled).toBe(true);
+		expect(feedbackCalls).toBe(2);
+	});
+
 	it('surfaces a visible error on a non-OK response', async () => {
 		stubOptimise(fullResponse(), 422);
 		render(Page);
