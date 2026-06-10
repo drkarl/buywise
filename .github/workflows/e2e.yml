@@ -87,7 +87,9 @@ jobs:
 
       # --- Artifacts on failure ------------------------------------------
       - name: Upload Playwright report
-        if: ${{ !cancelled() }}
+        # Only on failure: this section is for debugging a failed run, matching
+        # the sibling traces/screenshots step. (A green run needs no report.)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
