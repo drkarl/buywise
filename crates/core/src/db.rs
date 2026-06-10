@@ -557,9 +557,11 @@ pub async fn accepted_or_suggested_matches(
 /// choice. Joining through `product_matches` also scopes the lookup to the
 /// `(household_id, canonical_item_id)` pair and yields the product id directly.
 ///
-/// "Most recent" is `ORDER BY mf.created_at DESC LIMIT 1`. The optimiser calls
-/// this per resolved item and only acts on it for ask-policy items
-/// ([`crate::optimiser::classify_items`]); other policies ignore the result.
+/// "Most recent" is `ORDER BY mf.created_at DESC, mf.id DESC LIMIT 1`. The
+/// `mf.id DESC` tiebreaker keeps the pick deterministic if two `prefer` rows share
+/// a `created_at` (millisecond precision makes this practically unreachable, but it
+/// is cheap to harden). The optimiser calls this per ask-policy resolved item
+/// ([`crate::optimiser::classify_items`]); other policies skip the lookup entirely.
 pub async fn preferred_product_for_item(
     pool: &SqlitePool,
     household_id: &str,
@@ -571,7 +573,7 @@ pub async fn preferred_product_for_item(
          JOIN product_matches pm ON pm.id = mf.product_match_id \
          WHERE pm.household_id = ?1 AND pm.canonical_item_id = ?2 \
            AND mf.action = 'prefer' AND pm.status = 'accepted' \
-         ORDER BY mf.created_at DESC LIMIT 1",
+         ORDER BY mf.created_at DESC, mf.id DESC LIMIT 1",
     )
     .bind(household_id)
     .bind(canonical_item_id)
