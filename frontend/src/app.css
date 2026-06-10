@@ -1,0 +1,109 @@
+/*
+ * Global stylesheet — the app's one visual baseline.
+ *
+ * Every screen's *specific* styling lives in component-scoped `<style>` blocks;
+ * this file supplies only what those cannot: a CSS reset, design tokens, a real
+ * font stack (without it the browser falls back to Times New Roman), and base
+ * element defaults. It is imported once in `src/routes/+layout.svelte`.
+ *
+ * Specificity note: everything here is element- or `:root`-level, so any
+ * component's class-based rule (e.g. `.refresh`) overrides these defaults. This
+ * file raises the floor; it never fights component styling.
+ */
+
+:root {
+	/* Brand + accents (teal already used across the list/optimise components). */
+	--color-accent: #0f766e;
+	--color-accent-strong: #115e59;
+	--color-accent-soft: #f0fdfa;
+
+	/* Slate text + surface ramp. */
+	--color-text: #0f172a;
+	--color-text-muted: #475569;
+	--color-text-subtle: #64748b;
+	--color-bg: #f1f5f9;
+	--color-surface: #ffffff;
+	--color-surface-alt: #f8fafc;
+	--color-border: #e2e8f0;
+	--color-border-strong: #cbd5e1;
+
+	/* Status tints (shared with ConfidenceIndicator / ListItem). */
+	--color-danger: #b91c1c;
+	--color-danger-soft: #fef2f2;
+
+	--radius: 0.5rem;
+	--radius-sm: 0.4rem;
+	--shadow-card: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.1);
+
+	--font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica,
+		Arial, 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	font-family: var(--font-sans);
+	font-size: 16px;
+	line-height: 1.5;
+	color: var(--color-text);
+	background: var(--color-bg);
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4 {
+	margin: 0 0 0.5rem;
+	line-height: 1.25;
+	font-weight: 650;
+	color: var(--color-text);
+}
+
+p {
+	margin: 0 0 1rem;
+}
+
+a {
+	color: var(--color-accent);
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}
+
+/* Base form/button defaults — component classes override where they style their
+ * own controls; this just keeps un-classed inputs and buttons legible. */
+button,
+input,
+select,
+textarea {
+	font: inherit;
+	color: inherit;
+}
+
+button {
+	cursor: pointer;
+}
+
+button:disabled {
+	cursor: not-allowed;
+	opacity: 0.6;
+}
+
+:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 2px;
+}
