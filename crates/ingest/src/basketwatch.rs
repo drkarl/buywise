@@ -540,8 +540,12 @@ async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome
         QuotaAction::HardStop | QuotaAction::Proceed => {}
     }
 
-    let host = std::env::var("BASKETWATCH_API_HOST")
-        .unwrap_or_else(|_| "basketwatch.p.rapidapi.com".into());
+    // An empty/whitespace-only override falls back to the default rather than
+    // sending requests to an empty host: a bare `BASKETWATCH_API_HOST=` line
+    // (which systemd exports as `Ok("")`, and the upgrade note may seed) means
+    // "use the default", not "use no host" (see `crate::configured_env`).
+    let host = crate::configured_env("BASKETWATCH_API_HOST")
+        .unwrap_or_else(|| "basketwatch.p.rapidapi.com".into());
     // A per-request timeout bounds a stalled `send()`; otherwise a hung response
     // would keep the `running` row open indefinitely.
     let client = reqwest::Client::builder()
