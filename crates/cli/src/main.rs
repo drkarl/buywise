@@ -1,6 +1,6 @@
 //! BuyWise CLI entry point.
 //!
-//! Five Phase-0 subcommands (see issue #11):
+//! Six Phase-0 subcommands (see issues #11 and #90):
 //!
 //! * `validate-basket <fixture>` — resolve a basket fixture and print a
 //!   resolution table.
@@ -8,8 +8,12 @@
 //!   (no `--db`) it builds an in-memory database from the committed fixtures; in
 //!   *live mode* (`--db buywise.db`) it reads a populated SQLite file (the
 //!   Phase-0 gate path).
-//! * `ingest-basketwatch --db <db>` — run the BasketWatch ingest adapter,
-//!   writing to the given SQLite file. `--dry-run` forces the no-network path.
+//! * `ingest-basketwatch --db <db>` — run the BasketWatch ingest adapter
+//!   (Tesco/Dunnes/SuperValu/Aldi), writing to the given SQLite file.
+//!   `--dry-run` forces the no-network path.
+//! * `ingest-lidl --db <db>` — run the Lidl direct ingest adapter, writing to
+//!   the given SQLite file. `--dry-run` forces the no-network path; live mode
+//!   reads `LIDL_FEED_URL`.
 //! * `seed-matches --from <csv> --db <db> --household-id <uuid>` — upsert
 //!   `product_matches` rows from a CSV (idempotent; `ON CONFLICT … DO UPDATE`).
 //! * `generate-fixtures` — regenerate `fixtures/canonical_items.json` and
@@ -23,7 +27,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use buywise_cli::commands::{ingest, optimise, seed_matches, set_password, validate};
+use buywise_cli::commands::{ingest, ingest_lidl, optimise, seed_matches, set_password, validate};
 
 #[derive(Parser)]
 #[command(name = "buywise-cli", about = "BuyWise developer CLI")]
@@ -65,6 +69,20 @@ enum Command {
         db: String,
         /// Skip all network calls (reads fixtures/offers.json) but still write
         /// to the database. Sets BUYWISE_NO_NETWORK=1 internally.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Run the Lidl direct ingest adapter against a SQLite file.
+    ///
+    /// Live mode reads `LIDL_FEED_URL` for the feed endpoint and errors clearly
+    /// if it is unset (there is no verified default Lidl.ie feed).
+    IngestLidl {
+        /// SQLite database path to write into.
+        #[arg(long)]
+        db: String,
+        /// Skip all network calls (reads fixtures/lidl_offers.json) but still
+        /// write to the database. Sets BUYWISE_NO_NETWORK=1 internally.
         #[arg(long)]
         dry_run: bool,
     },
@@ -131,6 +149,7 @@ fn main() -> Result<()> {
             threshold3,
         } => optimise::run(&list, db.as_deref(), threshold2, threshold3),
         Command::IngestBasketwatch { db, dry_run } => ingest::run(&db, dry_run),
+        Command::IngestLidl { db, dry_run } => ingest_lidl::run(&db, dry_run),
         Command::SeedMatches {
             from,
             db,

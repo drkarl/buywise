@@ -18,6 +18,7 @@
 pub mod basket;
 pub mod fixture_db;
 pub mod ingest;
+pub mod ingest_lidl;
 pub mod optimise;
 pub mod seed_matches;
 pub mod set_password;
