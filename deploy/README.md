@@ -137,9 +137,13 @@ sudo ./setup.sh
   `buywise-ingest.service` and `buywise-ingest.timer`);
 - installs `litestream.yml` to `/etc/litestream.yml`;
 - runs `systemctl daemon-reload`;
-- enables and starts `buywise-ingest.timer` (the weekly ingest timer only — the
-  long-running `buywise`/`litestream` units are left for you to enable once the
-  binaries are in place);
+- *enables* (but does not start) `buywise-ingest.timer` — the weekly ingest
+  timer only; it is started in step 5 after the env file is set, because its
+  `Persistent=true` would otherwise fire a catch-up run immediately (the Monday
+  03:00 point has already elapsed) and red the ingest with `MissingApiKey`
+  before you configure `BASKETWATCH_API_KEY`. The long-running `buywise`/
+  `litestream` units are likewise left for you to enable once the binaries are
+  in place;
 - prints the next-step commands.
 
 ## 4. Set environment variables and the R2 endpoint
@@ -151,11 +155,18 @@ your Cloudflare account id (Cloudflare dashboard → R2). The bucket
 
 ## 5. Enable and start the services
 
+Do this only **after** the env file (step 4) is set — the weekly ingest needs
+`BASKETWATCH_API_KEY` before it first runs.
+
 ```bash
 sudo systemctl enable --now buywise litestream
-```
 
-`setup.sh` already enabled `buywise-ingest.timer`; you do not enable it here.
+# `setup.sh` already *enabled* buywise-ingest.timer (persisted for the next
+# boot) but deliberately did not start it. Start it now that the env file holds
+# BASKETWATCH_API_KEY, so a Persistent=true catch-up run can't red the ingest
+# with MissingApiKey before configuration:
+sudo systemctl start buywise-ingest.timer
+```
 
 ## 6. Smoke test (matches acceptance criteria)
 
