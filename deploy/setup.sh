@@ -99,6 +99,30 @@ BASKETWATCH_API_KEY=
 # half of the weekly ingest is best-effort and is skipped without failing the
 # timer; BasketWatch always runs. Set it to enable Lidl price ingest.
 LIDL_FEED_URL=
+
+# --- LLM resolution fallback (buywise-api; OPTIONAL, default OFF) ---
+# When enabled, the API falls back to a cheap LLM call to resolve a list term
+# that matches no catalogue item. The API runs fine with all of these unset;
+# an unresolved term simply stays unresolved. Leave LLM_FALLBACK_ENABLED unset
+# (or false) to keep the fallback off. When set to true, BOTH LLM_API_KEY and
+# LLM_MODEL must be set for any request to be made; if either is missing the
+# fallback silently stays disabled (no startup error).
+#
+# Master switch. "true" (case-insensitive) turns the fallback on; anything else
+# (including unset) leaves it off.
+#LLM_FALLBACK_ENABLED=false
+# API key sent as a bearer token. Required when the fallback is enabled.
+#LLM_API_KEY=
+# Model name (no default; providers rotate cheap models often, so you pick one).
+# Required when the fallback is enabled.
+#LLM_MODEL=
+# Optional provider identifier. Currently accepted but unused at runtime (every
+# provider is treated as OpenAI-chat-completions-compatible); reserved for future
+# per-provider defaults.
+#LLM_PROVIDER=
+# Optional chat-completions endpoint. Defaults to OpenAI's endpoint when unset;
+# override for self-hosted / proxy / non-OpenAI deployments.
+#LLM_BASE_URL=https://api.openai.com/v1/chat/completions
 EOF
     chmod 600 "${ENV_FILE}"
     chown root:root "${ENV_FILE}"
@@ -150,6 +174,18 @@ Next steps:
                                       the Lidl half of the weekly ingest is
                                       skipped (best-effort); BasketWatch always
                                       runs.
+
+     LLM resolution fallback (optional, default OFF; API runs fine without these):
+       LLM_FALLBACK_ENABLED           optional master switch (default false).
+       LLM_API_KEY                    required only when the fallback is enabled.
+       LLM_MODEL                      required only when the fallback is enabled.
+       LLM_PROVIDER                   optional (accepted but unused at runtime).
+       LLM_BASE_URL                   optional (defaults to OpenAI's endpoint).
+
+   The API starts and serves requests with no ingest or LLM vars set, but the
+   price comparison stays empty until the DB has retailer offers (from the
+   weekly ingest) AND product_matches rows. Seed the matches with
+   'buywise-cli seed-matches' (see docs/phase0-results.md).
 
    Also edit ${LITESTREAM_CONFIG} and replace <ACCOUNT_ID> in the endpoint
    with your Cloudflare account id.
