@@ -86,6 +86,13 @@ LITESTREAM_ACCESS_KEY_ID=
 LITESTREAM_SECRET_ACCESS_KEY=
 
 # --- weekly ingest (buywise-ingest.service / .timer) ---
+# REQUIRED for the weekly ingest to succeed. BasketWatch API key. The
+# ingest-basketwatch run (the primary, non-best-effort source) fails without
+# it, which reds the whole weekly unit. Set it before the first weekly fire.
+BASKETWATCH_API_KEY=
+# Optional. BasketWatch API host. Defaults to basketwatch.p.rapidapi.com when
+# unset; only set it to override (e.g. a different RapidAPI host).
+#BASKETWATCH_API_HOST=basketwatch.p.rapidapi.com
 # Optional. Source URL for the Lidl direct ingest adapter. If unset, the Lidl
 # half of the weekly ingest is best-effort and is skipped without failing the
 # timer; BasketWatch always runs. Set it to enable Lidl price ingest.
@@ -103,7 +110,12 @@ fi
 # The long-running buywise/litestream units are deliberately left for the
 # operator to enable once the binaries and env file are in place.
 echo "==> Enabling and starting buywise-ingest.timer (weekly price ingest)"
-systemctl enable --now buywise-ingest.timer
+# This script targets a real systemd host. On a box without systemd as PID 1
+# (container/chroot/nspawn) `enable --now` exits non-zero; guard it so a failure
+# warns but does not abort the rest of the script (the "Next steps" guidance
+# below) under `set -euo pipefail`.
+systemctl enable --now buywise-ingest.timer \
+    || echo "WARN: could not enable timer (no running systemd?); enable manually: systemctl enable --now buywise-ingest.timer" >&2
 
 cat <<EOF
 
@@ -122,10 +134,17 @@ Next steps:
        LITESTREAM_ACCESS_KEY_ID       R2 access key id
        LITESTREAM_SECRET_ACCESS_KEY   R2 secret access key
 
-     weekly ingest (optional):
-       LIDL_FEED_URL                  Lidl feed source URL. If unset, the Lidl
-                                      half of the weekly ingest is skipped
-                                      (best-effort); BasketWatch always runs.
+     weekly ingest:
+       BASKETWATCH_API_KEY            REQUIRED for the weekly ingest. Without it
+                                      the BasketWatch run fails and reds the
+                                      whole weekly unit. Set it before the first
+                                      weekly fire (Mon 03:00).
+       BASKETWATCH_API_HOST           optional (defaults to
+                                      basketwatch.p.rapidapi.com)
+       LIDL_FEED_URL                  optional Lidl feed source URL. If unset,
+                                      the Lidl half of the weekly ingest is
+                                      skipped (best-effort); BasketWatch always
+                                      runs.
 
    Also edit ${LITESTREAM_CONFIG} and replace <ACCOUNT_ID> in the endpoint
    with your Cloudflare account id.

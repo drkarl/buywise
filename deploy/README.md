@@ -50,9 +50,11 @@ above are the in-code defaults read by `crates/api/src/main.rs`.
 
 **Weekly ingest (`buywise-ingest.service`):**
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `LIDL_FEED_URL` | no | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. |
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `BASKETWATCH_API_KEY` | **yes** | — | BasketWatch API key. The `ingest-basketwatch` run is the primary, non-best-effort source: without this key it fails (`MissingApiKey`) and reds the whole weekly unit. Set it before the first weekly fire. |
+| `BASKETWATCH_API_HOST` | no | `basketwatch.p.rapidapi.com` | BasketWatch API host. Only set to override the default RapidAPI host. |
+| `LIDL_FEED_URL` | no | — | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. |
 
 ## 1. Build the ARM64 binary (on your build machine)
 
@@ -155,45 +157,6 @@ sudo systemctl enable --now buywise litestream
 
 `setup.sh` already enabled `buywise-ingest.timer`; you do not enable it here.
 
-## Weekly price ingest
-
-Price data is refreshed weekly by a oneshot systemd unit driven by a timer:
-
-- `buywise-ingest.service` (`Type=oneshot`) runs the ingest adapters as the
-  `buywise` user with `/etc/buywise/buywise.env` loaded (so it picks up
-  `LIDL_FEED_URL`). It runs, in order:
-  - `buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db` — the
-    **primary** source. If it fails, the unit fails (visible in `systemctl
-    status` / the journal).
-  - `buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db` — **best-effort**
-    (its `ExecStart` is prefixed with `-`). If `LIDL_FEED_URL` is unset or the
-    feed is broken, the Lidl step errors but does not fail the unit, so a Lidl
-    problem never reds the timer or masks a successful BasketWatch run. The
-    error is still logged to the journal.
-- `buywise-ingest.timer` fires **weekly, Monday 03:00** local time (a
-  low-traffic overnight window). It is `Persistent=true`, so if the host was
-  down at the scheduled time, the run fires once on the next boot instead of
-  waiting a full week.
-
-> The ingest writes to the same `/var/lib/buywise/buywise.db` the API reads.
-> SQLite WAL allows a single writer alongside concurrent readers and Litestream
-> replicates the WAL, so the weekly batch writer is safe beside the running API.
-
-**Inspect the schedule and the last run:**
-
-```bash
-systemctl list-timers buywise-ingest.timer
-systemctl status buywise-ingest.service
-journalctl -u buywise-ingest -n 50 --no-pager
-```
-
-**Trigger a manual ingest now** (does not affect the weekly schedule):
-
-```bash
-sudo systemctl start buywise-ingest.service
-journalctl -u buywise-ingest -f
-```
-
 ## 6. Smoke test (matches acceptance criteria)
 
 **Service is active:**
@@ -244,6 +207,56 @@ sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -o 
 sqlite3 /tmp/verify.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
 sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
 sudo rm -f /tmp/verify.db  # written by root
+```
+
+## Weekly price ingest
+
+Price data is refreshed weekly by a oneshot systemd unit driven by a timer:
+
+- `buywise-ingest.service` (`Type=oneshot`) runs the ingest adapters as the
+  `buywise` user with `/etc/buywise/buywise.env` loaded (so it picks up
+  `BASKETWATCH_API_KEY` and `LIDL_FEED_URL`). It runs, in order:
+  - `buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db` — the
+    **primary** source. It **requires `BASKETWATCH_API_KEY`** (see the env
+    table above); without it the run fails. If it fails, the unit fails (visible
+    in `systemctl status` / the journal).
+  - `buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db` — **best-effort**
+    (its `ExecStart` is prefixed with `-`). If `LIDL_FEED_URL` is unset or the
+    feed is broken, the Lidl step errors but does not fail the unit, so a Lidl
+    problem never reds the timer or masks a successful BasketWatch run. The
+    error is still logged to the journal.
+- `buywise-ingest.timer` fires **weekly, Monday 03:00** local time (a
+  low-traffic overnight window). It is `Persistent=true`, so if the host was
+  down at the scheduled time, the run fires once on the next boot instead of
+  waiting a full week.
+
+> The ingest writes to the same `/var/lib/buywise/buywise.db` the API uses.
+> There are two potential writers — this weekly batch and `buywise-api` itself
+> (sessions, lists, items, match feedback) — plus the API's reads. SQLite WAL
+> serialises writers (one at a time) alongside concurrent readers, so the two
+> can briefly contend during the batch (SQLite's busy-timeout governs the wait);
+> Litestream replicates the WAL. The weekly batch writer is safe beside the
+> running API, with at most brief lock waits.
+
+> **Upgrading an existing deploy:** `setup.sh` only seeds these env vars into a
+> *fresh* `/etc/buywise/buywise.env` (the template runs only when the file does
+> not yet exist). On an existing host, manually append the new vars
+> (`BASKETWATCH_API_KEY`, `BASKETWATCH_API_HOST`, `LIDL_FEED_URL`) to
+> `/etc/buywise/buywise.env` — re-running `setup.sh` leaves the file untouched.
+
+**Inspect the schedule and the last run:**
+
+```bash
+systemctl list-timers buywise-ingest.timer
+systemctl status buywise-ingest.service
+journalctl -u buywise-ingest -n 50 --no-pager
+```
+
+**Trigger a manual ingest now** (does not affect the weekly schedule):
+
+```bash
+sudo systemctl start buywise-ingest.service
+journalctl -u buywise-ingest -f
 ```
 
 ## Logs and troubleshooting
