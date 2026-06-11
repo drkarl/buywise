@@ -1,8 +1,8 @@
 //! BuyWise CLI library.
 //!
 //! Hosts the Phase-0 developer CLI: the deterministic seed-fixture generator
-//! ([`generate`]) plus the five subcommands in [`commands`] (validate-basket,
-//! optimise, ingest-basketwatch, seed-matches, generate-fixtures).
+//! ([`generate`]) plus the subcommands in [`commands`] (validate-basket,
+//! optimise, ingest-basketwatch, ingest-lidl, seed-matches, generate-fixtures).
 //!
 //! The seed generator reads `fixtures/dictionary.json` (the single source of
 //! truth, ported from Shoppy) and emits two byte-stable artefacts:

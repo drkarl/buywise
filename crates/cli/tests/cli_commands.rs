@@ -344,6 +344,44 @@ fn ingest_dry_run_completes_without_network_and_writes_rows() {
 }
 
 #[test]
+fn ingest_lidl_dry_run_completes_without_network_and_writes_rows() {
+    // Acceptance criterion (issue #90): `ingest-lidl --db <tmp> --dry-run`
+    // completes (exit 0) without any network calls. Per the command contract
+    // (see crates/cli/src/commands/ingest_lidl.rs), `--dry-run` forces the
+    // no-network path so the Lidl adapter reads `fixtures/lidl_offers.json`, but
+    // it STILL writes the resulting retailer_products + product_offers rows. So a
+    // successful dry-run is observable as Ok(()) plus non-empty data tables.
+    let dir = tempfile::Builder::new()
+        .prefix("lidl")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("dry.db");
+    let db = db_path.to_str().unwrap();
+
+    // Serialise the env-mutating window with the BasketWatch ingest tests. They
+    // all mutate the SAME process-global BUYWISE_NO_NETWORK; `ingest_lidl::run`
+    // restores the prior value on drop, but without this shared lock two runs
+    // could still race on the variable mid-run. Ignore a poisoned lock: the guard
+    // restores the env even on a panic, so the lock state is irrelevant.
+    let _env = INGEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Returns Ok(()) (exit 0) and prints the "dry-run mode" banner to stdout.
+    // `ingest_lidl::run` restores BUYWISE_NO_NETWORK to its prior value on return,
+    // so this dry-run does not leak the no-network flag to any later test.
+    buywise_cli::commands::ingest_lidl::run(db, true).expect("dry-run lidl ingest should succeed");
+
+    // The fixture-backed (no-network) run still persists rows.
+    assert!(
+        block_on(count_rows(db, "retailer_products")) > 0,
+        "dry-run should write retailer_products from fixtures/lidl_offers.json"
+    );
+    assert!(
+        block_on(count_rows(db, "product_offers")) > 0,
+        "dry-run should write product_offers from fixtures/lidl_offers.json"
+    );
+}
+
+#[test]
 fn ingest_then_seed_matches_is_idempotent() {
     // Acceptance criterion: seed-matches upserts rows and is idempotent on a
     // second run (stable row count + values; an updated status in the CSV updates
