@@ -512,7 +512,12 @@ fn load_fixture_offers() -> Result<Vec<RawBasketWatchProduct>, IngestError> {
 /// path template are read from the environment so they can be corrected without
 /// a code change.
 async fn live_fetch(pool: SqlitePool, fetched_at: String) -> Result<FetchOutcome, IngestError> {
-    let api_key = std::env::var("BASKETWATCH_API_KEY").map_err(|_| IngestError::MissingApiKey)?;
+    // An empty or whitespace-only key is treated as missing, not present:
+    // systemd's EnvironmentFile exports a bare `BASKETWATCH_API_KEY=` line as
+    // `Ok("")`, which would otherwise slip past into a live request and fail
+    // with a confusing RapidAPI error instead of the clear `MissingApiKey`
+    // (see `crate::configured_env`).
+    let api_key = crate::configured_env("BASKETWATCH_API_KEY").ok_or(IngestError::MissingApiKey)?;
     let month = month_of(&fetched_at);
 
     // Informational classification only (the warn / skip log). Enforcement is the

@@ -279,15 +279,20 @@ journalctl -u buywise-ingest -f
 ## Disaster recovery (restore from R2)
 
 If the server is lost, restore the database from R2 **before** `buywise` runs.
-This is order-sensitive: `buywise-api` opens the DB with `create_if_missing`, so
-if it starts (or is enabled at boot and the box reboots) before the restore
-completes, it will create an empty DB and race the restore. The restore must run
-into an empty path, so `buywise` must be **stopped and disabled** first.
+This is order-sensitive: both `buywise-api` and the weekly ingest (`buywise-cli`)
+open the DB with `create_if_missing`, so if either starts before the restore
+completes it will create an empty DB and race the restore. The restore must run
+into an empty path, so `buywise` **and** the ingest timer must be **stopped and
+disabled** first. The timer matters even when no run is due: `Persistent=true`
+fires a missed run on the next boot, which can land mid-restore.
 
 ```bash
-# 1. Stop AND disable buywise so it cannot start (now or at the next boot)
-#    and race the restore by re-creating an empty DB. litestream is also down.
-sudo systemctl disable --now buywise litestream
+# 1. Stop AND disable every writer so none can start (now or at the next boot)
+#    and race the restore by re-creating an empty DB. This covers buywise,
+#    litestream, and the weekly ingest timer; the explicit `stop` of the ingest
+#    service also kills a run that may already be in progress.
+sudo systemctl disable --now buywise litestream buywise-ingest.timer
+sudo systemctl stop buywise-ingest.service
 
 # 2. Make sure the target path is empty so restore writes a fresh copy.
 sudo rm -f /var/lib/buywise/buywise.db /var/lib/buywise/buywise.db-wal /var/lib/buywise/buywise.db-shm
@@ -301,10 +306,14 @@ sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -co
 sudo chown buywise:buywise /var/lib/buywise/buywise.db
 
 # 5. Re-enable and start the services, in order, only AFTER the restore is done.
-sudo systemctl enable --now buywise litestream
+#    Re-enable the ingest *timer* (not the oneshot service); it resumes its
+#    weekly schedule.
+sudo systemctl enable --now buywise litestream buywise-ingest.timer
 ```
 
-> Do not run `litestream restore` while `buywise` is enabled or active — the
-> `After=buywise.service`/`Wants=buywise.service` ordering on `litestream.service`
-> governs normal startup, but it does not protect a manual restore from an
-> already-running app. Disabling buywise (step 1) is what guards the restore.
+> Do not run `litestream restore` while `buywise` or the ingest timer is enabled
+> or active — the `After=buywise.service`/`Wants=buywise.service` ordering on
+> `litestream.service` governs normal startup, but it does not protect a manual
+> restore from an already-running app, and nothing orders the weekly ingest
+> against a restore. Disabling buywise and `buywise-ingest.timer` (step 1) is
+> what guards the restore.
