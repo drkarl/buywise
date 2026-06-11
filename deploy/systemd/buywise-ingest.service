@@ -13,10 +13,13 @@ Wants=network-online.target
 # keeping it running. Each weekly trigger is a single batch refresh.
 #
 # Concurrent-writer note: the ingest writes to the same SQLite file the API
-# reads (/var/lib/buywise/buywise.db). SQLite in WAL mode allows one writer at
-# a time alongside concurrent readers, and Litestream replicates the WAL, so a
-# weekly batch writer running beside the API is safe — there is no second
-# writer here, only the API's reads.
+# uses (/var/lib/buywise/buywise.db). There are two potential writers — this
+# weekly batch and buywise-api itself (sessions, lists, items, match feedback) —
+# plus the API's reads. SQLite in WAL mode serialises writers (one at a time)
+# alongside concurrent readers, so the two writers can briefly contend during
+# the batch; SQLite's busy-timeout governs how long a blocked writer waits for
+# the lock. Litestream replicates the WAL, so a weekly batch writer running
+# beside the API is safe, with at most brief lock waits.
 #
 # Adapter failure policy: BasketWatch is the primary price source and MUST
 # succeed, so its ExecStart has no prefix — a failure fails the unit and is
@@ -31,10 +34,12 @@ Type=oneshot
 User=buywise
 WorkingDirectory=/var/lib/buywise
 EnvironmentFile=/etc/buywise/buywise.env
+# A weekly ingest does several network fetches plus DB writes and can run well
+# past the default ~90s start timeout, which would kill it mid-batch. Allow up
+# to 15 minutes; the unit normally finishes far sooner.
+TimeoutStartSec=900
 # The ingest subcommands take a filesystem PATH (they build the sqlite:// URL
 # internally), not the sqlite:// DATABASE_URL from the env file. Pass the
 # canonical DB path used everywhere else in deploy (litestream.yml/README).
 ExecStart=/usr/local/bin/buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db
 ExecStart=-/usr/local/bin/buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db
-StandardOutput=journal
-StandardError=journal
