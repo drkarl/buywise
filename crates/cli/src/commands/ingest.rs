@@ -11,57 +11,22 @@
 //! Thread-safety caveat: `--dry-run` mutates a process-global env var because the
 //! BasketWatch adapter selects its fetch strategy from `BUYWISE_NO_NETWORK`
 //! ([`basketwatch::ingest`] takes only a pool, with no `no_network` parameter).
-//! The mutation is now **scoped**: a [`NoNetworkGuard`] saves the variable's
-//! prior value before setting `BUYWISE_NO_NETWORK=1` and restores it (to the old
-//! value, or unset if it was absent) when the run completes — on both the success
-//! and error paths. So a dry-run no longer permanently leaks state, and an
-//! in-process caller can safely run a dry-run followed by a live ingest.
-//! Concurrent calls in the *same* process still race on the shared variable for
-//! the duration of a single run, so in-process tests that interleave dry-run and
-//! live calls should still serialise themselves under a shared guard. Threading a
-//! `no_network: bool` through the adapter API would remove the remaining caveat
-//! but is out of scope for this CLI change.
+//! The mutation is now **scoped**: a [`NoNetworkGuard`]
+//! saves the variable's prior value before setting `BUYWISE_NO_NETWORK=1` and
+//! restores it (to the old value, or unset if it was absent) when the run
+//! completes — on both the success and error paths. So a dry-run no longer
+//! permanently leaks state, and an in-process caller can safely run a dry-run
+//! followed by a live ingest. Concurrent calls in the *same* process still race
+//! on the shared variable for the duration of a single run, so in-process tests
+//! that interleave dry-run and live calls should still serialise themselves under
+//! a shared guard. Threading a `no_network: bool` through the adapter API would
+//! remove the remaining caveat but is out of scope for this CLI change.
 
 use anyhow::{Context, Result};
 use buywise_core::db;
 use buywise_ingest::basketwatch;
 
-const NO_NETWORK_VAR: &str = "BUYWISE_NO_NETWORK";
-
-/// RAII guard that forces the BasketWatch adapter's no-network path for the
-/// lifetime of a dry-run, restoring `BUYWISE_NO_NETWORK` to its prior value
-/// (or unsetting it if it was absent) on drop. This keeps the env mutation
-/// scoped to the run rather than leaking it process-wide.
-struct NoNetworkGuard {
-    previous: Option<String>,
-}
-
-impl NoNetworkGuard {
-    fn engage() -> Self {
-        let previous = std::env::var(NO_NETWORK_VAR).ok();
-        // SAFETY: mutating the process environment is `unsafe` in edition 2024
-        // because it is not thread-safe. The CLI mutates this var only here,
-        // and the guard restores the prior value on drop, so the window in
-        // which the global is changed is bounded by a single ingest run.
-        unsafe {
-            std::env::set_var(NO_NETWORK_VAR, "1");
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for NoNetworkGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `engage` — restoring the previous value (or unsetting it)
-        // is the matching mutation that keeps the change scoped to this run.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(NO_NETWORK_VAR, value),
-                None => std::env::remove_var(NO_NETWORK_VAR),
-            }
-        }
-    }
-}
+use super::no_network::NoNetworkGuard;
 
 /// Entry point for `buywise-cli ingest-basketwatch`.
 pub fn run(db_path: &str, dry_run: bool) -> Result<()> {
