@@ -12,13 +12,15 @@
 //! `migrations/001_phase0_schema.sql`, and seeds it from the committed
 //! `fixtures/` (no file is written). With `--db <path>`, they run in *live mode*
 //! against that SQLite file, which is expected to have been populated by
-//! `ingest-basketwatch` + `seed-matches`. The write commands `ingest-basketwatch`
-//! and `seed-matches` always require a `--db` and never use fixture mode.
+//! `ingest-basketwatch` (and/or `ingest-lidl`) + `seed-matches`. The write
+//! commands `ingest-basketwatch`, `ingest-lidl`, and `seed-matches` always
+//! require a `--db` and never use fixture mode.
 
 pub mod basket;
 pub mod fixture_db;
 pub mod ingest;
 pub mod ingest_lidl;
+pub mod no_network;
 pub mod optimise;
 pub mod seed_matches;
 pub mod set_password;

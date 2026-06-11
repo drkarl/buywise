@@ -381,6 +381,80 @@ fn ingest_lidl_dry_run_completes_without_network_and_writes_rows() {
     );
 }
 
+/// RAII guard that snapshots an env var and restores it (to its prior value, or
+/// unset if it was absent) on drop — even if the body panics. Used by the live
+/// Lidl test below to leave `BUYWISE_NO_NETWORK` / `LIDL_FEED_URL` exactly as it
+/// found them, so it cannot leak state into the other ingest tests it shares the
+/// `INGEST_ENV_LOCK` with.
+struct EnvVarRestore {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            previous: std::env::var(key).ok(),
+        }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is `unsafe` in edition 2024 (not thread-safe). The
+        // shared INGEST_ENV_LOCK held by the test serialises this with the other
+        // ingest tests, so there is no concurrent reader during the restore.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[test]
+fn ingest_lidl_live_mode_without_feed_url_errors_with_hint() {
+    // Acceptance criterion (issue #90): in *live* mode (no --dry-run), an unset
+    // `LIDL_FEED_URL` must fail fast with an operator-facing error that names the
+    // variable. The Lidl adapter raises `IngestError::MissingFeedUrl` before any
+    // network call (see crates/ingest/src/lidl.rs), and `ingest_lidl::run` attaches
+    // the detailed `LIDL_FEED_URL` / `--dry-run` hint *only* for that variant, so
+    // the surfaced message mentions `LIDL_FEED_URL`.
+    let dir = tempfile::Builder::new()
+        .prefix("lidl-live")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("live.db");
+    let db = db_path.to_str().unwrap();
+
+    // This test reads the process-global BUYWISE_NO_NETWORK + LIDL_FEED_URL. Hold
+    // the shared lock so it cannot race the dry-run tests (which toggle the same
+    // BUYWISE_NO_NETWORK), and snapshot+restore both vars so it leaks nothing.
+    let _env = INGEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore_no_network = EnvVarRestore::capture("BUYWISE_NO_NETWORK");
+    let _restore_feed_url = EnvVarRestore::capture("LIDL_FEED_URL");
+
+    // Force the *live* path: BUYWISE_NO_NETWORK must not be "1", and LIDL_FEED_URL
+    // must be unset so the adapter fails fast with MissingFeedUrl.
+    // SAFETY: env mutation is `unsafe` in edition 2024; the shared lock above
+    // serialises this with every other env-touching ingest test, and the
+    // EnvVarRestore guards above put both vars back on return (incl. panic).
+    unsafe {
+        std::env::remove_var("BUYWISE_NO_NETWORK");
+        std::env::remove_var("LIDL_FEED_URL");
+    }
+
+    let err = buywise_cli::commands::ingest_lidl::run(db, false)
+        .expect_err("live ingest without LIDL_FEED_URL should error");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("LIDL_FEED_URL"),
+        "error should name the missing env var, got: {message}"
+    );
+}
+
 #[test]
 fn ingest_then_seed_matches_is_idempotent() {
     // Acceptance criterion: seed-matches upserts rows and is idempotent on a

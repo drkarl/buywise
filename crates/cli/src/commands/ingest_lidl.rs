@@ -13,65 +13,41 @@
 //!
 //! Live mode reads `LIDL_FEED_URL` for the feed endpoint. There is no verified
 //! default Lidl.ie feed (design §16), so an unset value fails fast: the adapter
-//! returns [`IngestError::MissingFeedUrl`], which this command surfaces with an
-//! operator-facing `.context(...)` so the CLI prints a clear instruction to set
-//! `LIDL_FEED_URL`.
+//! returns [`buywise_ingest::error::IngestError::MissingFeedUrl`], which this
+//! command surfaces with an operator-facing `.context(...)` so the CLI prints a
+//! clear instruction to set `LIDL_FEED_URL`. That detailed hint is attached
+//! **only** to the missing-URL variant; any other failure (a malformed
+//! `fixtures/lidl_offers.json` during a dry-run, a DB error, …) gets a neutral
+//! `"Lidl ingest"` context, so operators are never told to re-run with the mode
+//! that just failed.
 //!
 //! Thread-safety caveat: `--dry-run` mutates a process-global env var because the
 //! Lidl adapter selects its fetch strategy from `BUYWISE_NO_NETWORK`
 //! ([`lidl::ingest`] takes only a pool, with no `no_network` parameter). The
-//! mutation is **scoped**: a [`NoNetworkGuard`] saves the variable's prior value
-//! before setting `BUYWISE_NO_NETWORK=1` and restores it (to the old value, or
-//! unset if it was absent) when the run completes — on both the success and error
-//! paths. So a dry-run no longer permanently leaks state, and an in-process caller
-//! can safely run a dry-run followed by a live ingest. Concurrent calls in the
-//! *same* process still race on the shared variable for the duration of a single
-//! run, so in-process tests that interleave dry-run and live calls (including the
-//! BasketWatch ones, which mutate the *same* variable) should still serialise
-//! themselves under a shared guard. Threading a `no_network: bool` through the
-//! adapter API would remove the remaining caveat but is out of scope for this CLI
-//! change.
+//! mutation is **scoped**: a [`NoNetworkGuard`]
+//! saves the variable's prior value before setting `BUYWISE_NO_NETWORK=1` and
+//! restores it (to the old value, or unset if it was absent) when the run
+//! completes — on both the success and error paths. So a dry-run no longer
+//! permanently leaks state, and an in-process caller can safely run a dry-run
+//! followed by a live ingest. Concurrent calls in the *same* process still race
+//! on the shared variable for the duration of a single run, so in-process tests
+//! that interleave dry-run and live calls (including the BasketWatch ones, which
+//! mutate the *same* variable) should still serialise themselves under a shared
+//! guard. Threading a `no_network: bool` through the adapter API would remove the
+//! remaining caveat but is out of scope for this CLI change.
 
 use anyhow::{Context, Result};
 use buywise_core::db;
+use buywise_ingest::error::IngestError;
 use buywise_ingest::lidl;
 
-const NO_NETWORK_VAR: &str = "BUYWISE_NO_NETWORK";
+use super::no_network::NoNetworkGuard;
 
-/// RAII guard that forces the Lidl adapter's no-network path for the lifetime of
-/// a dry-run, restoring `BUYWISE_NO_NETWORK` to its prior value (or unsetting it
-/// if it was absent) on drop. This keeps the env mutation scoped to the run
-/// rather than leaking it process-wide.
-struct NoNetworkGuard {
-    previous: Option<String>,
-}
-
-impl NoNetworkGuard {
-    fn engage() -> Self {
-        let previous = std::env::var(NO_NETWORK_VAR).ok();
-        // SAFETY: mutating the process environment is `unsafe` in edition 2024
-        // because it is not thread-safe. The CLI mutates this var only here,
-        // and the guard restores the prior value on drop, so the window in
-        // which the global is changed is bounded by a single ingest run.
-        unsafe {
-            std::env::set_var(NO_NETWORK_VAR, "1");
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for NoNetworkGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `engage` — restoring the previous value (or unsetting it)
-        // is the matching mutation that keeps the change scoped to this run.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(NO_NETWORK_VAR, value),
-                None => std::env::remove_var(NO_NETWORK_VAR),
-            }
-        }
-    }
-}
+/// Operator-facing hint attached only when live mode fails because
+/// `LIDL_FEED_URL` is unset ([`IngestError::MissingFeedUrl`]).
+const MISSING_FEED_URL_HINT: &str =
+    "Lidl ingest (live mode requires LIDL_FEED_URL to be set to the Lidl feed endpoint; \
+     use --dry-run to read fixtures/lidl_offers.json offline)";
 
 /// Entry point for `buywise-cli ingest-lidl`.
 pub fn run(db_path: &str, dry_run: bool) -> Result<()> {
@@ -100,10 +76,16 @@ async fn run_async(db_path: &str, dry_run: bool) -> Result<()> {
         .await
         .context("running migrations")?;
 
-    let summary = lidl::ingest(&pool).await.context(
-        "Lidl ingest (live mode requires LIDL_FEED_URL to be set to the Lidl feed endpoint; \
-         use --dry-run to read fixtures/lidl_offers.json offline)",
-    )?;
+    // Inspect the `IngestError` before converting to anyhow so the detailed
+    // `LIDL_FEED_URL` / `--dry-run` hint is attached *only* to the missing-URL
+    // variant. Every other failure (a malformed fixture during a dry-run, a DB
+    // error, …) gets a neutral "Lidl ingest" context — matching the sibling
+    // BasketWatch command — so we never advise re-running with the very mode that
+    // just failed. anyhow's underlying cause chain is preserved in both arms.
+    let summary = lidl::ingest(&pool).await.map_err(|err| match err {
+        IngestError::MissingFeedUrl => anyhow::Error::new(err).context(MISSING_FEED_URL_HINT),
+        other => anyhow::Error::new(other).context("Lidl ingest"),
+    })?;
 
     println!(
         "ingest complete: run #{} — fetched {}, normalised {}, skipped {}, requests {}",
