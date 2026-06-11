@@ -1,9 +1,11 @@
 <script lang="ts">
 	// A single list row. Renders an entry and surfaces its operations via callback
 	// props; all Dexie/mutation logic lives in the parent + store, keeping this
-	// component presentational. Delete is offered two ways: swipe-to-delete (touch
-	// drag past a threshold) and a long-press context menu (also keyboard/mouse
-	// accessible via the explicit Delete button it reveals).
+	// component presentational. Delete is offered three ways: an always-visible "×"
+	// remove button (discoverable on desktop/mouse), swipe-to-delete (touch drag
+	// past a threshold), and a long-press context menu. Basket rows additionally
+	// show a "↩ List" button that moves a mistaken bought/skipped item back to the
+	// active list.
 
 	import type { LocalListEntry } from '$lib/db/dexie';
 	import { MAX_QUANTITY } from '$lib/stores/list';
@@ -26,9 +28,16 @@
 		 * `×N` is rendered instead.
 		 */
 		onquantity?: (id: string, quantity: number) => void;
+		/**
+		 * Move a bought/skipped entry back to the active list (undo a mistaken
+		 * check-off/skip). Optional so call sites without basket rows still
+		 * type-check; when absent the "↩ List" button is not shown.
+		 */
+		onmoveback?: (id: string) => void;
 	}
 
-	let { entry, onbought, onskipped, ondelete, onclarify, onquantity }: Props = $props();
+	let { entry, onbought, onskipped, ondelete, onclarify, onquantity, onmoveback }: Props =
+		$props();
 
 	const inBasket = $derived(entry.status === 'bought' || entry.status === 'skipped');
 	// An active, ambiguous entry the parent can disambiguate.
@@ -180,7 +189,20 @@
 			>
 		{:else}
 			<span class="status-tag">{entry.status === 'bought' ? 'Bought' : 'Skipped'} ×{entry.quantity}</span>
+			<button
+				type="button"
+				class="moveback"
+				aria-label="Move {entry.display_name} back to the list"
+				onclick={() => onmoveback?.(entry.id)}>↩ List</button
+			>
 		{/if}
+
+		<button
+			type="button"
+			class="remove"
+			aria-label="Remove {entry.display_name}"
+			onclick={() => ondelete(entry.id)}>×</button
+		>
 	</div>
 
 	{#if menuOpen}
@@ -276,6 +298,37 @@
 	.status-tag {
 		font-size: 0.85rem;
 		color: #64748b;
+	}
+	.moveback {
+		padding: 0.3rem 0.55rem;
+		border: 1px solid #0f766e;
+		border-radius: 0.4rem;
+		background: #f0fdfa;
+		color: #0f766e;
+		font-size: 0.8rem;
+		font-weight: 600;
+		cursor: pointer;
+		white-space: nowrap;
+	}
+	.remove {
+		flex-shrink: 0;
+		width: 1.75rem;
+		height: 1.75rem;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		border: 1px solid #e2e8f0;
+		border-radius: 0.4rem;
+		background: #fff;
+		color: #b91c1c;
+		font-size: 1.1rem;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.remove:hover {
+		background: #fef2f2;
+		border-color: #fca5a5;
 	}
 	.context-menu {
 		display: flex;

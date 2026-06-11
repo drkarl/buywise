@@ -220,3 +220,42 @@ describe('ListItem tap vs swipe gesture (issue #84)', () => {
 		expect(ondelete).not.toHaveBeenCalled();
 	});
 });
+
+describe('ListItem remove + move-back controls', () => {
+	it('calls ondelete when the visible × Remove button is clicked (active row)', async () => {
+		const ondelete = vi.fn();
+		render(ListItem, props({ ondelete }));
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Remove Milk' }));
+		expect(ondelete).toHaveBeenCalledWith('e1');
+	});
+
+	it('does not show a move-back button on an active row', () => {
+		render(ListItem, props({ onmoveback: vi.fn() }));
+		expect(screen.queryByRole('button', { name: /move milk back to the list/i })).toBeNull();
+	});
+
+	it('shows a move-back button on a bought (basket) row and calls onmoveback', async () => {
+		const onmoveback = vi.fn();
+		render(
+			ListItem,
+			props({ entry: mockEntry({ status: 'bought' }), onmoveback })
+		);
+
+		await fireEvent.click(
+			screen.getByRole('button', { name: 'Move Milk back to the list' })
+		);
+		expect(onmoveback).toHaveBeenCalledWith('e1');
+	});
+
+	it('keeps the × Remove button available on a basket row', async () => {
+		const ondelete = vi.fn();
+		render(
+			ListItem,
+			props({ entry: mockEntry({ status: 'skipped' }), ondelete, onmoveback: vi.fn() })
+		);
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Remove Milk' }));
+		expect(ondelete).toHaveBeenCalledWith('e1');
+	});
+});

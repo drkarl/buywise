@@ -452,3 +452,27 @@ async fn mutations_operation_type_check_accepts_set_quantity() {
         "set_quantity must be accepted after migration 008"
     );
 }
+
+/// Migration 009 widens the operation_type CHECK to include `move_to_list` by
+/// rebuilding the table; this asserts the new value is accepted after the rebuild
+/// (and so the constraint was recreated, not dropped).
+#[tokio::test]
+async fn mutations_operation_type_check_accepts_move_to_list() {
+    let pool = migrated_pool().await;
+    seed_list_prereqs(&pool).await;
+
+    let ok = sqlx::query(
+        "INSERT INTO mutations
+            (id, client_mutation_id, device_id, user_id, list_id,
+             entity_type, entity_id, operation_type, payload,
+             base_revision, created_at_client, received_at_server)
+         VALUES ('m1', 'cmid-mtl', 'dev-1', 'user-1', 'list-1',
+                 'list_entry', 'e-1', 'move_to_list', '{}', 0, 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        ok.is_ok(),
+        "move_to_list must be accepted after migration 009"
+    );
+}

@@ -1864,3 +1864,168 @@ async fn snapshot_converges_over_non_active_entries_after_drain() {
         "snapshot revision matches the DB revision (resume cursor intact)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// move_to_list (undo a mistaken bought/skipped)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn move_to_list_returns_a_bought_entry_to_active_and_clears_stamps() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Add an item, then check it off (bought).
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Bananas", "display_name": "Bananas" }),
+        ),
+    )
+    .await;
+    let bought = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "mark_bought",
+            serde_json::json!({ "bought_at": "2026-05-31T10:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(bought.status(), StatusCode::CREATED);
+
+    // Move it back to the list.
+    let back = post_mutation(
+        &pool,
+        &s,
+        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(back.status(), StatusCode::CREATED);
+    let v = json(back).await;
+    assert_eq!(v["status"], "accepted");
+    assert_eq!(v["entity"]["status"], "active", "entry is active again");
+    assert!(v["entity"]["bought_by"].is_null(), "bought_by cleared");
+    assert!(v["entity"]["bought_at"].is_null(), "bought_at cleared");
+
+    // The row reflects the reversal: active, with both stamps cleared.
+    let (status, by, at): (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT status, bought_by, bought_at FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    assert!(by.is_none());
+    assert!(at.is_none());
+
+    // Three accepted mutations → revision 3.
+    let current: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM shopping_lists WHERE id = 'list-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 3);
+}
+
+#[tokio::test]
+async fn move_to_list_returns_a_skipped_entry_to_active() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope("cm-2", "list-a", "entry-1", "mark_skipped", serde_json::json!({})),
+    )
+    .await;
+
+    let back = post_mutation(
+        &pool,
+        &s,
+        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(back.status(), StatusCode::CREATED);
+    assert_eq!(json(back).await["entity"]["status"], "active");
+}
+
+#[tokio::test]
+async fn delete_wins_over_move_to_list_and_logs_event() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope("cm-2", "list-a", "entry-1", "delete_item", serde_json::json!({})),
+    )
+    .await;
+
+    // move_to_list arrives AFTER the delete: delete wins, no resurrection.
+    let back = post_mutation(
+        &pool,
+        &s,
+        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(back.status(), StatusCode::CREATED);
+    assert_eq!(
+        json(back).await["entity"]["status"],
+        "deleted",
+        "deleted entry is not resurrected"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM list_entries WHERE id = 'entry-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "deleted");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM list_entry_events WHERE entry_id = 'entry-1' AND event_type = 'move_to_list_after_delete'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1, "the losing move_to_list is logged");
+}
