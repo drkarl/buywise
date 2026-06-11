@@ -2029,3 +2029,110 @@ async fn delete_wins_over_move_to_list_and_logs_event() {
     .unwrap();
     assert_eq!(events, 1, "the losing move_to_list is logged");
 }
+
+#[tokio::test]
+async fn move_to_list_merges_into_an_existing_active_twin() {
+    // Reviewer's flow: buy Milk, add Milk again, then undo the buy. Reactivating
+    // the resolved bought row would collide with the active twin on the partial
+    // unique dedup index — it must MERGE (not return a retryable 500).
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    seed_canonical_item(&pool, "cat-1", "item-1", "hh-a").await;
+    let s = login(&pool, "a@example.test").await;
+
+    // Resolved add of Milk (entry-1), then buy it.
+    post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-1",
+            "list-a",
+            "entry-1",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    post_mutation(
+        &pool,
+        &s,
+        envelope("cm-2", "list-a", "entry-1", "mark_bought", serde_json::json!({})),
+    )
+    .await;
+
+    // Add Milk again (entry-2): entry-1 is bought, so the dedup index (active-only)
+    // does not see it — entry-2 inserts cleanly as a second active row.
+    let add2 = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-2",
+            "add_item",
+            serde_json::json!({ "canonical_item_id": "item-1", "raw_text": "Milk", "display_name": "Milk" }),
+        ),
+    )
+    .await;
+    assert_eq!(add2.status(), StatusCode::CREATED);
+    assert_eq!(json(add2).await["status"], "accepted");
+
+    // Undo the buy: entry-1 would collide with entry-2 → merge, not 500.
+    let back = post_mutation(
+        &pool,
+        &s,
+        envelope("cm-4", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(back.status(), StatusCode::CREATED);
+    let v = json(back).await;
+    assert_eq!(v["status"], "merged", "reactivation merges into the active twin");
+    assert_eq!(v["entity"]["id"], "entry-2", "survivor is the existing active row");
+    assert_eq!(v["entity"]["status"], "active");
+    assert_eq!(v["entity"]["quantity"], 2, "quantities folded together");
+
+    // entry-1 is tombstoned; exactly one active row survives with quantity 2.
+    let st: String = sqlx::query_scalar("SELECT status FROM list_entries WHERE id = 'entry-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(st, "deleted", "the reactivated loser is tombstoned");
+
+    let (count, qty): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(quantity), 0) FROM list_entries \
+         WHERE list_id = 'list-a' AND status = 'active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "a single active row survives");
+    assert_eq!(qty, 2);
+
+    // Two 'merged' rows: the reactivation (cm-4) itself, plus the synthetic
+    // `delete_item` replay row recorded at R+1 to broadcast the tombstoned loser
+    // (same shape as apply_resolve_alias's loser broadcast).
+    let merged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mutations WHERE status = 'merged'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(merged, 2, "reactivation + the loser's broadcast row are both merged");
+
+    // The loser's deletion got its own distinct revision after the survivor's, so a
+    // `?since=` reconnect learns the basket row is gone (no shared-revision loss).
+    let loser_rev: i64 =
+        sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = 'entry-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let survivor_rev: i64 =
+        sqlx::query_scalar("SELECT last_updated_revision FROM list_entries WHERE id = 'entry-2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        loser_rev > survivor_rev,
+        "loser deletion (rev {loser_rev}) is stamped after the survivor (rev {survivor_rev})"
+    );
+}

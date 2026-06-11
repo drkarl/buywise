@@ -817,6 +817,16 @@ async fn apply_mark_skipped(
 /// Delete wins (M1): a deleted entry is never resurrected. As with
 /// `mark_skipped`, the mutation is still recorded as an accepted no-op on the row
 /// so the revision counter and idempotency log stay consistent.
+///
+/// Dedup merge: reactivating a RESOLVED entry can collide with the partial unique
+/// index `uq_list_entries_active_dedup` when another active row for the same
+/// `(list, canonical item, constraint hash)` already exists (buy Milk, add Milk
+/// again, then undo the buy). Rather than surface that as a retryable 500, we fold
+/// this entry's quantity into the surviving active row and tombstone this one —
+/// mirroring `apply_resolve_alias`'s merge. The loser is a row clients already
+/// hold (it sat in their basket), so its deletion is broadcast at its own revision
+/// via `deleted_loser_entry_id`. Unresolved entries carry a per-entry sentinel
+/// hash and are excluded by the index, so they never take this branch.
 async fn apply_move_to_list(
     tx: &mut Transaction<'_, Sqlite>,
     user: &AuthenticatedUser,
@@ -825,10 +835,18 @@ async fn apply_move_to_list(
     let entry_id = require_entry(req)?;
     let now = buywise_core::db::now_iso();
 
-    let prior_status = entry_status(tx, &entry_id, &req.list_id)
-        .await
-        .map_err(db_error("apply_move_to_list.lookup"))?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // Load the status plus the dedup key straight off the row (the entry is
+    // already resolved or not; we never recompute the hash here).
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT status, canonical_item_id, effective_constraint_hash \
+         FROM list_entries WHERE id = ?1 AND list_id = ?2",
+    )
+    .bind(&entry_id)
+    .bind(&req.list_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error("apply_move_to_list.lookup"))?;
+    let (prior_status, canonical_item_id, hash) = row.ok_or(StatusCode::NOT_FOUND)?;
 
     if prior_status == "deleted" {
         record_event(
@@ -847,7 +865,7 @@ async fn apply_move_to_list(
         ));
     }
 
-    sqlx::query(
+    let update = sqlx::query(
         "UPDATE list_entries \
          SET status = 'active', bought_by = NULL, bought_at = NULL, updated_at = ?2 \
          WHERE id = ?1 AND list_id = ?3",
@@ -856,13 +874,72 @@ async fn apply_move_to_list(
     .bind(&now)
     .bind(&req.list_id)
     .execute(&mut **tx)
-    .await
-    .map_err(db_error("apply_move_to_list.update"))?;
+    .await;
 
-    Ok(ApplyOutcome::touched(
-        Some(entry_id),
-        MutationStatus::Accepted,
-    ))
+    match update {
+        Ok(_) => Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        )),
+        // The partial dedup index fired: a resolved active row for the same
+        // (list, canonical item, hash) already exists. Fold this entry into it and
+        // tombstone this one, mirroring `apply_resolve_alias`'s merge. The active
+        // UPDATE above failed (and rolled back), so this row still carries its
+        // original quantity for the SELECT below.
+        Err(e) if is_dedup_index_violation(&e) => {
+            let surviving: Option<String> = sqlx::query_scalar(
+                "UPDATE list_entries \
+                 SET quantity = quantity + ( \
+                         SELECT quantity FROM list_entries WHERE id = ?4 AND list_id = ?1 \
+                     ), \
+                     updated_at = ?3 \
+                 WHERE list_id = ?1 AND canonical_item_id = ?2 \
+                   AND effective_constraint_hash = ?5 AND status = 'active' \
+                 RETURNING id",
+            )
+            .bind(&req.list_id)
+            .bind(&canonical_item_id)
+            .bind(&now)
+            .bind(&entry_id)
+            .bind(&hash)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_error("apply_move_to_list.merge"))?;
+
+            // The conflict proves a colliding active row exists, so the UPDATE
+            // must have matched it.
+            let surviving = surviving.ok_or_else(|| {
+                tracing::error!("mutations: move_to_list conflict but no row to merge into");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // Tombstone the loser (still `bought`/`skipped` — the active UPDATE
+            // rolled back). `merged` is not a valid `status`, so it becomes
+            // `deleted`.
+            sqlx::query(
+                "UPDATE list_entries SET status = 'deleted', updated_at = ?2 \
+                 WHERE id = ?1 AND list_id = ?3",
+            )
+            .bind(&entry_id)
+            .bind(&now)
+            .bind(&req.list_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error("apply_move_to_list.merge_delete"))?;
+
+            // The loser is a PRE-EXISTING row clients already hold (it sat in their
+            // basket), so its deletion needs its own distinct revision + replayable
+            // `mutations` row + SSE broadcast, or peers and `?since=` reconnects show
+            // it forever. The shared post-apply path does this for
+            // `deleted_loser_entry_id` at R+1 (same as `apply_resolve_alias`).
+            Ok(ApplyOutcome {
+                entry_id: Some(surviving),
+                status: MutationStatus::Merged,
+                deleted_loser_entry_id: Some(entry_id),
+            })
+        }
+        Err(e) => Err(db_error("apply_move_to_list.update")(e)),
+    }
 }
 
 /// `rename_item`: update `display_name` (and `raw_text` when supplied),
