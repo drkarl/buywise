@@ -418,10 +418,13 @@ pub async fn ingest(pool: &SqlitePool) -> Result<RunSummary, IngestError> {
     } else {
         // Live mode requires an explicitly configured feed URL. There is no
         // verified default Lidl.ie endpoint (design §16), so resolve it *before*
-        // opening a source_run: an unset value fails fast as MissingFeedUrl rather
-        // than recording a `failed` run against a known-bad default URL on every
-        // invocation.
-        let url = std::env::var("LIDL_FEED_URL").map_err(|_| IngestError::MissingFeedUrl)?;
+        // opening a source_run: an unset OR empty value fails fast as
+        // MissingFeedUrl rather than recording a `failed` run against a known-bad
+        // default URL on every invocation. The empty case matters because
+        // systemd's EnvironmentFile exports a bare `LIDL_FEED_URL=` line as an
+        // empty string (`Ok("")`), which must take the same skip path as unset
+        // (see `crate::configured_env`).
+        let url = crate::configured_env("LIDL_FEED_URL").ok_or(IngestError::MissingFeedUrl)?;
         run_ingest(pool, &fetched_at, move || live_fetch(url)).await
     }
 }
