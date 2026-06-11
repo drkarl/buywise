@@ -32,6 +32,7 @@ type OperationType =
   | 'add_item'
   | 'mark_bought'
   | 'mark_skipped'
+  | 'move_to_list'
   | 'delete_item'
   | 'resolve_alias'
   | 'set_quantity';
@@ -200,6 +201,35 @@ export async function markSkipped(listId: string, entryId: string): Promise<void
     if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
     await db.list_entries.update(entryId, {
       status: 'skipped',
+      updated_at: now
+    });
+    await db.mutation_queue.add(mutation);
+    return true;
+  });
+  if (enqueued) notifyMutationEnqueued(listId);
+}
+
+/**
+ * Moves a bought/skipped entry back to the active list — the "undo, I checked
+ * this off / skipped it by mistake" action. Optimistically sets status `active`
+ * and clears the bought stamps, enqueuing a `move_to_list` mutation in the same
+ * `listId`-guarded Dexie transaction.
+ */
+export async function moveToList(listId: string, entryId: string): Promise<void> {
+  const now = new Date().toISOString();
+  const mutation = await buildMutation(listId, entryId, 'move_to_list', {});
+
+  const enqueued = await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+    // Validate against `listId` and honour the backend's "delete wins" rule: a
+    // deleted entry is terminal and `apply_move_to_list` never resurrects it, so
+    // the offline UI doesn't either. The control is only shown on bought/skipped
+    // rows, but guard defensively against a racing delete.
+    const entry = await db.list_entries.get(entryId);
+    if (!entry || entry.list_id !== listId || entry.status === 'deleted') return false;
+    await db.list_entries.update(entryId, {
+      status: 'active',
+      bought_by: undefined,
+      bought_at: undefined,
       updated_at: now
     });
     await db.mutation_queue.add(mutation);

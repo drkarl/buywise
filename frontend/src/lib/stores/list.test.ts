@@ -5,6 +5,7 @@ import {
 	addItem,
 	markBought,
 	markSkipped,
+	moveToList,
 	deleteItem,
 	setQuantity,
 	resolveAlias,
@@ -150,6 +151,49 @@ describe('delete_item', () => {
 			(m) => m.operation_type === 'delete_item'
 		);
 		expect(delMut).toMatchObject({ entity_id: id, payload: {} });
+	});
+});
+
+describe('move_to_list', () => {
+	it('returns a bought entry to active, clears stamps, and queues a move_to_list mutation', async () => {
+		const id = await addItem(LIST, 'Yoghurt');
+		await markBought(LIST, id);
+		expect((await db.list_entries.get(id))?.status).toBe('bought');
+
+		await moveToList(LIST, id);
+
+		const entry = await db.list_entries.get(id);
+		expect(entry?.status).toBe('active');
+		expect(entry?.bought_at).toBeUndefined();
+		expect(entry?.bought_by).toBeUndefined();
+
+		const mut = (await db.mutation_queue.toArray()).find(
+			(m) => m.operation_type === 'move_to_list'
+		);
+		expect(mut).toMatchObject({ entity_id: id, payload: {}, status: 'pending' });
+	});
+
+	it('returns a skipped entry to active', async () => {
+		const id = await addItem(LIST, 'Napkins');
+		await markSkipped(LIST, id);
+		await moveToList(LIST, id);
+		expect((await db.list_entries.get(id))?.status).toBe('active');
+	});
+
+	it('does not resurrect a deleted entry (delete wins) and queues no mutation', async () => {
+		const id = await addItem(LIST, 'Crackers');
+		await deleteItem(LIST, id);
+		const before = await db.mutation_queue.count();
+
+		await moveToList(LIST, id);
+
+		expect((await db.list_entries.get(id))?.status).toBe('deleted');
+		expect(await db.mutation_queue.count()).toBe(before);
+	});
+
+	it('moveToList on an unknown id queues NO mutation', async () => {
+		await moveToList(LIST, 'does-not-exist');
+		expect(await db.mutation_queue.count()).toBe(0);
 	});
 });
 

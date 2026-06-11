@@ -18,6 +18,7 @@
 		addItem,
 		markBought,
 		markSkipped,
+		moveToList,
 		deleteItem,
 		setQuantity,
 		resolveAlias
@@ -48,6 +49,8 @@
 				return 'check off';
 			case 'mark_skipped':
 				return 'skip';
+			case 'move_to_list':
+				return 'move back to the list';
 			case 'delete_item':
 				return 'delete';
 			default:
@@ -215,6 +218,7 @@
 							onbought={(id) => markBought(listId, id)}
 							onskipped={(id) => markSkipped(listId, id)}
 							ondelete={(id) => deleteItem(listId, id)}
+							onmoveback={(id) => moveToList(listId, id)}
 						/>
 					{/each}
 				</ul>

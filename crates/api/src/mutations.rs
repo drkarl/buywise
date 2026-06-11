@@ -514,6 +514,7 @@ async fn apply_mutation(
         "delete_item" => apply_delete_item(tx, user, req).await,
         "mark_bought" => apply_mark_bought(tx, user, req).await,
         "mark_skipped" => apply_mark_skipped(tx, req).await,
+        "move_to_list" => apply_move_to_list(tx, user, req).await,
         "rename_item" => apply_rename_item(tx, req).await,
         "set_quantity" => apply_set_quantity(tx, req).await,
         // resolve_alias is the user-confirmation step of the resolution flow
@@ -801,6 +802,62 @@ async fn apply_mark_skipped(
     .execute(&mut **tx)
     .await
     .map_err(db_error("apply_mark_skipped.update"))?;
+
+    Ok(ApplyOutcome::touched(
+        Some(entry_id),
+        MutationStatus::Accepted,
+    ))
+}
+
+/// `move_to_list`: move a `bought` or `skipped` entry back to `active` — the
+/// "undo, I checked this off / skipped it by mistake" action — clearing
+/// `bought_by`/`bought_at`. Last-write-wins, scoped to `(id, list_id)` so a
+/// cross-list id is a 404 (H3).
+///
+/// Delete wins (M1): a deleted entry is never resurrected. As with
+/// `mark_skipped`, the mutation is still recorded as an accepted no-op on the row
+/// so the revision counter and idempotency log stay consistent.
+async fn apply_move_to_list(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &AuthenticatedUser,
+    req: &MutationRequest,
+) -> Result<ApplyOutcome, StatusCode> {
+    let entry_id = require_entry(req)?;
+    let now = buywise_core::db::now_iso();
+
+    let prior_status = entry_status(tx, &entry_id, &req.list_id)
+        .await
+        .map_err(db_error("apply_move_to_list.lookup"))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if prior_status == "deleted" {
+        record_event(
+            tx,
+            &entry_id,
+            &user.user_id,
+            "move_to_list_after_delete",
+            &req.payload,
+            &now,
+        )
+        .await
+        .map_err(db_error("apply_move_to_list.event"))?;
+        return Ok(ApplyOutcome::touched(
+            Some(entry_id),
+            MutationStatus::Accepted,
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE list_entries \
+         SET status = 'active', bought_by = NULL, bought_at = NULL, updated_at = ?2 \
+         WHERE id = ?1 AND list_id = ?3",
+    )
+    .bind(&entry_id)
+    .bind(&now)
+    .bind(&req.list_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_move_to_list.update"))?;
 
     Ok(ApplyOutcome::touched(
         Some(entry_id),
@@ -1581,6 +1638,7 @@ fn is_known_operation(op: &str) -> bool {
         "add_item"
             | "mark_bought"
             | "mark_skipped"
+            | "move_to_list"
             | "delete_item"
             | "rename_item"
             | "resolve_alias"
@@ -1677,11 +1735,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_operations_are_exactly_the_nine_check_values() {
+    fn known_operations_are_exactly_the_check_values() {
         for op in [
             "add_item",
             "mark_bought",
             "mark_skipped",
+            "move_to_list",
             "delete_item",
             "rename_item",
             "resolve_alias",
