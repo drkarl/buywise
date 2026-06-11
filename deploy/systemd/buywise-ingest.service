@@ -1,0 +1,40 @@
+[Unit]
+Description=BuyWise weekly price ingest (BasketWatch + Lidl)
+# Run after the network is up so the adapters can fetch their feeds.
+After=network-online.target
+Wants=network-online.target
+
+# No [Install] section on purpose: this is a oneshot job triggered by
+# buywise-ingest.timer, not a long-running unit that should start at boot.
+# `systemctl enable` the *timer*, never this service.
+#
+# Type=oneshot: systemd runs the ExecStart lines in order, waits for the
+# process to exit, and marks the unit "active (exited)" / "failed" instead of
+# keeping it running. Each weekly trigger is a single batch refresh.
+#
+# Concurrent-writer note: the ingest writes to the same SQLite file the API
+# reads (/var/lib/buywise/buywise.db). SQLite in WAL mode allows one writer at
+# a time alongside concurrent readers, and Litestream replicates the WAL, so a
+# weekly batch writer running beside the API is safe — there is no second
+# writer here, only the API's reads.
+#
+# Adapter failure policy: BasketWatch is the primary price source and MUST
+# succeed, so its ExecStart has no prefix — a failure fails the unit and is
+# visible in the journal / `systemctl status`. Lidl is supplementary and needs
+# an operator-provided LIDL_FEED_URL that may be absent on day one; its line is
+# prefixed with `-` (systemd "ignore failure") so a missing/broken feed does
+# not red the timer every week. The Lidl error is still logged to the journal.
+# BasketWatch runs first so a Lidl problem never masks a BasketWatch failure.
+
+[Service]
+Type=oneshot
+User=buywise
+WorkingDirectory=/var/lib/buywise
+EnvironmentFile=/etc/buywise/buywise.env
+# The ingest subcommands take a filesystem PATH (they build the sqlite:// URL
+# internally), not the sqlite:// DATABASE_URL from the env file. Pass the
+# canonical DB path used everywhere else in deploy (litestream.yml/README).
+ExecStart=/usr/local/bin/buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db
+ExecStart=-/usr/local/bin/buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db
+StandardOutput=journal
+StandardError=journal

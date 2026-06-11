@@ -1,0 +1,16 @@
+[Unit]
+Description=Weekly BuyWise price ingest schedule
+# Drives buywise-ingest.service. Price data is "weekly" by design, so a single
+# weekly run is enough; there is no benefit to ingesting more often.
+
+[Timer]
+# Monday 03:00 local time: a low-traffic window (overnight, start of week) so a
+# brief single-writer batch never contends with daytime API traffic.
+OnCalendar=Mon *-*-* 03:00:00
+# Catch up a run that was missed because the host was down at the scheduled
+# time (fires once on next boot instead of waiting a full week).
+Persistent=true
+Unit=buywise-ingest.service
+
+[Install]
+WantedBy=timers.target

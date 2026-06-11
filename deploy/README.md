@@ -7,15 +7,19 @@ replicates the SQLite database to Cloudflare R2.
 
 ## Architecture
 
-Two systemd services run side by side:
+Two long-running systemd services run side by side, plus a weekly ingest timer:
 
 - `buywise.service` — runs `/usr/local/bin/buywise-api` as the `buywise` user.
 - `litestream.service` — runs `/usr/local/bin/litestream replicate` against the
   same SQLite database, replicating to Cloudflare R2.
+- `buywise-ingest.timer` → `buywise-ingest.service` — a weekly oneshot that runs
+  the price-ingest adapters (`buywise-cli ingest-basketwatch` + `ingest-lidl`)
+  to refresh offer data. See "Weekly price ingest" below.
 
 | Item | Value |
 | --- | --- |
 | API binary | `/usr/local/bin/buywise-api` (package `crates/api`) |
+| CLI binary | `/usr/local/bin/buywise-cli` (package `crates/cli`) |
 | Litestream binary | `/usr/local/bin/litestream` |
 | Database | `/var/lib/buywise/buywise.db` |
 | Env file | `/etc/buywise/buywise.env` |
@@ -43,6 +47,12 @@ All variables live in `/etc/buywise/buywise.env`, loaded by both services.
 
 The variable names are referenced by `deploy/litestream.yml`. The default values
 above are the in-code defaults read by `crates/api/src/main.rs`.
+
+**Weekly ingest (`buywise-ingest.service`):**
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `LIDL_FEED_URL` | no | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. |
 
 ## 1. Build the ARM64 binary (on your build machine)
 
@@ -77,11 +87,17 @@ deploys and runs. Once the frontend exists, build it (`npm run build` in
 
 ## 2. Copy binaries to the server
 
-Copy the API binary:
+Copy the API binary and the CLI binary (the CLI runs the weekly price ingest):
 
 ```bash
 scp target/aarch64-unknown-linux-gnu/release/buywise-api root@<server>:/usr/local/bin/buywise-api
+scp target/aarch64-unknown-linux-gnu/release/buywise-cli root@<server>:/usr/local/bin/buywise-cli
 ```
+
+> Build the CLI the same way as the API, swapping the package:
+> `cargo build --release --target aarch64-unknown-linux-gnu -p buywise-cli`
+> (native on the CAX11: `cargo build --release -p buywise-cli`). The binary
+> lands at `target/aarch64-unknown-linux-gnu/release/buywise-cli`.
 
 Install Litestream on the server (ARM64 release). On the server:
 
@@ -93,10 +109,10 @@ tar -C /usr/local/bin -xzf /tmp/litestream.tar.gz litestream
 rm /tmp/litestream.tar.gz
 ```
 
-Confirm both binaries are present and executable:
+Confirm all binaries are present and executable:
 
 ```bash
-ls -l /usr/local/bin/buywise-api /usr/local/bin/litestream
+ls -l /usr/local/bin/buywise-api /usr/local/bin/buywise-cli /usr/local/bin/litestream
 ```
 
 ## 3. Run the setup script
@@ -115,9 +131,13 @@ sudo ./setup.sh
 - creates the `buywise` no-login system user (if missing);
 - creates `/var/lib/buywise/` owned by `buywise`;
 - creates `/etc/buywise/` and a `buywise.env` template (mode 600) if absent;
-- installs the systemd units to `/etc/systemd/system/`;
+- installs the systemd units to `/etc/systemd/system/` (including
+  `buywise-ingest.service` and `buywise-ingest.timer`);
 - installs `litestream.yml` to `/etc/litestream.yml`;
 - runs `systemctl daemon-reload`;
+- enables and starts `buywise-ingest.timer` (the weekly ingest timer only — the
+  long-running `buywise`/`litestream` units are left for you to enable once the
+  binaries are in place);
 - prints the next-step commands.
 
 ## 4. Set environment variables and the R2 endpoint
@@ -131,6 +151,47 @@ your Cloudflare account id (Cloudflare dashboard → R2). The bucket
 
 ```bash
 sudo systemctl enable --now buywise litestream
+```
+
+`setup.sh` already enabled `buywise-ingest.timer`; you do not enable it here.
+
+## Weekly price ingest
+
+Price data is refreshed weekly by a oneshot systemd unit driven by a timer:
+
+- `buywise-ingest.service` (`Type=oneshot`) runs the ingest adapters as the
+  `buywise` user with `/etc/buywise/buywise.env` loaded (so it picks up
+  `LIDL_FEED_URL`). It runs, in order:
+  - `buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db` — the
+    **primary** source. If it fails, the unit fails (visible in `systemctl
+    status` / the journal).
+  - `buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db` — **best-effort**
+    (its `ExecStart` is prefixed with `-`). If `LIDL_FEED_URL` is unset or the
+    feed is broken, the Lidl step errors but does not fail the unit, so a Lidl
+    problem never reds the timer or masks a successful BasketWatch run. The
+    error is still logged to the journal.
+- `buywise-ingest.timer` fires **weekly, Monday 03:00** local time (a
+  low-traffic overnight window). It is `Persistent=true`, so if the host was
+  down at the scheduled time, the run fires once on the next boot instead of
+  waiting a full week.
+
+> The ingest writes to the same `/var/lib/buywise/buywise.db` the API reads.
+> SQLite WAL allows a single writer alongside concurrent readers and Litestream
+> replicates the WAL, so the weekly batch writer is safe beside the running API.
+
+**Inspect the schedule and the last run:**
+
+```bash
+systemctl list-timers buywise-ingest.timer
+systemctl status buywise-ingest.service
+journalctl -u buywise-ingest -n 50 --no-pager
+```
+
+**Trigger a manual ingest now** (does not affect the weekly schedule):
+
+```bash
+sudo systemctl start buywise-ingest.service
+journalctl -u buywise-ingest -f
 ```
 
 ## 6. Smoke test (matches acceptance criteria)
@@ -190,9 +251,13 @@ sudo rm -f /tmp/verify.db  # written by root
 ```bash
 journalctl -u buywise -f
 journalctl -u litestream -f
+journalctl -u buywise-ingest -f
 ```
 
 - `buywise-api` logs at `RUST_LOG` level to the journal (`StandardOutput=journal`).
+- A red weekly ingest means `ingest-basketwatch` failed (Lidl is best-effort and
+  cannot fail the unit). Check `journalctl -u buywise-ingest` and confirm
+  `/usr/local/bin/buywise-cli` exists and the DB path is writable by `buywise`.
 - If `buywise` fails to start, check `DATABASE_URL` points at a writable path
   owned by the `buywise` user.
 - If `litestream` fails, check the R2 credentials in `buywise.env` and the
