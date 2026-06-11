@@ -56,6 +56,34 @@ above are the in-code defaults read by `crates/api/src/main.rs`.
 | `BASKETWATCH_API_HOST` | no | `basketwatch.p.rapidapi.com` | BasketWatch API host. Only set to override the default RapidAPI host. |
 | `LIDL_FEED_URL` | no | — | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. |
 
+**LLM resolution fallback (`buywise-api`; optional, default off):**
+
+The API can fall back to a cheap LLM call to resolve a list term that matches no
+catalogue item (`no_match`). It is **off by default** and the API runs fine
+without any of these set — an unresolved term simply stays `unresolved`. When
+`LLM_FALLBACK_ENABLED=true`, both `LLM_API_KEY` and `LLM_MODEL` are required for
+a request to be made; if either is missing the fallback silently stays disabled
+(no startup error). Every provider is assumed OpenAI-chat-completions-compatible.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `LLM_FALLBACK_ENABLED` | no | `false` | Master switch. `true` (case-insensitive) turns the fallback on; anything else (including unset) leaves it off. |
+| `LLM_API_KEY` | when enabled | — | API key sent as a bearer token. Required for a request to be made when the fallback is enabled. |
+| `LLM_MODEL` | when enabled | — | Model name. Never hardcoded (providers rotate cheap models often), so the operator picks one. Required when the fallback is enabled. |
+| `LLM_PROVIDER` | no | — | Provider identifier. Currently accepted but unused at runtime (every provider is treated as OpenAI-compatible); reserved for future per-provider defaults. |
+| `LLM_BASE_URL` | no | `https://api.openai.com/v1/chat/completions` | Chat-completions endpoint. Override for self-hosted / proxy / non-OpenAI deployments. |
+
+> **The API runs without any ingest or LLM variables.** It starts and serves
+> requests with none of the above set. But the **price comparison stays empty**
+> until the database holds both retailer **offers** (from the weekly ingest, see
+> "Weekly price ingest" below) **and** `product_matches` rows mapping canonical
+> items to retailer products. The optimiser filters retailer candidates through
+> `product_matches`; with no offers and no matches there is nothing to price. The
+> matches are seeded out-of-band via `buywise-cli seed-matches --from <csv> --db
+> <db> --household-id <uuid>` (idempotent upsert) — see the Phase-0 seeding flow
+> in [`docs/phase0-results.md`](../docs/phase0-results.md). The LLM fallback only
+> affects term resolution, not offer/match availability.
+
 ## 1. Build the ARM64 binary (on your build machine)
 
 Install the cross-compilation target and a linker, then build:
