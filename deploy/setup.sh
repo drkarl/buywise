@@ -7,8 +7,10 @@
 # and prints the env vars you must set in /etc/buywise/buywise.env before
 # enabling the services. It does NOT enable or start the long-running services
 # (buywise/litestream — the binaries must be in place first); it prints the
-# exact commands to do so. It DOES enable the weekly ingest *timer*, which is
-# harmless until the binary lands (it only fires on schedule).
+# exact commands to do so. It DOES `enable` (but deliberately does NOT `start`)
+# the weekly ingest *timer*: enabling persists it for the next boot, while
+# leaving the start to the post-env step prevents a Persistent=true catch-up
+# run from firing before the operator has set BASKETWATCH_API_KEY.
 #
 # Prerequisites (see deploy/README.md): the buywise-api, buywise-cli, and
 # litestream binaries must already be copied to /usr/local/bin/.
@@ -104,18 +106,21 @@ else
     echo "==> ${ENV_FILE} already exists, leaving it untouched"
 fi
 
-# Enable + start the weekly ingest TIMER (not the service). The timer is safe to
-# enable now: it only fires the oneshot ingest on schedule (Mon 03:00), so it has
-# no effect until /usr/local/bin/buywise-cli exists. `enable --now` is idempotent.
-# The long-running buywise/litestream units are deliberately left for the
-# operator to enable once the binaries and env file are in place.
-echo "==> Enabling and starting buywise-ingest.timer (weekly price ingest)"
+# Enable (NOT start) the weekly ingest TIMER. Enabling persists it so it arms on
+# the next boot; we deliberately do not `--now` it here. The timer has
+# Persistent=true, so activating it after the Mon 03:00 calendar point has
+# already elapsed makes systemd fire a catch-up run *immediately* — which on a
+# fresh deploy would red buywise-ingest.service with MissingApiKey before the
+# operator reaches the env-edit step. The post-env "Next steps" below starts the
+# timer once BASKETWATCH_API_KEY is configured. The long-running
+# buywise/litestream units are likewise left for the operator to enable.
+echo "==> Enabling buywise-ingest.timer (weekly price ingest; not started yet)"
 # This script targets a real systemd host. On a box without systemd as PID 1
-# (container/chroot/nspawn) `enable --now` exits non-zero; guard it so a failure
-# warns but does not abort the rest of the script (the "Next steps" guidance
-# below) under `set -euo pipefail`.
-systemctl enable --now buywise-ingest.timer \
-    || echo "WARN: could not enable timer (no running systemd?); enable manually: systemctl enable --now buywise-ingest.timer" >&2
+# (container/chroot/nspawn) `enable` exits non-zero; guard it so a failure warns
+# but does not abort the rest of the script (the "Next steps" guidance below)
+# under `set -euo pipefail`.
+systemctl enable buywise-ingest.timer \
+    || echo "WARN: could not enable timer (no running systemd?); enable manually after setting the env file: systemctl enable --now buywise-ingest.timer" >&2
 
 cat <<EOF
 
@@ -154,12 +159,17 @@ Next steps:
        /usr/local/bin/buywise-cli   (needed by the weekly ingest timer)
        /usr/local/bin/litestream
 
-3. Enable and start the services:
+3. Enable and start the services (only after the env file is set in step 1):
 
        sudo systemctl enable --now buywise litestream
 
-   The weekly ingest timer (buywise-ingest.timer) was already enabled by this
-   script. Inspect it and trigger a manual ingest run with:
+   The weekly ingest timer (buywise-ingest.timer) was *enabled* by this script
+   but NOT started, so it cannot fire a Persistent=true catch-up run before the
+   env file exists. Start it now that BASKETWATCH_API_KEY is set:
+
+       sudo systemctl start buywise-ingest.timer
+
+   Inspect it and trigger a manual ingest run with:
 
        systemctl list-timers buywise-ingest.timer
        sudo systemctl start buywise-ingest.service   # run ingest now
