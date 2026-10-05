@@ -14,7 +14,7 @@
 import { db, type LocalMutation } from '$lib/db/dexie';
 import { getDeviceId } from '$lib/db/device';
 import { jsonMutationHeaders } from '$lib/api/csrf';
-import { toLocalEntry, resolveCategoryId, type MutationResponse } from './types';
+import { toLocalEntry, resolveEntryGrouping, type MutationResponse } from './types';
 
 /** Network-error retry budget per mutation (plan P2-T4). */
 export const MAX_RETRIES = 3;
@@ -141,16 +141,19 @@ async function applySuccess(mutationId: number, res: MutationResponse): Promise<
       // newer row.
       const existing = await db.list_entries.get(entry.id);
       if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
-        // The mutation entity never carries `category_id`, so derive it from the
-        // cached catalogue (same as the SSE/snapshot apply paths). Without this a
-        // confirmed mutation (e.g. mark_bought) would overwrite a previously
-        // resolved entry with `category_id: undefined` and drop it into "Other"
-        // in shopping mode. Fall back to the existing row's category so a
-        // confirmation during a cold-cache/offline drain can't clobber a category
-        // that was already resolved.
-        await resolveCategoryId(entry);
+        // The mutation entity never carries grouping keys, so derive them from
+        // the cached catalogue (same as the SSE/snapshot apply paths). Without
+        // this a confirmed mutation (e.g. mark_bought) would overwrite a
+        // previously resolved entry with `category_id`/`subcategory_id`
+        // undefined and drop it into "Other" in shopping mode. Fall back to the
+        // existing row's keys so a confirmation during a cold-cache/offline
+        // drain can't clobber a group that was already resolved.
+        await resolveEntryGrouping(entry);
         if (entry.category_id === undefined && existing?.category_id !== undefined) {
           entry.category_id = existing.category_id;
+        }
+        if (entry.subcategory_id === undefined && existing?.subcategory_id !== undefined) {
+          entry.subcategory_id = existing.subcategory_id;
         }
         await db.list_entries.put(entry);
       }

@@ -864,6 +864,15 @@ async fn get_items_returns_items_with_aliases_and_constraints() {
     // The catalogue echoes the one category seeded above.
     let cats = body["categories"].as_array().unwrap();
     assert!(cats.iter().any(|c| c["id"] == "cat-1"));
+    // The shared sub-category catalogue is returned too (14 rows seeded by
+    // migration 010), and an item with no seed mapping reports a null
+    // subcategory_id so shopping mode falls back to its parent category.
+    assert_eq!(
+        body["subcategories"].as_array().unwrap().len(),
+        14,
+        "14 seeded sub-categories"
+    );
+    assert!(arr[0]["subcategory_id"].is_null());
     // store_category_orders is present (empty here: this synthetic household has
     // no seeded aisle orders — that path is covered against the migration seed in
     // `get_items_returns_categories_and_store_orders_for_seeded_household`).
@@ -909,4 +918,27 @@ async fn get_items_returns_categories_and_store_orders_for_seeded_household() {
     for store in ["tesco", "dunnes", "supervalu", "aldi", "lidl"] {
         assert!(stores.contains(store), "missing store {store}");
     }
+
+    // Issue #101: the shared sub-category catalogue is returned and every seeded
+    // Pantry item carries a sub-category, so a large Pantry section splits.
+    let subs = body["subcategories"].as_array().unwrap();
+    assert_eq!(subs.len(), 14, "14 seeded sub-categories");
+    const PANTRY: &str = "c1000000-0000-0000-0000-000000000005";
+    let pantry = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["category_id"] == PANTRY);
+    let mut pantry_subcategories = std::collections::HashSet::new();
+    for item in pantry {
+        let sub = item["subcategory_id"]
+            .as_str()
+            .expect("every seeded Pantry item is mapped");
+        pantry_subcategories.insert(sub.to_string());
+    }
+    assert_eq!(
+        pantry_subcategories.len(),
+        6,
+        "the Pantry items span 6 sub-categories"
+    );
 }

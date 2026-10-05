@@ -188,6 +188,9 @@ pub struct ItemView {
     pub name_es: String,
     /// `canonical_items.category_id`.
     pub category_id: String,
+    /// `canonical_items.subcategory_id`, or `None` when the item has no
+    /// sub-category and shopping mode should fall back to `category_id`.
+    pub subcategory_id: Option<String>,
     /// `canonical_items.default_constraint_policy`.
     pub default_constraint_policy: String,
     /// All aliases for this item.
@@ -240,20 +243,26 @@ pub struct ConstraintsView {
     pub substitution_policy: String,
 }
 
-/// The full `GET /api/items` payload: the canonical catalogue plus the two
+/// The full `GET /api/items` payload: the canonical catalogue plus the
 /// reference tables shopping mode needs to group + order items by store entirely
-/// offline (P2-T6). Canonical shape per `docs/implementation-plan.md` ("Store
-/// category orders: fetched from `GET /api/items` response").
+/// offline (P2-T6, extended for sub-categories by issue #101). Canonical shape
+/// per `docs/implementation-plan.md` ("Store category orders: fetched from
+/// `GET /api/items` response").
 ///
 /// Contract change (P2-T6): the endpoint previously returned a bare
 /// `Vec<ItemView>`; it now returns this envelope so the client can cache the
 /// `categories` catalogue and the per-store aisle orders alongside the items.
+///
+/// Contract change (issue #101): the envelope also carries the shared
+/// `subcategories` catalogue; each item carries its optional `subcategory_id`.
 #[derive(Debug, Serialize)]
 pub struct ItemsResponse {
     /// The canonical items with their aliases and (optional) constraints.
     pub items: Vec<ItemView>,
     /// The shared `categories` catalogue (id, names, icon, default order).
     pub categories: Vec<CategoryView>,
+    /// The shared `subcategories` catalogue (id, parent, names, default order).
+    pub subcategories: Vec<SubcategoryView>,
     /// The caller's household per-store aisle orders (`store_category_orders`).
     pub store_category_orders: Vec<StoreCategoryOrderView>,
 }
@@ -270,6 +279,22 @@ pub struct CategoryView {
     /// `categories.icon`.
     pub icon: String,
     /// `categories.default_order`.
+    pub default_order: i64,
+}
+
+/// One `subcategories` row, mirroring `crates/core/src/domain.rs::Subcategory`
+/// (issue #101). Shared reference data like [`CategoryView`].
+#[derive(Debug, Serialize)]
+pub struct SubcategoryView {
+    /// `subcategories.id`.
+    pub id: String,
+    /// `subcategories.category_id` — the parent category.
+    pub category_id: String,
+    /// `subcategories.name_en`.
+    pub name_en: String,
+    /// `subcategories.name_es`.
+    pub name_es: String,
+    /// `subcategories.default_order` (orders the split within its parent).
     pub default_order: i64,
 }
 
@@ -827,8 +852,20 @@ async fn list_items(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<ItemsResponse>, StatusCode> {
-    let item_rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
-        "SELECT id, household_id, name_en, name_es, category_id, default_constraint_policy \
+    let item_rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+        ),
+    >(
+        "SELECT id, household_id, name_en, name_es, category_id, subcategory_id, \
+                default_constraint_policy \
          FROM canonical_items \
          WHERE household_id IN \
                (SELECT household_id FROM household_members WHERE user_id = ?1) \
@@ -839,13 +876,17 @@ async fn list_items(
     .await
     .map_err(db_error("list_items.items"))?;
 
-    // The categories catalogue is shared (not household-scoped) and the per-store
-    // aisle orders are scoped to the caller's household set. Both are returned
-    // even when the caller has no canonical items yet, so a fresh household can
-    // still render shopping mode's store ordering from its seeded defaults.
+    // The categories + subcategories catalogues are shared (not household-scoped)
+    // and the per-store aisle orders are scoped to the caller's household set.
+    // All are returned even when the caller has no canonical items yet, so a fresh
+    // household can still render shopping mode's store ordering from its seeded
+    // defaults.
     let categories = load_categories(&state.pool)
         .await
         .map_err(db_error("list_items.categories"))?;
+    let subcategories = load_subcategories(&state.pool)
+        .await
+        .map_err(db_error("list_items.subcategories"))?;
     let store_category_orders = load_store_category_orders(&state.pool, &user.user_id)
         .await
         .map_err(db_error("list_items.store_category_orders"))?;
@@ -854,6 +895,7 @@ async fn list_items(
         return Ok(Json(ItemsResponse {
             items: Vec::new(),
             categories,
+            subcategories,
             store_category_orders,
         }));
     }
@@ -873,7 +915,15 @@ async fn list_items(
     let items = item_rows
         .into_iter()
         .map(
-            |(id, household_id, name_en, name_es, category_id, default_constraint_policy)| {
+            |(
+                id,
+                household_id,
+                name_en,
+                name_es,
+                category_id,
+                subcategory_id,
+                default_constraint_policy,
+            )| {
                 let aliases = aliases_by_item.remove(&id).unwrap_or_default();
                 let constraints = constraints_by_item.remove(&id);
                 ItemView {
@@ -882,6 +932,7 @@ async fn list_items(
                     name_en,
                     name_es,
                     category_id,
+                    subcategory_id,
                     default_constraint_policy,
                     aliases,
                     constraints,
@@ -893,6 +944,7 @@ async fn list_items(
     Ok(Json(ItemsResponse {
         items,
         categories,
+        subcategories,
         store_category_orders,
     }))
 }
@@ -919,6 +971,34 @@ async fn load_categories(pool: &sqlx::SqlitePool) -> Result<Vec<CategoryView>, s
             icon,
             default_order,
         })
+        .collect())
+}
+
+/// Load the shared `subcategories` catalogue (id, parent, names, default order).
+///
+/// Shared reference data like `categories`: every household sees the same
+/// sub-category split. Ordered by parent then display order so the client can
+/// group a category's items without re-sorting the catalogue.
+async fn load_subcategories(pool: &sqlx::SqlitePool) -> Result<Vec<SubcategoryView>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, i64)>(
+        "SELECT id, category_id, name_en, name_es, default_order \
+         FROM subcategories \
+         ORDER BY category_id, default_order, id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, category_id, name_en, name_es, default_order)| SubcategoryView {
+                id,
+                category_id,
+                name_en,
+                name_es,
+                default_order,
+            },
+        )
         .collect())
 }
 

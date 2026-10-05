@@ -681,7 +681,12 @@ async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
 
     let monthly = body["monthly"].as_array().expect("monthly array");
     assert_eq!(monthly.len(), 1, "one month");
-    assert_eq!(monthly[0]["month"], "2026-06");
+    // The savings_events row this flow creates is stamped with the server's
+    // `now()` at archive time, so the aggregate month is the CURRENT UTC month —
+    // never a fixed literal (this assertion hardcoded "2026-06" and rotted once
+    // the wall clock moved past it).
+    let expected_month = chrono::Utc::now().format("%Y-%m").to_string();
+    assert_eq!(monthly[0]["month"], expected_month);
     // The regression this guards: accepted is non-zero (would be 0 if the query
     // summed the never-written accepted_savings_cents column).
     assert_eq!(monthly[0]["accepted_cents"], expected_accepted);

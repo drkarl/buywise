@@ -17,6 +17,8 @@ export interface LocalListEntry {
   bought_by?: string;
   bought_at?: string;
   category_id?: string;
+  /** Sub-category id (issue #101); absent when the item has no split. */
+  subcategory_id?: string;
   last_updated_revision: number;
   updated_at: string;
 }
@@ -58,6 +60,21 @@ export interface LocalCategory {
 }
 
 /**
+ * An optional sub-category beneath a `LocalCategory` (issue #101), mirroring the
+ * `subcategories` row in the Rust core (crates/core/src/domain.rs::Subcategory).
+ * Shopping mode splits broad categories (e.g. Pantry) into these; `default_order`
+ * orders the split within `category_id`. Shared reference data like
+ * `LocalCategory`, cached from the `GET /api/items` response.
+ */
+export interface LocalSubcategory {
+  id: string;                    // subcategory_id
+  category_id: string;           // parent category id
+  name_en: string;
+  name_es: string;
+  default_order: number;
+}
+
+/**
  * One per-household, per-store aisle-ordering row, mirroring the
  * `store_category_orders` table (migrations/003_phase1_schema.sql). Cached from
  * `GET /api/items` so shopping mode can re-order categories per store fully
@@ -81,6 +98,9 @@ export interface LocalStoreCategoryOrder {
 export interface LocalItemCategory {
   canonical_item_id: string;     // canonical_items.id (the lookup key)
   category_id: string;           // canonical_items.category_id
+  // canonical_items.subcategory_id (issue #101); absent when the item has no
+  // sub-category, in which case shopping mode groups it by `category_id`.
+  subcategory_id?: string;
   // The canonical item's English display name, cached so the P3-T3 ambiguity
   // modal can label candidate ids (which are all the local entry carries).
   // Optional: entries cached before this field existed simply have no name and
@@ -93,6 +113,7 @@ export class BuyWiseDB extends Dexie {
   mutation_queue!: Table<LocalMutation, number>;
   list_meta!: Table<LocalListMeta, string>;
   categories!: Table<LocalCategory, string>;
+  subcategories!: Table<LocalSubcategory, string>;
   store_category_orders!: Table<LocalStoreCategoryOrder, string>;
   item_categories!: Table<LocalItemCategory, string>;
 
@@ -123,6 +144,15 @@ export class BuyWiseDB extends Dexie {
     // function is needed. Keyed by `canonical_item_id` for direct lookup.
     this.version(3).stores({
       item_categories: 'canonical_item_id',
+    });
+    // v4 (issue #101): cache the shared `subcategories` catalogue (parent +
+    // display order) from `GET /api/items` so shopping mode can split a broad
+    // category offline. Additive, like v2/v3 — Dexie carries the earlier stores
+    // forward untouched, so no upgrade function is needed. Indexed by
+    // `category_id` (the split lookup) and `default_order` (ordering within a
+    // parent).
+    this.version(4).stores({
+      subcategories: 'id, category_id, default_order',
     });
   }
 }

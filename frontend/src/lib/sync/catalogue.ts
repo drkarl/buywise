@@ -21,13 +21,16 @@ import {
   db,
   type LocalCategory,
   type LocalItemCategory,
-  type LocalStoreCategoryOrder
+  type LocalStoreCategoryOrder,
+  type LocalSubcategory
 } from '$lib/db/dexie';
 
 /** One item in the `GET /api/items` envelope (only the fields we cache). */
 interface ItemsResponseItem {
   id: string;
   category_id: string;
+  /** canonical_items.subcategory_id (issue #101); absent/null when unsplit. */
+  subcategory_id?: string | null;
   name_en: string;
 }
 
@@ -37,6 +40,15 @@ interface ItemsResponseCategory {
   name_en: string;
   name_es: string;
   icon: string;
+  default_order: number;
+}
+
+/** One subcategory row in the `GET /api/items` envelope (issue #101). */
+interface ItemsResponseSubcategory {
+  id: string;
+  category_id: string;
+  name_en: string;
+  name_es: string;
   default_order: number;
 }
 
@@ -52,6 +64,7 @@ interface ItemsResponseStoreOrder {
 interface ItemsResponse {
   items: ItemsResponseItem[];
   categories: ItemsResponseCategory[];
+  subcategories: ItemsResponseSubcategory[];
   store_category_orders: ItemsResponseStoreOrder[];
 }
 
@@ -62,6 +75,7 @@ function isItemsResponse(value: unknown): value is ItemsResponse {
   return (
     Array.isArray(v.items) &&
     Array.isArray(v.categories) &&
+    Array.isArray(v.subcategories) &&
     Array.isArray(v.store_category_orders)
   );
 }
@@ -99,11 +113,12 @@ export async function fetchCatalogue(fetchFn: typeof fetch = fetch): Promise<boo
 }
 
 /**
- * Replaces the cached `categories`, `store_category_orders`, and `item_categories`
- * with the envelope's contents. A full replace (clear + bulkPut) keeps the cache
- * in lock-step with the server: a category/order/item removed server-side does
- * not linger locally. All three writes share one transaction so a partial failure
- * never leaves the caches inconsistent.
+ * Replaces the cached `categories`, `subcategories`, `store_category_orders`,
+ * and `item_categories` with the envelope's contents. A full replace
+ * (clear + bulkPut) keeps the cache in lock-step with the server: a
+ * category/sub-category/order/item removed server-side does not linger locally.
+ * All four writes share one transaction so a partial failure never leaves the
+ * caches inconsistent.
  */
 async function writeCatalogue(body: ItemsResponse): Promise<void> {
   const categories: LocalCategory[] = body.categories.map((c) => ({
@@ -112,6 +127,13 @@ async function writeCatalogue(body: ItemsResponse): Promise<void> {
     name_es: c.name_es,
     icon: c.icon,
     default_order: c.default_order
+  }));
+  const subcategories: LocalSubcategory[] = body.subcategories.map((s) => ({
+    id: s.id,
+    category_id: s.category_id,
+    name_en: s.name_en,
+    name_es: s.name_es,
+    default_order: s.default_order
   }));
   const orders: LocalStoreCategoryOrder[] = body.store_category_orders.map((o) => ({
     id: o.id,
@@ -122,13 +144,21 @@ async function writeCatalogue(body: ItemsResponse): Promise<void> {
   const itemCategories: LocalItemCategory[] = body.items.map((i) => ({
     canonical_item_id: i.id,
     category_id: i.category_id,
+    subcategory_id: i.subcategory_id ?? undefined,
     name_en: i.name_en
   }));
 
-  const tables = [db.categories, db.store_category_orders, db.item_categories] as const;
+  const tables = [
+    db.categories,
+    db.subcategories,
+    db.store_category_orders,
+    db.item_categories
+  ] as const;
   await db.transaction('rw', tables, async () => {
     await db.categories.clear();
     await db.categories.bulkPut(categories);
+    await db.subcategories.clear();
+    await db.subcategories.bulkPut(subcategories);
     await db.store_category_orders.clear();
     await db.store_category_orders.bulkPut(orders);
     await db.item_categories.clear();
@@ -137,27 +167,45 @@ async function writeCatalogue(body: ItemsResponse): Promise<void> {
 }
 
 /**
- * Backfills `category_id` on stored list entries from the freshly-written
- * `item_categories` cache. Handles the catalogue-after-entries ordering: an entry
- * synced before the catalogue arrived has a `canonical_item_id` but no
- * `category_id`, so we resolve it now. We only touch entries that have a
- * `canonical_item_id` but no `category_id` (never overwrite a server-set one),
- * and only when the cache actually resolves the item.
+ * Backfills `category_id` and `subcategory_id` on stored list entries from the
+ * freshly-written `item_categories` cache. Handles the catalogue-after-entries
+ * ordering: an entry synced before the catalogue arrived has a
+ * `canonical_item_id` but no grouping keys, so we resolve them now.
+ *
+ * Each key is filled independently and only when absent, so a server-set
+ * `category_id` (or an item cached before sub-categories existed) is never
+ * clobbered; we only ever add from the cache.
  */
 async function backfillEntryCategories(): Promise<void> {
   await db.transaction('rw', db.list_entries, db.item_categories, async () => {
     const unresolved = await db.list_entries
-      .filter((e) => e.canonical_item_id !== undefined && e.category_id === undefined)
+      .filter(
+        (e) =>
+          e.canonical_item_id !== undefined &&
+          (e.category_id === undefined || e.subcategory_id === undefined)
+      )
       .toArray();
     if (unresolved.length === 0) return;
 
-    const updates: { id: string; category_id: string }[] = [];
+    const updates: { id: string; category_id?: string; subcategory_id?: string }[] = [];
     for (const entry of unresolved) {
       const mapping = await db.item_categories.get(entry.canonical_item_id as string);
-      if (mapping) updates.push({ id: entry.id, category_id: mapping.category_id });
+      if (!mapping) continue;
+
+      const update: { id: string; category_id?: string; subcategory_id?: string } = {
+        id: entry.id
+      };
+      if (entry.category_id === undefined) update.category_id = mapping.category_id;
+      if (entry.subcategory_id === undefined && mapping.subcategory_id !== undefined) {
+        update.subcategory_id = mapping.subcategory_id;
+      }
+      if (update.category_id !== undefined || update.subcategory_id !== undefined) {
+        updates.push(update);
+      }
     }
     for (const u of updates) {
-      await db.list_entries.update(u.id, { category_id: u.category_id });
+      const { id, ...fields } = u;
+      await db.list_entries.update(id, fields);
     }
   });
 }

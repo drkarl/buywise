@@ -13,7 +13,8 @@ import {
   db,
   type LocalCategory,
   type LocalListEntry,
-  type LocalStoreCategoryOrder
+  type LocalStoreCategoryOrder,
+  type LocalSubcategory
 } from '$lib/db/dexie';
 
 /**
@@ -78,6 +79,11 @@ export function shoppingEntries(listId: string): Readable<LocalListEntry[]> {
 /** The cached category catalogue (names, icons, default order). */
 export function categories(): Readable<LocalCategory[]> {
   return liveStore<LocalCategory[]>(() => db.categories.toArray(), []);
+}
+
+/** The cached sub-category catalogue (parent, names, default order). */
+export function subcategories(): Readable<LocalSubcategory[]> {
+  return liveStore<LocalSubcategory[]>(() => db.subcategories.toArray(), []);
 }
 
 /** All cached per-store aisle orders across every store. */

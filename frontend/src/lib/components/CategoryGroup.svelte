@@ -1,9 +1,10 @@
 <script lang="ts">
-	// A single collapsible category section in shopping mode. Header shows the
-	// category name and the count of items still to buy ("remaining"). Items stay
-	// in place when checked off — bought items render struck-through within the
-	// same group rather than moving to a separate section, so the shopper sees
-	// what's done in context (P2-T6 behaviour).
+	// A single collapsible section in shopping mode: a sub-category (issue #101)
+	// when the catalogue splits its parent, otherwise the parent category itself.
+	// Header shows the section name and the count of items still to buy
+	// ("remaining"). Items stay in place when checked off — bought items render
+	// struck-through within the same group rather than moving to a separate
+	// section, so the shopper sees what's done in context (P2-T6 behaviour).
 
 	import type { CategoryGroup } from '$lib/shopping/sortByStoreOrder';
 
@@ -20,9 +21,10 @@
 	let open = $state(true);
 
 	// User-facing label for the bucket `sortByStoreOrder` keys as UNCATEGORISED_ID
-	// (entries with no `category_id`). "Other" reads better in the UI than
-	// "uncategorised"; they refer to the same bucket.
-	const title = $derived(group.category?.name_en ?? 'Other');
+	// (entries with no grouping). "Other" reads better in the UI than
+	// "uncategorised"; they refer to the same bucket. A split section is titled by
+	// its sub-category; an unsplit one by its parent category.
+	const title = $derived(group.subcategory?.name_en ?? group.category?.name_en ?? 'Other');
 </script>
 
 <section class="category">

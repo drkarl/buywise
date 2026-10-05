@@ -29,6 +29,7 @@ export interface ServerListEntry {
   bought_by?: string | null;
   bought_at?: string | null;
   category_id?: string | null;
+  subcategory_id?: string | null;
   last_updated_revision: number;
   updated_at: string;
   // Server-only columns the client does not store; declared for completeness.
@@ -89,31 +90,35 @@ export function toLocalEntry(entity: ServerListEntry): LocalListEntry {
     bought_by: entity.bought_by ?? undefined,
     bought_at: entity.bought_at ?? undefined,
     category_id: entity.category_id ?? undefined,
+    subcategory_id: entity.subcategory_id ?? undefined,
     last_updated_revision: entity.last_updated_revision,
     updated_at: entity.updated_at
   };
 }
 
 /**
- * Resolves the `category_id` for a local entry from the cached `item_categories`
- * map (P2-T6). List entries carry only a (nullable) `canonical_item_id`; shopping
- * mode buckets on `category_id`, so we derive it client-side from the catalogue
- * cached by the `GET /api/items` fetch.
+ * Resolves the `category_id` and `subcategory_id` for a local entry from the
+ * cached `item_categories` map (P2-T6, issue #101). List entries carry only a
+ * (nullable) `canonical_item_id`; shopping mode buckets on these grouping keys,
+ * so we derive them client-side from the catalogue cached by the `GET /api/items`
+ * fetch.
  *
- * Precedence: an explicit server-supplied `category_id` (should the backend ever
- * start sending one) wins; otherwise we look up the entry's `canonical_item_id`
- * in the cache. An unresolved entry (no `canonical_item_id`) or a cache miss (the
+ * Precedence: an explicit server-supplied key (should the backend ever start
+ * sending one) wins; otherwise we look up the entry's `canonical_item_id` in the
+ * cache. An unresolved entry (no `canonical_item_id`) or a cache miss (the
  * catalogue hasn't been fetched yet, or the item is newer than the cache)
- * correctly leaves `category_id` undefined, so the entry buckets as uncategorised
+ * correctly leaves the key undefined, so the entry buckets as uncategorised
  * ("Other") until a catalogue (re)fetch backfills it.
  *
- * Mutates `entry.category_id` in place and returns the same entry for chaining.
- * Must be called inside (or before) the same Dexie write the caller performs.
+ * Mutates the entry in place and returns the same entry for chaining. Must be
+ * called inside (or before) the same Dexie write the caller performs.
  */
-export async function resolveCategoryId(entry: LocalListEntry): Promise<LocalListEntry> {
-  if (entry.category_id !== undefined) return entry; // already known — keep it
+export async function resolveEntryGrouping(entry: LocalListEntry): Promise<LocalListEntry> {
+  if (entry.category_id !== undefined && entry.subcategory_id !== undefined) return entry;
   if (entry.canonical_item_id === undefined) return entry; // unresolved → "Other"
   const mapping = await db.item_categories.get(entry.canonical_item_id);
-  if (mapping) entry.category_id = mapping.category_id;
+  if (!mapping) return entry;
+  if (entry.category_id === undefined) entry.category_id = mapping.category_id;
+  if (entry.subcategory_id === undefined) entry.subcategory_id = mapping.subcategory_id;
   return entry;
 }
