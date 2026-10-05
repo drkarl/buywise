@@ -659,6 +659,14 @@ pub fn optimise_core(
     candidates: &[Candidate],
     no_offer_count: usize,
 ) -> CorePlans {
+    optimise_core_with_candidates(input, candidates, no_offer_count).0
+}
+
+fn optimise_core_with_candidates(
+    input: &OptimiserInput,
+    candidates: &[Candidate],
+    no_offer_count: usize,
+) -> (CorePlans, Vec<StorePlan>) {
     // Group candidates by item, keeping the cheapest per (item, retailer).
     // Map: item_index -> retailer -> best candidate.
     let mut best_per_item_retailer: BTreeMap<usize, HashMap<Retailer, Candidate>> = BTreeMap::new();
@@ -722,7 +730,7 @@ pub fn optimise_core(
             ));
         }
     }
-    let best_two_store = pick_best_two_store_plan(two_store_plans);
+    let best_two_store = pick_best_two_store_plan(&two_store_plans);
 
     // ---- Theoretical minimum: each item at its globally cheapest retailer.
     let theoretical_minimum = build_theoretical_minimum(
@@ -732,11 +740,18 @@ pub fn optimise_core(
         no_offer_count,
     );
 
-    CorePlans {
-        best_single,
-        best_two_store,
-        theoretical_minimum,
-    }
+    let genuine_two_store_candidates = two_store_plans
+        .into_iter()
+        .filter(|plan| plan.stores.len() == 2)
+        .collect();
+    (
+        CorePlans {
+            best_single,
+            best_two_store,
+            theoretical_minimum,
+        },
+        genuine_two_store_candidates,
+    )
 }
 
 /// Whether candidate `a` is strictly preferable to `b` for the same item, using
@@ -936,15 +951,16 @@ fn pick_best_plan(plans: Vec<StorePlan>) -> Option<StorePlan> {
 /// `best_two_store.stores` to hold exactly two retailers). When no pair yields a
 /// genuine split — e.g. one store dominates the basket, or there is a single
 /// priceable item — this returns `None` and `best_two_store` is absent.
-fn pick_best_two_store_plan(plans: Vec<StorePlan>) -> Option<StorePlan> {
+fn pick_best_two_store_plan(plans: &[StorePlan]) -> Option<StorePlan> {
     plans
-        .into_iter()
+        .iter()
         .filter(|p| p.stores.len() == 2)
         .min_by(|a, b| {
             a.missing_count
                 .cmp(&b.missing_count)
                 .then(a.total_cents.cmp(&b.total_cents))
         })
+        .cloned()
 }
 
 /// Compute freshness confidence from the current run number and the run number
@@ -1005,38 +1021,51 @@ fn dunnes_voucher_text(lines: &[PlanLine]) -> Option<String> {
 /// fulfilment rule again: cost can never override missing-item count.
 ///
 /// `nearby` lists the retailers the household marked as close by (issue #98).
-/// When the two-store split includes any of them, the extra trip is cheap, so the
-/// bar drops to `min(threshold_2_cents, NEARBY_THRESHOLD_2_CENTS)`. A split of
-/// two distant stores keeps the full threshold.
+/// The lower bar applies only to stores added beyond the single-store plan.
 fn recommend(
     best_single: Option<StorePlan>,
     best_two_store: Option<StorePlan>,
+    two_store_candidates: Vec<StorePlan>,
     threshold_2_cents: Cents,
     nearby: &[Retailer],
 ) -> Option<Recommendation> {
     match (best_single, best_two_store) {
-        (Some(single), Some(two)) => {
-            let saving = single.total_cents - two.total_cents;
-            // A more-complete split (fewer missing) is preferred regardless of
-            // cost; an equally complete split must beat the threshold; a
-            // less-complete split never wins.
-            let split_more_complete = two.missing_count < single.missing_count;
-            let split_equal_complete = two.missing_count == single.missing_count;
-            // A split touching a nearby store needs a smaller saving than a split
-            // of two distant stores. `min` keeps an already-smaller household
-            // threshold intact.
-            let effective_threshold = if two.stores.iter().any(|r| nearby.contains(r)) {
-                threshold_2_cents.min(NEARBY_THRESHOLD_2_CENTS)
-            } else {
-                threshold_2_cents
-            };
-            let clears_threshold = saving > effective_threshold;
+        (Some(single), Some(best_two)) => {
+            let best_saving = single.total_cents - best_two.total_cents;
+            let qualifying_two = two_store_candidates
+                .into_iter()
+                .filter_map(|two| {
+                    let saving = single.total_cents - two.total_cents;
+                    let more_complete = two.missing_count < single.missing_count;
+                    let equal_complete = two.missing_count == single.missing_count;
+                    let added_store_is_nearby = two
+                        .stores
+                        .iter()
+                        .filter(|store| !single.stores.contains(store))
+                        .any(|store| nearby.contains(store));
+                    let threshold = if added_store_is_nearby {
+                        threshold_2_cents.min(NEARBY_THRESHOLD_2_CENTS)
+                    } else {
+                        threshold_2_cents
+                    };
+                    let clears_threshold = saving > threshold;
+                    (more_complete || (equal_complete && clears_threshold)).then_some((
+                        two,
+                        saving,
+                        equal_complete && clears_threshold,
+                    ))
+                })
+                .min_by(|(a, _, _), (b, _, _)| {
+                    a.missing_count
+                        .cmp(&b.missing_count)
+                        .then(a.total_cents.cmp(&b.total_cents))
+                });
 
-            if split_more_complete || (split_equal_complete && clears_threshold) {
+            if let Some((plan, saving, clears_convenience_threshold)) = qualifying_two {
                 Some(Recommendation {
                     kind: RecommendedKind::TwoStore,
-                    plan: two,
-                    clears_convenience_threshold: split_equal_complete && clears_threshold,
+                    plan,
+                    clears_convenience_threshold,
                     two_store_saving_cents: saving,
                 })
             } else {
@@ -1044,7 +1073,7 @@ fn recommend(
                     kind: RecommendedKind::SingleStore,
                     plan: single,
                     clears_convenience_threshold: false,
-                    two_store_saving_cents: saving,
+                    two_store_saving_cents: best_saving,
                 })
             }
         }
@@ -1380,7 +1409,8 @@ fn build_output(
     // Resolved-but-unpriceable items are missing at every store, so they fold into
     // every plan's missing_count as a constant (see StorePlan::missing_count).
     let no_offer_count = classification.no_valid_offer.len();
-    let core = optimise_core(input, &candidates, no_offer_count);
+    let (core, two_store_candidates) =
+        optimise_core_with_candidates(input, &candidates, no_offer_count);
     let nearby: Vec<Retailer> = Retailer::ALL
         .into_iter()
         .filter(|r| input.is_nearby(*r))
@@ -1388,6 +1418,7 @@ fn build_output(
     let recommended = recommend(
         core.best_single.clone(),
         core.best_two_store.clone(),
+        two_store_candidates,
         input.threshold_2_cents,
         &nearby,
     );

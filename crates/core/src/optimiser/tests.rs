@@ -476,6 +476,36 @@ fn two_store_split_rows(saving_cents: Cents) -> BTreeMap<usize, Rows> {
     priced
 }
 
+/// Two-item prices keyed by retailer, used to exercise competing two-store pairs.
+fn two_item_retailer_rows(prices: &[(Retailer, Cents, Cents)]) -> BTreeMap<usize, Rows> {
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    for (retailer, first_price, second_price) in prices {
+        for (index, (canonical_id, price)) in
+            [("ci-rice", *first_price), ("ci-coffee", *second_price)]
+                .into_iter()
+                .enumerate()
+        {
+            let product_id = format!("p-{retailer:?}-{index}");
+            priced.entry(index).or_default().push((
+                product_match(
+                    &format!("m-{retailer:?}-{index}"),
+                    canonical_id,
+                    &product_id,
+                    MatchStatus::Accepted,
+                ),
+                product(&product_id, *retailer),
+                offer(
+                    &format!("o-{retailer:?}-{index}"),
+                    &product_id,
+                    price,
+                    Some(5),
+                ),
+            ));
+        }
+    }
+    priced
+}
+
 /// Like [`recommendation_with_saving`], but with household store settings
 /// (issue #98) applied so callers can exercise the nearby/status rules.
 fn recommendation_with_saving_and_settings(
@@ -1941,11 +1971,64 @@ fn nearby_store_recommended_for_a_smaller_saving_than_a_distant_one() {
 
     let nearby = recommendation_with_saving_and_settings(
         700,
-        vec![store_setting(Retailer::Aldi, StoreStatus::Active, true)],
+        vec![store_setting(Retailer::Tesco, StoreStatus::Active, true)],
     );
     assert_eq!(nearby.kind, RecommendedKind::TwoStore);
     assert!(nearby.clears_convenience_threshold);
     assert_eq!(nearby.two_store_saving_cents, 700);
+}
+
+#[test]
+fn nearby_existing_single_store_does_not_lower_bar_for_distant_added_store() {
+    let input = two_store_split_input(
+        DEFAULT_THRESHOLD_2_CENTS,
+        vec![store_setting(Retailer::Aldi, StoreStatus::Active, true)],
+    );
+    let out = run(
+        &input,
+        two_item_retailer_rows(&[
+            (Retailer::Aldi, 10_000, 30_000),
+            (Retailer::Lidl, 10_600, 29_400),
+        ]),
+    );
+
+    assert_eq!(out.best_single.unwrap().stores, vec![Retailer::Aldi]);
+    let best_split = out.best_two_store.expect("two-store split");
+    assert_eq!(best_split.total_cents, 39_400);
+    assert_eq!(best_split.stores.len(), 2);
+    let recommendation = out.recommended.expect("recommendation");
+    assert_eq!(recommendation.kind, RecommendedKind::SingleStore);
+    assert_eq!(recommendation.two_store_saving_cents, 600);
+    assert_eq!(recommendation.plan.stores, vec![Retailer::Aldi]);
+}
+
+#[test]
+fn qualifying_nearby_pair_is_considered_when_cheaper_distant_pair_fails() {
+    let input = two_store_split_input(
+        DEFAULT_THRESHOLD_2_CENTS,
+        vec![store_setting(
+            Retailer::SuperValu,
+            StoreStatus::Active,
+            true,
+        )],
+    );
+    let out = run(
+        &input,
+        two_item_retailer_rows(&[
+            (Retailer::Tesco, 20_000, 20_000),
+            (Retailer::Lidl, 19_200, 30_000),
+            (Retailer::SuperValu, 19_400, 30_000),
+        ]),
+    );
+
+    assert_eq!(out.best_single.unwrap().stores, vec![Retailer::Tesco]);
+    assert_eq!(out.best_two_store.unwrap().total_cents, 39_200);
+    let recommendation = out.recommended.expect("recommendation");
+    assert_eq!(recommendation.kind, RecommendedKind::TwoStore);
+    assert_eq!(recommendation.two_store_saving_cents, 600);
+    assert!(recommendation.plan.stores.contains(&Retailer::Tesco));
+    assert!(recommendation.plan.stores.contains(&Retailer::SuperValu));
+    assert!(!recommendation.plan.stores.contains(&Retailer::Lidl));
 }
 
 /// The nearby bar is a floor, not a replacement: a household that set a smaller
@@ -1956,7 +2039,7 @@ fn nearby_threshold_never_raises_a_smaller_household_threshold() {
     // clears €3, so the split is recommended.
     let input = two_store_split_input(
         300,
-        vec![store_setting(Retailer::Aldi, StoreStatus::Active, true)],
+        vec![store_setting(Retailer::Tesco, StoreStatus::Active, true)],
     );
     let rec = run(&input, two_store_split_rows(400))
         .recommended
