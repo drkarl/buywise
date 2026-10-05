@@ -98,6 +98,9 @@ function stubPreferences(preferences: Preferences): FetchMock {
 		if (url.endsWith('/preferences')) {
 			return jsonResponse(preferences);
 		}
+		if (url === '/api/list/list-a') {
+			return jsonResponse({ id: 'list-a', name: 'Weekly', current_revision: 1, entries: [] });
+		}
 		if (url === '/api/match-feedback') {
 			return jsonResponse({ product_match_id: 'm-1', status: 'rejected', action: 'reject' }, 201);
 		}
