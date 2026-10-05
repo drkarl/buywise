@@ -755,7 +755,7 @@ pub async fn item_constraints_by_canonical_id(
 /// A SQL `NULL` (`None` input) and an unparseable value both yield `None`:
 /// constraint list columns are advisory, so one malformed row must never abort
 /// the whole optimiser run. Mirrors the lenient enum-column handling above.
-pub(crate) fn parse_json_string_list(raw: Option<&str>) -> Option<Vec<String>> {
+pub fn parse_json_string_list(raw: Option<&str>) -> Option<Vec<String>> {
     raw.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
 }
 

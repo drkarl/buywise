@@ -91,7 +91,13 @@ function fullResponse(): OptimiseResponse {
 		},
 		unresolved_items: [{ item_index: 2, entry_id: 'e-2', display_text: 'cream' }],
 		no_valid_offer_items: [
-			{ item_index: 3, entry_id: 'e-3', display_text: 'truffle oil', reason: 'no_matches' }
+			{
+				item_index: 3,
+				entry_id: 'e-3',
+				display_text: 'truffle oil',
+				canonical_item_id: 'ci-3',
+				reason: 'no_matches'
+			}
 		],
 		needs_confirmation_items: [],
 		plain_language_explanation: 'Splitting between Tesco and Aldi saves you the most.',
@@ -323,7 +329,13 @@ describe('optimise page', () => {
 			}
 		];
 		response.no_valid_offer_items = [
-			{ item_index: 5, entry_id: 'e-5', display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
+			{
+				item_index: 5,
+				entry_id: 'e-5',
+				display_text: 'San Pellegrino',
+				canonical_item_id: 'ci-5',
+				reason: 'strict_no_exact_offer'
+			}
 		];
 		stubOptimise(response);
 		render(Page);

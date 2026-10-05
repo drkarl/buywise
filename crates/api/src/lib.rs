@@ -3,8 +3,9 @@
 //! Phase 1 exposes the authentication routes (P1-T2) under `/api/auth`, the
 //! list-management routes (P1-T3) under `/api/lists`, `/api/list/:id`, and
 //! `/api/items`, the offline-sync mutation endpoint (P1-T4) at `/api/mutations`,
-//! the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`, and a Phase-4
-//! placeholder for the basket optimiser (P4-T1) at `/api/optimise`. The shared
+//! the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`, the basket
+//! optimiser (P4-T1) at `/api/optimise`, and the household product-preference
+//! screen (issue #102) at `/api/items/{id}/preferences`. The shared
 //! [`AppState`] carries the SQLite pool that handlers and the
 //! [`middleware::AuthenticatedUser`] extractor read from, plus the per-list SSE
 //! broadcast registry.
@@ -38,6 +39,7 @@ pub mod match_feedback;
 pub mod middleware;
 pub mod mutations;
 pub mod optimise;
+pub mod preferences;
 pub mod resolution;
 pub mod savings;
 pub mod settings;
@@ -130,6 +132,9 @@ pub fn api_router(state: AppState) -> Router {
         // `match_feedback::router` carries the absolute `/api/match-feedback`
         // path: the accept/reject/prefer write path for product matches (P5-T1).
         .merge(match_feedback::router())
+        // `preferences::router` carries the absolute `/api/items/{id}/preferences`
+        // path: the per-item household product preferences screen (issue #102).
+        .merge(preferences::router())
         // `savings::router` carries the absolute `/api/list/{id}/actual-spend`
         // path: record post-shop actual spend and compute the net saving (P5-T3).
         .merge(savings::router())

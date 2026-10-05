@@ -92,7 +92,7 @@
 		// EventTarget and may be a non-Element (e.g. a Text node), so guard before
 		// calling `closest`.
 		const target = event.target;
-		if (target instanceof Element && target.closest('button')) return;
+		if (target instanceof Element && target.closest('button, a')) return;
 		startX = event.clientX;
 		pointerId = event.pointerId;
 		dragging = true;
@@ -166,6 +166,14 @@
 		{/if}
 
 		<span class="name">{entry.display_name}</span>
+
+		{#if !inBasket && entry.resolution_status === 'resolved' && entry.canonical_item_id}
+			<a
+				class="prefs"
+				href="/items/{entry.canonical_item_id}/preferences?list={entry.list_id}"
+				aria-label="Preferences for {entry.display_name}">Prefs</a
+			>
+		{/if}
 
 		{#if pending}
 			<span
@@ -262,6 +270,17 @@
 	}
 	.in-basket .name {
 		text-decoration: line-through;
+	}
+	.prefs {
+		flex-shrink: 0;
+		padding: 0.2rem 0.5rem;
+		border: 1px solid #cbd5e1;
+		border-radius: 0.4rem;
+		background: #f8fafc;
+		color: #0f766e;
+		font-size: 0.75rem;
+		text-decoration: none;
+		white-space: nowrap;
 	}
 	.pending-marker {
 		flex-shrink: 0;
