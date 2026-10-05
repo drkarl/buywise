@@ -1,5 +1,5 @@
 -- ============================================================================
--- Migration 010: Household store settings (issue #98)
+-- Migration 011: Household store settings (issue #98)
 -- ============================================================================
 -- Per-household disposition of each retailer during plan generation, plus the
 -- "nearby" convenience flag. Sourced from issue #98 (roadmap #114): a household

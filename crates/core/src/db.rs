@@ -814,7 +814,7 @@ mod tests {
             "household_settings",
             // Sub-categories (010, issue #101)
             "subcategories",
-            // Issue #98 (010)
+            // Issue #98 (011)
             "household_store_settings",
         ];
 
