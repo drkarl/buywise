@@ -404,6 +404,33 @@ fn freshness_unknown_when_current_run_is_null() {
         FreshnessConfidence::Unknown
     );
     assert!(reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices).is_none());
+    let freshness = reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf)
+        .expect("freshness reason without a snapshot date");
+    assert_eq!(freshness.snapshot_date, None);
+}
+
+#[test]
+fn older_unknown_freshness_with_known_run_numbers_is_stale() {
+    let input = OptimiserInput::new("hh-1", Some(5), vec![item("milk", "ci-milk", 1)]);
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m", "ci-milk", "p", MatchStatus::Accepted),
+            product("p", Retailer::Tesco),
+            offer("o", "p", 200, Some(3)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.as_ref().expect("single-store plan");
+    assert_eq!(
+        single.lines[0].freshness_confidence,
+        FreshnessConfidence::Unknown
+    );
+    let stale = reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices)
+        .expect("known older fetch run should be stale");
+    assert_eq!(stale.item_indices, vec![0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,15 +2173,18 @@ fn reason_credits_the_cheapest_store_and_reports_coverage() {
     ] {
         let coverage = reason_with(&out, kind, ReasonCode::Coverage)
             .unwrap_or_else(|| panic!("{kind:?} has no coverage reason"));
-        assert!(!coverage.item_indices.is_empty(), "{kind:?} coverage is empty");
+        assert!(
+            !coverage.item_indices.is_empty(),
+            "{kind:?} coverage is empty"
+        );
     }
     let coverage = reason_with(&out, PlanKind::BestSingle, ReasonCode::Coverage).expect("coverage");
     assert_eq!(coverage.item_indices, vec![0, 1]);
     assert_eq!(coverage.cents, Some(320));
 
     // The rejected Tesco alternative is reported like-for-like (same coverage).
-    let rejected = reason_with(&out, PlanKind::BestSingle, ReasonCode::RejectedStore)
-        .expect("rejected store");
+    let rejected =
+        reason_with(&out, PlanKind::BestSingle, ReasonCode::RejectedStore).expect("rejected store");
     assert_eq!(rejected.retailers, vec![Retailer::Tesco]);
     assert_eq!(rejected.cents, Some(320 - 330));
 
@@ -2165,10 +2195,7 @@ fn reason_credits_the_cheapest_store_and_reports_coverage() {
         .expect("threshold-not-cleared reason");
     assert_eq!(not_cleared.retailers, vec![Retailer::Tesco]);
     assert_eq!(not_cleared.cents, Some(40));
-    assert_eq!(
-        not_cleared.threshold_cents,
-        Some(DEFAULT_THRESHOLD_2_CENTS)
-    );
+    assert_eq!(not_cleared.threshold_cents, Some(DEFAULT_THRESHOLD_2_CENTS));
 }
 
 #[test]
@@ -2470,10 +2497,7 @@ fn reason_reports_price_date_and_stale_lines() {
 }
 
 #[test]
-fn every_published_plan_carries_at_least_two_reasons() {
-    // Acceptance (issue #103): each plan card shows two to four reasons. The core
-    // emits every applicable reason; the card caps the display at four. This
-    // guards the lower bound, so a plan can never drop to a single lonely reason.
+fn every_published_plan_carries_coverage_and_freshness_reasons() {
     let out = run(&two_by_two_input(), two_by_two_rows());
     for kind in [
         PlanKind::Recommended,
@@ -2481,9 +2505,8 @@ fn every_published_plan_carries_at_least_two_reasons() {
         PlanKind::BestTwoStore,
         PlanKind::TheoreticalMinimum,
     ] {
-        let count = out.reasons.iter().filter(|r| r.plan == kind).count();
-        assert!((2..=4).contains(&count), "{kind:?} has {count} reasons");
         assert!(reason_with(&out, kind, ReasonCode::Coverage).is_some());
+        assert!(reason_with(&out, kind, ReasonCode::PriceAsOf).is_some());
     }
 }
 
@@ -2520,7 +2543,8 @@ fn reasons_stay_consistent_with_the_plan_lines_they_describe() {
             !(reason.item_indices.is_empty()
                 && reason.retailers.is_empty()
                 && reason.cents.is_none()
-                && reason.snapshot_date.is_none()),
+                && reason.snapshot_date.is_none())
+                || reason.code == ReasonCode::PriceAsOf,
             "reason carries no facts: {reason:?}"
         );
     }

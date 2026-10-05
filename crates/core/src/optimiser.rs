@@ -494,10 +494,11 @@ pub enum ReasonCode {
     NoKnownPriceAnywhere,
     /// `item_indices` could not be resolved to a catalogue item at all.
     UnresolvedItems,
-    /// `item_indices` are lines at `retailers[0]` whose price is not from the
-    /// latest successful source run.
+    /// `item_indices` are lines at `retailers` whose price is not from the latest
+    /// successful source run.
     StalePrices,
-    /// `snapshot_date` is the latest source snapshot date among this plan's offers.
+    /// `snapshot_date` is the latest source snapshot date among this plan's
+    /// offers, or `None` when none of them has a recorded date.
     PriceAsOf,
     /// The recommended two-store split's saving (`cents`) clears the convenience
     /// bar (`threshold_cents`) for the store(s) it adds in `retailers`.
@@ -1435,7 +1436,7 @@ struct ReasonContext<'a> {
 
 /// Build the deterministic reasons for all published plans (issue #103).
 ///
-/// Each plan's reasons are ordered most-important-first and capped at four.
+/// Each plan's reasons are ordered most-important-first.
 /// Reasons are derived from the plan's actual lines plus the run's
 /// constraints, threshold and known price dates, so they are traceable and
 /// reproducible — never generated text.
@@ -1739,37 +1740,57 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                 .and_then(|c| c.offer.source_snapshot_date.clone())
         })
         .max();
-    if let Some(date) = as_of {
+    out.push(reason(
+        kind,
+        ReasonCode::PriceAsOf,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        as_of,
+    ));
+
+    let stale_lines: Vec<&PlanLine> = plan
+        .lines
+        .iter()
+        .filter(|line| {
+            let Some(offer) = ctx
+                .comp
+                .best_per_item
+                .get(&line.item_index)
+                .and_then(|by_retailer| by_retailer.get(&line.retailer))
+                .map(|candidate| &candidate.offer)
+            else {
+                return false;
+            };
+            match (
+                ctx.input.current_source_run_number,
+                offer.source_successful_run_number_at_fetch,
+            ) {
+                (Some(current), Some(fetched)) => current > fetched,
+                _ => false,
+            }
+        })
+        .collect();
+    if !stale_lines.is_empty() {
+        let stale_retailers: Vec<Retailer> = stale_lines.iter().map(|line| line.retailer).fold(
+            Vec::new(),
+            |mut retailers, retailer| {
+                if !retailers.contains(&retailer) {
+                    retailers.push(retailer);
+                }
+                retailers
+            },
+        );
         out.push(reason(
             kind,
-            ReasonCode::PriceAsOf,
-            Vec::new(),
-            Vec::new(),
+            ReasonCode::StalePrices,
+            stale_lines.iter().map(|line| line.item_index).collect(),
+            stale_retailers,
             None,
             None,
-            Some(date),
+            None,
         ));
-    }
-    for &retailer in &plan.stores {
-        let stale: Vec<usize> = plan
-            .lines
-            .iter()
-            .filter(|l| {
-                l.retailer == retailer && l.freshness_confidence == FreshnessConfidence::Low
-            })
-            .map(|l| l.item_index)
-            .collect();
-        if !stale.is_empty() {
-            out.push(reason(
-                kind,
-                ReasonCode::StalePrices,
-                stale,
-                vec![retailer],
-                None,
-                None,
-                None,
-            ));
-        }
     }
 
     // ---- Stores left out by the household's eligibility settings. ----------
@@ -1801,22 +1822,20 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
     }
 
     out.sort_by_key(|reason| match reason.code {
-        ReasonCode::Coverage => 0,
-        ReasonCode::NoKnownPriceHere
-        | ReasonCode::NoKnownPriceAnywhere
-        | ReasonCode::UnresolvedItems => 1,
-        ReasonCode::PriceAsOf | ReasonCode::StalePrices => 2,
         ReasonCode::ThresholdCleared
         | ReasonCode::ThresholdNotCleared
         | ReasonCode::SplitDropsItems
-        | ReasonCode::MoreComplete
-        | ReasonCode::CoverageDiffers
-        | ReasonCode::RejectedStore => 3,
+        | ReasonCode::MoreComplete => 0,
+        ReasonCode::CoverageDiffers | ReasonCode::RejectedStore => 1,
+        ReasonCode::Coverage => 2,
+        ReasonCode::NoKnownPriceHere
+        | ReasonCode::NoKnownPriceAnywhere
+        | ReasonCode::UnresolvedItems => 3,
+        ReasonCode::PriceAsOf | ReasonCode::StalePrices => 4,
         ReasonCode::BrandRule => 4,
         ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip => 5,
         ReasonCode::CheapestAtStore | ReasonCode::OnlyStoreStocking => 6,
     });
-    out.truncate(4);
     out
 }
 

@@ -701,9 +701,9 @@ async fn build_explanation(
 
 /// Render the core's structured [`PlanReason`]s into per-plan English sentences.
 ///
-/// Reasons are grouped by [`PlanKind`] in card order and keep the core's
-/// most-important-first ordering, so the UI can print the first four of each
-/// plan's list unchanged.
+/// Reasons are grouped by [`PlanKind`] in card order. Choice, coverage, missing
+/// price, and freshness facts are combined or prioritized before the four-card
+/// limit is applied.
 fn render_plan_explanations(
     reasons: &[PlanReason],
     input: &OptimiserInput,
@@ -717,11 +717,70 @@ fn render_plan_explanations(
     ];
     let mut plans = Vec::new();
     for kind in ORDER {
-        let rendered: Vec<String> = reasons
+        let plan_reasons: Vec<&PlanReason> = reasons.iter().filter(|r| r.plan == kind).collect();
+        let mut rendered = Vec::new();
+
+        if let Some(choice) = plan_reasons.iter().find(|reason| {
+            matches!(
+                reason.code,
+                ReasonCode::ThresholdCleared
+                    | ReasonCode::ThresholdNotCleared
+                    | ReasonCode::SplitDropsItems
+                    | ReasonCode::MoreComplete
+                    | ReasonCode::CoverageDiffers
+            )
+        }) {
+            rendered.push(render_reason(choice, input, categories));
+        }
+        if let Some(coverage) = plan_reasons
             .iter()
-            .filter(|r| r.plan == kind)
-            .map(|r| render_reason(r, input, categories))
-            .collect();
+            .find(|reason| reason.code == ReasonCode::Coverage)
+        {
+            rendered.push(render_reason(coverage, input, categories));
+        }
+
+        const GROUPS: [&[ReasonCode]; 2] = [
+            &[
+                ReasonCode::NoKnownPriceHere,
+                ReasonCode::NoKnownPriceAnywhere,
+                ReasonCode::UnresolvedItems,
+            ],
+            &[ReasonCode::PriceAsOf, ReasonCode::StalePrices],
+        ];
+        for codes in GROUPS {
+            let grouped = plan_reasons
+                .iter()
+                .filter(|reason| codes.contains(&reason.code))
+                .map(|reason| render_reason(reason, input, categories))
+                .collect::<Vec<_>>();
+            if !grouped.is_empty() {
+                rendered.push(grouped.join("; "));
+            }
+        }
+
+        for reason in &plan_reasons {
+            if rendered.len() == 4 {
+                break;
+            }
+            if matches!(
+                reason.code,
+                ReasonCode::ThresholdCleared
+                    | ReasonCode::ThresholdNotCleared
+                    | ReasonCode::SplitDropsItems
+                    | ReasonCode::MoreComplete
+                    | ReasonCode::CoverageDiffers
+                    | ReasonCode::Coverage
+                    | ReasonCode::NoKnownPriceHere
+                    | ReasonCode::NoKnownPriceAnywhere
+                    | ReasonCode::UnresolvedItems
+                    | ReasonCode::PriceAsOf
+                    | ReasonCode::StalePrices
+            ) {
+                continue;
+            }
+            rendered.push(render_reason(reason, input, categories));
+        }
+        rendered.truncate(4);
         if !rendered.is_empty() {
             plans.push(PlanExplanation {
                 plan: kind,
@@ -1311,5 +1370,63 @@ mod tests {
         assert_eq!(plans[0].reasons.len(), 2);
         assert_eq!(plans[0].reasons[0], "Prices 1 of 3 basket items for €?");
         assert_eq!(plans[0].reasons[1], "Aldi is cheapest for 1 item (Dairy)");
+    }
+
+    #[test]
+    fn card_reasons_keep_choice_coverage_gaps_and_freshness_with_many_candidates() {
+        let mut basket = input();
+        basket.items[2].canonical_item_id = None;
+        basket.threshold_2_cents = 400;
+        let reasons = vec![
+            PlanReason {
+                retailers: vec![Retailer::Aldi],
+                cents: Some(500),
+                threshold_cents: Some(400),
+                ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::NoKnownPriceHere)
+            },
+            PlanReason {
+                item_indices: vec![1],
+                ..bare(PlanKind::Recommended, ReasonCode::NoKnownPriceAnywhere)
+            },
+            PlanReason {
+                item_indices: vec![2],
+                ..bare(PlanKind::Recommended, ReasonCode::UnresolvedItems)
+            },
+            PlanReason {
+                item_indices: vec![0, 1],
+                cents: Some(300),
+                ..bare(PlanKind::Recommended, ReasonCode::Coverage)
+            },
+            PlanReason {
+                ..bare(PlanKind::Recommended, ReasonCode::PriceAsOf)
+            },
+            PlanReason {
+                item_indices: vec![0, 1],
+                retailers: vec![Retailer::Aldi, Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::StalePrices)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Aldi],
+                ..bare(PlanKind::Recommended, ReasonCode::CheapestAtStore)
+            },
+        ];
+
+        let plans = render_plan_explanations(&reasons, &basket, &categories());
+        let card = &plans[0].reasons;
+        assert_eq!(card.len(), 4);
+        assert!(card[0].contains("above your €4.00 bar"), "{card:?}");
+        assert!(card[1].contains("Prices 2 of 3 basket items"));
+        assert!(card[2].contains("No known price at Tesco"));
+        assert!(card[2].contains("No qualifying price on record anywhere"));
+        assert!(card[2].contains("Could not match 1 item"));
+        assert!(card[3].contains("Prices have no recorded snapshot date"));
+        assert!(card[3].contains("not from the latest run"));
+        assert!(card[3].contains("at Aldi, Tesco"));
     }
 }
