@@ -15,7 +15,7 @@ use super::*;
 use crate::db;
 use crate::domain::{
     MatchStatus, ProductMatch, ProductOffer, Retailer, RetailerProduct, Source, SourceConfidence,
-    SubstitutionPolicy,
+    StoreStatus, SubstitutionPolicy,
 };
 use sqlx::sqlite::SqlitePool;
 
@@ -420,11 +420,28 @@ fn freshness_unknown_when_current_run_is_null() {
 /// takes rice@Tesco + coffee@Aldi = 400 - saving, genuinely using both stores,
 /// so `single.total - two.total = saving`.
 fn recommendation_with_saving(saving_cents: Cents) -> Recommendation {
-    let input = OptimiserInput::new(
+    recommendation_with_saving_and_settings(saving_cents, Vec::new())
+}
+
+/// The two-item Tesco/Aldi basket used by the convenience-threshold tests, with
+/// an explicit household threshold and store settings (issue #98).
+fn two_store_split_input(
+    threshold_2_cents: Cents,
+    store_settings: Vec<StoreSetting>,
+) -> OptimiserInput {
+    let mut input = OptimiserInput::new(
         "hh-1",
         Some(5),
         vec![item("rice", "ci-rice", 1), item("coffee", "ci-coffee", 1)],
     );
+    input.threshold_2_cents = threshold_2_cents;
+    input.store_settings = store_settings;
+    input
+}
+
+/// Priced rows for the two-item split where the two-store plan saves exactly
+/// `saving_cents` over the best single store (see [`recommendation_with_saving`]).
+fn two_store_split_rows(saving_cents: Cents) -> BTreeMap<usize, Rows> {
     let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
     priced.insert(
         0,
@@ -456,7 +473,45 @@ fn recommendation_with_saving(saving_cents: Cents) -> Recommendation {
             ),
         ],
     );
-    run(&input, priced).recommended.expect("recommendation")
+    priced
+}
+
+/// Like [`recommendation_with_saving`], but with household store settings
+/// (issue #98) applied so callers can exercise the nearby/status rules.
+fn recommendation_with_saving_and_settings(
+    saving_cents: Cents,
+    store_settings: Vec<StoreSetting>,
+) -> Recommendation {
+    run(
+        &two_store_split_input(DEFAULT_THRESHOLD_2_CENTS, store_settings),
+        two_store_split_rows(saving_cents),
+    )
+    .recommended
+    .expect("recommendation")
+}
+
+/// A [`StoreSetting`] with the given status/nearby (issue #98).
+fn store_setting(retailer: Retailer, status: StoreStatus, nearby: bool) -> StoreSetting {
+    StoreSetting {
+        retailer,
+        status,
+        nearby,
+    }
+}
+
+/// A single Dunnes item priced at exactly `price_cents`, as a one-entry priced
+/// map (used for the Dunnes status/voucher tests).
+fn dunnes_rows(price_cents: Cents) -> BTreeMap<usize, Rows> {
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m", "ci-hamper", "p", MatchStatus::Accepted),
+            product("p", Retailer::Dunnes),
+            offer("o", "p", price_cents, Some(5)),
+        )],
+    );
+    priced
 }
 
 #[test]
@@ -1747,4 +1802,165 @@ async fn integration_current_source_run_number_helper() {
             .expect("run number"),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Household store settings (issue #98)
+// ---------------------------------------------------------------------------
+
+/// With no store settings and no trip, every retailer stays eligible — the
+/// pre-#98 behaviour. (Regression guard for the new eligibility filter.)
+#[test]
+fn default_store_settings_leave_every_retailer_active() {
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-a", "ci-milk", "p-a", MatchStatus::Accepted),
+                product("p-a", Retailer::Aldi),
+                offer("o-a", "p-a", 100, Some(5)),
+            ),
+            (
+                product_match("m-t", "ci-milk", "p-t", MatchStatus::Accepted),
+                product("p-t", Retailer::Tesco),
+                offer("o-t", "p-t", 150, Some(5)),
+            ),
+        ],
+    );
+    let input = OptimiserInput::new("hh-1", Some(5), vec![item("milk", "ci-milk", 1)]);
+    let out = run(&input, priced);
+    let single = out.best_single.expect("plan");
+    assert_eq!(single.stores, vec![Retailer::Aldi]);
+    assert_eq!(single.total_cents, 100);
+}
+
+/// A store set to `off` is dropped from every plan and from the theoretical
+/// benchmark, even though it is the cheapest.
+#[test]
+fn off_store_is_excluded_from_every_plan() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("milk", "ci-milk", 1)]);
+    input.store_settings = vec![store_setting(Retailer::Aldi, StoreStatus::Off, false)];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-a", "ci-milk", "p-a", MatchStatus::Accepted),
+                product("p-a", Retailer::Aldi),
+                offer("o-a", "p-a", 100, Some(5)),
+            ),
+            (
+                product_match("m-t", "ci-milk", "p-t", MatchStatus::Accepted),
+                product("p-t", Retailer::Tesco),
+                offer("o-t", "p-t", 150, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.expect("plan");
+    assert_eq!(single.stores, vec![Retailer::Tesco]);
+    assert_eq!(single.total_cents, 150);
+    let benchmark = out.theoretical_minimum.expect("benchmark");
+    assert_eq!(benchmark.stores, vec![Retailer::Tesco]);
+}
+
+/// An `occasional` store is excluded until the household marks a trip to it.
+#[test]
+fn occasional_store_is_excluded_until_marked_as_a_trip() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("hamper", "ci-hamper", 1)]);
+    input.store_settings = vec![store_setting(
+        Retailer::Dunnes,
+        StoreStatus::Occasional,
+        false,
+    )];
+
+    let out = run(&input, dunnes_rows(1000));
+    assert!(out.best_single.is_none(), "occasional store not on a trip");
+    assert!(out.best_two_store.is_none());
+    assert!(out.theoretical_minimum.is_none());
+
+    input.trip_retailers = vec![Retailer::Dunnes];
+    let out = run(&input, dunnes_rows(1000));
+    let single = out.best_single.expect("plan");
+    assert_eq!(single.stores, vec![Retailer::Dunnes]);
+    assert_eq!(single.total_cents, 1000);
+}
+
+/// Acceptance (issue #98): with Dunnes set to `occasional`, no plan includes it
+/// and no voucher hint is shown unless the household marks a Dunnes trip.
+#[test]
+fn dunnes_voucher_hint_hidden_when_occasional_and_no_trip() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("hamper", "ci-hamper", 1)]);
+    input.store_settings = vec![store_setting(
+        Retailer::Dunnes,
+        StoreStatus::Occasional,
+        false,
+    )];
+
+    // €48.00 would sit in the €45–€50 voucher window, but Dunnes is not eligible,
+    // so no plan carries the hint.
+    let out = run(&input, dunnes_rows(4800));
+    assert!(out.best_single.is_none());
+    assert!(out.theoretical_minimum.is_none());
+
+    // Marking the trip admits Dunnes, and the hint appears.
+    input.trip_retailers = vec![Retailer::Dunnes];
+    let out = run(&input, dunnes_rows(4800));
+    let single = out.best_single.expect("plan");
+    assert_eq!(single.stores, vec![Retailer::Dunnes]);
+    assert_eq!(
+        single.dunnes_voucher_offer_text,
+        Some("add €2.00 more to potentially trigger the €50 voucher".into())
+    );
+}
+
+/// A trip only admits `occasional` stores; an `off` store stays out.
+#[test]
+fn trip_does_not_admit_an_off_store() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("hamper", "ci-hamper", 1)]);
+    input.store_settings = vec![store_setting(Retailer::Dunnes, StoreStatus::Off, false)];
+    input.trip_retailers = vec![Retailer::Dunnes];
+
+    let out = run(&input, dunnes_rows(1000));
+    assert!(out.best_single.is_none());
+    assert!(out.theoretical_minimum.is_none());
+}
+
+/// Acceptance (issue #98): a nearby store is recommended for a smaller saving
+/// than a distant one. A €7.00 saving is below the €10.00 default second-store
+/// bar but above the €5.00 nearby bar, so only the split touching a nearby store
+/// is recommended.
+#[test]
+fn nearby_store_recommended_for_a_smaller_saving_than_a_distant_one() {
+    let distant = recommendation_with_saving_and_settings(700, Vec::new());
+    assert_eq!(distant.kind, RecommendedKind::SingleStore);
+    assert!(!distant.clears_convenience_threshold);
+
+    let nearby = recommendation_with_saving_and_settings(
+        700,
+        vec![store_setting(Retailer::Aldi, StoreStatus::Active, true)],
+    );
+    assert_eq!(nearby.kind, RecommendedKind::TwoStore);
+    assert!(nearby.clears_convenience_threshold);
+    assert_eq!(nearby.two_store_saving_cents, 700);
+}
+
+/// The nearby bar is a floor, not a replacement: a household that set a smaller
+/// threshold than €5 keeps it even when the split touches a nearby store.
+#[test]
+fn nearby_threshold_never_raises_a_smaller_household_threshold() {
+    // Household threshold €3.00 (300) < nearby €5.00 (500); a €4.00 (400) saving
+    // clears €3, so the split is recommended.
+    let input = two_store_split_input(
+        300,
+        vec![store_setting(Retailer::Aldi, StoreStatus::Active, true)],
+    );
+    let rec = run(&input, two_store_split_rows(400))
+        .recommended
+        .expect("recommendation");
+    assert_eq!(rec.kind, RecommendedKind::TwoStore);
+    assert!(rec.clears_convenience_threshold);
 }

@@ -605,3 +605,233 @@ async fn optimise_uses_stored_threshold_and_flips_at_boundary() {
         "an explicit request threshold overrides the stored value: {body:#}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-store settings (issue #98)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/settings` returns all five retailers, defaulting to active and not
+/// nearby, so a household that configures nothing keeps the pre-#98 behaviour.
+#[tokio::test]
+async fn get_settings_returns_all_stores_active_by_default() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let body = json_body(get_settings(&pool, &session).await).await;
+    let stores = body["stores"].as_array().expect("stores array");
+    assert_eq!(stores.len(), 5, "one entry per retailer");
+    let retailers: Vec<&str> = stores
+        .iter()
+        .map(|s| s["retailer"].as_str().unwrap())
+        .collect();
+    assert_eq!(retailers, ["tesco", "dunnes", "supervalu", "aldi", "lidl"]);
+    for store in stores {
+        assert_eq!(store["status"], "active", "default status: {store:#}");
+        assert_eq!(store["nearby"], false, "default nearby: {store:#}");
+    }
+}
+
+/// `PATCH /api/settings` updates a store's status and another's nearby flag; the
+/// change is returned and persists across a fresh `GET`.
+#[tokio::test]
+async fn patch_settings_updates_store_status_and_nearby() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let body = json_body(
+        patch_settings(
+            &pool,
+            &session,
+            serde_json::json!({
+                "stores": [
+                    { "retailer": "dunnes", "status": "occasional" },
+                    { "retailer": "supervalu", "nearby": true }
+                ]
+            }),
+        )
+        .await,
+    )
+    .await;
+    let dunnes = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "dunnes")
+        .unwrap();
+    assert_eq!(dunnes["status"], "occasional");
+    assert_eq!(dunnes["nearby"], false);
+    let supervalu = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "supervalu")
+        .unwrap();
+    assert_eq!(supervalu["nearby"], true);
+    assert_eq!(supervalu["status"], "active");
+
+    // Persisted: a fresh GET reflects both changes.
+    let body = json_body(get_settings(&pool, &session).await).await;
+    let dunnes = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "dunnes")
+        .unwrap();
+    assert_eq!(dunnes["status"], "occasional");
+    let supervalu = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "supervalu")
+        .unwrap();
+    assert_eq!(supervalu["nearby"], true);
+}
+
+/// A store entry that sets neither `status` nor `nearby` changes nothing and is
+/// a 422.
+#[tokio::test]
+async fn patch_settings_store_entry_without_fields_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({ "stores": [{ "retailer": "dunnes" }] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// An unknown retailer id is rejected as 422, and no store row is written.
+#[tokio::test]
+async fn patch_settings_unknown_retailer_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({ "stores": [{ "retailer": "waitrose", "status": "off" }] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = json_body(get_settings(&pool, &session).await).await;
+    for store in body["stores"].as_array().unwrap() {
+        assert_eq!(store["status"], "active", "no store was changed: {body:#}");
+    }
+}
+
+/// Acceptance (issue #98): with Dunnes set to `occasional`, no plan includes
+/// Dunnes and no voucher hint is shown unless the household marks a Dunnes trip.
+#[tokio::test]
+async fn occasional_dunnes_excluded_and_voucher_hidden_unless_trip() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    // The only item is priced at both Tesco (€50.00) and Dunnes (€48.00, inside
+    // the €45–€50 spend-and-save window), so a Dunnes plan would carry the hint.
+    seed_priced_match(&pool, "p-hamper-tesco", "tesco", MILK_ID, 5000).await;
+    seed_priced_match(&pool, "p-hamper-dunnes", "dunnes", MILK_ID, 4800).await;
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-hamper", "list-1", MILK_ID, "hamper", "user-a").await;
+
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({ "stores": [{ "retailer": "dunnes", "status": "occasional" }] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body =
+        json_body(post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await)
+            .await;
+    assert_eq!(
+        body["best_single"]["stores"],
+        serde_json::json!(["tesco"]),
+        "occasional Dunnes must not appear in a plan: {body:#}"
+    );
+    assert!(
+        body["best_single"]["dunnes_voucher_offer_text"].is_null(),
+        "no voucher hint without a Dunnes trip: {body:#}"
+    );
+    for key in ["best_single", "best_two_store", "theoretical_minimum"] {
+        if let Some(plan) = body.get(key).filter(|v| !v.is_null()) {
+            let stores = plan["stores"].as_array().unwrap();
+            assert!(
+                !stores.iter().any(|s| s == "dunnes"),
+                "{key} must not include Dunnes: {body:#}"
+            );
+        }
+    }
+
+    // Marking a Dunnes trip admits it, and the hint appears.
+    let body = json_body(
+        post_optimise(
+            &pool,
+            &session,
+            serde_json::json!({ "list_id": "list-1", "trip_retailers": ["dunnes"] }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body["best_single"]["stores"], serde_json::json!(["dunnes"]));
+    assert_eq!(
+        body["best_single"]["dunnes_voucher_offer_text"],
+        "add €2.00 more to potentially trigger the €50 voucher"
+    );
+}
+
+/// Acceptance (issue #98): a nearby store is recommended for a smaller saving
+/// than a distant one. The two-store split saves €7.00 — under the €10.00 default
+/// bar but over the €5.00 nearby bar — so it is recommended only once the
+/// household marks the added store nearby.
+#[tokio::test]
+async fn nearby_store_lowers_second_store_threshold_end_to_end() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    // Milk: Aldi €3.00 vs Tesco €10.00. Bread: Tesco €10.00 vs Aldi €22.00.
+    // Best single store: Tesco €20.00. Best split: milk@Aldi + bread@Tesco =
+    // €13.00 → saving €7.00, genuinely two stores, adding Aldi.
+    seed_priced_match(&pool, "p-milk-tesco", "tesco", MILK_ID, 1000).await;
+    seed_priced_match(&pool, "p-milk-aldi", "aldi", MILK_ID, 300).await;
+    seed_priced_match(&pool, "p-bread-tesco", "tesco", BREAD_ID, 1000).await;
+    seed_priced_match(&pool, "p-bread-aldi", "aldi", BREAD_ID, 2200).await;
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "milk", "user-a").await;
+    seed_resolved_entry(&pool, "e-bread", "list-1", BREAD_ID, "bread", "user-a").await;
+
+    // Default (distant) split: €7.00 < €10.00 → single store.
+    let body =
+        json_body(post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await)
+            .await;
+    assert_eq!(
+        body["recommended"]["kind"], "single_store",
+        "the split must not clear the default bar: {body:#}"
+    );
+    assert_eq!(body["recommended"]["two_store_saving_cents"], 700);
+
+    // Mark Aldi nearby → €7.00 > €5.00 → the split is recommended.
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({ "stores": [{ "retailer": "aldi", "nearby": true }] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body =
+        json_body(post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await)
+            .await;
+    assert_eq!(
+        body["recommended"]["kind"], "two_store",
+        "a nearby store must lower the second-store bar: {body:#}"
+    );
+    assert_eq!(body["recommended"]["clears_convenience_threshold"], true);
+    assert_eq!(body["recommended"]["two_store_saving_cents"], 700);
+}

@@ -279,7 +279,10 @@
 				{/if}
 			{/if}
 
-			<p class="ledger-link"><a href="/savings">View your savings ledger →</a></p>
+			<p class="ledger-link">
+				<a href="/settings">Store settings →</a>
+				· <a href="/savings">View your savings ledger →</a>
+			</p>
 		</div>
 	{/if}
 </main>

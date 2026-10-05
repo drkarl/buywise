@@ -38,6 +38,14 @@
 //! are single- and two-store only, so threshold-3 has no effect on the plans
 //! today; it is accepted and persisted for forward-compatibility (and validated:
 //! a third store can never be easier to justify than a second).
+//!
+//! # Store settings
+//!
+//! The household's per-retailer settings (issue #98) are read alongside the
+//! thresholds and passed to the core: `active` stores always take part,
+//! `occasional` stores only when the request's `trip_retailers` marks a trip to
+//! them today, and `off` stores never do. The request's `trip_retailers` has no
+//! effect on `active`/`off` stores.
 
 use std::collections::BTreeMap;
 
@@ -51,7 +59,7 @@ use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
     optimise, BasketItem, NeedsConfirmationItem, NoValidOfferItem, OptimiserInput, OptimiserOutput,
-    Recommendation, RecommendedKind, StorePlan, UnresolvedItem, DEFAULT_THRESHOLDS,
+    Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -79,6 +87,12 @@ pub struct OptimiseRequest {
     pub convenience_threshold_2: Option<Cents>,
     /// Third-store convenience threshold in cents; optional (household default).
     pub convenience_threshold_3: Option<Cents>,
+    /// Retailers the household is visiting today (issue #98). An `occasional`
+    /// store listed here takes part in this run's plans; a store left out is not
+    /// planned for even if it is cheap. Optional (defaults to none) and has no
+    /// effect on `active`/`off` stores. Unknown ids are rejected as 422.
+    #[serde(default)]
+    pub trip_retailers: Option<Vec<Retailer>>,
 }
 
 /// Response for `POST /api/optimise`: the four plans, the resolved/unfulfilled
@@ -175,9 +189,25 @@ async fn optimise_list(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let input = build_input_from_list(pool, &household_id, &body.list_id, threshold_2)
+    // Household store settings (issue #98): which retailers take part in plans
+    // and which are nearby. Retailers missing a row default to active/not-nearby
+    // in the core, preserving pre-#98 behaviour. `trip_retailers` admits the
+    // household's occasional stores into this run only.
+    let store_settings = crate::settings::stored_store_settings(pool, &household_id)
         .await
-        .map_err(db_error("optimise_list.build_input"))?;
+        .map_err(db_error("optimise_list.store_settings"))?;
+    let trip_retailers = body.trip_retailers.clone().unwrap_or_default();
+
+    let input = build_input_from_list(
+        pool,
+        &household_id,
+        &body.list_id,
+        threshold_2,
+        store_settings,
+        trip_retailers,
+    )
+    .await
+    .map_err(db_error("optimise_list.build_input"))?;
 
     let output = optimise(pool, &input)
         .await
@@ -287,6 +317,8 @@ async fn build_input_from_list(
     household_id: &str,
     list_id: &str,
     threshold_2_cents: Cents,
+    store_settings: Vec<StoreSetting>,
+    trip_retailers: Vec<Retailer>,
 ) -> Result<OptimiserInput, DbError> {
     // ACTIVE entries only, ordered for determinism (matches lists.rs ordering).
     let rows = sqlx::query_as::<_, (String, Option<String>, String, i64)>(
@@ -350,6 +382,8 @@ async fn build_input_from_list(
 
     let mut input = OptimiserInput::new(household_id, current_run, items);
     input.threshold_2_cents = threshold_2_cents;
+    input.store_settings = store_settings;
+    input.trip_retailers = trip_retailers;
     Ok(input)
 }
 

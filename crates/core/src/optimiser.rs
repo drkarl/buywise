@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{self, DbError};
 use crate::domain::{
     Cents, ConstraintPolicy, FreshnessConfidence, ItemConstraints, MatchStatus, ProductMatch,
-    ProductOffer, Retailer, RetailerProduct, SizeBasis, SubstitutionPolicy,
+    ProductOffer, Retailer, RetailerProduct, SizeBasis, StoreStatus, SubstitutionPolicy,
 };
 use crate::normalise::normalize;
 use sqlx::sqlite::SqlitePool;
@@ -73,6 +73,15 @@ pub const DEFAULT_THRESHOLD_3_CENTS: Cents = 2500;
 /// a household has no stored settings row. Centralised so every caller agrees.
 pub const DEFAULT_THRESHOLDS: (Cents, Cents) =
     (DEFAULT_THRESHOLD_2_CENTS, DEFAULT_THRESHOLD_3_CENTS);
+
+/// Second-store convenience threshold (cents) applied when the two-store split
+/// includes a retailer the household marked as **nearby** (issue #98). A nearby
+/// store is cheap to reach (e.g. SuperValu around the corner), so the extra trip
+/// is worth a smaller saving than the default €10–€15 — €5.00.
+///
+/// The nearby threshold is applied as `min(threshold_2_cents, NEARBY_THRESHOLD_2_CENTS)`
+/// so a household that deliberately sets an even smaller threshold keeps it.
+pub const NEARBY_THRESHOLD_2_CENTS: Cents = 500;
 
 /// Tolerance band for size matching: a product's size must be within ±20% of the
 /// constrained size (and on the same [`SizeBasis`]) to qualify. Phase-0 scope
@@ -113,6 +122,20 @@ pub struct BasketItem {
     pub constraints: Option<ItemConstraints>,
 }
 
+/// One household's stored disposition of a retailer (issue #98): whether it takes
+/// part in plan generation and whether its trip is cheap enough to lower the
+/// second-store convenience threshold. Carried on [`OptimiserInput`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoreSetting {
+    /// The retailer this setting applies to.
+    pub retailer: Retailer,
+    /// Whether the store is active, occasional (trip-gated) or off.
+    pub status: StoreStatus,
+    /// True when the store is close by, so a two-store split including it clears
+    /// the lower [`NEARBY_THRESHOLD_2_CENTS`] bar.
+    pub nearby: bool,
+}
+
 /// Everything the optimiser needs for one run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimiserInput {
@@ -126,11 +149,18 @@ pub struct OptimiserInput {
     pub threshold_2_cents: Cents,
     /// The basket lines.
     pub items: Vec<BasketItem>,
+    /// Per-retailer household settings (issue #98). Empty ⇒ every retailer is
+    /// [`StoreStatus::Active`] and none is nearby — the pre-#98 behaviour.
+    pub store_settings: Vec<StoreSetting>,
+    /// Retailers the household is visiting today, which admit their
+    /// [`StoreStatus::Occasional`] stores into this run's plans. Empty by default.
+    pub trip_retailers: Vec<Retailer>,
 }
 
 impl OptimiserInput {
     /// Construct an input with the default convenience threshold
-    /// ([`DEFAULT_THRESHOLD_2_CENTS`]).
+    /// ([`DEFAULT_THRESHOLD_2_CENTS`]) and no store preferences (every retailer
+    /// active, none nearby, no trip) — i.e. pre-#98 behaviour.
     pub fn new(
         household_id: impl Into<String>,
         current_source_run_number: Option<i64>,
@@ -141,7 +171,38 @@ impl OptimiserInput {
             current_source_run_number,
             threshold_2_cents: DEFAULT_THRESHOLD_2_CENTS,
             items,
+            store_settings: Vec::new(),
+            trip_retailers: Vec::new(),
         }
+    }
+
+    /// The stored status for `retailer`, or [`StoreStatus::Active`] when the
+    /// household has no setting for it (the default that preserves pre-#98
+    /// behaviour).
+    fn store_status(&self, retailer: Retailer) -> StoreStatus {
+        self.store_settings
+            .iter()
+            .find(|s| s.retailer == retailer)
+            .map(|s| s.status)
+            .unwrap_or(StoreStatus::Active)
+    }
+
+    /// Whether `retailer` is eligible for this run's plans: an active store always
+    /// is; an occasional store is eligible only when listed in [`Self::trip_retailers`];
+    /// an off store never is.
+    fn is_eligible(&self, retailer: Retailer) -> bool {
+        match self.store_status(retailer) {
+            StoreStatus::Active => true,
+            StoreStatus::Occasional => self.trip_retailers.contains(&retailer),
+            StoreStatus::Off => false,
+        }
+    }
+
+    /// Whether the household marked `retailer` as nearby.
+    fn is_nearby(&self, retailer: Retailer) -> bool {
+        self.store_settings
+            .iter()
+            .any(|s| s.retailer == retailer && s.nearby)
     }
 }
 
@@ -615,10 +676,15 @@ pub fn optimise_core(
     // caller flagged as unresolved/no-offer never appear here.
     let priced_items: Vec<usize> = best_per_item_retailer.keys().copied().collect();
 
-    // The retailers that appear anywhere, in a stable order.
+    // The retailers that appear anywhere and are eligible for this run, in a
+    // stable order. Stores the household set to `off` (or left `occasional`
+    // without a trip today) never seed a plan, so they cannot appear anywhere in
+    // the output — including the Dunnes spend-and-save voucher hint, which is
+    // driven purely by the Dunnes lines a plan carries (issue #98).
     let mut all_retailers: Vec<Retailer> = best_per_item_retailer
         .values()
         .flat_map(|m| m.keys().copied())
+        .filter(|&r| input.is_eligible(r))
         .collect();
     all_retailers.sort_by_key(|r| r.as_db_str());
     all_retailers.dedup();
@@ -818,10 +884,18 @@ fn build_theoretical_minimum(
             Some(m) => m,
             None => continue,
         };
-        // The globally cheapest candidate for this item.
+        // The globally cheapest candidate for this item among eligible stores.
+        // An ineligible store (off, or occasional without a trip today) is never
+        // routed, so it cannot appear in the benchmark either (issue #98).
         let cheapest = by_retailer
             .values()
-            .reduce(|acc, c| if is_cheaper(c, acc) { c } else { acc })?;
+            .filter(|c| input.is_eligible(c.retailer))
+            .reduce(|acc, c| if is_cheaper(c, acc) { c } else { acc });
+        let Some(cheapest) = cheapest else {
+            // No eligible store prices this item; it is missing from the
+            // benchmark (and counted missing via `priced_items.len()`).
+            continue;
+        };
         if !stores.contains(&cheapest.retailer) {
             stores.push(cheapest.retailer);
         }
@@ -929,10 +1003,16 @@ fn dunnes_voucher_text(lines: &[PlanLine]) -> Option<String> {
 /// then does cost matter, and only if the saving strictly exceeds
 /// `threshold_2_cents`. Otherwise the single store is recommended. This is the
 /// fulfilment rule again: cost can never override missing-item count.
+///
+/// `nearby` lists the retailers the household marked as close by (issue #98).
+/// When the two-store split includes any of them, the extra trip is cheap, so the
+/// bar drops to `min(threshold_2_cents, NEARBY_THRESHOLD_2_CENTS)`. A split of
+/// two distant stores keeps the full threshold.
 fn recommend(
     best_single: Option<StorePlan>,
     best_two_store: Option<StorePlan>,
     threshold_2_cents: Cents,
+    nearby: &[Retailer],
 ) -> Option<Recommendation> {
     match (best_single, best_two_store) {
         (Some(single), Some(two)) => {
@@ -942,7 +1022,15 @@ fn recommend(
             // less-complete split never wins.
             let split_more_complete = two.missing_count < single.missing_count;
             let split_equal_complete = two.missing_count == single.missing_count;
-            let clears_threshold = saving > threshold_2_cents;
+            // A split touching a nearby store needs a smaller saving than a split
+            // of two distant stores. `min` keeps an already-smaller household
+            // threshold intact.
+            let effective_threshold = if two.stores.iter().any(|r| nearby.contains(r)) {
+                threshold_2_cents.min(NEARBY_THRESHOLD_2_CENTS)
+            } else {
+                threshold_2_cents
+            };
+            let clears_threshold = saving > effective_threshold;
 
             if split_more_complete || (split_equal_complete && clears_threshold) {
                 Some(Recommendation {
@@ -1293,10 +1381,15 @@ fn build_output(
     // every plan's missing_count as a constant (see StorePlan::missing_count).
     let no_offer_count = classification.no_valid_offer.len();
     let core = optimise_core(input, &candidates, no_offer_count);
+    let nearby: Vec<Retailer> = Retailer::ALL
+        .into_iter()
+        .filter(|r| input.is_nearby(*r))
+        .collect();
     let recommended = recommend(
         core.best_single.clone(),
         core.best_two_store.clone(),
         input.threshold_2_cents,
+        &nearby,
     );
     OptimiserOutput {
         best_single: core.best_single,

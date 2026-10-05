@@ -109,6 +109,31 @@ async fn migration_005_backfills_household_settings_defaults() {
     assert_eq!(threshold_3, 2500, "default threshold_3 is €25.00");
 }
 
+/// Migration 010 back-fills one `household_store_settings` row per existing
+/// household × retailer, all `active` and not nearby (issue #98), so a household
+/// that configures nothing keeps the pre-#98 planning behaviour.
+#[tokio::test]
+async fn migration_010_backfills_household_store_defaults() {
+    let pool = migrated_pool().await;
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT retailer, status, nearby FROM household_store_settings \
+         WHERE household_id = ? ORDER BY retailer",
+    )
+    .bind(HOUSEHOLD)
+    .fetch_all(&pool)
+    .await
+    .expect("back-filled store settings rows");
+
+    assert_eq!(rows.len(), 5, "one row per retailer");
+    let retailers: Vec<&str> = rows.iter().map(|(r, _, _)| r.as_str()).collect();
+    assert_eq!(retailers, ["aldi", "dunnes", "lidl", "supervalu", "tesco"]);
+    for (retailer, status, nearby) in rows {
+        assert_eq!(status, "active", "{retailer} defaults to active");
+        assert_eq!(nearby, 0, "{retailer} defaults to not nearby");
+    }
+}
+
 /// Helper: a `list_entries` INSERT with the given (resolution_status,
 /// canonical_item_id, resolution_candidates_json) triple must be rejected by a
 /// CHECK constraint. All other columns are filled with valid values so the only
