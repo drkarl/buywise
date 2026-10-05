@@ -166,7 +166,8 @@
 		savedMessage = '';
 		saveError = '';
 
-		const allowed = parseBrandList(allowedBrandsText);
+		const allowed =
+			policy === 'allowed_set' ? parseBrandList(allowedBrandsText) : [];
 		const excluded = parseBrandList(excludedBrandsText);
 		const trimmedBrand = brand.trim();
 
@@ -360,7 +361,11 @@
 								{#if match.size_text}<span class="product-meta">{match.size_text}</span>{/if}
 								<span class="product-meta">{retailerLabel(match.retailer)}</span>
 								<span class="product-status">
-									{match.status === 'rejected' ? 'Rejected' : 'Allowed'}
+									{match.status === 'rejected'
+										? 'Rejected'
+										: match.status === 'pending'
+											? 'Awaiting review'
+											: 'Allowed'}
 								</span>
 							</span>
 							{#if match.status === 'rejected'}

@@ -126,6 +126,30 @@ describe('item preferences', () => {
 		});
 	});
 
+	it('clears allowed brands when switching to any product', async () => {
+		const preferences = basePreferences();
+		preferences.default_constraint_policy = 'allowed_set';
+		preferences.constraints.allowed_brands = ['Branston'];
+		const fetchMock = stubPreferences(preferences);
+		render(Page);
+		await waitFor(() => expect(screen.getByLabelText('Rule')).toBeTruthy());
+
+		await fireEvent.change(screen.getByLabelText('Rule'), { target: { value: 'any' } });
+		await fireEvent.click(screen.getByText('Save preferences'));
+
+		await waitFor(() => expect(putBody(fetchMock)?.allowed_brands).toEqual([]));
+	});
+
+	it('labels pending matches as awaiting review', async () => {
+		const preferences = basePreferences();
+		preferences.matches[0].status = 'pending';
+		stubPreferences(preferences);
+		render(Page);
+
+		await waitFor(() => expect(screen.getByText('Awaiting review')).toBeTruthy());
+		expect(screen.queryByText('Allowed')).toBeNull();
+	});
+
 	it('refuses to save a brand rule without a brand', async () => {
 		const fetchMock = stubPreferences(basePreferences());
 		render(Page);
