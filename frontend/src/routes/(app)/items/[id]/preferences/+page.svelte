@@ -474,6 +474,14 @@
 									onclick={() => decideMatch(match.retailer_product_id, 'undo')}>Undo</button
 								>
 							{:else}
+								{#if match.status === 'pending'}
+									<button
+										type="button"
+										class="restore"
+										disabled={matchBusy.has(match.retailer_product_id)}
+										onclick={() => decideMatch(match.retailer_product_id, 'accept')}>Match</button
+									>
+								{/if}
 								<button
 									type="button"
 									class="reject"

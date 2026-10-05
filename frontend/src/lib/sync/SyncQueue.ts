@@ -141,6 +141,7 @@ async function applySuccess(mutationId: number, res: MutationResponse): Promise<
       // newer row.
       const existing = await db.list_entries.get(entry.id);
       if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+        if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
         // The mutation entity never carries grouping keys, so derive them from
         // the cached catalogue (same as the SSE/snapshot apply paths). Without
         // this a confirmed mutation (e.g. mark_bought) would overwrite a

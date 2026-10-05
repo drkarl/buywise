@@ -266,6 +266,24 @@ async fn get_preferences(
     get_preferences_with_state(AppState::new(pool.clone()), session, item_id).await
 }
 
+async fn post_mutation(pool: &SqlitePool, session: &Session, body: Value) -> (StatusCode, Value) {
+    let resp = app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mutations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={}", session.session))
+                .header("X-CSRF-Token", &session.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, json_body(resp).await)
+}
+
 async fn post_feedback_with_state(
     state: AppState,
     session: &Session,
@@ -591,6 +609,36 @@ async fn list_snapshot_marks_unmatched_items_until_matched() {
         .find(|e| e["id"] == "e-beans")
         .expect("entry present");
     assert_eq!(entry["needs_match"], false);
+}
+
+/// A single mutation entity carries the same unmatched-coverage fact as a snapshot.
+#[tokio::test]
+async fn mutation_entity_marks_an_unmatched_resolved_entry() {
+    let pool = setup_pool().await;
+    let session = seed_unmatched_household(&pool).await;
+    seed_list(&pool, "list-a", HOUSEHOLD).await;
+    seed_resolved_entry(&pool, "e-beans", "list-a", "user-a").await;
+
+    let (status, body) = post_mutation(
+        &pool,
+        &session,
+        json!({
+            "client_mutation_id": "mutation-needs-match",
+            "device_id": "device-a",
+            "list_id": "list-a",
+            "base_revision": 0,
+            "entity_type": "list_entry",
+            "entity_id": "e-beans",
+            "operation_type": "set_quantity",
+            "payload": { "quantity": 2 },
+            "created_at_client": "2026-06-03T00:00:00.000Z"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["entity"]["needs_match"], true);
+    assert_eq!(body["entity"]["quantity"], 2);
 }
 
 /// A fake LLM that reverses the candidate order it is given.

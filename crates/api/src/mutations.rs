@@ -136,9 +136,7 @@ pub struct MutationResponse {
 }
 
 /// A `list_entries` row as returned in [`MutationResponse::entity`]. Mirrors the
-/// `EntryView` shape `lists.rs` returns so a client decodes both identically —
-/// except `EntryView.needs_match` (issue #108), which is a catalogue-wide fact
-/// computed only for the list snapshot and absent from a single mutation's entity.
+/// `EntryView` shape `lists.rs` returns so a client decodes both identically.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EntityView {
     /// `list_entries.id`.
@@ -173,53 +171,63 @@ pub struct EntityView {
     pub created_at: String,
     /// `list_entries.updated_at`.
     pub updated_at: String,
+    /// Whether an active, resolved entry lacks an accepted or suggested match.
+    pub needs_match: bool,
 }
 
-/// Every `list_entries` column, in a fixed SELECT order, as a flat tuple sqlx can
-/// decode. Shared by the load + render helpers.
-pub(crate) type EntryRow = (
-    String,         // id
-    String,         // list_id
-    Option<String>, // canonical_item_id
-    String,         // resolution_status
-    Option<String>, // resolution_candidates_json
-    String,         // raw_text
-    String,         // display_name
-    String,         // added_by
-    i64,            // quantity
-    String,         // status
-    Option<String>, // bought_by
-    Option<String>, // bought_at
-    String,         // effective_constraint_hash
-    i64,            // last_updated_revision
-    String,         // created_at
-    String,         // updated_at
-);
+/// Every list-entry field plus current match coverage, decoded from a fixed SELECT.
+#[derive(sqlx::FromRow)]
+pub(crate) struct EntryRow {
+    id: String,
+    list_id: String,
+    canonical_item_id: Option<String>,
+    resolution_status: String,
+    resolution_candidates_json: Option<String>,
+    raw_text: String,
+    display_name: String,
+    added_by: String,
+    quantity: i64,
+    status: String,
+    bought_by: Option<String>,
+    bought_at: Option<String>,
+    effective_constraint_hash: String,
+    last_updated_revision: i64,
+    created_at: String,
+    updated_at: String,
+    needs_match: i64,
+}
 
-/// The `list_entries` SELECT column list, matching [`EntryRow`] order.
+/// The list-entry fields plus current match coverage, matching [`EntryRow`] order.
 pub(crate) const ENTRY_COLUMNS: &str = "id, list_id, canonical_item_id, resolution_status, \
      resolution_candidates_json, raw_text, display_name, added_by, quantity, status, \
-     bought_by, bought_at, effective_constraint_hash, last_updated_revision, created_at, updated_at";
+     bought_by, bought_at, effective_constraint_hash, last_updated_revision, created_at, updated_at, \
+     CASE WHEN list_entries.status = 'active' AND list_entries.resolution_status = 'resolved' \
+       AND list_entries.canonical_item_id IS NOT NULL AND NOT EXISTS ( \
+         SELECT 1 FROM shopping_lists sl JOIN product_matches pm ON pm.household_id = sl.household_id \
+         WHERE sl.id = list_entries.list_id AND pm.canonical_item_id = list_entries.canonical_item_id \
+           AND pm.status IN ('accepted', 'suggested') \
+       ) THEN 1 ELSE 0 END AS needs_match";
 
 impl From<EntryRow> for EntityView {
     fn from(r: EntryRow) -> Self {
         EntityView {
-            id: r.0,
-            list_id: r.1,
-            canonical_item_id: r.2,
-            resolution_status: r.3,
-            resolution_candidates_json: r.4,
-            raw_text: r.5,
-            display_name: r.6,
-            added_by: r.7,
-            quantity: r.8,
-            status: r.9,
-            bought_by: r.10,
-            bought_at: r.11,
-            effective_constraint_hash: r.12,
-            last_updated_revision: r.13,
-            created_at: r.14,
-            updated_at: r.15,
+            id: r.id,
+            list_id: r.list_id,
+            canonical_item_id: r.canonical_item_id,
+            resolution_status: r.resolution_status,
+            resolution_candidates_json: r.resolution_candidates_json,
+            raw_text: r.raw_text,
+            display_name: r.display_name,
+            added_by: r.added_by,
+            quantity: r.quantity,
+            status: r.status,
+            bought_by: r.bought_by,
+            bought_at: r.bought_at,
+            effective_constraint_hash: r.effective_constraint_hash,
+            last_updated_revision: r.last_updated_revision,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            needs_match: r.needs_match != 0,
         }
     }
 }

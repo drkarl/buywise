@@ -24,8 +24,8 @@ export interface LocalListEntry {
   /**
    * Whether the entry is resolved but has no usable product match, so no price
    * can be produced for it (issue #108); drives the "Needs match" prompt on the
-   * list row. Carried only by the full list snapshot, so it is absent on entries
-   * received through a single mutation/SSE event.
+   * list row. Older mutation/SSE payloads may omit it; local upserts preserve the
+   * known value in that case.
    */
   needs_match?: boolean;
 }
