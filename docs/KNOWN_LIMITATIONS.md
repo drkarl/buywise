@@ -260,10 +260,55 @@ scoring still runs on each preferences read and decision.
 **Follow-up.** Reduce repeated catalogue scans and LLM ranking calls without hiding newly available
 candidates.
 
+## Purchase suggestions
+
+Estimates, per canonical item, the typical interval between check-offs (median days, minimum three
+distinct purchase days) and surfaces items near due in a separate Suggested section on the list
+page; confirming adds the item to the list and dismissing pushes the next suggestion one typical
+interval later (issue #106, part of roadmap #114). Statistics only — no AI.
+
+### 1. History is check-off driven, household-scoped, and ignores unresolved check-offs
+
+**What happens.** A purchase is recorded only when a RESOLVED list entry is checked off
+(`purchase_events`, source `check_off`, written by `apply_mark_bought` in
+`crates/api/src/mutations.rs`). Checking off an unresolved or ambiguous entry records nothing,
+because there is no canonical item to attribute it to. Evidence is keyed by household, not list, so
+an item still active on one list is not excluded from the Suggested section of a *different* list
+of the same household. The `purchase_events.source` column exists so a later receipt/import source
+can be added, but no such importer is built (a non-goal of this issue).
+
+**Why accepted.** The captain's version-one scope treats check-offs as a proxy for purchases,
+distinct from receipt-confirmed purchases, and explicitly excludes importing purchases. Resolved
+check-off covers the household-staples flow; resolution normally happens moments after an item is
+added.
+
+**Workaround.** Check off items only after they resolve (the list flags unresolved/ambiguous
+entries), or add an item manually if a suggestion is missing.
+
+**Follow-up.** Attribute a check-off to its canonical item once resolution completes, add a receipt
+or import source, and decide whether suggestions should be scoped per list rather than per
+household.
+
+### 2. A dismissal is time-limited, cannot be undone, and does not mean "never suggest this again"
+
+**What happens.** Dismissing a suggestion appends a `purchase_dismissals` row and suppresses the
+item until one typical interval has elapsed since the dismissal, after which it is suggested again.
+The table is append-only and there is no UI to un-dismiss or to permanently opt an item out.
+
+**Why accepted.** The captain's scope is "dismissals push the next suggestion later"; a permanent
+opt-out and an undo are larger product surfaces left to a follow-up. Resurfacing next cycle matches
+the "suggest what the household is likely to need" intent.
+
+**Workaround.** Dismiss again if the item is still not wanted, or simply ignore the suggestion —
+nothing is added to the list without confirmation.
+
+**Follow-up.** Add a "don't suggest this again" (permanent opt-out) option and a way to review or
+undo dismissals.
+
 ## Per-store category rules
 
 Rules that keep a store out of plan generation for chosen categories (issue #99, the Aldi
-packaged-food case). Storage: `household_store_category_rules` (migration 013); enforcement in
+packaged-food case). Storage: `household_store_category_rules` (migration 014); enforcement in
 `crates/core/src/optimiser.rs`; settings surface at `frontend/src/routes/(app)/settings/+page.svelte`.
 
 ### 1. Category rules apply only to plan generation

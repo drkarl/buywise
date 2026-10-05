@@ -52,39 +52,49 @@ export interface SseClientOptions {
 }
 
 /** Applies a `mutation` event: authoritative upsert + monotonic revision bump. */
-export async function applyMutationEvent(data: SseMutationData): Promise<void> {
-  const entry = toLocalEntry(data.entity);
+export async function applyMutationEvent(
+  data: SseMutationData,
+  fallbackListId?: string
+): Promise<void> {
+  // A null entity (e.g. `dismiss_suggestion`, issue #106) touches no entry but
+  // still advances the list revision. The SSE client knows its list id, so the
+  // caller passes it as a fallback.
+  const entry = data.entity ? toLocalEntry(data.entity) : null;
+  const listId = entry?.list_id ?? fallbackListId;
   await db.transaction('rw', db.list_entries, db.list_meta, db.item_categories, async () => {
-    // Derive the grouping keys (category + sub-category) from the cached
-    // catalogue (P2-T6, issue #101) so shopping mode can bucket this synced
-    // entry. A cache miss leaves them undefined ("Other"); a later catalogue
-    // (re)fetch backfills them (see catalogue.ts backfill).
-    await resolveEntryGrouping(entry);
-    // Per-entry monotonic guard: only overwrite the local row if the incoming
-    // entity is at least as new (by `last_updated_revision`). Events for the same
-    // entry can arrive out of order across the SSE and drain paths (e.g. an SSE
-    // delete at rev 3 racing a delayed POST response at rev 2); writing the older
-    // entity would clobber the newer one while meta stays advanced, leaving a
-    // stale row a reconnect won't repair. Read-modify-write stays in this txn.
-    const existing = await db.list_entries.get(entry.id);
-    if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
-      if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
-      await db.list_entries.put(entry);
+    if (entry) {
+      // Derive the grouping keys (category + sub-category) from the cached
+      // catalogue (P2-T6, issue #101) so shopping mode can bucket this synced
+      // entry. A cache miss leaves them undefined ("Other"); a later catalogue
+      // (re)fetch backfills them (see catalogue.ts backfill).
+      await resolveEntryGrouping(entry);
+      // Per-entry monotonic guard: only overwrite the local row if the incoming
+      // entity is at least as new (by `last_updated_revision`). Events for the same
+      // entry can arrive out of order across the SSE and drain paths (e.g. an SSE
+      // delete at rev 3 racing a delayed POST response at rev 2); writing the older
+      // entity would clobber the newer one while meta stays advanced, leaving a
+      // stale row a reconnect won't repair. Read-modify-write stays in this txn.
+      const existing = await db.list_entries.get(entry.id);
+      if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+        if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
+        await db.list_entries.put(entry);
+      }
     }
-    const meta = await db.list_meta.get(entry.list_id);
+    if (!listId) return; // no entity and no known list — nothing to advance
+    const meta = await db.list_meta.get(listId);
     const now = new Date().toISOString();
     if (meta) {
       const next =
         data.server_revision > meta.current_revision
           ? data.server_revision
           : meta.current_revision;
-      await db.list_meta.update(entry.list_id, {
+      await db.list_meta.update(listId, {
         current_revision: next,
         last_synced_at: now
       });
     } else {
       await db.list_meta.put({
-        id: entry.list_id,
+        id: listId,
         name: '',
         current_revision: data.server_revision,
         last_synced_at: now
@@ -365,7 +375,9 @@ export class SseClient {
     };
 
     source.addEventListener('mutation', (event) => {
-      void this.handle(() => applyMutationEvent(JSON.parse(event.data) as SseMutationData));
+      void this.handle(() =>
+        applyMutationEvent(JSON.parse(event.data) as SseMutationData, this.listId)
+      );
     });
     source.addEventListener('full_snapshot', (event) => {
       void this.handle(() =>

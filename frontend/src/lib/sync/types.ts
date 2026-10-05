@@ -49,7 +49,12 @@ export interface MutationResponse {
   client_mutation_id: string;
   status: 'accepted' | 'merged';
   server_revision: number;
-  entity: ServerListEntry;
+  /**
+   * The affected entry, or `null` for an operation that touches no list entry
+   * (`dismiss_suggestion`, issue #106). Callers must skip the local upsert when
+   * it is null but still advance the revision and mark the mutation confirmed.
+   */
+  entity: ServerListEntry | null;
 }
 
 /** `GET /api/list/:id` response (plan P1-T3). `current_revision` is top-level. */
@@ -63,7 +68,8 @@ export interface ListSnapshot {
 /** SSE `mutation` event `data` payload (plan P1-T5, design §11). */
 export interface SseMutationData {
   server_revision: number;
-  entity: ServerListEntry;
+  /** `null` for an operation that touches no list entry (`dismiss_suggestion`). */
+  entity: ServerListEntry | null;
 }
 
 /**

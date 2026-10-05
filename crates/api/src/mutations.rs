@@ -70,6 +70,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use buywise_core::constraint_hash::effective_constraint_hash;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Sqlite, Transaction};
@@ -523,7 +524,7 @@ async fn apply_mutation(
     match req.operation_type.as_str() {
         "add_item" => apply_add_item(tx, user, household_id, req).await,
         "delete_item" => apply_delete_item(tx, user, req).await,
-        "mark_bought" => apply_mark_bought(tx, user, req).await,
+        "mark_bought" => apply_mark_bought(tx, user, household_id, req).await,
         "mark_skipped" => apply_mark_skipped(tx, req).await,
         "move_to_list" => apply_move_to_list(tx, user, req).await,
         "rename_item" => apply_rename_item(tx, req).await,
@@ -534,6 +535,11 @@ async fn apply_mutation(
         // canonical mapping as an `accepted_match` alias — both writes inside this
         // one transaction (atomic; never a half-applied bind/alias).
         "resolve_alias" => apply_resolve_alias(tx, household_id, req).await,
+        // dismiss_suggestion records the household's "not now" for a computed
+        // purchase suggestion (issue #106). It touches no list entry: the
+        // dismissal table gains a row, and the response carries a null entity
+        // (the client advances the revision and refreshes suggestions).
+        "dismiss_suggestion" => apply_dismiss_suggestion(tx, user, household_id, req).await,
         // reject_match / set_constraint remain accept-and-log (last-write-wins,
         // no extra row mutation): the richer field semantics land later. The
         // targeted entry is still verified to belong to `req.list_id` (the shared
@@ -726,19 +732,38 @@ async fn apply_delete_item(
 /// `mark_bought`: set status `bought`, stamp `bought_by`/`bought_at`. If the
 /// entry was already `deleted`, the delete wins (status stays `deleted`) and the
 /// bought action is recorded in `list_entry_events` instead.
+///
+/// A successful check-off of a RESOLVED entry also appends a `purchase_events`
+/// row (source `check_off`) so the household's purchase history builds up from
+/// normal use (issue #106). `move_to_list` removes that evidence again when the
+/// check-off is undone. An unresolved entry has no canonical item to attribute
+/// the purchase to, so no evidence is written for it.
 async fn apply_mark_bought(
     tx: &mut Transaction<'_, Sqlite>,
     user: &AuthenticatedUser,
+    household_id: &str,
     req: &MutationRequest,
 ) -> Result<ApplyOutcome, StatusCode> {
     let entry_id = require_entry(req)?;
     let now = buywise_core::db::now_iso();
-    let bought_at = string_field(&req.payload, "bought_at").unwrap_or_else(|| now.clone());
+    let server_now = DateTime::parse_from_rfc3339(&now)
+        .expect("now_iso returns RFC3339")
+        .with_timezone(&Utc);
+    let bought_at = string_field(&req.payload, "bought_at")
+        .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc).min(server_now))
+        .unwrap_or(server_now)
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
 
-    let prior_status = entry_status(tx, &entry_id, &req.list_id)
-        .await
-        .map_err(db_error("apply_mark_bought.lookup"))?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, canonical_item_id FROM list_entries WHERE id = ?1 AND list_id = ?2",
+    )
+    .bind(&entry_id)
+    .bind(&req.list_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error("apply_mark_bought.lookup"))?;
+    let (prior_status, canonical_item_id) = row.ok_or(StatusCode::NOT_FOUND)?;
 
     // Delete wins over a concurrent mark_bought: do not resurrect a deleted entry;
     // log the bought action so the signal survives.
@@ -772,6 +797,32 @@ async fn apply_mark_bought(
     .execute(&mut **tx)
     .await
     .map_err(db_error("apply_mark_bought.update"))?;
+
+    // Purchase evidence, only for a resolved entry (see this fn's doc comment).
+    if let Some(canonical_item_id) = canonical_item_id {
+        sqlx::query("DELETE FROM purchase_events WHERE entry_id = ?1")
+            .bind(&entry_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error("apply_mark_bought.replace_evidence"))?;
+
+        sqlx::query(
+            "INSERT INTO purchase_events \
+                 (id, household_id, canonical_item_id, list_id, entry_id, source, \
+                  occurred_at, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'check_off', ?6, ?7)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(household_id)
+        .bind(&canonical_item_id)
+        .bind(&req.list_id)
+        .bind(&entry_id)
+        .bind(&bought_at)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error("apply_mark_bought.evidence"))?;
+    }
 
     Ok(ApplyOutcome::touched(
         Some(entry_id),
@@ -814,10 +865,59 @@ async fn apply_mark_skipped(
     .await
     .map_err(db_error("apply_mark_skipped.update"))?;
 
+    sqlx::query("DELETE FROM purchase_events WHERE entry_id = ?1")
+        .bind(&entry_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error("apply_mark_skipped.evidence"))?;
+
     Ok(ApplyOutcome::touched(
         Some(entry_id),
         MutationStatus::Accepted,
     ))
+}
+
+/// `dismiss_suggestion`: record the household's "not now" for a purchase
+/// suggestion (issue #106) so the item is suppressed for one typical interval.
+///
+/// A dismissal is household-scoped evidence keyed by canonical item, not a list
+/// entry, so `entity_type` is `canonical_item` and `entity_id` carries the
+/// canonical item id. The item must belong to the caller's household (a guessed
+/// foreign id is a 404, mirroring `add_item`). The response entity is `None`; the
+/// shared post-apply path skips the entry stamp, still bumps the list revision so
+/// the mutation replays in order, and the client refreshes its suggestions.
+async fn apply_dismiss_suggestion(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &AuthenticatedUser,
+    household_id: &str,
+    req: &MutationRequest,
+) -> Result<ApplyOutcome, StatusCode> {
+    let canonical_item_id = req.entity_id.trim();
+    if canonical_item_id.is_empty() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if !canonical_item_in_household(tx, canonical_item_id, household_id)
+        .await
+        .map_err(db_error("apply_dismiss_suggestion.canonical_item_check"))?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    sqlx::query(
+        "INSERT INTO purchase_dismissals \
+             (id, household_id, canonical_item_id, dismissed_by, dismissed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .bind(&user.user_id)
+    .bind(buywise_core::db::now_iso())
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error("apply_dismiss_suggestion.insert"))?;
+
+    Ok(ApplyOutcome::touched(None, MutationStatus::Accepted))
 }
 
 /// `move_to_list`: move a `bought` or `skipped` entry back to `active` — the
@@ -875,6 +975,16 @@ async fn apply_move_to_list(
             MutationStatus::Accepted,
         ));
     }
+
+    // Undoing a check-off also undoes its purchase evidence: a mistaken
+    // check-off must not pollute the interval history (issue #106). Runs before
+    // the status write so both the plain reactivate and the dedup-merge branch
+    // leave no check_off evidence behind.
+    sqlx::query("DELETE FROM purchase_events WHERE entry_id = ?1")
+        .bind(&entry_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error("apply_move_to_list.evidence"))?;
 
     let update = sqlx::query(
         "UPDATE list_entries \
@@ -1719,7 +1829,7 @@ async fn insert_loser_replay_row(
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// True for one of the nine `mutations.operation_type` CHECK values.
+/// True for one of the `mutations.operation_type` CHECK values.
 fn is_known_operation(op: &str) -> bool {
     matches!(
         op,
@@ -1733,6 +1843,7 @@ fn is_known_operation(op: &str) -> bool {
             | "reject_match"
             | "set_constraint"
             | "set_quantity"
+            | "dismiss_suggestion"
     )
 }
 
@@ -1835,6 +1946,7 @@ mod tests {
             "reject_match",
             "set_constraint",
             "set_quantity",
+            "dismiss_suggestion",
         ] {
             assert!(is_known_operation(op), "{op} should be known");
         }

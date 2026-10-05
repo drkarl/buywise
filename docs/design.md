@@ -475,7 +475,7 @@ for a split that includes it to `NEARBY_THRESHOLD_2_CENTS` (€5.00), so a close
 store such as SuperValu needs a smaller saving to be added than the default €10.
 
 Each store additionally carries **per-category rules** (issue #99) in
-`household_store_category_rules` (migration 013): a household may keep a store out
+`household_store_category_rules` (migration 014): a household may keep a store out
 of plans for categories it does not trust it for — the motivating case is Aldi's
 fresh food versus its packaged food. A rule names a category, or one sub-category
 of it as a refinement, and whether the store may fulfil items in that scope. Rules

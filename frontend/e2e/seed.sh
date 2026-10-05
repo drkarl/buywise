@@ -209,4 +209,48 @@ SQL
 
 echo "seed.sh: seeded product-matching fixture (list-e2e-match) into $DB"
 
+# ---------------------------------------------------------------------------
+# Purchase-suggestion fixture (issue #106)
+# ---------------------------------------------------------------------------
+# A dedicated list with two staples whose check-off history is weekly for the
+# last four weeks, so both are due at the seeded "today" (interval 7 days, last
+# bought 7 days ago). `purchase_events` is the durable evidence the suggestion
+# endpoint reads; no list entry exists for either item, so neither is excluded.
+# The spec confirms one and dismisses the other. Kept on its own list so it does
+# not perturb the entries the other specs assert on list-e2e.
+sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=5000;
+INSERT OR IGNORE INTO shopping_lists (id, household_id, name, status, current_revision, created_at)
+  VALUES ('list-e2e-suggest', '$HOUSEHOLD_ID', 'Suggestion test', 'active', 0, '$NOW');
+INSERT OR IGNORE INTO canonical_items
+  (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at)
+  VALUES ('e2e-ci-oat', '$HOUSEHOLD_ID', 'Oat milk', 'Leche de avena',
+          'c1000000-0000-0000-0000-000000000005', 'any', '$NOW');
+INSERT OR IGNORE INTO canonical_items
+  (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at)
+  VALUES ('e2e-ci-soy', '$HOUSEHOLD_ID', 'Soy sauce', 'Salsa de soja',
+          'c1000000-0000-0000-0000-000000000005', 'any', '$NOW');
+INSERT OR IGNORE INTO purchase_events
+  (id, household_id, canonical_item_id, list_id, entry_id, source, occurred_at, recorded_at)
+VALUES
+  ('e2e-pe-oat-4', '$HOUSEHOLD_ID', 'e2e-ci-oat', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-28 days'), '$NOW'),
+  ('e2e-pe-oat-3', '$HOUSEHOLD_ID', 'e2e-ci-oat', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-21 days'), '$NOW'),
+  ('e2e-pe-oat-2', '$HOUSEHOLD_ID', 'e2e-ci-oat', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-14 days'), '$NOW'),
+  ('e2e-pe-oat-1', '$HOUSEHOLD_ID', 'e2e-ci-oat', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days'), '$NOW'),
+  ('e2e-pe-soy-4', '$HOUSEHOLD_ID', 'e2e-ci-soy', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-28 days'), '$NOW'),
+  ('e2e-pe-soy-3', '$HOUSEHOLD_ID', 'e2e-ci-soy', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-21 days'), '$NOW'),
+  ('e2e-pe-soy-2', '$HOUSEHOLD_ID', 'e2e-ci-soy', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-14 days'), '$NOW'),
+  ('e2e-pe-soy-1', '$HOUSEHOLD_ID', 'e2e-ci-soy', NULL, NULL, 'check_off',
+   strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days'), '$NOW');
+SQL
+
+echo "seed.sh: seeded purchase-suggestion fixture (list-e2e-suggest) into $DB"
+
 echo "seed.sh: seeded user=$EMAIL list=$LIST_ID into $DB"

@@ -502,6 +502,30 @@ async fn mutations_operation_type_check_accepts_move_to_list() {
     );
 }
 
+/// Migration 013 widens the operation_type CHECK to include
+/// `dismiss_suggestion` by rebuilding the table; this asserts the new value is
+/// accepted after the rebuild (and so the constraint was recreated, not dropped).
+#[tokio::test]
+async fn mutations_operation_type_check_accepts_dismiss_suggestion() {
+    let pool = migrated_pool().await;
+    seed_list_prereqs(&pool).await;
+
+    let ok = sqlx::query(
+        "INSERT INTO mutations
+            (id, client_mutation_id, device_id, user_id, list_id,
+             entity_type, entity_id, operation_type, payload,
+             base_revision, created_at_client, received_at_server)
+         VALUES ('m1', 'cmid-dismiss', 'dev-1', 'user-1', 'list-1',
+                 'canonical_item', 'e-1', 'dismiss_suggestion', '{}', 0, 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        ok.is_ok(),
+        "dismiss_suggestion must be accepted after migration 013"
+    );
+}
+
 /// Migration 012 widens the `match_feedback.action` CHECK to include `undo`
 /// (issue #108) by rebuilding the table; this asserts the new value is accepted
 /// after the rebuild (and so the constraint was recreated, not dropped) while the
@@ -629,7 +653,7 @@ async fn migration_010_seeds_subcategories_and_backfills_items() {
 /// rows, so a household that configures nothing allows every category at every
 /// store — the pre-#99 planning behaviour (issue #99).
 #[tokio::test]
-async fn migration_013_store_category_rules_start_empty() {
+async fn migration_014_store_category_rules_start_empty() {
     let pool = migrated_pool().await;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM household_store_category_rules")
@@ -644,7 +668,7 @@ async fn migration_013_store_category_rules_start_empty() {
 /// holds exactly one rule per (household, retailer, category, sub-category),
 /// with NULL sub-category treated as its own scope (issue #99).
 #[tokio::test]
-async fn migration_013_allows_one_rule_per_scope() {
+async fn migration_014_allows_one_rule_per_scope() {
     const ALDI: &str = "aldi";
     const PANTRY: &str = "c1000000-0000-0000-0000-000000000005";
     const PASTA_RICE: &str = "d1000000-0000-0000-0000-000000000001";

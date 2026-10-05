@@ -44,6 +44,7 @@ pub mod resolution;
 pub mod savings;
 pub mod settings;
 pub mod sse;
+pub mod suggestions;
 
 /// Registry of per-list SSE broadcast senders, keyed by `list_id`.
 ///
@@ -138,6 +139,9 @@ pub fn api_router(state: AppState) -> Router {
         // `savings::router` carries the absolute `/api/list/{id}/actual-spend`
         // path: record post-shop actual spend and compute the net saving (P5-T3).
         .merge(savings::router())
+        // `suggestions::router` carries `/api/list/{id}/suggestions`: the
+        // purchase-history "Suggested" section (issue #106).
+        .merge(suggestions::router())
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,

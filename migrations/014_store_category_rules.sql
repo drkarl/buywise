@@ -1,5 +1,5 @@
 -- ============================================================================
--- Migration 013: per-store category rules (issue #99)
+-- Migration 014: per-store category rules (issue #99)
 -- ============================================================================
 -- A household shops at a store only for the categories it trusts it for: Aldi's
 -- fresh food is considered lower quality, but its packaged food is acceptable.
