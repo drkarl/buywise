@@ -42,6 +42,7 @@ deploy/
   litestream.yml   Litestream → Cloudflare R2 config
 docs/
   design.md        Architecture and design document
+  KNOWN_LIMITATIONS.md  Accepted gaps and their follow-ups
 ```
 
 ## Running locally
@@ -179,6 +180,10 @@ build-and-serve flow above to exercise the full app.
 ## Design document
 
 See [`docs/design.md`](docs/design.md) for the full architecture, schema, sync protocol, bilingual resolution cascade, and phased build plan.
+
+## Known limitations
+
+See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for accepted gaps and the follow-up that removes each.
 
 ## Build phases
 
