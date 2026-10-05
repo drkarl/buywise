@@ -1,7 +1,7 @@
 // Pure allocation of a chosen optimiser plan to per-store trips (issue #104).
 //
-// The optimiser returns priced plan lines plus the items it could not price
-// (unresolved, no valid offer, held for confirmation). This module turns that
+// The optimiser returns priced plan lines, excluded items, and identity metadata
+// for every input item. This module turns that
 // response — for ONE chosen plan — into a derived view over the household's list
 // entries: every priced line is assigned to the store that fulfils it, and every
 // item the plan does not allocate lands in an explicit `unallocated` list.
@@ -18,6 +18,7 @@
 // to a household entry and is skipped; the API always sets it for a stored list.
 
 import type {
+	BasketItemIdentity,
 	FreshnessConfidence,
 	NeedsConfirmationItem,
 	NoValidOfferItem,
@@ -27,7 +28,11 @@ import type {
 import type { RetailerId } from '$lib/stores/shopping';
 
 /** Why an item the plan did not allocate was left out. */
-export type UnallocatedReason = 'unresolved' | 'no_offer' | 'needs_confirmation';
+export type UnallocatedReason =
+	| 'unresolved'
+	| 'no_offer'
+	| 'needs_confirmation'
+	| 'not_in_plan';
 
 /** One priced plan line, assigned to its store and keyed by list entry. */
 export interface AllocatedLine {
@@ -70,19 +75,19 @@ export interface PlanAllocation {
 /**
  * Allocate `plan` to its stores over the household's list entries.
  *
- * Every `entry_id` appearing anywhere in the response lands in exactly one of
- * `byStore[*].lines` or `unallocated`, so the two together account for the whole
- * planned basket and no entry is counted twice. `plan.stores` fixes the store
- * order; `unallocated` preserves the optimiser's `item_index` order (i.e. the
- * list order the optimiser saw).
+ * Every submitted `entry_id` lands in exactly one of `byStore[*].lines` or
+ * `unallocated`, so the two together account for the whole basket and no entry
+ * is counted twice. `plan.stores` fixes the store order; `unallocated` preserves
+ * the optimiser's `item_index` order (i.e. the list order the optimiser saw).
  */
 export function allocatePlan(args: {
 	plan: StorePlan;
 	unresolvedItems: UnresolvedItem[];
 	noValidOfferItems: NoValidOfferItem[];
 	needsConfirmationItems: NeedsConfirmationItem[];
+	basketItems: BasketItemIdentity[];
 }): PlanAllocation {
-	const { plan, unresolvedItems, noValidOfferItems, needsConfirmationItems } = args;
+	const { plan, unresolvedItems, noValidOfferItems, needsConfirmationItems, basketItems } = args;
 
 	const stores: RetailerId[] = [...plan.stores];
 	const linesByStore: Record<string, AllocatedLine[]> = {};
@@ -122,6 +127,7 @@ export function allocatePlan(args: {
 	for (const item of unresolvedItems) push(item, 'unresolved');
 	for (const item of noValidOfferItems) push(item, 'no_offer');
 	for (const item of needsConfirmationItems) push(item, 'needs_confirmation');
+	for (const item of basketItems) push(item, 'not_in_plan');
 	unallocatedByIndex.sort((a, b) => a.item_index - b.item_index);
 
 	const unallocated: UnallocatedLine[] = unallocatedByIndex.map(({ entryId, reason }) => ({

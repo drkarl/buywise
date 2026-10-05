@@ -59,7 +59,8 @@ use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
     optimise, BasketItem, NeedsConfirmationItem, NoValidOfferItem, OptimiserInput, OptimiserOutput,
-    Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
+    BasketItemIdentity, Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem,
+    DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -95,8 +96,9 @@ pub struct OptimiseRequest {
     pub trip_retailers: Option<Vec<Retailer>>,
 }
 
-/// Response for `POST /api/optimise`: the four plans, the resolved/unfulfilled
-/// item lists, the generated explanation, the `run_id`, and the snapshot date.
+/// Response for `POST /api/optimise`: the four plans, all submitted item
+/// identities, the resolved/unfulfilled item lists, the generated explanation,
+/// the `run_id`, and the snapshot date.
 #[derive(Debug, Serialize)]
 pub struct OptimiseResponse {
     /// The persisted `recommendation_runs.id`, for correlation with later
@@ -110,6 +112,8 @@ pub struct OptimiseResponse {
     pub theoretical_minimum: Option<StorePlan>,
     /// The practical recommendation (or `null`).
     pub recommended: Option<Recommendation>,
+    /// Identity and input order for every active list entry sent to the optimiser.
+    pub basket_items: Vec<BasketItemIdentity>,
     /// Items with `resolution_status != 'resolved'` (excluded from every total).
     pub unresolved_items: Vec<UnresolvedItem>,
     /// Resolved items that produced no priceable offer anywhere.
@@ -240,6 +244,7 @@ async fn optimise_list(
         best_two_store: output.best_two_store,
         theoretical_minimum: output.theoretical_minimum,
         recommended: output.recommended,
+        basket_items: output.basket_items,
         unresolved_items: output.unresolved_items,
         no_valid_offer_items: output.no_valid_offer_items,
         needs_confirmation_items: output.needs_confirmation_items,

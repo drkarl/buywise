@@ -128,6 +128,18 @@ pub struct BasketItem {
     pub constraints: Option<ItemConstraints>,
 }
 
+/// Identity and input order for one basket item, echoed in [`OptimiserOutput`]
+/// so callers can account for entries omitted by a particular store plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BasketItemIdentity {
+    /// Index into `OptimiserInput::items`.
+    pub item_index: usize,
+    /// Caller-supplied identity for the source line, when one exists.
+    pub entry_id: Option<String>,
+    /// Original display text.
+    pub display_text: String,
+}
+
 /// One household's stored disposition of a retailer (issue #98): whether it takes
 /// part in plan generation and whether its trip is cheap enough to lower the
 /// second-store convenience threshold. Carried on [`OptimiserInput`].
@@ -475,6 +487,9 @@ pub struct NeedsConfirmationItem {
 /// The full optimiser result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimiserOutput {
+    /// Identities of every input item, in input order, so callers can account
+    /// for entries omitted by a particular plan.
+    pub basket_items: Vec<BasketItemIdentity>,
     /// Cheapest plan at a single retailer (exactly one store), or `None` if no
     /// item could be priced anywhere.
     pub best_single: Option<StorePlan>,
@@ -1454,6 +1469,16 @@ fn build_output(
         &nearby,
     );
     OptimiserOutput {
+        basket_items: input
+            .items
+            .iter()
+            .enumerate()
+            .map(|(item_index, item)| BasketItemIdentity {
+                item_index,
+                entry_id: item.entry_id.clone(),
+                display_text: item.display_text.clone(),
+            })
+            .collect(),
         best_single: core.best_single,
         best_two_store: core.best_two_store,
         theoretical_minimum: core.theoretical_minimum,

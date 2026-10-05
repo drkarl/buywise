@@ -194,6 +194,33 @@ fn run_with_preferred(
     build_output(input, &priced, &preferred)
 }
 
+#[test]
+fn output_echoes_all_basket_item_identities_in_input_order() {
+    let mut milk = item("milk", "ci-milk", 1);
+    milk.entry_id = Some("entry-milk".into());
+    let mut bread = item("bread", "ci-bread", 1);
+    bread.entry_id = Some("entry-bread".into());
+    let input = OptimiserInput::new("hh-1", Some(5), vec![milk, bread]);
+
+    let output = run(&input, BTreeMap::new());
+
+    assert_eq!(
+        output.basket_items,
+        vec![
+            BasketItemIdentity {
+                item_index: 0,
+                entry_id: Some("entry-milk".into()),
+                display_text: "milk".into(),
+            },
+            BasketItemIdentity {
+                item_index: 1,
+                entry_id: Some("entry-bread".into()),
+                display_text: "bread".into(),
+            },
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Single-store
 // ---------------------------------------------------------------------------

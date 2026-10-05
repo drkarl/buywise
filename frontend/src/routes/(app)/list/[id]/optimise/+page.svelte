@@ -177,7 +177,8 @@
 				plan,
 				unresolvedItems: result.unresolved_items,
 				noValidOfferItems: result.no_valid_offer_items,
-				needsConfirmationItems: result.needs_confirmation_items
+				needsConfirmationItems: result.needs_confirmation_items,
+				basketItems: result.basket_items
 			}),
 			savedAt: new Date().toISOString()
 		});

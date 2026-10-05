@@ -67,6 +67,13 @@ export interface Recommendation {
 	two_store_saving_cents: number;
 }
 
+/** Identity and input order for one item submitted to the optimiser. */
+export interface BasketItemIdentity {
+	item_index: number;
+	entry_id: string | null;
+	display_text: string;
+}
+
 /** A list item the optimiser could not resolve to a catalogue item. */
 export interface UnresolvedItem {
 	item_index: number;
@@ -128,6 +135,7 @@ export interface NeedsConfirmationItem {
 
 /** The full `POST /api/optimise` 200 response body. */
 export interface OptimiseResponse {
+	basket_items: BasketItemIdentity[];
 	run_id: string;
 	best_single: StorePlan | null;
 	best_two_store: StorePlan | null;

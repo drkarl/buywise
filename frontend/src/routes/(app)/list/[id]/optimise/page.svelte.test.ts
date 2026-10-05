@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { db } from '$lib/db/dexie';
 import type { OptimiseResponse } from '$lib/api/optimise';
 import type { Settings } from '$lib/api/settings';
+import type { ChosenTrip } from '$lib/shopping/chosenTrip';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
 // the route id under test without a running kit server.
@@ -18,6 +19,12 @@ type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<
 /** A response exercising recommended + all four plans + both excluded buckets. */
 function fullResponse(): OptimiseResponse {
 	return {
+		basket_items: [
+			{ item_index: 0, entry_id: 'e-0', display_text: 'Milk 2L' },
+			{ item_index: 1, entry_id: 'e-1', display_text: 'bread' },
+			{ item_index: 2, entry_id: 'e-2', display_text: 'cream' },
+			{ item_index: 3, entry_id: 'e-3', display_text: 'truffle oil' }
+		],
 		run_id: 'run-1',
 		best_single: {
 			stores: ['tesco'],
@@ -217,6 +224,25 @@ describe('optimise page', () => {
 		await waitFor(() => expect(screen.getByLabelText(/recommended/i)).toBeTruthy());
 	});
 
+	it('persists plan-specific misses in the chosen trip coverage', async () => {
+		stubOptimise(fullResponse());
+		render(Page);
+
+		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
+		document.addEventListener('click', (event) => event.preventDefault(), {
+			capture: true,
+			once: true
+		});
+		await fireEvent.click(chooseLinks[0]);
+
+		const saved = JSON.parse(localStorage.getItem('buywise:trip:list-42')!) as ChosenTrip;
+		expect(saved.allocation.unallocated).toContainEqual({
+			entryId: 'e-1',
+			reason: 'not_in_plan'
+		});
+		expect(new Set(saved.allocation.entryIds)).toEqual(new Set(['e-0', 'e-1', 'e-2', 'e-3']));
+	});
+
 	it('renders the plain-language explanation', async () => {
 		stubOptimise(fullResponse());
 		render(Page);
@@ -385,6 +411,7 @@ describe('optimise page', () => {
 
 		// Two ask items, one candidate each → two "Choose" buttons.
 		const twoAsk: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-ask',
 			best_single: null,
 			best_two_store: null,
@@ -511,6 +538,7 @@ describe('optimise page', () => {
 		const { fireEvent } = await import('@testing-library/svelte');
 
 		const twoAsk: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-ask',
 			best_single: null,
 			best_two_store: null,
@@ -604,6 +632,7 @@ describe('optimise page', () => {
 
 	it('renders an empty-state when every plan is null', async () => {
 		const empty: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-empty',
 			best_single: null,
 			best_two_store: null,
@@ -624,6 +653,7 @@ describe('optimise page', () => {
 		// All items held for confirmation → optimiser returns no plans, but the
 		// list is not empty. The generic "add some items" copy would be wrong.
 		const allHeld: OptimiseResponse = {
+			basket_items: [{ item_index: 0, entry_id: 'e-0', display_text: 'yoghurt' }],
 			run_id: 'run-held',
 			best_single: null,
 			best_two_store: null,

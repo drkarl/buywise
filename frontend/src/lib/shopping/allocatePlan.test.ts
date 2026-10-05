@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { allocatePlan } from './allocatePlan';
 import type {
+	BasketItemIdentity,
 	NeedsConfirmationItem,
 	NoValidOfferItem,
 	PlanLine,
@@ -40,7 +41,8 @@ function plan(stores: StorePlan['stores'], lines: PlanLine[]): StorePlan {
 const noUnallocated = {
 	unresolvedItems: [] as UnresolvedItem[],
 	noValidOfferItems: [] as NoValidOfferItem[],
-	needsConfirmationItems: [] as NeedsConfirmationItem[]
+	needsConfirmationItems: [] as NeedsConfirmationItem[],
+	basketItems: [] as BasketItemIdentity[]
 };
 
 describe('allocatePlan', () => {
@@ -88,7 +90,8 @@ describe('allocatePlan', () => {
 					candidate_count: 0,
 					candidates: []
 				}
-			]
+			],
+			basketItems: []
 		});
 
 		// Ordered by the list position the optimiser saw (`item_index`).
@@ -124,11 +127,37 @@ describe('allocatePlan', () => {
 			),
 			unresolvedItems: [{ item_index: 9, entry_id: 'e-cream', display_text: 'cream' }],
 			noValidOfferItems: [],
-			needsConfirmationItems: []
+			needsConfirmationItems: [],
+			basketItems: []
 		});
 
 		const all = allocation.entryIds;
 		expect(new Set(all).size).toBe(all.length);
 		expect(new Set(all)).toEqual(new Set(['e-bread', 'e-milk', 'e-cream']));
+	});
+
+	it('accounts for plan-specific misses using the optimiser input identities', () => {
+		const allocation = allocatePlan({
+			plan: plan(
+				['tesco'],
+				[line({ entry_id: 'e-bread', retailer: 'tesco', item_index: 0 })]
+			),
+			...noUnallocated,
+			basketItems: [
+				{ item_index: 0, entry_id: 'e-bread', display_text: 'bread' },
+				{ item_index: 1, entry_id: 'e-nappies', display_text: 'nappies' },
+				{ item_index: 2, entry_id: 'e-milk', display_text: 'milk' }
+			]
+		});
+
+		expect(allocation.unallocated).toEqual([
+			{ entryId: 'e-nappies', reason: 'not_in_plan' },
+			{ entryId: 'e-milk', reason: 'not_in_plan' }
+		]);
+		const storeIds = allocation.byStore.flatMap((store) => store.lines.map((item) => item.entryId));
+		const allIds = [...storeIds, ...allocation.unallocated.map((item) => item.entryId)];
+		expect(new Set(allIds).size).toBe(allIds.length);
+		expect(allIds).toEqual(['e-bread', 'e-nappies', 'e-milk']);
+		expect(allocation.entryIds).toEqual(allIds);
 	});
 });

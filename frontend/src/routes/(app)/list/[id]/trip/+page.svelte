@@ -103,6 +103,8 @@
 				return 'no matching product';
 			case 'needs_confirmation':
 				return 'waiting for your confirmation';
+			case 'not_in_plan':
+				return 'not stocked at your stores';
 		}
 	}
 
@@ -185,8 +187,9 @@
 					<span class="store-total">{unallocatedView.count} item{unallocatedView.count === 1 ? '' : 's'}</span>
 				</header>
 				<p class="note">
-					These items aren’t in a store’s list — they need clarifying, have no matching product, or
-					are waiting for your confirmation. Check them off here when you pick them up.
+					These items aren’t in a store’s list — they need clarifying, have no matching product, are
+					waiting for your confirmation, or aren’t stocked at your stores. Check them off here when
+					you pick them up.
 				</p>
 				{#if unallocatedView.count > 0}
 					<div class="groups">
