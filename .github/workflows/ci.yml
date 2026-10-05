@@ -1,0 +1,82 @@
+# Continuous integration for the Rust workspace and the frontend (issue #112).
+#
+# Complements `.github/workflows/e2e.yml`, which drives the real backend with
+# Playwright. This workflow is the fast gate that runs on every pull request and
+# on pushes to `main`: Rust formatting, lints and the workspace test suite, plus
+# the frontend unit tests and the SvelteKit type check. The Rust job uses the
+# same cargo/target cache shape as the e2e workflow so the two share cache
+# entries for the same `Cargo.lock`.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rustfmt + clippy are not in the default stable profile; the `fmt`
+          # and `clippy` steps below fail with "no such subcommand" without them.
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -- -D warnings
+        # `--all-targets` lints the integration tests and benches too, so a
+        # warning anywhere in the workspace fails the job.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  frontend:
+    name: Frontend (unit tests, type check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      - name: Unit tests
+        run: npm run test

@@ -1908,7 +1908,13 @@ async fn move_to_list_returns_a_bought_entry_to_active_and_clears_stamps() {
     let back = post_mutation(
         &pool,
         &s,
-        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "move_to_list",
+            serde_json::json!({}),
+        ),
     )
     .await;
     assert_eq!(back.status(), StatusCode::CREATED);
@@ -1919,11 +1925,12 @@ async fn move_to_list_returns_a_bought_entry_to_active_and_clears_stamps() {
     assert!(v["entity"]["bought_at"].is_null(), "bought_at cleared");
 
     // The row reflects the reversal: active, with both stamps cleared.
-    let (status, by, at): (String, Option<String>, Option<String>) =
-        sqlx::query_as("SELECT status, bought_by, bought_at FROM list_entries WHERE id = 'entry-1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (status, by, at): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, bought_by, bought_at FROM list_entries WHERE id = 'entry-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(status, "active");
     assert!(by.is_none());
     assert!(at.is_none());
@@ -1960,14 +1967,26 @@ async fn move_to_list_returns_a_skipped_entry_to_active() {
     post_mutation(
         &pool,
         &s,
-        envelope("cm-2", "list-a", "entry-1", "mark_skipped", serde_json::json!({})),
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "mark_skipped",
+            serde_json::json!({}),
+        ),
     )
     .await;
 
     let back = post_mutation(
         &pool,
         &s,
-        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "move_to_list",
+            serde_json::json!({}),
+        ),
     )
     .await;
     assert_eq!(back.status(), StatusCode::CREATED);
@@ -1997,7 +2016,13 @@ async fn delete_wins_over_move_to_list_and_logs_event() {
     post_mutation(
         &pool,
         &s,
-        envelope("cm-2", "list-a", "entry-1", "delete_item", serde_json::json!({})),
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "delete_item",
+            serde_json::json!({}),
+        ),
     )
     .await;
 
@@ -2005,7 +2030,13 @@ async fn delete_wins_over_move_to_list_and_logs_event() {
     let back = post_mutation(
         &pool,
         &s,
-        envelope("cm-3", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+        envelope(
+            "cm-3",
+            "list-a",
+            "entry-1",
+            "move_to_list",
+            serde_json::json!({}),
+        ),
     )
     .await;
     assert_eq!(back.status(), StatusCode::CREATED);
@@ -2058,7 +2089,13 @@ async fn move_to_list_merges_into_an_existing_active_twin() {
     post_mutation(
         &pool,
         &s,
-        envelope("cm-2", "list-a", "entry-1", "mark_bought", serde_json::json!({})),
+        envelope(
+            "cm-2",
+            "list-a",
+            "entry-1",
+            "mark_bought",
+            serde_json::json!({}),
+        ),
     )
     .await;
 
@@ -2083,13 +2120,25 @@ async fn move_to_list_merges_into_an_existing_active_twin() {
     let back = post_mutation(
         &pool,
         &s,
-        envelope("cm-4", "list-a", "entry-1", "move_to_list", serde_json::json!({})),
+        envelope(
+            "cm-4",
+            "list-a",
+            "entry-1",
+            "move_to_list",
+            serde_json::json!({}),
+        ),
     )
     .await;
     assert_eq!(back.status(), StatusCode::CREATED);
     let v = json(back).await;
-    assert_eq!(v["status"], "merged", "reactivation merges into the active twin");
-    assert_eq!(v["entity"]["id"], "entry-2", "survivor is the existing active row");
+    assert_eq!(
+        v["status"], "merged",
+        "reactivation merges into the active twin"
+    );
+    assert_eq!(
+        v["entity"]["id"], "entry-2",
+        "survivor is the existing active row"
+    );
     assert_eq!(v["entity"]["status"], "active");
     assert_eq!(v["entity"]["quantity"], 2, "quantities folded together");
 
@@ -2117,7 +2166,10 @@ async fn move_to_list_merges_into_an_existing_active_twin() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(merged, 2, "reactivation + the loser's broadcast row are both merged");
+    assert_eq!(
+        merged, 2,
+        "reactivation + the loser's broadcast row are both merged"
+    );
 
     // The loser's deletion got its own distinct revision after the survivor's, so a
     // `?since=` reconnect learns the basket row is gone (no shared-revision loss).
