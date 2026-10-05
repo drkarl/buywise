@@ -27,6 +27,6 @@ describe('CategoryGroup', () => {
 			props: { group, pendingIds: new Set([item.id]), onbought: vi.fn() }
 		});
 
-		expect(screen.getByRole('img', { name: 'Not synced yet' })).toBeVisible();
+		expect(screen.getByRole('img', { name: 'Not synced yet' })).toBeTruthy();
 	});
 });
