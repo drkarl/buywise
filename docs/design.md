@@ -468,7 +468,7 @@ store such as SuperValu needs a smaller saving to be added than the default €1
 
 - **Tesco Clubcard** — loyalty price is the active price; assume household has card
 - **SuperValu Real Rewards** — same assumption
-- **Dunnes spend-and-save** — model basket-threshold vouchers: if basket is near €50, flag that crossing it may yield a €10 voucher (for a future shop, not the current basket — do not subtract this from current basket total without flagging the timing)
+- **Dunnes spend-and-save** — when Dunnes is eligible for the run (active, or occasional with a trip marked), if its basket is near €50, flag that crossing it may yield a €10 voucher (for a future shop, not the current basket — do not subtract this from current basket total without flagging the timing). Do not show the hint when Dunnes is occasional without a marked trip or is off.
 - **Aldi / Lidl offers** — from the cached `offer_text` field; no loyalty programme
 
 ### Unresolved and ambiguous entries
