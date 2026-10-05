@@ -63,6 +63,9 @@ test('matching an unmatched item makes it priced on the next optimisation', asyn
 			hasText: 'Tesco Basmati Rice 1kg'
 		});
 		await heinz.getByRole('button', { name: 'Undo' }).click();
+		await expect(page.locator('section[aria-label="Suggested products"]')).toContainText(
+			'Tesco Basmati Rice 1kg'
+		);
 		await page.goto(`/list/${MATCH_LIST}`);
 		await expect(
 			page.getByRole('link', { name: 'Match a product to Basmati rice' })
