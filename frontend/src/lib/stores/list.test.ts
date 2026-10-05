@@ -10,6 +10,8 @@ import {
 	deleteItem,
 	setQuantity,
 	resolveAlias,
+	addCanonicalItem,
+	dismissSuggestion,
 	activeEntries,
 	basketEntries,
 	MAX_QUANTITY
@@ -556,6 +558,59 @@ describe('setQuantity', () => {
 		expect(entry?.status).toBe('deleted');
 		expect(entry?.quantity).toBe(1);
 		expect(await db.mutation_queue.count()).toBe(before);
+	});
+});
+
+describe('addCanonicalItem (suggestion confirm)', () => {
+	it('inserts a resolved active entry and queues an add_item carrying the canonical id', async () => {
+		const id = await addCanonicalItem(LIST, 'ci-milk', 'Milk');
+
+		const entries = await db.list_entries.toArray();
+		expect(entries).toHaveLength(1);
+		expect(entries[0]).toMatchObject({
+			id,
+			list_id: LIST,
+			canonical_item_id: 'ci-milk',
+			resolution_status: 'resolved',
+			display_name: 'Milk',
+			status: 'active'
+		});
+
+		const muts = await db.mutation_queue.toArray();
+		expect(muts).toHaveLength(1);
+		expect(muts[0]).toMatchObject({
+			operation_type: 'add_item',
+			entity_type: 'list_entry',
+			entity_id: id,
+			status: 'pending'
+		});
+		expect(muts[0].payload).toMatchObject({
+			canonical_item_id: 'ci-milk',
+			raw_text: 'Milk',
+			quantity: 1
+		});
+	});
+
+	it('rejects an empty canonical id', async () => {
+		await expect(addCanonicalItem(LIST, '', 'Milk')).rejects.toThrow();
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+});
+
+describe('dismissSuggestion', () => {
+	it('queues a household-scoped dismiss_suggestion and writes no entry', async () => {
+		await dismissSuggestion(LIST, 'ci-milk');
+
+		expect(await db.list_entries.count()).toBe(0);
+		const muts = await db.mutation_queue.toArray();
+		expect(muts).toHaveLength(1);
+		expect(muts[0]).toMatchObject({
+			operation_type: 'dismiss_suggestion',
+			entity_type: 'canonical_item',
+			entity_id: 'ci-milk',
+			list_id: LIST,
+			status: 'pending'
+		});
 	});
 });
 

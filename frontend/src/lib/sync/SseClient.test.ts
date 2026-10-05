@@ -101,6 +101,13 @@ describe('event appliers', () => {
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(9);
   });
 
+  it('applyMutationEvent advances the revision for a null entity using the fallback list id', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 3 });
+    await applyMutationEvent({ server_revision: 8, entity: null }, LIST);
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(8);
+    expect(await db.list_entries.count()).toBe(0);
+  });
+
   it('applyMutationEvent does not let an older entity overwrite a newer entry', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 1 });
     // A newer SSE event (delete at rev 3) applied first.
