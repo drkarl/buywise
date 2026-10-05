@@ -2400,6 +2400,46 @@ fn subcategory_exclusion_applies_within_an_allowed_category() {
         .any(|l| l.item_index == 1 && l.retailer == Retailer::Aldi));
 }
 
+#[test]
+fn ask_policy_filters_category_exclusions_before_confirmation_or_preference() {
+    let mut basket_item = item_in("chicken", "ci-chicken", PRODUCE, None);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-aldi", "ci-chicken", "p-aldi", MatchStatus::Accepted),
+                product("p-aldi", Retailer::Aldi),
+                offer("o-aldi", "p-aldi", 100, Some(5)),
+            ),
+            (
+                product_match("m-tesco", "ci-chicken", "p-tesco", MatchStatus::Accepted),
+                product("p-tesco", Retailer::Tesco),
+                offer("o-tesco", "p-tesco", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let awaiting_choice = run(&input, priced.clone());
+    let confirmation = &awaiting_choice.needs_confirmation_items[0];
+    assert_eq!(confirmation.candidate_count, 1);
+    assert_eq!(confirmation.candidates[0].retailer, Retailer::Tesco);
+
+    let mut preferred = BTreeMap::new();
+    preferred.insert(0, "p-aldi".to_string());
+    let excluded_preference = run_with_preferred(&input, priced, preferred);
+    assert!(excluded_preference.best_single.is_none());
+    let confirmation = &excluded_preference.needs_confirmation_items[0];
+    assert_eq!(confirmation.candidate_count, 1);
+    assert_eq!(confirmation.candidates[0].retailer, Retailer::Tesco);
+}
+
 /// An item we cannot classify (no category) is never excluded by a category
 /// rule — we drop unpriceable unknowns, never silently lose a resolved item.
 #[test]

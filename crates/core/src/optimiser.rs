@@ -2148,6 +2148,9 @@ fn classify_items(
         let mut item_candidates = Vec::new();
         let mut config_error = false;
         for (m, product, offer) in rows {
+            if !input.store_allows_item(product.retailer, item_index) {
+                continue;
+            }
             match check_constraints(item.constraint_policy, item.constraints.as_ref(), product) {
                 ConstraintCheck::ConfigError => {
                     config_error = true;
