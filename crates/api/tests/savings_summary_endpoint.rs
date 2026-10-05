@@ -679,6 +679,8 @@ async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
         "fixture must be positive"
     );
 
+    let monthly = body["monthly"].as_array().expect("monthly array");
+    assert_eq!(monthly.len(), 1, "one month");
     // The savings_events row this flow creates is stamped with the server's
     // `now()` at archive time, so the aggregate month is the CURRENT UTC month —
     // never a fixed literal (this assertion hardcoded "2026-06" and rotted once
