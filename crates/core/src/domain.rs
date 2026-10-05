@@ -134,6 +134,43 @@ text_enum_db!(Retailer {
     Lidl => "lidl",
 });
 
+impl Retailer {
+    /// Every retailer BuyWise tracks, in `as_db_str` order. The canonical list
+    /// the settings surface enumerates so a household always sees all five,
+    /// whether or not it has stored a row for one (issue #98).
+    pub const ALL: [Retailer; 5] = [
+        Retailer::Tesco,
+        Retailer::Dunnes,
+        Retailer::SuperValu,
+        Retailer::Aldi,
+        Retailer::Lidl,
+    ];
+}
+
+/// A household's disposition of one retailer during plan generation (issue #98).
+/// DB TEXT: `active`, `occasional`, `off`.
+///
+/// * [`Active`](StoreStatus::Active) — always eligible for plans.
+/// * [`Occasional`](StoreStatus::Occasional) — eligible only when the household
+///   marks a trip to it for the current run.
+/// * [`Off`](StoreStatus::Off) — never eligible.
+///
+/// A retailer absent from a household's stored settings is treated as
+/// [`Active`](StoreStatus::Active), preserving pre-#98 behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreStatus {
+    Active,
+    Occasional,
+    Off,
+}
+
+text_enum_db!(StoreStatus {
+    Active => "active",
+    Occasional => "occasional",
+    Off => "off",
+});
+
 /// Origin of a retailer product / offer. DB TEXT mapping is non-uniform:
 /// `BasketWatch` → `basketwatch`, `LidlDirect` → `lidl_direct`, `Manual` → `manual`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

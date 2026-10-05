@@ -26,8 +26,10 @@
 
 	import { page } from '$app/state';
 	import { jsonMutationHeaders } from '$lib/api/csrf';
+	import { fetchSettings } from '$lib/api/settings';
 	import { flushPendingMutations } from '$lib/sync';
 	import PlanCard from '$lib/components/PlanCard.svelte';
+	import type { RetailerId } from '$lib/stores/shopping';
 	import {
 		formatEuros,
 		retailerLabel,
@@ -56,6 +58,36 @@
 	let confirmingItemIds = $state<Set<string>>(new Set());
 	/** A per-item confirmation error message, keyed by canonical id. */
 	let confirmError = $state<Record<string, string>>({});
+
+	/**
+	 * The household's `occasional` stores (issue #98). Loaded from settings so the
+	 * page can offer "are you going there today?" toggles; a store not marked is
+	 * left out of this run's plans. A settings fetch failure is non-fatal — the
+	 * page simply shows no trip control (active/off stores need none).
+	 */
+	let occasionalStores = $state<RetailerId[]>([]);
+	/** The occasional stores the household is visiting today, sent as `trip_retailers`. */
+	let tripRetailers = $state<RetailerId[]>([]);
+
+	/** Load the list of occasional stores once per mount; non-fatal on failure. */
+	async function loadOccasionalStores() {
+		try {
+			const settings = await fetchSettings();
+			occasionalStores = settings.stores
+				.filter((s) => s.status === 'occasional')
+				.map((s) => s.retailer);
+		} catch {
+			occasionalStores = [];
+		}
+	}
+
+	/** Toggle whether the household is visiting `store` today, then re-optimise. */
+	function toggleTrip(store: RetailerId) {
+		tripRetailers = tripRetailers.includes(store)
+			? tripRetailers.filter((r) => r !== store)
+			: [...tripRetailers, store];
+		if (listId) runOptimise(listId);
+	}
 
 	/**
 	 * Confirm a candidate for an ask-gated item (issue #78): persist the choice via
@@ -155,7 +187,7 @@
 			const res = await fetch('/api/optimise', {
 				method: 'POST',
 				headers: jsonMutationHeaders(),
-				body: JSON.stringify({ list_id: id })
+				body: JSON.stringify({ list_id: id, trip_retailers: tripRetailers })
 			});
 			if (superseded()) return;
 			if (!res.ok) {
@@ -176,9 +208,11 @@
 	}
 
 	// Run once per list id. `$effect` re-runs if the route id changes (rare here)
-	// so navigating between lists re-optimises the right basket.
+	// so navigating between lists re-optimises the right basket. The occasional-
+	// store list is loaded alongside so the trip control is ready.
 	$effect(() => {
 		if (!listId) return;
+		loadOccasionalStores();
 		runOptimise(listId);
 	});
 
@@ -227,6 +261,29 @@
 	{:else if result}
 		{#if result.offer_snapshot_date}
 			<p class="snapshot">Prices as of {result.offer_snapshot_date}.</p>
+		{/if}
+
+		{#if occasionalStores.length > 0}
+			<section class="trip" aria-label="Stores you are visiting today">
+				<h2>Going anywhere else today?</h2>
+				<p class="trip-note">
+					You only visit these stores occasionally. Mark any you are going to now and they’ll be
+					included in your plan.
+				</p>
+				<div class="trip-buttons">
+					{#each occasionalStores as store (store)}
+						<button
+							type="button"
+							class="trip-store"
+							class:on={tripRetailers.includes(store)}
+							aria-pressed={tripRetailers.includes(store)}
+							onclick={() => toggleTrip(store)}
+						>
+							{retailerLabel(store)}
+						</button>
+					{/each}
+				</div>
+			</section>
 		{/if}
 
 		<section class="plans" aria-label="Plans">
@@ -399,6 +456,38 @@
 		margin: 0;
 		font-size: 0.85rem;
 		color: #94a3b8;
+	}
+	.trip {
+		border: 1px solid #e2e8f0;
+		border-radius: 0.5rem;
+		padding: 0.85rem 1rem;
+	}
+	.trip h2 {
+		margin: 0 0 0.25rem;
+		font-size: 1rem;
+	}
+	.trip-note {
+		margin: 0 0 0.6rem;
+		font-size: 0.85rem;
+		color: #64748b;
+	}
+	.trip-buttons {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+	.trip-store {
+		padding: 0.4rem 0.85rem;
+		border: 1px solid #cbd5e1;
+		border-radius: 999px;
+		background: #f8fafc;
+		font-size: 0.9rem;
+		cursor: pointer;
+	}
+	.trip-store.on {
+		background: #0f766e;
+		border-color: #0f766e;
+		color: #fff;
 	}
 	.plans {
 		display: flex;

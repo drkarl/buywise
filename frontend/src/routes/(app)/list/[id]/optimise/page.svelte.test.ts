@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { db } from '$lib/db/dexie';
 import type { OptimiseResponse } from '$lib/api/optimise';
+import type { Settings } from '$lib/api/settings';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
 // the route id under test without a running kit server.
@@ -10,6 +11,9 @@ vi.mock('$app/state', () => ({
 }));
 
 import Page from './+page.svelte';
+
+/** A stubbed `fetch` (as installed by {@link stubOptimise}). */
+type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>;
 
 /** A response exercising recommended + all four plans + both excluded buckets. */
 function fullResponse(): OptimiseResponse {
@@ -82,9 +86,18 @@ function fullResponse(): OptimiseResponse {
 	};
 }
 
-function stubOptimise(response: OptimiseResponse, status = 200) {
+/**
+ * Stub `fetch` for the optimise page. Always answers `/api/optimise` with
+ * `response`/`status`. When `settings` is given it also answers `/api/settings`
+ * (issue #98, for the occasional-store trip control); otherwise that path 404s
+ * and the page simply shows no trip control.
+ */
+function stubOptimise(response: OptimiseResponse, status = 200, settings?: Settings): FetchMock {
 	const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input.toString();
+		if (settings && url.includes('/api/settings')) {
+			return new Response(JSON.stringify(settings), { status: 200 });
+		}
 		if (url.includes('/api/optimise')) {
 			return new Response(JSON.stringify(response), { status });
 		}
@@ -109,11 +122,20 @@ afterEach(() => {
 
 describe('optimise page', () => {
 	/** The init of the first `POST /api/optimise` call recorded by the mock. */
-	function optimiseCallInit(fetchMock: ReturnType<typeof stubOptimise>): RequestInit | undefined {
+	function optimiseCallInit(fetchMock: FetchMock): RequestInit | undefined {
 		const call = fetchMock.mock.calls.find(([input]) =>
 			(typeof input === 'string' ? input : input.toString()).includes('/api/optimise')
 		);
 		return call?.[1];
+	}
+
+	/** Every parsed body of `POST /api/optimise` recorded by the mock. */
+	function optimiseCallBodies(fetchMock: FetchMock): Record<string, unknown>[] {
+		return fetchMock.mock.calls
+			.filter(([input]) =>
+				(typeof input === 'string' ? input : input.toString()).includes('/api/optimise')
+			)
+			.map(([, init]) => JSON.parse((init?.body as string) ?? '{}'));
 	}
 
 	it('POSTs to /api/optimise on mount with the list id', async () => {
@@ -124,7 +146,38 @@ describe('optimise page', () => {
 		await waitFor(() => expect(optimiseCallInit(fetchMock)).toBeDefined());
 		const init = optimiseCallInit(fetchMock);
 		expect(init?.method).toBe('POST');
-		expect(JSON.parse(init?.body as string)).toEqual({ list_id: 'list-42' });
+		expect(JSON.parse(init?.body as string)).toEqual({ list_id: 'list-42', trip_retailers: [] });
+	});
+
+	it('offers a trip toggle for occasional stores and re-optimises with the trip', async () => {
+		const fetchMock = stubOptimise(fullResponse(), 200, {
+			convenience_threshold_2_cents: 1000,
+			convenience_threshold_3_cents: 2500,
+			stores: [
+				{ retailer: 'tesco', status: 'active', nearby: false },
+				{ retailer: 'dunnes', status: 'occasional', nearby: false },
+				{ retailer: 'supervalu', status: 'active', nearby: true },
+				{ retailer: 'aldi', status: 'active', nearby: false },
+				{ retailer: 'lidl', status: 'off', nearby: false }
+			]
+		});
+		render(Page);
+
+		// Only the occasional Dunnes gets a toggle; active/off stores do not.
+		const toggle = await screen.findByRole('button', { name: 'Dunnes' });
+		expect(toggle.getAttribute('aria-pressed')).toBe('false');
+		expect(screen.queryByRole('button', { name: 'Tesco' })).toBeNull();
+
+		await fireEvent.click(toggle);
+
+		await waitFor(() => {
+			expect(
+				optimiseCallBodies(fetchMock).some((body) =>
+					Array.isArray(body.trip_retailers) &&
+					(body.trip_retailers as string[]).includes('dunnes')
+				)
+			).toBe(true);
+		});
 	});
 
 	it('carries the CSRF header on the POST when a token cookie is present', async () => {

@@ -447,6 +447,23 @@ Configurable defaults:
 
 If the split does not clear the threshold, the recommendation defaults to the best single store.
 
+### Household store settings
+
+Each household stores a disposition per retailer in `household_store_settings`
+(migration 010), read and written through `GET`/`PATCH /api/settings`:
+
+- **active** — always eligible for plans (the default for a retailer with no row,
+  so a household that configures nothing keeps the pre-existing behaviour);
+- **occasional** — eligible only when the household marks a trip to it for the
+  current run via the `trip_retailers` field on `POST /api/optimise`;
+- **off** — never eligible.
+
+A retailer that is not eligible is dropped before plans are built, so it can
+appear in no plan (including the theoretical minimum) and its spend-and-save
+voucher hint cannot fire. Marking a store **nearby** lowers the second-store bar
+for a split that includes it to `NEARBY_THRESHOLD_2_CENTS` (€5.00), so a close
+store such as SuperValu needs a smaller saving to be added than the default €10.
+
 ### Retailer incentive modelling
 
 - **Tesco Clubcard** — loyalty price is the active price; assume household has card
