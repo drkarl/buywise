@@ -450,7 +450,7 @@ If the split does not clear the threshold, the recommendation defaults to the be
 ### Household store settings
 
 Each household stores a disposition per retailer in `household_store_settings`
-(migration 010), read and written through `GET`/`PATCH /api/settings`:
+(migration 011), read and written through `GET`/`PATCH /api/settings`:
 
 - **active** — always eligible for plans (the default for a retailer with no row,
   so a household that configures nothing keeps the pre-existing behaviour);
