@@ -720,7 +720,7 @@ fn render_plan_explanations(
         let plan_reasons: Vec<&PlanReason> = reasons.iter().filter(|r| r.plan == kind).collect();
         let mut rendered = Vec::new();
 
-        if let Some(choice) = plan_reasons.iter().find(|reason| {
+        let choice = plan_reasons.iter().copied().find(|reason| {
             matches!(
                 reason.code,
                 ReasonCode::ThresholdCleared
@@ -729,33 +729,74 @@ fn render_plan_explanations(
                     | ReasonCode::MoreComplete
                     | ReasonCode::CoverageDiffers
             )
-        }) {
+        });
+        if let Some(choice) = choice {
             rendered.push(render_reason(choice, input, categories));
         }
-        if let Some(coverage) = plan_reasons
+
+        let coverage_and_gaps = plan_reasons
             .iter()
-            .find(|reason| reason.code == ReasonCode::Coverage)
-        {
-            rendered.push(render_reason(coverage, input, categories));
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::Coverage
+                        | ReasonCode::NoKnownPriceHere
+                        | ReasonCode::NoKnownPriceAnywhere
+                        | ReasonCode::UnresolvedItems
+                )
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        if !coverage_and_gaps.is_empty() {
+            rendered.push(coverage_and_gaps.join("; "));
         }
 
-        const GROUPS: [&[ReasonCode]; 2] = [
-            &[
-                ReasonCode::NoKnownPriceHere,
-                ReasonCode::NoKnownPriceAnywhere,
-                ReasonCode::UnresolvedItems,
-            ],
-            &[ReasonCode::PriceAsOf, ReasonCode::StalePrices],
-        ];
-        for codes in GROUPS {
-            let grouped = plan_reasons
-                .iter()
-                .filter(|reason| codes.contains(&reason.code))
-                .map(|reason| render_reason(reason, input, categories))
-                .collect::<Vec<_>>();
-            if !grouped.is_empty() {
-                rendered.push(grouped.join("; "));
-            }
+        let freshness = plan_reasons
+            .iter()
+            .filter(|reason| matches!(reason.code, ReasonCode::PriceAsOf | ReasonCode::StalePrices))
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        if !freshness.is_empty() {
+            rendered.push(freshness.join("; "));
+        }
+
+        let routing = plan_reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::CheapestAtStore
+                        | ReasonCode::OnlyStoreStocking
+                        | ReasonCode::BrandRule
+                )
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        let alternatives = plan_reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::RejectedStore | ReasonCode::CoverageDiffers
+                ) && !choice.is_some_and(|chosen| std::ptr::eq(chosen, **reason))
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        let routing_and_alternatives = match (routing.is_empty(), alternatives.is_empty()) {
+            (false, false) => Some(format!(
+                "{}; Alternatives considered: {}",
+                routing.join("; "),
+                alternatives.join("; ")
+            )),
+            (false, true) => Some(routing.join("; ")),
+            (true, false) => Some(format!(
+                "Alternatives considered: {}",
+                alternatives.join("; ")
+            )),
+            (true, true) => None,
+        };
+        if let Some(reason) = routing_and_alternatives {
+            rendered.push(reason);
         }
 
         for reason in &plan_reasons {
@@ -775,6 +816,10 @@ fn render_plan_explanations(
                     | ReasonCode::UnresolvedItems
                     | ReasonCode::PriceAsOf
                     | ReasonCode::StalePrices
+                    | ReasonCode::CheapestAtStore
+                    | ReasonCode::OnlyStoreStocking
+                    | ReasonCode::BrandRule
+                    | ReasonCode::RejectedStore
             ) {
                 continue;
             }
@@ -1422,11 +1467,83 @@ mod tests {
         assert_eq!(card.len(), 4);
         assert!(card[0].contains("above your €4.00 bar"), "{card:?}");
         assert!(card[1].contains("Prices 2 of 3 basket items"));
-        assert!(card[2].contains("No known price at Tesco"));
-        assert!(card[2].contains("No qualifying price on record anywhere"));
-        assert!(card[2].contains("Could not match 1 item"));
-        assert!(card[3].contains("Prices have no recorded snapshot date"));
-        assert!(card[3].contains("not from the latest run"));
-        assert!(card[3].contains("at Aldi, Tesco"));
+        assert!(card[1].contains("No known price at Tesco"));
+        assert!(card[1].contains("No qualifying price on record anywhere"));
+        assert!(card[1].contains("Could not match 1 item"));
+        assert!(card[2].contains("Prices have no recorded snapshot date"));
+        assert!(card[2].contains("not from the latest run"));
+        assert!(card[2].contains("at Aldi, Tesco"));
+    }
+
+    #[test]
+    fn recommended_split_reserves_routing_and_merges_rejected_stores() {
+        let reasons = vec![
+            PlanReason {
+                retailers: vec![Retailer::Tesco],
+                cents: Some(1500),
+                threshold_cents: Some(1000),
+                ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+            },
+            PlanReason {
+                item_indices: vec![0, 1, 2],
+                cents: Some(1000),
+                ..bare(PlanKind::Recommended, ReasonCode::Coverage)
+            },
+            PlanReason {
+                snapshot_date: Some("2026-06-01".to_string()),
+                ..bare(PlanKind::Recommended, ReasonCode::PriceAsOf)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Aldi],
+                ..bare(PlanKind::Recommended, ReasonCode::CheapestAtStore)
+            },
+            PlanReason {
+                item_indices: vec![1],
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::OnlyStoreStocking)
+            },
+            PlanReason {
+                item_indices: vec![2],
+                ..bare(PlanKind::Recommended, ReasonCode::BrandRule)
+            },
+            PlanReason {
+                retailers: vec![Retailer::Dunnes],
+                cents: Some(200),
+                ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+            },
+            PlanReason {
+                retailers: vec![Retailer::Lidl],
+                cents: Some(-125),
+                ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+            },
+            PlanReason {
+                retailers: vec![Retailer::SuperValu],
+                ..bare(PlanKind::Recommended, ReasonCode::CoverageDiffers)
+            },
+        ];
+
+        let plans = render_plan_explanations(&reasons, &input(), &categories());
+        let card = &plans[0].reasons;
+        assert_eq!(card.len(), 4);
+        assert!(card[0].contains("above your €10.00 bar"));
+        assert!(card[1].contains("Prices all 3 basket items"));
+        assert!(card[2].contains("Prices as of 2026-06-01"));
+        assert!(card[3].contains("Aldi is cheapest for 1 item"));
+        assert!(card[3].contains("Tesco is the only store we have a price for"));
+        assert!(card[3].contains("1 item held to your brand rule"));
+        assert!(card[3].contains("Shopping at Dunnes alone would save €2.00"));
+        assert!(card[3].contains("Shopping at Lidl alone would cost €1.25 more"));
+        assert!(card[3].contains("SuperValu alone prices a different set of items"));
+        assert_eq!(
+            card.iter()
+                .filter(|line| line.contains("Shopping at"))
+                .count(),
+            1
+        );
+        assert!(
+            card[3].find("Aldi is cheapest") < card[3].find("Alternatives considered"),
+            "routing should precede rejected-store notes: {card:?}"
+        );
     }
 }
