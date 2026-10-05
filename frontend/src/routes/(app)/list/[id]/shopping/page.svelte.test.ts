@@ -160,8 +160,12 @@ describe('shopping page', () => {
 		expect(titles).toEqual(['Pasta & Rice', 'Tins & Jars', 'Pantry']);
 	});
 
-	it('shows only the chosen plan’s stores and that store’s items', async () => {
+	it('shows chosen store items and links to the other trip entries', async () => {
 		await seed();
+		await db.list_entries.bulkPut([
+			entry('e-cream', 'Cream', DAIRY),
+			entry('e-batteries', 'Batteries', PRODUCE)
+		]);
 		// A two-store trip: Apples (Produce) at Aldi, Milk (Dairy) at Tesco.
 		saveChosenTrip({
 			listId: LIST,
@@ -203,8 +207,8 @@ describe('shopping page', () => {
 						]
 					}
 				],
-				unallocated: [],
-				entryIds: ['e-milk', 'e-apple']
+				unallocated: [{ entryId: 'e-cream', reason: 'no_offer' }],
+				entryIds: ['e-milk', 'e-apple', 'e-cream']
 			}
 		});
 
@@ -217,6 +221,10 @@ describe('shopping page', () => {
 		expect(screen.queryByRole('button', { name: 'Lidl' })).toBeNull();
 		// Tesco's list holds only its own allocated item.
 		expect(screen.queryByText('Apples')).toBeNull();
+		const wholeTripLink = screen.getByRole('link', {
+			name: '2 items not in a store list — View whole trip'
+		});
+		expect(wholeTripLink.getAttribute('href')).toBe('/list/list-42/trip');
 
 		// Switching to Aldi shows only Aldi's allocated item.
 		await fireEvent.click(screen.getByRole('button', { name: 'Aldi' }));

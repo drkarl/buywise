@@ -72,6 +72,14 @@
 		const alloc = trip.allocation.byStore.find((s) => s.retailer === activeStore);
 		return new Set((alloc?.lines ?? []).map((l) => l.entryId));
 	});
+	const notInStoreListCount = $derived.by(() => {
+		if (!trip) return 0;
+		const unallocatedIds = new Set(trip.allocation.unallocated.map((item) => item.entryId));
+		const accountedIds = new Set(trip.allocation.entryIds);
+		return $entries.filter(
+			(entry) => unallocatedIds.has(entry.id) || !accountedIds.has(entry.id)
+		).length;
+	});
 
 	/** The entries in scope for the active store (all of them without a trip). */
 	const visibleEntries = $derived(
@@ -131,11 +139,16 @@
 	<StoreSelector stores={storeOptions} selected={activeStore} onselect={selectStore} />
 
 	{#if trip}
-		<p class="trip-note">
-			Shopping your {retailerLabel(activeStore)} trip — only that store’s items are shown.
-			<a class="back" href="/list/{listId}/trip">View whole trip</a>
-		</p>
-	{/if}
+	<p class="trip-note">
+		Shopping your {retailerLabel(activeStore)} trip — only that store’s items are shown.
+		<a class="back" href="/list/{listId}/trip">
+			{#if notInStoreListCount > 0}
+				{notInStoreListCount} item{notInStoreListCount === 1 ? '' : 's'} not in a store list —
+			{/if}
+			View whole trip
+		</a>
+	</p>
+{/if}
 
 	<ProgressBar {bought} {total} />
 
