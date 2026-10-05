@@ -398,11 +398,12 @@ fn freshness_unknown_when_current_run_is_null() {
         )],
     );
     let out = run(&input, priced);
-    let single = out.best_single.unwrap();
+    let single = out.best_single.as_ref().unwrap();
     assert_eq!(
         single.lines[0].freshness_confidence,
         FreshnessConfidence::Unknown
     );
+    assert!(reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,6 +2311,39 @@ fn reason_flags_coverage_differs_instead_of_a_false_saving() {
 }
 
 #[test]
+fn equal_missing_counts_with_different_items_are_not_comparable() {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("eggs", "ci-eggs", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-a", "ci-milk", "p-a", MatchStatus::Accepted),
+            product("p-a", Retailer::Aldi),
+            offer("o-a", "p-a", 50, Some(5)),
+        )],
+    );
+    priced.insert(
+        1,
+        vec![(
+            product_match("m-t", "ci-eggs", "p-t", MatchStatus::Accepted),
+            product("p-t", Retailer::Tesco),
+            offer("o-t", "p-t", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let alternative = reason_with(&out, PlanKind::BestSingle, ReasonCode::CoverageDiffers)
+        .expect("different priced item set is not comparable");
+    assert_eq!(alternative.retailers, vec![Retailer::Tesco]);
+    assert_eq!(alternative.cents, None);
+    assert!(reason_with(&out, PlanKind::BestSingle, ReasonCode::RejectedStore).is_none());
+}
+
+#[test]
 fn reason_reports_the_cleared_threshold_for_a_split() {
     let out = run(
         &two_store_split_input(DEFAULT_THRESHOLD_2_CENTS, Vec::new()),
@@ -2362,8 +2396,8 @@ fn reason_marks_items_under_the_brand_rule() {
     );
 
     let out = run(&input, priced);
-    let brand = reason_with(&out, PlanKind::BestSingle, ReasonCode::BrandRule)
-        .expect("brand-rule reason");
+    let brand =
+        reason_with(&out, PlanKind::BestSingle, ReasonCode::BrandRule).expect("brand-rule reason");
     assert_eq!(brand.item_indices, vec![0]);
 }
 
@@ -2385,8 +2419,8 @@ fn reason_explains_stores_left_out_by_settings() {
     );
 
     let out = run(&input, priced);
-    let off = reason_with(&out, PlanKind::Recommended, ReasonCode::StoreOff)
-        .expect("store-off reason");
+    let off =
+        reason_with(&out, PlanKind::Recommended, ReasonCode::StoreOff).expect("store-off reason");
     assert_eq!(off.retailers, vec![Retailer::Aldi]);
     let not_on_trip = reason_with(&out, PlanKind::Recommended, ReasonCode::StoreNotOnTrip)
         .expect("store-not-on-trip reason");
@@ -2426,8 +2460,8 @@ fn reason_reports_price_date_and_stale_lines() {
     );
 
     let out = run(&input, priced);
-    let as_of = reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf)
-        .expect("price-as-of reason");
+    let as_of =
+        reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf).expect("price-as-of reason");
     assert_eq!(as_of.snapshot_date.as_deref(), Some("2026-06-01"));
     let stale = reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices)
         .expect("stale-prices reason");
@@ -2448,7 +2482,8 @@ fn every_published_plan_carries_at_least_two_reasons() {
         PlanKind::TheoreticalMinimum,
     ] {
         let count = out.reasons.iter().filter(|r| r.plan == kind).count();
-        assert!(count >= 2, "{kind:?} has only {count} reason(s)");
+        assert!((2..=4).contains(&count), "{kind:?} has {count} reasons");
+        assert!(reason_with(&out, kind, ReasonCode::Coverage).is_some());
     }
 }
 

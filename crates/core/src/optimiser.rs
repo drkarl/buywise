@@ -505,8 +505,8 @@ pub enum ReasonCode {
     /// The best split would have saved `cents`, below the `threshold_cents` bar,
     /// so the single store was kept. `retailers` are the stores it would add.
     ThresholdNotCleared,
-    /// The best split is cheaper (`cents`) but would drop `item_indices`, so the
-    /// more complete single store was kept. `retailers` are the stores it would add.
+    /// The best split would drop `item_indices`, so the more complete single
+    /// store was kept. `retailers` are the stores it would add.
     SplitDropsItems,
     /// The recommended split reaches `item_indices` the best single store cannot,
     /// which is why the extra stop is worth it even below the saving bar.
@@ -516,7 +516,7 @@ pub enum ReasonCode {
     /// cheaper; negative: it would cost that much more). Only emitted when the two
     /// plans price the same coverage, so the figures are like-for-like.
     RejectedStore,
-    /// `retailers[0]` alone would price a different number of items, so its total
+    /// `retailers[0]` alone would price a different set of items, so its total
     /// is not comparable with this plan's; no saving is reported.
     CoverageDiffers,
     /// `retailers[0]` is switched off in the household's store settings, so it is
@@ -1162,11 +1162,11 @@ struct RejectedSplit {
     /// when the split prices the same items (otherwise coverage, not cost,
     /// decided and no like-for-like saving may be reported).
     threshold_cents: Cents,
-    /// The split reaches fewer items than the single store.
-    less_complete: bool,
     /// The split prices exactly the same items as the single store, so its total
     /// is directly comparable (a like-for-like saving).
     same_items: bool,
+    /// The split reaches fewer items than the single-store plan.
+    less_complete: bool,
 }
 
 /// The recommendation plus the decision context the reason generator needs.
@@ -1232,14 +1232,20 @@ fn decide_recommendation(
                     let saving = single.total_cents - two.total_cents;
                     let more_complete = two.missing_count < single.missing_count;
                     let equal_complete = two.missing_count == single.missing_count;
+                    let single_items: BTreeSet<usize> =
+                        single.lines.iter().map(|l| l.item_index).collect();
+                    let two_items: BTreeSet<usize> =
+                        two.lines.iter().map(|l| l.item_index).collect();
+                    let same_items = single_items == two_items;
                     let (threshold, nearby_applied) = bar_for(single, two);
-                    let clears_threshold = saving > threshold;
+                    let clears_threshold = same_items && saving > threshold;
                     (more_complete || (equal_complete && clears_threshold)).then_some((
                         two,
                         saving,
                         equal_complete && clears_threshold,
                         threshold,
                         nearby_applied,
+                        same_items,
                     ))
                 })
                 .min_by(|(a, ..), (b, ..)| {
@@ -1248,7 +1254,9 @@ fn decide_recommendation(
                         .then(a.total_cents.cmp(&b.total_cents))
                 });
 
-            if let Some((two, saving, clears, threshold, nearby_applied)) = qualifying_two {
+            if let Some((two, saving, clears, threshold, nearby_applied, same_items)) =
+                qualifying_two
+            {
                 let gained_items: Vec<usize> = two
                     .lines
                     .iter()
@@ -1260,7 +1268,7 @@ fn decide_recommendation(
                         kind: RecommendedKind::TwoStore,
                         plan: two.clone(),
                         clears_convenience_threshold: clears,
-                        two_store_saving_cents: saving,
+                        two_store_saving_cents: if same_items { saving } else { 0 },
                     }),
                     threshold_cents: threshold,
                     nearby_applied,
@@ -1273,7 +1281,8 @@ fn decide_recommendation(
                     single.lines.iter().map(|l| l.item_index).collect();
                 let two_items: BTreeSet<usize> =
                     best_two.lines.iter().map(|l| l.item_index).collect();
-                let dropped_items: Vec<usize> = single_items.difference(&two_items).copied().collect();
+                let dropped_items: Vec<usize> =
+                    single_items.difference(&two_items).copied().collect();
                 let added_stores: Vec<Retailer> = best_two
                     .stores
                     .iter()
@@ -1285,17 +1294,25 @@ fn decide_recommendation(
                         kind: RecommendedKind::SingleStore,
                         plan: single.clone(),
                         clears_convenience_threshold: false,
-                        two_store_saving_cents: best_saving,
+                        two_store_saving_cents: if single_items == two_items {
+                            best_saving
+                        } else {
+                            0
+                        },
                     }),
                     threshold_cents: threshold,
                     nearby_applied,
                     rejected_split: Some(RejectedSplit {
                         stores: added_stores,
                         dropped_items,
-                        saving_cents: best_saving,
+                        saving_cents: if single_items == two_items {
+                            best_saving
+                        } else {
+                            0
+                        },
                         threshold_cents: threshold,
-                        less_complete: best_two.missing_count > single.missing_count,
                         same_items: single_items == two_items,
+                        less_complete: best_two.missing_count > single.missing_count,
                     }),
                     gained_items: Vec::new(),
                 }
@@ -1398,7 +1415,10 @@ fn has_brand_rule(item: &BasketItem) -> bool {
 
 /// Stores in `stores` that are not part of the single-store baseline — the stops
 /// a split would add.
-fn added_stores(stores: impl Iterator<Item = Retailer>, single: Option<&StorePlan>) -> Vec<Retailer> {
+fn added_stores(
+    stores: impl Iterator<Item = Retailer>,
+    single: Option<&StorePlan>,
+) -> Vec<Retailer> {
     let single_stores: &[Retailer] = single.map(|p| p.stores.as_slice()).unwrap_or(&[]);
     stores.filter(|s| !single_stores.contains(s)).collect()
 }
@@ -1415,8 +1435,8 @@ struct ReasonContext<'a> {
 
 /// Build the deterministic reasons for all published plans (issue #103).
 ///
-/// Each plan's reasons are ordered most-important-first; callers render up to
-/// four per card. Reasons are derived from the plan's actual lines plus the run's
+/// Each plan's reasons are ordered most-important-first and capped at four.
+/// Reasons are derived from the plan's actual lines plus the run's
 /// constraints, threshold and known price dates, so they are traceable and
 /// reproducible — never generated text.
 fn build_reasons(
@@ -1493,14 +1513,13 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                 }
                 RecommendedKind::SingleStore => {
                     if let Some(rejected) = ctx.decision.rejected_split.as_ref() {
-                        if rejected.less_complete {
-                            // The split is cheaper but reaches fewer items.
+                        if rejected.less_complete && !rejected.dropped_items.is_empty() {
                             out.push(reason(
                                 kind,
                                 ReasonCode::SplitDropsItems,
                                 rejected.dropped_items.clone(),
                                 rejected.stores.clone(),
-                                Some(rejected.saving_cents),
+                                None,
                                 None,
                                 None,
                             ));
@@ -1678,7 +1697,10 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
             if plan.stores.contains(&retailer) {
                 continue;
             }
-            if single_plan.missing_count == plan.missing_count {
+            let single_items: BTreeSet<usize> =
+                single_plan.lines.iter().map(|l| l.item_index).collect();
+            let plan_items: BTreeSet<usize> = plan.lines.iter().map(|l| l.item_index).collect();
+            if single_items == plan_items {
                 // Like-for-like: report the difference (negative = it would cost
                 // more than this plan).
                 out.push(reason(
@@ -1732,7 +1754,9 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
         let stale: Vec<usize> = plan
             .lines
             .iter()
-            .filter(|l| l.retailer == retailer && l.freshness_confidence != FreshnessConfidence::High)
+            .filter(|l| {
+                l.retailer == retailer && l.freshness_confidence == FreshnessConfidence::Low
+            })
             .map(|l| l.item_index)
             .collect();
         if !stale.is_empty() {
@@ -1761,8 +1785,8 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                     None,
                     None,
                 )),
-                StoreStatus::Occasional if !ctx.input.trip_retailers.contains(&retailer) => {
-                    out.push(reason(
+                StoreStatus::Occasional if !ctx.input.trip_retailers.contains(&retailer) => out
+                    .push(reason(
                         kind,
                         ReasonCode::StoreNotOnTrip,
                         Vec::new(),
@@ -1770,13 +1794,29 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                         None,
                         None,
                         None,
-                    ))
-                }
+                    )),
                 _ => {}
             }
         }
     }
 
+    out.sort_by_key(|reason| match reason.code {
+        ReasonCode::Coverage => 0,
+        ReasonCode::NoKnownPriceHere
+        | ReasonCode::NoKnownPriceAnywhere
+        | ReasonCode::UnresolvedItems => 1,
+        ReasonCode::PriceAsOf | ReasonCode::StalePrices => 2,
+        ReasonCode::ThresholdCleared
+        | ReasonCode::ThresholdNotCleared
+        | ReasonCode::SplitDropsItems
+        | ReasonCode::MoreComplete
+        | ReasonCode::CoverageDiffers
+        | ReasonCode::RejectedStore => 3,
+        ReasonCode::BrandRule => 4,
+        ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip => 5,
+        ReasonCode::CheapestAtStore | ReasonCode::OnlyStoreStocking => 6,
+    });
+    out.truncate(4);
     out
 }
 

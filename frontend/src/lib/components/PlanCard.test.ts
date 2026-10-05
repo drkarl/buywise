@@ -81,9 +81,20 @@ describe('PlanCard', () => {
 		render(PlanCard, {
 			plan: mockPlan({ stores: ['tesco', 'aldi'] }),
 			title: 'Cheapest split',
-			bestSingleTotalCents: 500
+			bestSingleTotalCents: 500,
+			bestSingleItemIndices: [0, 1]
 		});
 		expect(screen.getByText(/Saves €1\.51/)).toBeTruthy();
+	});
+
+	it('hides a saving when the priced item set differs from the single-store baseline', () => {
+		render(PlanCard, {
+			plan: mockPlan({ lines: [mockPlan().lines[0]] }),
+			title: 'Cheapest split',
+			bestSingleTotalCents: 500,
+			bestSingleItemIndices: [0, 1]
+		});
+		expect(screen.queryByText(/Saves|more than best single|Same price as best single/)).toBeNull();
 	});
 
 	it('shows the Dunnes voucher text inline when present', () => {

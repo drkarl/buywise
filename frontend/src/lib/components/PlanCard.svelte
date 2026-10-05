@@ -26,6 +26,8 @@
 		 * line. Null when there is no single-store baseline (then we show no saving).
 		 */
 		bestSingleTotalCents?: number | null;
+		/** Item indices priced by the best single-store plan. */
+		bestSingleItemIndices?: number[];
 		/**
 		 * True for the theoretical-minimum card: a costing benchmark that is never
 		 * routed (may split across many stores). Labelled as a reference, not a plan
@@ -44,6 +46,7 @@
 		title,
 		recommended = false,
 		bestSingleTotalCents = null,
+		bestSingleItemIndices = [],
 		benchmark = false,
 		reasons = []
 	}: Props = $props();
@@ -51,14 +54,22 @@
 	// Saving vs the best single-store plan = bestSingle.total − thisPlan.total.
 	// Only meaningful when a single-store baseline exists and this isn't that very
 	// baseline or the never-routed benchmark. May be <= 0 (a split can cost more).
-	const savingCents = $derived(
-		bestSingleTotalCents === null || benchmark ? null : bestSingleTotalCents - plan.total_cents
-	);
+	const savingCents = $derived.by(() => {
+		if (bestSingleTotalCents === null || benchmark) return null;
+		const baselineItems = [...bestSingleItemIndices].sort((a, b) => a - b);
+		const planItems = plan.lines.map((line) => line.item_index).sort((a, b) => a - b);
+		if (
+			baselineItems.length !== planItems.length ||
+			baselineItems.some((item, index) => item !== planItems[index])
+		) {
+			return null;
+		}
+		return bestSingleTotalCents - plan.total_cents;
+	});
 
 	const storeNames = $derived(plan.stores.map(retailerLabel).join(' + '));
 
-	// The server sends every reason it has; the card shows at most the four most
-	// important (the contract's upper bound) and nothing at all when there are none.
+	// The server prioritizes reasons and sends at most four for this plan.
 	const shownReasons = $derived(reasons.slice(0, 4));
 </script>
 

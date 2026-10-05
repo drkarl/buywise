@@ -140,6 +140,9 @@
 	 * render a redundant "Same price as best single store" line.
 	 */
 	const bestSingleTotal = $derived(result?.best_single?.total_cents ?? null);
+	const bestSingleItemIndices = $derived(
+		result?.best_single?.lines.map((line) => line.item_index) ?? []
+	);
 
 	/**
 	 * Plain-language reasons for the card of a given plan kind (issue #103). The
@@ -303,6 +306,7 @@
 					title={result.recommended.kind === 'two_store' ? 'Recommended split' : 'Recommended store'}
 					recommended
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
 					reasons={planReasons('recommended')}
 				/>
 			{/if}
@@ -319,6 +323,7 @@
 					plan={result.best_two_store}
 					title="Cheapest two-store split"
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
 					reasons={planReasons('best_two_store')}
 				/>
 			{/if}
@@ -328,6 +333,7 @@
 					title="Theoretical minimum"
 					benchmark
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
 					reasons={planReasons('theoretical_minimum')}
 				/>
 			{/if}
