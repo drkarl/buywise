@@ -10,6 +10,7 @@ Built for two adults and two children. Not a public product.
 - Bilingual entry (English and Spanish resolve to the same item)
 - Weekly price data via BasketWatch (RapidAPI) and Lidl direct
 - Four optimisation plans with plain-language reasons for each recommendation
+- Per-item product rules, preferred sizes, substitutions, and known product matches
 - Offline-first PWA: the shopping list works without connectivity in-store, with sync status and pending items shown until the server confirms them
 - Savings ledger: tracks what was actually saved over time
 
@@ -146,6 +147,7 @@ Useful screens once logged in:
 | `/list/<id>` | Shopping list (add items, paste a list, real-time sync) |
 | `/list/<id>/shopping` | In-store shopping mode |
 | `/list/<id>/optimise` | The four optimisation plans |
+| `/items/<canonical-item-id>/preferences?list=<id>` | Per-item product and substitution preferences, with known matches |
 | `/list/<id>/trip` | Per-store lists for the chosen plan (plus unallocated items) |
 | `/settings` | Household store preferences and convenience thresholds |
 | `/savings` | Savings ledger |
