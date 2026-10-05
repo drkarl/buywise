@@ -267,7 +267,7 @@ store_category_orders (id, household_id, store,    -- tesco | dunnes | supervalu
                        category_id, display_order,  -- per-store aisle ordering for shopping mode
                        updated_at)
                      -- unique(household_id, store, category_id)
-                     -- defaults seeded per store; household can drag-reorder in settings
+                     -- default ordering seeded per store
                      -- orders PARENT categories only; per-store sub-category layouts are
                      --   out of scope (issue #101), sub-categories use their default_order
 
