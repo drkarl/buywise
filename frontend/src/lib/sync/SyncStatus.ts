@@ -95,7 +95,7 @@ export interface SyncStatusStore {
   /** The SSE stream opened or dropped. */
   setConnected(connected: boolean): void;
   /** A queue drain started or finished. */
-  setSyncing(syncing: boolean): void;
+  setSyncing(syncing: boolean): Promise<void>;
 }
 
 /**
@@ -115,6 +115,13 @@ export function createSyncStatusStore(listId: string): SyncStatusStore {
   let failed = 0;
 
   let publish: (() => void) | null = null;
+  const readQueueCounts = async () => {
+    const rows = await db.mutation_queue.where('list_id').equals(listId).toArray();
+    return {
+      pending: rows.filter((m) => m.status === 'pending' || m.status === 'sent').length,
+      failed: rows.filter((m) => m.status === 'failed').length
+    };
+  };
 
   const status = readable<SyncStatus>(deriveSyncStatus({ online, connected }), (set) => {
     const emit = () => set(deriveSyncStatus({ online, connected, pending, failed, syncing }));
@@ -123,13 +130,7 @@ export function createSyncStatusStore(listId: string): SyncStatusStore {
 
     // The pending count comes straight from the local queue: it rises the
     // instant an edit is enqueued and falls when the drain confirms it.
-    const subscription = liveQuery(async () => {
-      const rows = await db.mutation_queue.where('list_id').equals(listId).toArray();
-      return {
-        pending: rows.filter((m) => m.status === 'pending' || m.status === 'sent').length,
-        failed: rows.filter((m) => m.status === 'failed').length
-      };
-    }).subscribe({
+    const subscription = liveQuery(readQueueCounts).subscribe({
       next: (counts) => {
         pending = counts.pending;
         failed = counts.failed;
@@ -170,9 +171,21 @@ export function createSyncStatusStore(listId: string): SyncStatusStore {
       connected = value;
       publish?.();
     },
-    setSyncing(value) {
-      syncing = value;
-      publish?.();
+    async setSyncing(value) {
+      if (value) {
+        syncing = true;
+        publish?.();
+        return;
+      }
+
+      try {
+        const counts = await readQueueCounts();
+        pending = counts.pending;
+        failed = counts.failed;
+      } finally {
+        syncing = false;
+        publish?.();
+      }
     },
   };
 }
