@@ -18,12 +18,13 @@
 	import {
 		fetchPreferences,
 		savePreferences,
+		type CandidateView,
 		type ConstraintPolicy,
 		type Preferences,
 		type SizeBasis,
 		type SubstitutionPolicy
 	} from '$lib/api/preferences';
-	import { retailerLabel, sendMatchFeedback } from '$lib/api/optimise';
+	import { formatEuros, retailerLabel, sendMatchFeedback } from '$lib/api/optimise';
 
 	const canonicalItemId = $derived(page.params.id ?? '');
 	/** The list to return to, threaded through from the list/optimise links. */
@@ -136,10 +137,15 @@
 		load();
 	}
 
-	/** Accept or reject a known product; re-read so warnings reflect the change. */
-	async function decideMatch(retailerProductId: string, action: 'accept' | 'reject') {
+	/**
+	 * Accept, reject or undo a product match; re-read so the candidate list,
+	 * known-product list and warnings all reflect the change. `undo` returns a
+	 * decided product to `pending`, so it is proposed again as a candidate.
+	 */
+	async function decideMatch(retailerProductId: string, action: 'accept' | 'reject' | 'undo') {
 		if (matchBusy.has(retailerProductId)) return;
 		matchBusy = new Set(matchBusy).add(retailerProductId);
+		saveError = '';
 		try {
 			const { ok } = await sendMatchFeedback({
 				canonicalItemId,
@@ -157,6 +163,34 @@
 			const next = new Set(matchBusy);
 			next.delete(retailerProductId);
 			matchBusy = next;
+		}
+	}
+
+	/**
+	 * Candidate products grouped by retailer, preserving the server's best-first
+	 * order within each store (issue #108).
+	 */
+	const candidatesByRetailer = $derived.by(() => {
+		const groups: { retailer: string; items: CandidateView[] }[] = [];
+		for (const candidate of prefs?.candidates ?? []) {
+			const group = groups.find((g) => g.retailer === candidate.retailer);
+			if (group) group.items.push(candidate);
+			else groups.push({ retailer: candidate.retailer, items: [candidate] });
+		}
+		return groups;
+	});
+
+	/** Human text for a candidate's score signals. */
+	function signalText(signal: string): string {
+		switch (signal) {
+			case 'name':
+				return 'name match';
+			case 'brand':
+				return 'brand match';
+			case 'size':
+				return 'size match';
+			default:
+				return signal;
 		}
 	}
 
@@ -249,6 +283,70 @@
 				{/each}
 			</ul>
 		{/if}
+
+		<section class="candidates" aria-label="Suggested products" id="suggested-products">
+			<h2>Suggested products</h2>
+			{#if candidatesByRetailer.length === 0}
+				<p class="hint">
+					No product in your stores’ catalogue looks like this item yet. Matching a product
+					here is what gives it a price in your plans.
+				</p>
+			{:else}
+				<p class="hint">
+					Match a product to price this item in your plans. Rejecting one keeps it out of
+					every plan until you undo that decision.
+				</p>
+				{#each candidatesByRetailer as group (group.retailer)}
+					<div class="store-group">
+						<h3>{retailerLabel(group.retailer)}</h3>
+						<ul class="product-list">
+							{#each group.items as candidate (candidate.retailer_product_id)}
+								<li class="product">
+									<span class="product-detail">
+										<span class="product-name">{candidate.name}</span>
+										{#if candidate.brand}<span class="product-meta">{candidate.brand}</span>{/if}
+										{#if candidate.size_text}<span class="product-meta">{candidate.size_text}</span>{/if}
+										<span class="product-price">
+											{formatEuros(candidate.price_cents)}
+											{#if candidate.loyalty_price_cents !== null}
+												<span class="loyalty"
+													>{formatEuros(candidate.loyalty_price_cents)} with loyalty</span
+												>
+											{/if}
+										</span>
+										<span class="product-provenance">
+											price seen {candidate.offer_snapshot_date ?? candidate.fetched_at} · confidence
+											{candidate.source_confidence}
+										</span>
+										{#if candidate.signals.length > 0}
+											<span class="product-signals"
+												>{candidate.signals.map(signalText).join(', ')}</span
+											>
+										{/if}
+									</span>
+									<span class="candidate-actions">
+										<button
+											type="button"
+											class="accept"
+											disabled={matchBusy.has(candidate.retailer_product_id)}
+											onclick={() => decideMatch(candidate.retailer_product_id, 'accept')}
+											>Match</button
+										>
+										<button
+											type="button"
+											class="reject"
+											disabled={matchBusy.has(candidate.retailer_product_id)}
+											onclick={() => decideMatch(candidate.retailer_product_id, 'reject')}
+											>Reject</button
+										>
+									</span>
+								</li>
+							{/each}
+						</ul>
+					</div>
+				{/each}
+			{/if}
+		</section>
 
 		<form class="preferences-form" onsubmit={save}>
 			<section aria-label="Item rule">
@@ -345,12 +443,12 @@
 			<h2>Known products</h2>
 			{#if prefs.matches.length === 0}
 				<p class="hint">
-					No products are matched to this item yet, so your rules cannot be checked until one
-					is.
+					No products are matched to this item yet. Match one from “Suggested products” above
+					so your rules can be checked.
 				</p>
 			{:else}
 				<p class="hint">
-					Reject a product to keep it out of every plan; restore one to allow it again.
+					Reject a product to keep it out of every plan; undo a decision to review it again.
 				</p>
 				<ul class="product-list">
 					{#each prefs.matches as match (match.retailer_product_id)}
@@ -373,7 +471,7 @@
 									type="button"
 									class="restore"
 									disabled={matchBusy.has(match.retailer_product_id)}
-									onclick={() => decideMatch(match.retailer_product_id, 'accept')}>Restore</button
+									onclick={() => decideMatch(match.retailer_product_id, 'undo')}>Undo</button
 								>
 							{:else}
 								<button
@@ -382,6 +480,14 @@
 									disabled={matchBusy.has(match.retailer_product_id)}
 									onclick={() => decideMatch(match.retailer_product_id, 'reject')}>Reject</button
 								>
+								{#if match.status !== 'pending'}
+									<button
+										type="button"
+										class="restore"
+										disabled={matchBusy.has(match.retailer_product_id)}
+										onclick={() => decideMatch(match.retailer_product_id, 'undo')}>Undo</button
+									>
+								{/if}
 							{/if}
 						</li>
 					{/each}
@@ -482,6 +588,65 @@
 		margin: 0;
 		font-size: 0.8rem;
 		color: #64748b;
+	}
+	.candidates {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		border: 1px solid #e2e8f0;
+		border-radius: 0.5rem;
+		padding: 0.8rem;
+	}
+	.candidates h2 {
+		font-size: 1rem;
+		margin: 0;
+	}
+	.store-group h3 {
+		font-size: 0.85rem;
+		margin: 0.6rem 0 0.2rem;
+		color: #334155;
+	}
+	.candidate-actions {
+		display: flex;
+		gap: 0.4rem;
+		flex-shrink: 0;
+	}
+	.product-price {
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: #0f172a;
+		display: inline-flex;
+		gap: 0.35rem;
+		align-items: baseline;
+	}
+	.loyalty {
+		font-size: 0.75rem;
+		font-weight: 400;
+		color: #0f766e;
+	}
+	.product-provenance {
+		font-size: 0.72rem;
+		color: #94a3b8;
+		flex-basis: 100%;
+	}
+	.product-signals {
+		font-size: 0.72rem;
+		color: #0f766e;
+		flex-basis: 100%;
+	}
+	.accept {
+		flex-shrink: 0;
+		padding: 0.3rem 0.6rem;
+		border: 1px solid #0f766e;
+		border-radius: 0.4rem;
+		background: #0f766e;
+		color: #fff;
+		font-size: 0.8rem;
+		cursor: pointer;
+	}
+	.accept:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 	.substitution {
 		display: grid;

@@ -59,6 +59,16 @@
 	const isAmbiguous = $derived(
 		entry.resolution_status === 'ambiguous' && !inBasket && onclarify !== undefined
 	);
+	// A resolved active entry with no usable product match (issue #108): the link
+	// is promoted from "Prefs" to "Match" so an unmatched staple prompts for a
+	// match instead of silently having no price. `needs_match` is snapshot-only,
+	// so it is simply false until the next full snapshot.
+	const needsMatch = $derived(
+		!inBasket &&
+			entry.resolution_status === 'resolved' &&
+			!!entry.canonical_item_id &&
+			entry.needs_match === true
+	);
 	// Show the +/- stepper only for an active (not in-basket) entry when the parent
 	// wired `onquantity`. The `-` button is disabled at quantity 1 so it never goes
 	// below 1, and `+` is disabled at MAX_QUANTITY so the UI never round-trips a
@@ -170,8 +180,13 @@
 		{#if !inBasket && entry.resolution_status === 'resolved' && entry.canonical_item_id}
 			<a
 				class="prefs"
+				class:needs-match={needsMatch}
 				href="/items/{entry.canonical_item_id}/preferences?list={entry.list_id}"
-				aria-label="Preferences for {entry.display_name}">Prefs</a
+				aria-label={needsMatch
+					? `Match a product to ${entry.display_name}`
+					: `Preferences for ${entry.display_name}`}
+				title={needsMatch ? 'No product matched yet — choose one to get a price' : undefined}
+				>{needsMatch ? 'Match' : 'Prefs'}</a
 			>
 		{/if}
 
@@ -281,6 +296,12 @@
 		font-size: 0.75rem;
 		text-decoration: none;
 		white-space: nowrap;
+	}
+	.prefs.needs-match {
+		border-color: #f59e0b;
+		background: #fffbeb;
+		color: #92400e;
+		font-weight: 600;
 	}
 	.pending-marker {
 		flex-shrink: 0;

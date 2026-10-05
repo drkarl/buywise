@@ -202,15 +202,20 @@ export function formatEuros(cents: number): string {
 	return `${sign}€${euros}`;
 }
 
-/** A user's feedback on a product match, mirroring the API's `action` field. */
-export type MatchFeedbackAction = 'accept' | 'reject' | 'prefer';
+/**
+ * A user's feedback on a product match, mirroring the API's `action` field.
+ * `undo` (issue #108) resets a decided match to `pending` so the product is
+ * no longer auto-priced and is proposed again as a candidate.
+ */
+export type MatchFeedbackAction = 'accept' | 'reject' | 'prefer' | 'undo';
 
 /**
- * POST a user's accept/reject/prefer decision on a product match to
- * `POST /api/match-feedback` (P5-T1). Stamps the `X-CSRF-Token` header (the
- * backend 403s mutating calls without it) and resolves to the response's OK flag
- * so callers can surface a failure without coupling to the (non-stable) error
- * body. Throws only on a network/transport failure, which callers catch.
+ * POST a user's accept/reject/prefer/undo decision on a product match to
+ * `POST /api/match-feedback` (P5-T1, issue #108). Stamps the `X-CSRF-Token`
+ * header (the backend 403s mutating calls without it) and resolves to the
+ * response's OK flag so callers can surface a failure without coupling to the
+ * (non-stable) error body. Throws only on a network/transport failure, which
+ * callers catch.
  */
 export async function sendMatchFeedback(args: {
 	canonicalItemId: string;

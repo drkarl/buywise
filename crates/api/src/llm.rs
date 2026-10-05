@@ -170,6 +170,25 @@ pub trait LlmClient: Send + Sync {
         raw_text: &str,
         candidate_names: &[String],
     ) -> Result<Option<String>, LlmError>;
+
+    /// Optionally reorder candidate retailer products for one canonical item
+    /// (issue #108).
+    ///
+    /// Given a human description of the item and the exact candidate labels
+    /// (product name + retailer), return those labels best-first. This is
+    /// advisory only: the caller keeps its deterministic order for any candidate
+    /// the model omits, and falls back entirely on `Ok(None)` or an error, so a
+    /// bad answer can never lose a candidate or invent one. The default
+    /// implementation opts out (`Ok(None)`); [`ReqwestLlmClient`] implements it.
+    /// Callers gate on [`is_enabled`](Self::is_enabled) before calling, so an
+    /// off fallback costs nothing.
+    async fn rank_candidates(
+        &self,
+        _item_description: &str,
+        _candidate_labels: &[String],
+    ) -> Result<Option<Vec<String>>, LlmError> {
+        Ok(None)
+    }
 }
 
 /// Production [`LlmClient`] backed by `reqwest`, targeting an OpenAI-compatible
@@ -221,6 +240,23 @@ impl ReqwestLlmClient {
              their household catalogue:\n{list}\n\nWhich of these grocery items is this \
              most likely referring to? Return only the exact item name from the list, or \
              'none' if there is no plausible match."
+        )
+    }
+
+    /// Build the ranking prompt: the item being shopped for and a numbered list of
+    /// candidate products (label + retailer), asking for those labels best-first.
+    fn build_ranking_prompt(item_description: &str, candidate_labels: &[String]) -> String {
+        let list = candidate_labels
+            .iter()
+            .map(|n| format!("- {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "A shopper wants to buy \"{item_description}\". Here are candidate products \
+             found in their stores:\n{list}\n\nRank the candidates by how likely each is \
+             the product the shopper means. Return a JSON array of the exact candidate \
+             strings (as written after \"- \"), best first. Include only plausible \
+             candidates; omit any that do not match."
         )
     }
 }
@@ -308,6 +344,61 @@ impl LlmClient for ReqwestLlmClient {
 
         Ok(interpret_answer(&content))
     }
+
+    async fn rank_candidates(
+        &self,
+        item_description: &str,
+        candidate_labels: &[String],
+    ) -> Result<Option<Vec<String>>, LlmError> {
+        if !self.is_enabled() {
+            return Err(LlmError::Disabled);
+        }
+        // Nothing to order → no call.
+        if candidate_labels.is_empty() {
+            return Ok(None);
+        }
+        let http = self.http.as_ref().ok_or(LlmError::Disabled)?;
+        let api_key = self.config.api_key.as_deref().ok_or(LlmError::Disabled)?;
+        let model = self.config.model.as_deref().ok_or(LlmError::Disabled)?;
+
+        let prompt = Self::build_ranking_prompt(item_description, candidate_labels);
+        // `temperature: 0` keeps the ordering deterministic; the token budget is
+        // larger than resolve_item's because the array can hold several labels.
+        let body = serde_json::json!({
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 512,
+            "messages": [
+                { "role": "system", "content": "You rank grocery products by how likely they are the same item a shopper means. Answer with a JSON array of the exact candidate strings, best first." },
+                { "role": "user", "content": prompt }
+            ]
+        });
+
+        let resp = http
+            .post(&self.config.base_url)
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Request(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(LlmError::Status(resp.status().as_u16()));
+        }
+
+        let parsed: ChatCompletionResponse = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Malformed(e.to_string()))?;
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| LlmError::Malformed("no choices in response".to_string()))?;
+
+        Ok(interpret_ranking(&content, candidate_labels))
+    }
 }
 
 /// Interpret the model's raw answer: trim it, treat the `none` sentinel (and an
@@ -325,6 +416,33 @@ fn interpret_answer(content: &str) -> Option<String> {
         return None;
     }
     Some(cleaned.to_string())
+}
+
+/// Interpret the model's ranking answer: extract a JSON array of candidate
+/// labels, keep only labels that were actually offered (exact match), drop
+/// duplicates, and preserve the model's order. Anything unparseable or naming no
+/// known candidate yields `None`, so the caller keeps its deterministic order.
+/// This is the safety boundary: the model can reorder the candidates it was
+/// given, but can never add one.
+fn interpret_ranking(content: &str, candidate_labels: &[String]) -> Option<Vec<String>> {
+    let start = content.find('[')?;
+    let end = content.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    let parsed: Vec<String> = serde_json::from_str(&content[start..=end]).ok()?;
+
+    let mut ordered: Vec<String> = Vec::new();
+    for label in parsed {
+        if candidate_labels.iter().any(|c| c == &label) && !ordered.contains(&label) {
+            ordered.push(label);
+        }
+    }
+    if ordered.is_empty() {
+        None
+    } else {
+        Some(ordered)
+    }
 }
 
 /// Build the application's [`LlmClient`] from the environment. Always returns a
@@ -443,6 +561,72 @@ mod tests {
             interpret_answer("  \"Apple Juice\".  "),
             Some("Apple Juice".to_string())
         );
+    }
+
+    #[test]
+    fn interpret_ranking_keeps_only_offered_labels_in_order() {
+        let offered = vec![
+            "Heinz Baked Beans | tesco".to_string(),
+            "Own Baked Beans | aldi".to_string(),
+        ];
+        // Model returns offered labels out of order, one hallucinated, one dup.
+        let content = "Here you go:\n[\"Own Baked Beans | aldi\", \"Ghost Product | lidl\", \
+                       \"Heinz Baked Beans | tesco\", \"Own Baked Beans | aldi\"]";
+        assert_eq!(
+            interpret_ranking(content, &offered),
+            Some(vec![
+                "Own Baked Beans | aldi".to_string(),
+                "Heinz Baked Beans | tesco".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn interpret_ranking_rejects_unparseable_or_unknown_only() {
+        let offered = vec!["Milk | tesco".to_string()];
+        assert_eq!(interpret_ranking("no array here", &offered), None);
+        assert_eq!(interpret_ranking("[\"Unknown | lidl\"]", &offered), None);
+        assert_eq!(interpret_ranking("[]", &offered), None);
+    }
+
+    #[tokio::test]
+    async fn default_rank_candidates_opts_out() {
+        struct Noop;
+        #[async_trait]
+        impl LlmClient for Noop {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            async fn resolve_item(
+                &self,
+                _raw_text: &str,
+                _candidate_names: &[String],
+            ) -> Result<Option<String>, LlmError> {
+                Ok(None)
+            }
+        }
+        assert_eq!(
+            Noop.rank_candidates("Milk", &["Milk | tesco".to_string()])
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_rank_candidates_short_circuits() {
+        let client = ReqwestLlmClient::new(LlmConfig {
+            enabled: false,
+            provider: None,
+            api_key: Some("k".to_string()),
+            model: Some("m".to_string()),
+            base_url: "http://127.0.0.1:1/unused".to_string(),
+        });
+        let err = client
+            .rank_candidates("Milk", &["Milk | tesco".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::Disabled));
     }
 
     #[tokio::test]

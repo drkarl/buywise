@@ -21,6 +21,13 @@ export interface LocalListEntry {
   subcategory_id?: string;
   last_updated_revision: number;
   updated_at: string;
+  /**
+   * Whether the entry is resolved but has no usable product match, so no price
+   * can be produced for it (issue #108); drives the "Needs match" prompt on the
+   * list row. Carried only by the full list snapshot, so it is absent on entries
+   * received through a single mutation/SSE event.
+   */
+  needs_match?: boolean;
 }
 
 export interface LocalMutation {

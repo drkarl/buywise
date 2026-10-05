@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import type { Preferences } from '$lib/api/preferences';
+import type { CandidateView, Preferences } from '$lib/api/preferences';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
 // the route id (and the optional back-to-list param) without a kit server.
@@ -41,7 +41,31 @@ function basePreferences(): Preferences {
 				size_text: '415g'
 			}
 		],
+		candidates: [],
 		warnings: []
+	};
+}
+
+/** A candidate payload for the "Suggested products" section. */
+function candidate(overrides: Partial<CandidateView> = {}): CandidateView {
+	return {
+		retailer_product_id: 'rp-own-aldi',
+		retailer: 'aldi',
+		name: 'Own Brand Baked Beans',
+		brand: 'Aldi',
+		size_text: '420g',
+		pack_count: 1,
+		score: 70,
+		signals: ['name'],
+		price_cents: 85,
+		loyalty_price_cents: null,
+		loyalty_scheme: null,
+		unit_price_eur_micros: null,
+		unit_price_basis: null,
+		offer_snapshot_date: '2026-06-01',
+		fetched_at: '2026-06-02T00:00:00.000Z',
+		source_confidence: 'high',
+		...overrides
 	};
 }
 
@@ -179,6 +203,58 @@ describe('item preferences', () => {
 			const body = JSON.parse(feedback![1]!.body as string);
 			expect(body.action).toBe('reject');
 			expect(body.canonical_item_id).toBe('ci-beans');
+			expect(body.retailer_product_id).toBe('rp-heinz-tesco');
+		});
+	});
+
+	it('renders a suggested candidate with its price and provenance', async () => {
+		const preferences = basePreferences();
+		preferences.candidates = [candidate()];
+		stubPreferences(preferences);
+		render(Page);
+
+		await waitFor(() => expect(screen.getByText('Own Brand Baked Beans')).toBeTruthy());
+		expect(screen.getByText('€0.85')).toBeTruthy();
+		expect(screen.getByText(/price seen 2026-06-01/)).toBeTruthy();
+		expect(screen.getByText('name match')).toBeTruthy();
+	});
+
+	it('matches a suggested candidate', async () => {
+		const preferences = basePreferences();
+		preferences.candidates = [candidate()];
+		const fetchMock = stubPreferences(preferences);
+		render(Page);
+		await waitFor(() => expect(screen.getByText('Own Brand Baked Beans')).toBeTruthy());
+
+		await fireEvent.click(screen.getByText('Match'));
+
+		await waitFor(() => {
+			const feedback = fetchMock.mock.calls.find(([input]) =>
+				String(input).endsWith('/api/match-feedback')
+			);
+			expect(feedback).toBeTruthy();
+			const body = JSON.parse(feedback![1]!.body as string);
+			expect(body.action).toBe('accept');
+			expect(body.retailer_product_id).toBe('rp-own-aldi');
+		});
+	});
+
+	it('undoes a rejected match, restoring it for review', async () => {
+		const preferences = basePreferences();
+		preferences.matches[0].status = 'rejected';
+		const fetchMock = stubPreferences(preferences);
+		render(Page);
+		await waitFor(() => expect(screen.getByText('Undo')).toBeTruthy());
+
+		await fireEvent.click(screen.getByText('Undo'));
+
+		await waitFor(() => {
+			const feedback = fetchMock.mock.calls.find(([input]) =>
+				String(input).endsWith('/api/match-feedback')
+			);
+			expect(feedback).toBeTruthy();
+			const body = JSON.parse(feedback![1]!.body as string);
+			expect(body.action).toBe('undo');
 			expect(body.retailer_product_id).toBe('rp-heinz-tesco');
 		});
 	});

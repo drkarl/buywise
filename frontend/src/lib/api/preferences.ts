@@ -45,6 +45,37 @@ export interface PreferencesConstraints {
 	substitution_policy: SubstitutionPolicy;
 }
 
+/** Why a candidate was ranked the way it was (stable signal codes). */
+export type MatchSignal = 'name' | 'brand' | 'size';
+
+/** Ingest confidence of a candidate's offer (mirrors `SourceConfidence`). */
+export type SourceConfidence = 'high' | 'medium' | 'low';
+
+/**
+ * One proposed retailer product the household can match to the item (issue #108).
+ * Carries the product identity and the price provenance the decision is based on.
+ * A candidate is only proposed when it has a current offer and is not already
+ * accepted/suggested/rejected for the item.
+ */
+export interface CandidateView {
+	retailer_product_id: string;
+	retailer: RetailerId;
+	name: string;
+	brand: string | null;
+	size_text: string | null;
+	pack_count: number | null;
+	score: number;
+	signals: MatchSignal[];
+	price_cents: number;
+	loyalty_price_cents: number | null;
+	loyalty_scheme: string | null;
+	unit_price_eur_micros: number | null;
+	unit_price_basis: string | null;
+	offer_snapshot_date: string | null;
+	fetched_at: string;
+	source_confidence: SourceConfidence;
+}
+
 /** The full `GET`/`PUT /api/items/{id}/preferences` response body. */
 export interface Preferences {
 	canonical_item_id: string;
@@ -53,6 +84,8 @@ export interface Preferences {
 	default_constraint_policy: ConstraintPolicy;
 	constraints: PreferencesConstraints;
 	matches: MatchView[];
+	/** Proposed products per retailer, best match first (issue #108). */
+	candidates: CandidateView[];
 	/**
 	 * Stable warning codes for data the optimiser cannot evaluate:
 	 * `brand_policy_missing_brand`, `allowed_set_empty`, `no_usable_matches`.

@@ -502,6 +502,42 @@ async fn mutations_operation_type_check_accepts_move_to_list() {
     );
 }
 
+/// Migration 012 widens the `match_feedback.action` CHECK to include `undo`
+/// (issue #108) by rebuilding the table; this asserts the new value is accepted
+/// after the rebuild (and so the constraint was recreated, not dropped) while the
+/// foreign keys to `product_matches` / `users` still hold.
+#[tokio::test]
+async fn match_feedback_action_check_accepts_undo() {
+    let pool = migrated_pool().await;
+    seed_list_prereqs(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO retailer_products (id, source, retailer, name, first_seen_at, last_seen_at) \
+         VALUES ('rp-1', 'manual', 'tesco', 'Milk', 't', 't')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO product_matches \
+             (id, household_id, canonical_item_id, retailer_product_id, status, matched_by, \
+              created_at, updated_at) \
+         VALUES ('pm-1', ?, 'ci-1', 'rp-1', 'accepted', 'user', 't', 't')",
+    )
+    .bind(HOUSEHOLD)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ok = sqlx::query(
+        "INSERT INTO match_feedback (id, product_match_id, user_id, action, created_at) \
+         VALUES ('mf-1', 'pm-1', 'user-1', 'undo', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(ok.is_ok(), "undo must be accepted after migration 012");
+}
+
 /// Migration 010 seeds the shared sub-category catalogue and backfills
 /// `canonical_items.subcategory_id` from the name-keyed seed mapping (issue #101).
 ///
