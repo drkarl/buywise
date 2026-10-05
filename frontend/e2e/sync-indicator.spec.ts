@@ -12,7 +12,8 @@ import {
   addItem,
   uniqueName,
   waitForDrained,
-  activeRow
+  activeRow,
+  listPath
 } from './fixtures';
 
 test.describe('sync status indicator', () => {
