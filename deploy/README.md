@@ -79,10 +79,13 @@ a request to be made; if either is missing the fallback silently stays disabled
 > "Weekly price ingest" below) **and** `product_matches` rows mapping canonical
 > items to retailer products. The optimiser filters retailer candidates through
 > `product_matches`; with no offers and no matches there is nothing to price. The
-> matches are seeded out-of-band via `buywise-cli seed-matches --from <csv> --db
-> <db> --household-id <uuid>` (idempotent upsert) — see the Phase-0 seeding flow
-> in [`docs/phase0-results.md`](../docs/phase0-results.md). The LLM fallback only
-> affects term resolution, not offer/match availability.
+> initial matches can be seeded out-of-band via `buywise-cli seed-matches --from
+> <csv> --db <db> --household-id <uuid>` (idempotent upsert) — see the Phase-0
+> seeding flow in [`docs/phase0-results.md`](../docs/phase0-results.md). The app
+> can also propose retailer products for unmatched items in the item's
+> preferences screen; accepting a proposal creates a match. The LLM fallback can
+> rank those proposals when enabled, in addition to its separate term-resolution
+> use.
 
 ## 1. Build the ARM64 binary (on your build machine)
 
