@@ -19,6 +19,7 @@ const item: LocalListEntry = {
 describe('CategoryGroup', () => {
 	it('marks a shopping-mode item while its mutation is pending', () => {
 		const group: CategoryGroupData = {
+			id: '__uncategorised__',
 			category_id: '__uncategorised__',
 			items: [item],
 			remaining: 1
