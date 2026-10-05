@@ -573,6 +573,8 @@ Offline capabilities:
 
 Service worker caches the SvelteKit app shell. Dexie holds the local list mirror and mutation queue. On reconnect, the mutation queue drains against the server in order.
 
+The list and shopping-mode screens show an always-visible sync status: synced, syncing, offline with the number of pending changes, or a sync error for rejected changes. Each item with a pending or sent mutation has a subtle marker until the server confirms it. Rejected mutations remain visible as an error until the user dismisses them; dismissal reconciles local state from the server snapshot before clearing the error.
+
 ---
 
 ## 14. Build Order
