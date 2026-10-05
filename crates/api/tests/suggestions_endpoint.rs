@@ -367,6 +367,74 @@ async fn mark_bought_records_evidence_and_move_to_list_removes_it() {
 }
 
 #[tokio::test]
+async fn mark_bought_normalizes_timestamps_and_keeps_one_evidence_row() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a").await;
+    seed_item(&pool, "item-milk", "hh-a", "Milk").await;
+    seed_resolved_entry(&pool, "entry-milk", "list-a", "user-a", "item-milk").await;
+    let s = login(&pool, "a@example.test").await;
+
+    for (mutation_id, bought_at) in [
+        ("cm-future", "2099-01-01T00:00:00Z"),
+        ("cm-invalid", "not-a-timestamp"),
+    ] {
+        let resp = post_mutation(
+            &pool,
+            &s,
+            envelope(
+                mutation_id,
+                "list-a",
+                "list_entry",
+                "entry-milk",
+                "mark_bought",
+                json!({ "bought_at": bought_at }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let (entry_at, event_at, count): (String, String, i64) = sqlx::query_as(
+            "SELECT le.bought_at, pe.occurred_at, \
+                    (SELECT COUNT(*) FROM purchase_events WHERE entry_id = le.id) \
+             FROM list_entries le JOIN purchase_events pe ON pe.entry_id = le.id \
+             WHERE le.id = 'entry-milk'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let entry_time = chrono::DateTime::parse_from_rfc3339(&entry_at).unwrap();
+        let event_time = chrono::DateTime::parse_from_rfc3339(&event_at).unwrap();
+        assert!(entry_time <= Utc::now());
+        assert!(event_time <= Utc::now());
+        assert_eq!(entry_time, event_time);
+        assert_eq!(count, 1);
+    }
+
+    let resp = post_mutation(
+        &pool,
+        &s,
+        envelope(
+            "cm-skip",
+            "list-a",
+            "list_entry",
+            "entry-milk",
+            "mark_skipped",
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM purchase_events WHERE entry_id = 'entry-milk'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn dismissal_suppresses_the_next_suggestion() {
     let pool = setup_pool().await;
     seed_household(&pool, "hh-a", "Household A").await;
