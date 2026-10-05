@@ -18,7 +18,9 @@ import {
 } from './SseClient';
 import { onMutationEnqueued } from './enqueueSignal';
 import { fetchCatalogue } from './catalogue';
+import { createSyncStatusStore, type SyncStatus } from './SyncStatus';
 import type { ListSnapshot } from './types';
+import type { Readable } from 'svelte/store';
 
 export { drainQueue, MAX_RETRIES } from './SyncQueue';
 export type { DrainResult, FailedMutation, SyncQueueOptions } from './SyncQueue';
@@ -32,6 +34,12 @@ export {
 export type { SseClientOptions } from './SseClient';
 export { notifyMutationEnqueued, onMutationEnqueued } from './enqueueSignal';
 export { fetchCatalogue } from './catalogue';
+export {
+  createSyncStatusStore,
+  deriveSyncStatus,
+  syncStatusLabel
+} from './SyncStatus';
+export type { SyncState, SyncStatus, SyncStatusInput, SyncStatusStore } from './SyncStatus';
 export * from './types';
 
 export interface SyncOptions {
@@ -48,6 +56,13 @@ export interface SyncHandle {
   resync(): Promise<void>;
   /** Tears down the SSE stream and detaches the `online` listener. */
   stop(): void;
+  /** Live sync/connectivity status for the always-visible indicator. */
+  status: Readable<SyncStatus>;
+  /**
+   * Acknowledges a surfaced terminal failure (e.g. the user dismissed its
+   * notice) so it stops counting toward the indicator's error state.
+   */
+  acknowledgeFailure(clientMutationId: string): void;
 }
 
 /**
@@ -170,7 +185,35 @@ export async function flushPendingMutations(
  * `onMount`; call the returned `stop()` in the component teardown.
  */
 export function startSync(listId: string, options: SyncOptions = {}): SyncHandle {
-  const sse = new SseClient(listId, options.sse);
+  const statusStore = createSyncStatusStore(listId);
+
+  const sse = new SseClient(listId, {
+    ...options.sse,
+    // Fold the stream's liveness into the indicator before delegating to any
+    // caller-supplied callbacks (the test seam in `SyncOptions.sse`).
+    onOpen: () => {
+      options.sse?.onOpen?.();
+      statusStore.setConnected(true);
+    },
+    onReconnectScheduled: (delayMs) => {
+      options.sse?.onReconnectScheduled?.(delayMs);
+      statusStore.setConnected(false);
+    }
+  });
+
+  // Terminal 4xx failures feed the indicator's error state. Tracked by
+  // client_mutation_id so a replayed drain (which re-reports the same rejection)
+  // cannot inflate the count; `acknowledgeFailure` clears an acknowledged one.
+  const failedMutations = new Set<string>();
+  const userOnFailed = options.onFailed;
+  const syncOptions: SyncOptions = {
+    ...options,
+    onFailed: (failure) => {
+      failedMutations.add(failure.client_mutation_id);
+      statusStore.setFailed(failedMutations.size);
+      userOnFailed?.(failure);
+    }
+  };
 
   // Single cancellation flag checked by every async continuation. stop() flips
   // it so post-teardown work (the deferred sse.start(), an in-flight resync, a
@@ -185,9 +228,16 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
   function enqueueSync(): Promise<void> {
     syncChain = syncChain
       .catch(() => {}) // a prior failure must not poison later runs
-      .then(() => {
+      .then(async () => {
         if (stopped) return; // cancelled during teardown — skip
-        return runSync(listId, options);
+        // The indicator shows "syncing" for the whole drain, including the
+        // snapshot/catalogue work before the first mutation is confirmed.
+        statusStore.setSyncing(true);
+        try {
+          await runSync(listId, syncOptions);
+        } finally {
+          statusStore.setSyncing(false);
+        }
       });
     return syncChain;
   }
@@ -223,6 +273,12 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
   });
 
   return {
+    status: statusStore.status,
+    acknowledgeFailure(clientMutationId: string) {
+      if (failedMutations.delete(clientMutationId)) {
+        statusStore.setFailed(failedMutations.size);
+      }
+    },
     async resync() {
       await bootstrap; // ensure the initial pass has wired up before re-draining
       await enqueueSync();

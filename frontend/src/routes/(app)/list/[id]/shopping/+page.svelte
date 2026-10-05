@@ -11,6 +11,7 @@
 	import StoreSelector from '$lib/components/StoreSelector.svelte';
 	import CategoryGroup from '$lib/components/CategoryGroup.svelte';
 	import ProgressBar from '$lib/components/ProgressBar.svelte';
+	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
 	import { markBought } from '$lib/stores/list';
 	import {
 		shoppingEntries,
@@ -22,7 +23,7 @@
 		type RetailerId
 	} from '$lib/stores/shopping';
 	import { sortByStoreOrder } from '$lib/shopping/sortByStoreOrder';
-	import { startSync, type SyncHandle } from '$lib/sync';
+	import { startSync, deriveSyncStatus, type SyncHandle, type SyncStatus } from '$lib/sync';
 
 	const listId = $derived(page.params.id ?? '');
 
@@ -56,13 +57,17 @@
 	const bought = $derived($entries.filter((e) => e.status === 'bought').length);
 
 	// Start the sync engine so check-offs flush when online and remote changes
-	// stream in; identical lifecycle to the main list view.
+	// stream in; identical lifecycle to the main list view. The engine's live
+	// status drives the always-visible indicator in the header.
 	let sync: SyncHandle | null = null;
+	let syncStatus = $state<SyncStatus>(deriveSyncStatus());
 	$effect(() => {
 		if (!listId) return;
 		const handle = startSync(listId);
+		const unsubscribeStatus = handle.status.subscribe((next) => (syncStatus = next));
 		sync = handle;
 		return () => {
+			unsubscribeStatus();
 			handle.stop();
 			if (sync === handle) sync = null;
 		};
@@ -76,7 +81,10 @@
 <main class="shopping-view">
 	<header class="shopping-header">
 		<h1>Shopping</h1>
-		<a class="back" href="/list/{listId}">Back to list</a>
+		<div class="shopping-header-meta">
+			<SyncIndicator status={syncStatus} />
+			<a class="back" href="/list/{listId}">Back to list</a>
+		</div>
 	</header>
 
 	<StoreSelector selected={selectedStore} onselect={selectStore} />
@@ -109,10 +117,19 @@
 		display: flex;
 		align-items: baseline;
 		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: 0.5rem;
 	}
 	.shopping-header h1 {
 		font-size: 1.4rem;
 		margin: 0;
+	}
+	.shopping-header-meta {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
 	}
 	.back {
 		font-size: 0.9rem;

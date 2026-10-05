@@ -34,10 +34,25 @@
 		 * type-check; when absent the "↩ List" button is not shown.
 		 */
 		onmoveback?: (id: string) => void;
+		/**
+		 * A mutation for this entry is queued but not yet confirmed by the server
+		 * (issue #113). Renders a subtle "not synced yet" marker so a pending
+		 * change stays visible per item until the server confirms it. Defaults to
+		 * false so existing call sites that don't track sync state still render.
+		 */
+		pending?: boolean;
 	}
 
-	let { entry, onbought, onskipped, ondelete, onclarify, onquantity, onmoveback }: Props =
-		$props();
+	let {
+		entry,
+		onbought,
+		onskipped,
+		ondelete,
+		onclarify,
+		onquantity,
+		onmoveback,
+		pending = false
+	}: Props = $props();
 
 	const inBasket = $derived(entry.status === 'bought' || entry.status === 'skipped');
 	// An active, ambiguous entry the parent can disambiguate.
@@ -152,6 +167,15 @@
 
 		<span class="name">{entry.display_name}</span>
 
+		{#if pending}
+			<span
+				class="pending-marker"
+				role="img"
+				aria-label="Not synced yet"
+				title="Not synced yet">•</span
+			>
+		{/if}
+
 		{#if isAmbiguous}
 			<button
 				type="button"
@@ -238,6 +262,12 @@
 	}
 	.in-basket .name {
 		text-decoration: line-through;
+	}
+	.pending-marker {
+		flex-shrink: 0;
+		color: #b45309;
+		font-size: 1.1rem;
+		line-height: 1;
 	}
 	.check {
 		width: 1.75rem;
