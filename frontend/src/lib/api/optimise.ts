@@ -97,6 +97,11 @@ export interface NoValidOfferItem {
 	/** The source list entry (see {@link PlanLine.entry_id}); `null` if none. */
 	entry_id: string | null;
 	display_text: string;
+	/**
+	 * The resolved canonical item id, so the UI can link the warning straight to
+	 * the item's preferences screen (issue #102).
+	 */
+	canonical_item_id: string;
 	reason: NoValidOfferReason;
 }
 

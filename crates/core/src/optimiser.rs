@@ -416,6 +416,11 @@ pub struct NoValidOfferItem {
     pub entry_id: Option<String>,
     /// The original display text.
     pub display_text: String,
+    /// The resolved canonical item id. Always present: only a resolved entry
+    /// reaches `no_valid_offer_items` (an unresolved entry is excluded from
+    /// pricing and surfaced in `unresolved_items` instead). Lets the UI link the
+    /// warning straight to that item's preferences screen.
+    pub canonical_item_id: String,
     /// Structured reason for the warning.
     pub reason: NoOfferReason,
 }
@@ -2000,12 +2005,21 @@ fn classify_items(
             continue;
         }
 
+        // Resolved from here on: every exit below is a `no_valid_offer` entry,
+        // each carrying the canonical id so the UI can link the warning to the
+        // item's preferences screen.
+        let canonical_item_id = item
+            .canonical_item_id
+            .clone()
+            .expect("resolved item has a canonical id");
+
         // 1b. No matches / offers at all.
         let Some(rows) = priced_inputs.get(&item_index).filter(|r| !r.is_empty()) else {
             no_valid_offer.push(NoValidOfferItem {
                 item_index,
                 entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
+                canonical_item_id: canonical_item_id.clone(),
                 reason: NoOfferReason::NoMatches,
             });
             continue;
@@ -2038,6 +2052,7 @@ fn classify_items(
                 item_index,
                 entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
+                canonical_item_id: canonical_item_id.clone(),
                 reason: NoOfferReason::BrandPolicyMissingBrand,
             });
             continue;
@@ -2048,6 +2063,7 @@ fn classify_items(
                 item_index,
                 entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
+                canonical_item_id: canonical_item_id.clone(),
                 reason: NoOfferReason::ConstraintsEliminatedAll,
             });
             continue;
@@ -2078,6 +2094,7 @@ fn classify_items(
                         item_index,
                         entry_id: item.entry_id.clone(),
                         display_text: item.display_text.clone(),
+                        canonical_item_id: canonical_item_id.clone(),
                         reason: NoOfferReason::StrictNoExactOffer,
                     });
                 } else {
@@ -2103,12 +2120,8 @@ fn classify_items(
                         candidates.push(confirmed);
                     }
                     None => {
-                        // `canonical_item_id` is Some here: an unresolved item never
-                        // reaches the policy branch (it short-circuits at 1a above).
-                        let canonical_item_id = item
-                            .canonical_item_id
-                            .clone()
-                            .expect("resolved item has a canonical id");
+                        // `canonical_item_id` is bound above: an unresolved item
+                        // never reaches the policy branch (it short-circuits at 1a).
                         needs_confirmation.push(NeedsConfirmationItem {
                             item_index,
                             entry_id: item.entry_id.clone(),

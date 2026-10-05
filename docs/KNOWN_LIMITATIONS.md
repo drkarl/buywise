@@ -81,3 +81,62 @@ across a re-optimise was out of scope for the store-settings change (issue #98).
 
 **Follow-up.** Keep the trip controls mounted across a re-optimise (render them outside the loading
 branch, or scope the loading state to the plans region).
+
+## Household product preferences
+
+### 5. Only the `brand` policy changes behaviour; `own_label`, `exact` and `ask` are stored but inert
+
+**What happens.** The per-item preferences screen (`/items/{id}/preferences`, issue #102) offers all
+six `ConstraintPolicy` values. The optimiser, however, special-cases only `brand`
+(`crates/core/src/optimiser.rs::check_constraints`): under `own_label`, `exact` and `ask` it applies
+no policy-specific filter, so a product that merely passes the field filters (allowed/excluded
+brands, size band, form, dietary, pack) is accepted. The `ask`/`exact` behaviours the household
+expects are actually driven by the separate `substitution_policy` (`ask` / `strict`) the same screen
+sets.
+
+**Why accepted.** `substitution_policy` already implements the intended substitution semantics
+(ask-before-substituting, exact-product-only) and is enforced; adding a parallel policy meaning for
+`own_label`/`exact`/`ask` would duplicate it. The screen keeps all six values for schema fidelity and
+so policy and substitution can be unified later.
+
+**Workaround.** Use the substitution control for ask/exact behaviour; use `brand` or `allowed_set`
+for brand rules.
+
+**Follow-up.** Either collapse the policy vocabulary to the enforced set, or implement `own_label`
+and `exact` and derive substitution from the policy.
+
+### 6. The screen exposes preferred size only, not min/max size, pack count, form or dietary flags
+
+**What happens.** `item_constraints` carries `min_size_value`/`max_size_value`, `pack_count`,
+`form_factor` and `dietary_flags`, and the optimiser enforces them when set — but the v1 preferences
+screen edits only `preferred_size_value` (+ basis), `brand`, `allowed_brands`, `excluded_brands` and
+`substitution_policy`. The other fields keep whatever a seed or direct DB write put there; the screen
+neither shows nor clears them.
+
+**Why accepted.** The first-class controls requested for v1 were the policy selector, brand rules,
+preferred size, rejected products and substitution behaviour; the remaining columns are rarely used
+by the household and add UI surface without a driving need.
+
+**Workaround.** None from the app; the values are inherited from the item's existing constraint row
+and are not disturbed by a save (the `PUT` upsert leaves those columns untouched).
+
+**Follow-up.** Add controls for min/max size, pack count, form factor and dietary flags, or remove
+the unenforced columns.
+
+### 7. Rejecting a product requires an existing match row; there is no product search here
+
+**What happens.** The screen's "Known products" list is exactly the item's `product_matches` rows
+(joined to `retailer_products`). Rejecting or restoring a product writes through
+`POST /api/match-feedback`. A product that has never been matched to the item cannot be added from
+this screen, so an item with no matches only shows the `no_usable_matches` warning and cannot be
+constrained against a specific product until matching data exists.
+
+**Why accepted.** The product-matching helper (issue #108) is a separate, later piece of work; #102
+reuses the existing match/feedback path and leaves matching to it.
+
+**Workaround.** Confirm a candidate from the optimise screen's "Waiting for your confirmation"
+section (which creates a match), then manage it here.
+
+**Follow-up.** Build the product-matching helper (#108) and let the preferences screen search/add
+retailer products directly.
+

@@ -464,6 +464,10 @@
 					{#each result.no_valid_offer_items as item (item.item_index)}
 						<li>
 							<span>{item.display_text} — {reasonText(item.reason)}</span>
+							<a
+								class="clarify"
+								href="/items/{item.canonical_item_id}/preferences?list={listId}">Set preferences</a
+							>
 							<a class="clarify" href="/list/{listId}">Review on your list</a>
 						</li>
 					{/each}

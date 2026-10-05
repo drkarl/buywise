@@ -123,3 +123,51 @@ VALUES
 SQL
 
 echo "seed.sh: seeded two-store trip fixture into $DB"
+
+# ---------------------------------------------------------------------------
+# Household product-preferences fixture (issue #102)
+# ---------------------------------------------------------------------------
+# One canonical item ("Baked beans") matched to a Heinz product at Tesco and a
+# cheaper own-brand product at Aldi, plus a resolved entry on the seeded list.
+# The preferences spec sets "Heinz only" through the UI and proves the cheaper
+# Aldi product (a store without a Heinz beans product) is dropped from the plan.
+# IDs and prices mirror frontend/e2e/preferences.spec.ts.
+#
+# `INSERT OR IGNORE` keeps re-seeding harmless; run-server.sh deletes the DB on
+# every boot, so a fresh run always starts from policy 'any'.
+sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=5000;
+INSERT OR IGNORE INTO canonical_items
+  (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at)
+  VALUES ('e2e-beans', '$HOUSEHOLD_ID', 'Baked beans', 'Judías cocidas',
+          'c1000000-0000-0000-0000-000000000005', 'any', '$NOW');
+INSERT OR IGNORE INTO retailer_products
+  (id, source, retailer, external_id, name, brand, pack_size_text, size_value, size_unit, pack_count, first_seen_at, last_seen_at)
+  VALUES ('rp-e2e-beans-heinz', 'basketwatch', 'tesco', 'e2e-beans-heinz',
+          'Heinz Baked Beans', 'Heinz', '415g', 415, 'g', 1, '$NOW', '$NOW');
+INSERT OR IGNORE INTO retailer_products
+  (id, source, retailer, external_id, name, brand, pack_size_text, size_value, size_unit, pack_count, first_seen_at, last_seen_at)
+  VALUES ('rp-e2e-beans-aldi', 'basketwatch', 'aldi', 'e2e-beans-aldi',
+          'Own Brand Baked Beans', 'Aldi', '420g', 420, 'g', 1, '$NOW', '$NOW');
+INSERT OR IGNORE INTO product_offers
+  (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, source_confidence_at_ingest)
+  VALUES ('off-e2e-beans-heinz', 'rp-e2e-beans-heinz', 120, '2026-07-01', '$NOW', 'high');
+INSERT OR IGNORE INTO product_offers
+  (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, source_confidence_at_ingest)
+  VALUES ('off-e2e-beans-aldi', 'rp-e2e-beans-aldi', 85, '2026-07-01', '$NOW', 'high');
+INSERT OR IGNORE INTO product_matches
+  (id, household_id, canonical_item_id, retailer_product_id, status, matched_by, created_at, updated_at)
+  VALUES ('match-e2e-beans-heinz', '$HOUSEHOLD_ID', 'e2e-beans', 'rp-e2e-beans-heinz',
+          'accepted', 'system', '$NOW', '$NOW');
+INSERT OR IGNORE INTO product_matches
+  (id, household_id, canonical_item_id, retailer_product_id, status, matched_by, created_at, updated_at)
+  VALUES ('match-e2e-beans-aldi', '$HOUSEHOLD_ID', 'e2e-beans', 'rp-e2e-beans-aldi',
+          'accepted', 'system', '$NOW', '$NOW');
+INSERT OR IGNORE INTO list_entries
+  (id, list_id, canonical_item_id, resolution_status, raw_text, display_name, added_by,
+   quantity, status, effective_constraint_hash, last_updated_revision, created_at, updated_at)
+  VALUES ('e2e-entry-beans', '$LIST_ID', 'e2e-beans', 'resolved', 'baked beans', 'Baked beans',
+          '$USER_ID', 1, 'active', 'default', 0, '$NOW', '$NOW');
+SQL
+
+echo "seed.sh: seeded user=$EMAIL list=$LIST_ID into $DB"
