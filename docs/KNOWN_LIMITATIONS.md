@@ -139,4 +139,3 @@ section (which creates a match), then manage it here.
 
 **Follow-up.** Build the product-matching helper (#108) and let the preferences screen search/add
 retailer products directly.
-
