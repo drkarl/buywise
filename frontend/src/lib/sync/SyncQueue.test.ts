@@ -174,6 +174,33 @@ describe('drainQueue', () => {
     expect((await db.list_entries.get('e1'))?.category_id).toBe('cat-dairy');
   });
 
+  it('preserves match coverage when an older mutation response omits it', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await enqueue('e1', 'mark_bought');
+    await db.list_entries.update('e1', {
+      canonical_item_id: 'ci-milk',
+      resolution_status: 'resolved',
+      needs_match: true
+    });
+
+    const fetchFn = vi.fn(async (_url, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      const entity = serverEntity('e1', 'bought', 1);
+      entity.canonical_item_id = 'ci-milk';
+      entity.resolution_status = 'resolved';
+      return okResponse({
+        client_mutation_id: sent.client_mutation_id,
+        status: 'accepted',
+        server_revision: 1,
+        entity
+      });
+    }) as unknown as typeof fetch;
+
+    await drainQueue(LIST, { fetchFn });
+
+    expect((await db.list_entries.get('e1'))?.needs_match).toBe(true);
+  });
+
   it('retries network errors with exponential backoff up to MAX_RETRIES', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     const id = await enqueue('e1', 'add_item');

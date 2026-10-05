@@ -167,11 +167,21 @@ describe('item preferences', () => {
 	it('labels pending matches as awaiting review', async () => {
 		const preferences = basePreferences();
 		preferences.matches[0].status = 'pending';
-		stubPreferences(preferences);
+		const fetchMock = stubPreferences(preferences);
 		render(Page);
 
 		await waitFor(() => expect(screen.getByText('Awaiting review')).toBeTruthy());
 		expect(screen.queryByText('Allowed')).toBeNull();
+		expect(screen.getByText('Match')).toBeTruthy();
+
+		await fireEvent.click(screen.getByText('Match'));
+		await waitFor(() => {
+			const feedback = fetchMock.mock.calls.find(([input]) =>
+				String(input).endsWith('/api/match-feedback')
+			);
+			expect(feedback).toBeTruthy();
+			expect(JSON.parse(feedback![1]!.body as string).action).toBe('accept');
+		});
 	});
 
 	it('refuses to save a brand rule without a brand', async () => {

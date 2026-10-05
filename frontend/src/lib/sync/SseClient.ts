@@ -68,6 +68,7 @@ export async function applyMutationEvent(data: SseMutationData): Promise<void> {
     // stale row a reconnect won't repair. Read-modify-write stays in this txn.
     const existing = await db.list_entries.get(entry.id);
     if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+      if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
       await db.list_entries.put(entry);
     }
     const meta = await db.list_meta.get(entry.list_id);

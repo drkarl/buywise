@@ -61,8 +61,8 @@
 	);
 	// A resolved active entry with no usable product match (issue #108): the link
 	// is promoted from "Prefs" to "Match" so an unmatched staple prompts for a
-	// match instead of silently having no price. `needs_match` is snapshot-only,
-	// so it is simply false until the next full snapshot.
+	// match instead of silently having no price. Older clients may still receive
+	// no value until their next full snapshot.
 	const needsMatch = $derived(
 		!inBasket &&
 			entry.resolution_status === 'resolved' &&

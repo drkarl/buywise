@@ -38,8 +38,8 @@ export interface ServerListEntry {
   resolution_candidates_json?: string | null;
   /**
    * Whether the entry needs a product match (issue #108). Present on
-   * `GET /api/list/:id` snapshots; absent from a single mutation's `entity`, so
-   * it is optional here and normalised to `undefined` locally.
+   * `GET /api/list/:id` snapshots and current mutation entities; optional for
+   * compatibility with older mutation payloads.
    */
   needs_match?: boolean | null;
 }
@@ -99,8 +99,8 @@ export function toLocalEntry(entity: ServerListEntry): LocalListEntry {
     subcategory_id: entity.subcategory_id ?? undefined,
     last_updated_revision: entity.last_updated_revision,
     updated_at: entity.updated_at,
-    // Snapshot-only (issue #108): a mutation/SSE entity omits it, which reads as
-    // "unknown"/no prompt until the next full snapshot.
+    // Older mutation/SSE entities may omit this field; callers preserve a known
+    // local value when applying those payloads.
     needs_match: entity.needs_match ?? undefined
   };
 }

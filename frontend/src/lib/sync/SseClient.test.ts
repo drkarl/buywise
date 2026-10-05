@@ -77,6 +77,24 @@ describe('event appliers', () => {
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(7);
   });
 
+  it('keeps the match prompt from add through a quantity mutation without a snapshot', async () => {
+    const added = {
+      ...serverEntity('e-added', 'active', 1),
+      resolution_status: 'resolved' as const,
+      canonical_item_id: 'ci-milk',
+      needs_match: true
+    };
+    await applyMutationEvent({ server_revision: 1, entity: added });
+    expect((await db.list_entries.get('e-added'))?.needs_match).toBe(true);
+
+    const quantityChange = { ...serverEntity('e-added', 'active', 2), quantity: 2 };
+    await applyMutationEvent({ server_revision: 2, entity: quantityChange });
+
+    const entry = await db.list_entries.get('e-added');
+    expect(entry?.quantity).toBe(2);
+    expect(entry?.needs_match).toBe(true);
+  });
+
   it('applyMutationEvent never rolls the revision backwards', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 9 });
     await applyMutationEvent({ server_revision: 4, entity: serverEntity('e1', 'active', 4) });

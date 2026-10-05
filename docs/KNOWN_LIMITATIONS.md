@@ -213,13 +213,13 @@ among the proposals.
 surfaces an exact product alongside the ranked candidates. Tracked as a version-one follow-up for
 issue #108.
 
-### 2. The list's "Match" prompt is snapshot-only and matching does not bump the list revision
+### 2. Matching does not bump the list revision
 
-**What happens.** `needs_match` (issue #108) is computed only for the full list snapshot
-(`GET /api/list/:id` and the SSE `full_snapshot`); a single mutation's `entity` omits the field.
-`POST /api/match-feedback` writes `product_matches`, not `list_entries`, so matching emits no SSE
-`mutation` event. After a household matches an item, the list row's "Match" prompt clears only on the
-next full snapshot (a navigation/reload or a resync), not immediately.
+**What happens.** `needs_match` (issue #108) is computed for list snapshots and current mutation
+entities. However, `POST /api/match-feedback` writes `product_matches`, not `list_entries`, so a
+match decision emits no SSE `mutation` event. After a household matches an item, the list row's
+"Match" prompt clears only on the next full snapshot (a navigation/reload or a resync), not
+immediately.
 
 **Why accepted.** Matching is a catalogue-level, online action independent of the offline list
 mutation stream; folding it into the list revision would couple two separate pipelines for a
@@ -227,8 +227,8 @@ cosmetic refresh.
 
 **Workaround.** Reload the list (or navigate away and back) to refresh the prompt.
 
-**Follow-up.** Carry a per-item match-coverage flag on mutation entities, or bump the list revision
-when a match decision changes, so the prompt updates live.
+**Follow-up.** Bump the list revision or otherwise refresh match coverage when a match decision
+changes, so the prompt updates live.
 
 ### 3. Candidates are drawn from every store, including retailers the household switched off
 
@@ -243,3 +243,18 @@ to store settings was out of scope.
 **Workaround.** Reject the unwanted store's candidate (it does not recur) or leave it unmatched.
 
 **Follow-up.** Filter candidates by the household's active/nearby stores before ranking.
+
+### 4. Candidate ranking repeats on every preferences read and decision
+
+**What happens.** Each preferences read and each accept, reject, or undo decision regenerates
+candidates by scanning priced retailer products, so scan and scoring cost grows with the catalogue.
+When the LLM fallback is enabled, each such call also makes a paid `rank_candidates` request for the
+item.
+
+**Why accepted.** Candidate generation has no cache or explicit rank action in version one.
+
+**Workaround.** Disable the LLM fallback to avoid paid ranking requests; deterministic catalogue
+scoring still runs on each preferences read and decision.
+
+**Follow-up.** Reduce repeated catalogue scans and LLM ranking calls without hiding newly available
+candidates.
