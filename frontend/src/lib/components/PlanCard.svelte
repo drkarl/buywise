@@ -32,6 +32,11 @@
 		 * to follow, and its saving line is suppressed.
 		 */
 		benchmark?: boolean;
+		/**
+		 * Plain-language reasons for this plan (issue #103), ordered most important
+		 * first. At most four are shown; absent/empty renders nothing extra.
+		 */
+		reasons?: string[];
 	}
 
 	let {
@@ -39,7 +44,8 @@
 		title,
 		recommended = false,
 		bestSingleTotalCents = null,
-		benchmark = false
+		benchmark = false,
+		reasons = []
 	}: Props = $props();
 
 	// Saving vs the best single-store plan = bestSingle.total − thisPlan.total.
@@ -50,6 +56,10 @@
 	);
 
 	const storeNames = $derived(plan.stores.map(retailerLabel).join(' + '));
+
+	// The server sends every reason it has; the card shows at most the four most
+	// important (the contract's upper bound) and nothing at all when there are none.
+	const shownReasons = $derived(reasons.slice(0, 4));
 </script>
 
 <article
@@ -87,6 +97,14 @@
 		<p class="voucher">🎟️ Dunnes voucher: {plan.dunnes_voucher_offer_text}</p>
 	{/if}
 
+	{#if shownReasons.length > 0}
+		<ul class="reasons" aria-label="Why this plan">
+			{#each shownReasons as reason, index (index)}
+				<li>{reason}</li>
+			{/each}
+		</ul>
+	{/if}
+
 	<ul class="lines">
 		{#each plan.lines as line (line.item_index)}
 			<PlanItem {line} />
@@ -95,8 +113,10 @@
 
 	{#if plan.missing_count > 0}
 		<p class="missing">
-			{plan.missing_count} item{plan.missing_count === 1 ? '' : 's'} not available here (excluded
-			from total)
+			{plan.missing_count} item{plan.missing_count === 1 ? '' : 's'} {plan.missing_count === 1
+				? 'has'
+				: 'have'} no known price here and {plan.missing_count === 1 ? 'is' : 'are'} excluded from
+			the total
 		</p>
 	{/if}
 </article>
@@ -176,6 +196,16 @@
 		border: 1px solid #fde68a;
 		border-radius: 0.5rem;
 		padding: 0.4rem 0.6rem;
+	}
+	.reasons {
+		margin: 0;
+		padding-left: 1.1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		font-size: 0.85rem;
+		line-height: 1.4;
+		color: #475569;
 	}
 	.lines {
 		list-style: none;

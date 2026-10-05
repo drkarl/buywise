@@ -36,7 +36,8 @@
 		sendMatchFeedback,
 		type CandidateOffer,
 		type NoValidOfferReason,
-		type OptimiseResponse
+		type OptimiseResponse,
+		type PlanKind
 	} from '$lib/api/optimise';
 
 	const listId = $derived(page.params.id ?? '');
@@ -139,6 +140,15 @@
 	 * render a redundant "Same price as best single store" line.
 	 */
 	const bestSingleTotal = $derived(result?.best_single?.total_cents ?? null);
+
+	/**
+	 * Plain-language reasons for the card of a given plan kind (issue #103). The
+	 * optimiser may omit a plan entirely or send it with no reasons, so both fall
+	 * back to an empty list and the card renders nothing extra.
+	 */
+	function planReasons(kind: PlanKind): string[] {
+		return result?.plan_explanations.find((p) => p.plan === kind)?.reasons ?? [];
+	}
 
 	/**
 	 * Monotonic token for in-flight `runOptimise` calls. Each call captures the
@@ -293,6 +303,7 @@
 					title={result.recommended.kind === 'two_store' ? 'Recommended split' : 'Recommended store'}
 					recommended
 					bestSingleTotalCents={bestSingleTotal}
+					reasons={planReasons('recommended')}
 				/>
 			{/if}
 			{#if result.best_single}
@@ -300,6 +311,7 @@
 					plan={result.best_single}
 					title="Best single store"
 					bestSingleTotalCents={null}
+					reasons={planReasons('best_single')}
 				/>
 			{/if}
 			{#if result.best_two_store}
@@ -307,6 +319,7 @@
 					plan={result.best_two_store}
 					title="Cheapest two-store split"
 					bestSingleTotalCents={bestSingleTotal}
+					reasons={planReasons('best_two_store')}
 				/>
 			{/if}
 			{#if result.theoretical_minimum}
@@ -315,6 +328,7 @@
 					title="Theoretical minimum"
 					benchmark
 					bestSingleTotalCents={bestSingleTotal}
+					reasons={planReasons('theoretical_minimum')}
 				/>
 			{/if}
 			{#if !result.recommended && !result.best_single && !result.best_two_store && !result.theoretical_minimum}

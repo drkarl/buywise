@@ -2047,3 +2047,446 @@ fn nearby_threshold_never_raises_a_smaller_household_threshold() {
     assert_eq!(rec.kind, RecommendedKind::TwoStore);
     assert!(rec.clears_convenience_threshold);
 }
+
+// ---------------------------------------------------------------------------
+// Plan reasons (issue #103)
+// ---------------------------------------------------------------------------
+
+/// An offer carrying an explicit source snapshot date.
+fn offer_dated(
+    id: &str,
+    product_id: &str,
+    price_cents: Cents,
+    at_fetch: Option<i64>,
+    snapshot_date: Option<&str>,
+) -> ProductOffer {
+    ProductOffer {
+        source_snapshot_date: snapshot_date.map(Into::into),
+        ..offer(id, product_id, price_cents, at_fetch)
+    }
+}
+
+/// The first reason with `code` for `kind`, if any.
+fn reason_with(out: &OptimiserOutput, kind: PlanKind, code: ReasonCode) -> Option<&PlanReason> {
+    out.reasons
+        .iter()
+        .find(|r| r.plan == kind && r.code == code)
+}
+
+/// Basket used by the reason tests: milk cheapest at Aldi, bread cheapest at
+/// Tesco, so the two-store split genuinely spans both stores.
+fn two_by_two_input() -> OptimiserInput {
+    OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("bread", "ci-bread", 1)],
+    )
+}
+
+/// Priced rows for [`two_by_two_input`]: milk Aldi 100 / Tesco 150, bread Tesco
+/// 180 / Aldi 220. Best single = Aldi 320; split = 280 (saving 40).
+fn two_by_two_rows() -> BTreeMap<usize, Rows> {
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-ma", "ci-milk", "p-ma", MatchStatus::Accepted),
+                product("p-ma", Retailer::Aldi),
+                offer("o-ma", "p-ma", 100, Some(5)),
+            ),
+            (
+                product_match("m-mt", "ci-milk", "p-mt", MatchStatus::Accepted),
+                product("p-mt", Retailer::Tesco),
+                offer("o-mt", "p-mt", 150, Some(5)),
+            ),
+        ],
+    );
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-bt", "ci-bread", "p-bt", MatchStatus::Accepted),
+                product("p-bt", Retailer::Tesco),
+                offer("o-bt", "p-bt", 180, Some(5)),
+            ),
+            (
+                product_match("m-ba", "ci-bread", "p-ba", MatchStatus::Accepted),
+                product("p-ba", Retailer::Aldi),
+                offer("o-ba", "p-ba", 220, Some(5)),
+            ),
+        ],
+    );
+    priced
+}
+
+#[test]
+fn reason_credits_the_cheapest_store_and_reports_coverage() {
+    let out = run(&two_by_two_input(), two_by_two_rows());
+
+    // Aldi alone is cheapest and complete (320 vs Tesco 330); the split saves only
+    // €0.40, below the €10 bar, so Aldi is recommended.
+    let single = out.best_single.as_ref().expect("single");
+    assert_eq!(single.stores, vec![Retailer::Aldi]);
+    assert_eq!(single.total_cents, 320);
+
+    // Aldi is credited as cheapest for milk only — bread is cheapest at Tesco.
+    let cheapest = reason_with(&out, PlanKind::BestSingle, ReasonCode::CheapestAtStore)
+        .expect("cheapest-at-store reason");
+    assert_eq!(cheapest.retailers, vec![Retailer::Aldi]);
+    assert_eq!(cheapest.item_indices, vec![0]);
+
+    // Coffee-table: every published plan states its coverage.
+    for kind in [
+        PlanKind::Recommended,
+        PlanKind::BestSingle,
+        PlanKind::BestTwoStore,
+        PlanKind::TheoreticalMinimum,
+    ] {
+        let coverage = reason_with(&out, kind, ReasonCode::Coverage)
+            .unwrap_or_else(|| panic!("{kind:?} has no coverage reason"));
+        assert!(!coverage.item_indices.is_empty(), "{kind:?} coverage is empty");
+    }
+    let coverage = reason_with(&out, PlanKind::BestSingle, ReasonCode::Coverage).expect("coverage");
+    assert_eq!(coverage.item_indices, vec![0, 1]);
+    assert_eq!(coverage.cents, Some(320));
+
+    // The rejected Tesco alternative is reported like-for-like (same coverage).
+    let rejected = reason_with(&out, PlanKind::BestSingle, ReasonCode::RejectedStore)
+        .expect("rejected store");
+    assert_eq!(rejected.retailers, vec![Retailer::Tesco]);
+    assert_eq!(rejected.cents, Some(320 - 330));
+
+    // The recommendation explains the rejected split and its sub-bar saving.
+    let rec = out.recommended.as_ref().expect("recommended");
+    assert_eq!(rec.kind, RecommendedKind::SingleStore);
+    let not_cleared = reason_with(&out, PlanKind::Recommended, ReasonCode::ThresholdNotCleared)
+        .expect("threshold-not-cleared reason");
+    assert_eq!(not_cleared.retailers, vec![Retailer::Tesco]);
+    assert_eq!(not_cleared.cents, Some(40));
+    assert_eq!(
+        not_cleared.threshold_cents,
+        Some(DEFAULT_THRESHOLD_2_CENTS)
+    );
+}
+
+#[test]
+fn reason_reports_no_known_price_here_without_claiming_unavailability() {
+    // milk 90 at Aldi only; bread 100 at Tesco only. Aldi is cheapest overall but
+    // incomplete, so it wins on the fulfilment rule (both miss one item, Aldi is
+    // cheaper).
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("bread", "ci-bread", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-ma", "ci-milk", "p-ma", MatchStatus::Accepted),
+            product("p-ma", Retailer::Aldi),
+            offer("o-ma", "p-ma", 90, Some(5)),
+        )],
+    );
+    priced.insert(
+        1,
+        vec![(
+            product_match("m-bt", "ci-bread", "p-bt", MatchStatus::Accepted),
+            product("p-bt", Retailer::Tesco),
+            offer("o-bt", "p-bt", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.as_ref().expect("single");
+    assert_eq!(single.stores, vec![Retailer::Aldi]);
+    assert_eq!(single.missing_count, 1);
+
+    // Bread has a known price elsewhere but none at Aldi: "no known price here".
+    let here = reason_with(&out, PlanKind::BestSingle, ReasonCode::NoKnownPriceHere)
+        .expect("no-known-price-here reason");
+    assert_eq!(here.item_indices, vec![1]);
+    assert_eq!(here.retailers, vec![Retailer::Aldi]);
+
+    // Milk is only priced at Aldi, so it gets the stronger only-store reason and
+    // is deliberately NOT double-counted as merely "cheapest".
+    let only = reason_with(&out, PlanKind::BestSingle, ReasonCode::OnlyStoreStocking)
+        .expect("only-store-stocking reason");
+    assert_eq!(only.item_indices, vec![0]);
+    assert_eq!(only.retailers, vec![Retailer::Aldi]);
+    assert!(reason_with(&out, PlanKind::BestSingle, ReasonCode::CheapestAtStore).is_none());
+}
+
+#[test]
+fn reason_distinguishes_unpriced_and_unresolved_items() {
+    // item0 is priced at Tesco; item1 resolves but has no matches anywhere; item2
+    // was never resolved.
+    let unresolved_item = BasketItem {
+        display_text: "cream".into(),
+        canonical_item_id: None,
+        count: 1,
+        constraint_policy: ConstraintPolicy::Any,
+        constraints: None,
+    };
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            item("milk", "ci-milk", 1),
+            item("eggs", "ci-eggs", 1),
+            unresolved_item,
+        ],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-mt", "ci-milk", "p-mt", MatchStatus::Accepted),
+            product("p-mt", Retailer::Tesco),
+            offer("o-mt", "p-mt", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let anywhere = reason_with(&out, PlanKind::BestSingle, ReasonCode::NoKnownPriceAnywhere)
+        .expect("no-known-price-anywhere reason");
+    assert_eq!(anywhere.item_indices, vec![1]);
+    let unresolved = reason_with(&out, PlanKind::BestSingle, ReasonCode::UnresolvedItems)
+        .expect("unresolved reason");
+    assert_eq!(unresolved.item_indices, vec![2]);
+    // Only the priced line counts as coverage.
+    let coverage = reason_with(&out, PlanKind::BestSingle, ReasonCode::Coverage).expect("coverage");
+    assert_eq!(coverage.item_indices, vec![0]);
+}
+
+#[test]
+fn reason_flags_coverage_differs_instead_of_a_false_saving() {
+    // Tesco stocks both items and is complete; Aldi stocks only milk (cheap).
+    // Aldi's cheap total covers less, so it must not be reported as a saving.
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("eggs", "ci-eggs", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-ma", "ci-milk", "p-ma", MatchStatus::Accepted),
+                product("p-ma", Retailer::Aldi),
+                offer("o-ma", "p-ma", 50, Some(5)),
+            ),
+            (
+                product_match("m-mt", "ci-milk", "p-mt", MatchStatus::Accepted),
+                product("p-mt", Retailer::Tesco),
+                offer("o-mt", "p-mt", 200, Some(5)),
+            ),
+        ],
+    );
+    priced.insert(
+        1,
+        vec![(
+            product_match("m-et", "ci-eggs", "p-et", MatchStatus::Accepted),
+            product("p-et", Retailer::Tesco),
+            offer("o-et", "p-et", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.as_ref().expect("single");
+    // Completeness beats cost: Tesco prices both items, Aldi only one.
+    assert_eq!(single.stores, vec![Retailer::Tesco]);
+    assert_eq!(single.missing_count, 0);
+
+    assert!(
+        reason_with(&out, PlanKind::BestSingle, ReasonCode::RejectedStore).is_none(),
+        "a differing-coverage store must not be reported as a like-for-like alternative"
+    );
+    let differs = reason_with(&out, PlanKind::BestSingle, ReasonCode::CoverageDiffers)
+        .expect("coverage-differs reason");
+    assert_eq!(differs.retailers, vec![Retailer::Aldi]);
+}
+
+#[test]
+fn reason_reports_the_cleared_threshold_for_a_split() {
+    let out = run(
+        &two_store_split_input(DEFAULT_THRESHOLD_2_CENTS, Vec::new()),
+        two_store_split_rows(1001),
+    );
+    let rec = out.recommended.as_ref().expect("recommended");
+    assert_eq!(rec.kind, RecommendedKind::TwoStore);
+    let cleared = reason_with(&out, PlanKind::Recommended, ReasonCode::ThresholdCleared)
+        .expect("threshold-cleared reason");
+    assert_eq!(cleared.cents, Some(1001));
+    assert_eq!(cleared.threshold_cents, Some(DEFAULT_THRESHOLD_2_CENTS));
+    // The reason names the added store, not the single-store baseline (Aldi is
+    // the cheaper single store; Tesco is the store the split adds).
+    assert_eq!(cleared.retailers, vec![Retailer::Tesco]);
+}
+
+#[test]
+fn reason_reports_the_lower_nearby_bar_when_applied() {
+    let out = run(
+        &two_store_split_input(
+            DEFAULT_THRESHOLD_2_CENTS,
+            vec![store_setting(Retailer::Tesco, StoreStatus::Active, true)],
+        ),
+        two_store_split_rows(700),
+    );
+    let rec = out.recommended.as_ref().expect("recommended");
+    assert_eq!(rec.kind, RecommendedKind::TwoStore);
+    let cleared = reason_with(&out, PlanKind::Recommended, ReasonCode::ThresholdCleared)
+        .expect("threshold-cleared reason");
+    // €7 clears the €5 nearby bar (the split adds nearby Tesco) even though it is
+    // below the €10 default.
+    assert_eq!(cleared.threshold_cents, Some(NEARBY_THRESHOLD_2_CENTS));
+    assert_eq!(cleared.retailers, vec![Retailer::Tesco]);
+}
+
+#[test]
+fn reason_marks_items_under_the_brand_rule() {
+    let mut basket_item = item("dish soap", "ci-soap", 1);
+    basket_item.constraint_policy = ConstraintPolicy::Brand;
+    basket_item.constraints = Some(brand_constraints(Some("Fairy")));
+    let input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m", "ci-soap", "p", MatchStatus::Accepted),
+            branded_product("p", Retailer::Tesco, "Fairy", 500.0, "ml"),
+            offer("o", "p", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let brand = reason_with(&out, PlanKind::BestSingle, ReasonCode::BrandRule)
+        .expect("brand-rule reason");
+    assert_eq!(brand.item_indices, vec![0]);
+}
+
+#[test]
+fn reason_explains_stores_left_out_by_settings() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("milk", "ci-milk", 1)]);
+    input.store_settings = vec![
+        store_setting(Retailer::Aldi, StoreStatus::Off, false),
+        store_setting(Retailer::Dunnes, StoreStatus::Occasional, false),
+    ];
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-mt", "ci-milk", "p-mt", MatchStatus::Accepted),
+            product("p-mt", Retailer::Tesco),
+            offer("o-mt", "p-mt", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let off = reason_with(&out, PlanKind::Recommended, ReasonCode::StoreOff)
+        .expect("store-off reason");
+    assert_eq!(off.retailers, vec![Retailer::Aldi]);
+    let not_on_trip = reason_with(&out, PlanKind::Recommended, ReasonCode::StoreNotOnTrip)
+        .expect("store-not-on-trip reason");
+    assert_eq!(not_on_trip.retailers, vec![Retailer::Dunnes]);
+    // The store actually planned for is never listed as excluded.
+    assert!(out
+        .reasons
+        .iter()
+        .filter(|r| matches!(r.code, ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip))
+        .all(|r| !r.retailers.contains(&Retailer::Tesco)));
+}
+
+#[test]
+fn reason_reports_price_date_and_stale_lines() {
+    // Two Tesco lines: one fresh (run 5), one a run behind (Low confidence).
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("bread", "ci-bread", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m1", "ci-milk", "p1", MatchStatus::Accepted),
+            product("p1", Retailer::Tesco),
+            offer_dated("o1", "p1", 100, Some(5), Some("2026-06-01")),
+        )],
+    );
+    priced.insert(
+        1,
+        vec![(
+            product_match("m2", "ci-bread", "p2", MatchStatus::Accepted),
+            product("p2", Retailer::Tesco),
+            offer_dated("o2", "p2", 200, Some(4), Some("2026-05-20")),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let as_of = reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf)
+        .expect("price-as-of reason");
+    assert_eq!(as_of.snapshot_date.as_deref(), Some("2026-06-01"));
+    let stale = reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices)
+        .expect("stale-prices reason");
+    assert_eq!(stale.item_indices, vec![1]);
+    assert_eq!(stale.retailers, vec![Retailer::Tesco]);
+}
+
+#[test]
+fn every_published_plan_carries_at_least_two_reasons() {
+    // Acceptance (issue #103): each plan card shows two to four reasons. The core
+    // emits every applicable reason; the card caps the display at four. This
+    // guards the lower bound, so a plan can never drop to a single lonely reason.
+    let out = run(&two_by_two_input(), two_by_two_rows());
+    for kind in [
+        PlanKind::Recommended,
+        PlanKind::BestSingle,
+        PlanKind::BestTwoStore,
+        PlanKind::TheoreticalMinimum,
+    ] {
+        let count = out.reasons.iter().filter(|r| r.plan == kind).count();
+        assert!(count >= 2, "{kind:?} has only {count} reason(s)");
+    }
+}
+
+#[test]
+fn reasons_stay_consistent_with_the_plan_lines_they_describe() {
+    let out = run(&two_by_two_input(), two_by_two_rows());
+    for reason in &out.reasons {
+        let plan = match reason.plan {
+            PlanKind::Recommended => out.recommended.as_ref().map(|r| &r.plan),
+            PlanKind::BestSingle => out.best_single.as_ref(),
+            PlanKind::BestTwoStore => out.best_two_store.as_ref(),
+            PlanKind::TheoreticalMinimum => out.theoretical_minimum.as_ref(),
+        }
+        .expect("a reason must reference a plan that exists");
+        let line_items: std::collections::BTreeSet<usize> =
+            plan.lines.iter().map(|l| l.item_index).collect();
+        match reason.code {
+            ReasonCode::CheapestAtStore | ReasonCode::OnlyStoreStocking | ReasonCode::Coverage => {
+                assert!(
+                    reason.item_indices.iter().all(|i| line_items.contains(i)),
+                    "reason names items outside its plan: {reason:?}"
+                );
+            }
+            ReasonCode::NoKnownPriceHere => {
+                assert!(
+                    reason.item_indices.iter().all(|i| !line_items.contains(i)),
+                    "a missing-price reason must not name priced lines: {reason:?}"
+                );
+            }
+            _ => {}
+        }
+        // Every reason either names something or is a plan-wide statement.
+        assert!(
+            !(reason.item_indices.is_empty()
+                && reason.retailers.is_empty()
+                && reason.cents.is_none()
+                && reason.snapshot_date.is_none()),
+            "reason carries no facts: {reason:?}"
+        );
+    }
+}

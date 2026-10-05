@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { db } from '$lib/db/dexie';
 import type { OptimiseResponse } from '$lib/api/optimise';
 import type { Settings } from '$lib/api/settings';
@@ -82,6 +82,19 @@ function fullResponse(): OptimiseResponse {
 		no_valid_offer_items: [{ item_index: 3, display_text: 'truffle oil', reason: 'no_matches' }],
 		needs_confirmation_items: [],
 		plain_language_explanation: 'Splitting between Tesco and Aldi saves you the most.',
+		plan_explanations: [
+			{
+				plan: 'recommended',
+				reasons: [
+					'Two stores together cover your whole list.',
+					'This is the cheapest way to buy everything today.'
+				]
+			},
+			{
+				plan: 'best_single',
+				reasons: ['One trip covers your whole list.', 'No split between stores needed.']
+			}
+		],
 		offer_snapshot_date: '2026-06-07'
 	};
 }
@@ -215,6 +228,21 @@ describe('optimise page', () => {
 		stubOptimise(fullResponse());
 		render(Page);
 		await screen.findByText(/Splitting between Tesco and Aldi/);
+	});
+
+	it('renders each plan card’s reasons, scoped to its own card', async () => {
+		stubOptimise(fullResponse());
+		render(Page);
+
+		// The recommended card carries its own reasons, in server order. Scoping to
+		// the card proves the lookup matched the right plan kind (rather than every
+		// card getting every plan's reasons).
+		const recommended = await screen.findByLabelText(/recommended/i);
+		const reasons = within(recommended).getByRole('list', { name: 'Why this plan' });
+		expect(within(reasons).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+			'Two stores together cover your whole list.',
+			'This is the cheapest way to buy everything today.'
+		]);
 	});
 
 	it('lists unresolved items separately with a review link to the list view', async () => {
@@ -419,6 +447,7 @@ describe('optimise page', () => {
 				}
 			],
 			plain_language_explanation: '',
+			plan_explanations: [],
 			offer_snapshot_date: null
 		};
 
@@ -543,6 +572,7 @@ describe('optimise page', () => {
 				}
 			],
 			plain_language_explanation: '',
+			plan_explanations: [],
 			offer_snapshot_date: null
 		};
 
@@ -601,6 +631,7 @@ describe('optimise page', () => {
 			no_valid_offer_items: [],
 			needs_confirmation_items: [],
 			plain_language_explanation: '',
+			plan_explanations: [],
 			offer_snapshot_date: null
 		};
 		stubOptimise(empty);
@@ -646,6 +677,7 @@ describe('optimise page', () => {
 				}
 			],
 			plain_language_explanation: '',
+			plan_explanations: [],
 			offer_snapshot_date: null
 		};
 		stubOptimise(allHeld);

@@ -453,6 +453,49 @@ async fn optimise_returns_four_plans_persists_run_and_explains() {
         "explanation should name both winning stores, got: {explanation}"
     );
 
+    // Issue #103: every published plan carries ordered, plain-language reasons
+    // that are traceable to its own lines and coverage.
+    let explanations = body["plan_explanations"]
+        .as_array()
+        .expect("plan_explanations array");
+    for kind in ["recommended", "best_single"] {
+        assert!(
+            explanations.iter().any(|e| e["plan"] == kind),
+            "missing reasons for {kind}: {explanations:?}"
+        );
+    }
+    for entry in explanations {
+        let reasons = entry["reasons"].as_array().expect("reasons array");
+        assert!(
+            !reasons.is_empty(),
+            "plan {} has no reasons",
+            entry["plan"]
+        );
+        assert!(
+            reasons.iter().all(|r| r.as_str().is_some_and(|s| !s.is_empty())),
+            "empty reason text for {}",
+            entry["plan"]
+        );
+    }
+    let recommended = explanations
+        .iter()
+        .find(|e| e["plan"] == "recommended")
+        .expect("recommended explanation");
+    let joined: String = recommended["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    // The recommended (Aldi) card names the store the split would have added and
+    // why it lost, names the category it is cheapest for, and states that the
+    // subtotal covers two of the three basket lines (the ambiguous one is not).
+    assert!(joined.contains("Tesco"), "got: {joined}");
+    assert!(joined.contains("Dairy"), "got: {joined}");
+    assert!(joined.contains("Prices 2 of 3 basket items"), "got: {joined}");
+    assert!(joined.contains("Prices as of 2026-06-01"), "got: {joined}");
+
     // offer_snapshot_date is the latest among the recommended plan's offers.
     assert!(
         body["offer_snapshot_date"].is_string(),
