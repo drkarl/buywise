@@ -47,7 +47,7 @@
 //! them today, and `off` stores never do. The request's `trip_retailers` has no
 //! effect on `active`/`off` stores.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -671,17 +671,8 @@ async fn build_explanation(
             "Recommended: shop at {stores} for a total of {}",
             euros(rec.plan.total_cents)
         ));
-        let single = output.best_single.as_ref().map(|p| p.total_cents);
-        if let Some(single_total) = single {
-            let saving = (single_total - rec.plan.total_cents).max(0);
-            if saving > 0 {
-                out.push_str(&format!(
-                    ", saving {} versus the best single store",
-                    euros(saving)
-                ));
-            } else {
-                out.push_str(", the cheapest single store overall");
-            }
+        if let Some(best_single) = output.best_single.as_ref() {
+            out.push_str(&recommendation_comparison(&rec.plan, best_single));
         }
         out.push('.');
     } else {
@@ -697,6 +688,29 @@ async fn build_explanation(
         summary: out,
         plans,
     })
+}
+
+fn recommendation_comparison(recommended: &StorePlan, best_single: &StorePlan) -> String {
+    let recommended_items: BTreeSet<_> = recommended
+        .lines
+        .iter()
+        .map(|line| line.item_index)
+        .collect();
+    let single_items: BTreeSet<_> = best_single
+        .lines
+        .iter()
+        .map(|line| line.item_index)
+        .collect();
+    if recommended_items != single_items {
+        return ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store".to_string();
+    }
+
+    let saving = (best_single.total_cents - recommended.total_cents).max(0);
+    if saving > 0 {
+        format!(", saving {} versus the best single store", euros(saving))
+    } else {
+        ", the cheapest single store overall".to_string()
+    }
 }
 
 /// Render the core's structured [`PlanReason`]s into per-plan English sentences.
@@ -937,6 +951,10 @@ fn render_reason(
                 "Shopping at {} alone would save {}",
                 store_names(&reason.retailers),
                 euros(delta)
+            ),
+            Some(0) => format!(
+                "Shopping at {} alone would cost the same",
+                store_names(&reason.retailers)
             ),
             Some(delta) => format!(
                 "Shopping at {} alone would cost {} more",
@@ -1236,6 +1254,30 @@ mod tests {
         ])
     }
 
+    fn plan_with_items(item_indices: &[usize], total_cents: Cents) -> StorePlan {
+        StorePlan {
+            stores: vec![Retailer::Tesco],
+            lines: item_indices
+                .iter()
+                .map(|&item_index| buywise_core::optimiser::PlanLine {
+                    item_index,
+                    display_text: format!("item {item_index}"),
+                    canonical_item_id: Some(format!("item-{item_index}")),
+                    retailer: Retailer::Tesco,
+                    retailer_product_id: format!("product-{item_index}"),
+                    offer_id: format!("offer-{item_index}"),
+                    unit_price_cents: 100,
+                    line_total_cents: 100,
+                    loyalty_applied: false,
+                    freshness_confidence: buywise_core::domain::FreshnessConfidence::High,
+                })
+                .collect(),
+            total_cents,
+            missing_count: 0,
+            dunnes_voucher_offer_text: None,
+        }
+    }
+
     /// A reason with the given code and nothing else set.
     fn bare(plan: PlanKind, code: ReasonCode) -> PlanReason {
         PlanReason {
@@ -1282,6 +1324,29 @@ mod tests {
         assert_eq!(
             render_reason(&full, &input(), &categories()),
             "Prices all 3 basket items for €5.00"
+        );
+    }
+
+    #[test]
+    fn recommendation_comparison_requires_identical_priced_items() {
+        let best_single = plan_with_items(&[0, 1], 3_000);
+
+        let more_complete = plan_with_items(&[0, 1, 2], 2_800);
+        assert_eq!(
+            recommendation_comparison(&more_complete, &best_single),
+            ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store"
+        );
+
+        let costlier_more_complete = plan_with_items(&[0, 1, 2], 3_200);
+        assert_eq!(
+            recommendation_comparison(&costlier_more_complete, &best_single),
+            ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store"
+        );
+
+        let same_items = plan_with_items(&[1, 0], 2_800);
+        assert_eq!(
+            recommendation_comparison(&same_items, &best_single),
+            ", saving €2.00 versus the best single store"
         );
     }
 
@@ -1369,6 +1434,16 @@ mod tests {
         assert_eq!(
             render_reason(&costlier, &input(), &categories()),
             "Shopping at Tesco alone would cost €2.50 more"
+        );
+
+        let tied = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(0),
+            ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+        };
+        assert_eq!(
+            render_reason(&tied, &input(), &categories()),
+            "Shopping at Tesco alone would cost the same"
         );
     }
 
