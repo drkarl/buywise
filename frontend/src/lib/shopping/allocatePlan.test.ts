@@ -79,7 +79,13 @@ describe('allocatePlan', () => {
 			plan: plan(['tesco', 'lidl'], [line({ entry_id: 'e-milk', retailer: 'lidl' })]),
 			unresolvedItems: [{ item_index: 2, entry_id: 'e-cream', display_text: 'cream' }],
 			noValidOfferItems: [
-				{ item_index: 3, entry_id: 'e-truffle', display_text: 'truffle oil', reason: 'no_matches' }
+				{
+					item_index: 3,
+					entry_id: 'e-truffle',
+					display_text: 'truffle oil',
+					canonical_item_id: 'ci-truffle',
+					reason: 'no_matches'
+				}
 			],
 			needsConfirmationItems: [
 				{
