@@ -606,31 +606,31 @@ async fn lagged_subscriber_receives_full_snapshot() {
         broadcast_capacity: 1,
         ..SseConfig::default()
     };
-    let base = spawn_server_with_config(pool.clone(), config).await;
+    let state = AppState::new(pool.clone()).with_sse_config(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let base = format!("http://{addr}");
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(server_state))
+            .await
+            .expect("serve");
+    });
     let client = Client::login(&base, "a@example.test").await;
 
-    // Open the stream but do NOT read it yet, so the producer task's mpsc fills
-    // (cap 1) and — once the kernel socket / hyper write buffers also fill — it
-    // blocks on `tx.send` and stops draining the broadcast receiver.
+    // The HTTP response means the handler has subscribed. Three synchronous
+    // broadcasts overflow the one-event channel before its receiver task can run.
     let mut r = SseReader::new(client.open_sse("list-a", None).await);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Post far more mutations than any socket buffer can hold while the consumer
-    // is stalled, so the producer blocks on `tx.send`, the 1-event broadcast
-    // buffer overflows, and the next `recv` reports `Lagged`.
-    for i in 1..=400 {
-        let status = client
-            .post_mutation(add_item_envelope(
-                &format!("cm-{i}"),
-                "list-a",
-                &format!("entry-{i}"),
-            ))
-            .await;
-        assert_eq!(
-            status,
-            reqwest::StatusCode::CREATED,
-            "mutation {i} accepted"
-        );
+    let sender = buywise_api::sse::sender_for(&state, "list-a");
+    for revision in 1..=3 {
+        sender
+            .send(buywise_api::sse::SseEvent::Mutation {
+                server_revision: revision,
+                entity: serde_json::Value::Null,
+            })
+            .expect("subscriber is connected");
     }
 
     // Now drain. Within the stream we must encounter a `full_snapshot` produced
