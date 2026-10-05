@@ -98,6 +98,27 @@ describe('drainQueue', () => {
     expect((await db.list_meta.get(LIST))?.current_revision).toBe(2);
   });
 
+  it('confirms a null-entity response and advances revision without touching entries', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
+    await enqueue('ci-milk', 'dismiss_suggestion', { entity_type: 'canonical_item' });
+    const before = await db.list_entries.toArray();
+
+    const fetchFn = vi.fn(async () =>
+      okResponse({
+        client_mutation_id: 'cmid-ci-milk-dismiss_suggestion',
+        status: 'accepted',
+        server_revision: 3,
+        entity: null
+      })
+    ) as unknown as typeof fetch;
+
+    const result = await drainQueue(LIST, { fetchFn });
+
+    expect(result.confirmed).toBe(1);
+    expect((await db.list_meta.get(LIST))?.current_revision).toBe(3);
+    expect(await db.list_entries.toArray()).toEqual(before);
+  });
+
   it('replaces the local entry with the server entity (server authoritative)', async () => {
     await db.list_meta.put({ id: LIST, name: 'L', current_revision: 0 });
     await enqueue('e1', 'mark_bought');

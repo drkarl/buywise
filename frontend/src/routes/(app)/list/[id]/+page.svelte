@@ -11,6 +11,7 @@
 	import BulkAddModal from '$lib/components/BulkAddModal.svelte';
 	import ListItem from '$lib/components/ListItem.svelte';
 	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
+	import SuggestedItems from '$lib/components/SuggestedItems.svelte';
 	import AmbiguityModal, {
 		type CandidateItem
 	} from '$lib/components/AmbiguityModal.svelte';
@@ -28,6 +29,7 @@
 		resolveAlias
 	} from '$lib/stores/list';
 	import { db, type LocalListEntry } from '$lib/db/dexie';
+	import { createSuggestionsStore, type SuggestionsHandle } from '$lib/stores/suggestions';
 	import {
 		startSync,
 		deriveSyncStatus,
@@ -131,6 +133,13 @@
 		clarifying = null;
 	}
 
+	// Purchase suggestions (issue #106): fetched from the server on mount and
+	// refreshed whenever a drain settles into the `synced` state (so a check-off
+	// that makes something due, or a confirm/dismiss, is reflected). Confirm and
+	// dismiss enqueue the normal offline mutations and hide the row immediately.
+	let suggestionStore = $state<SuggestionsHandle | null>(null);
+	let lastSyncState: SyncStatus['state'] | null = null;
+
 	// Start the sync engine (queue drain + live SSE) for the current list and
 	// tear it down when the id changes or the view unmounts. `$effect` re-runs
 	// whenever `listId` changes; its cleanup stops the previous handle.
@@ -147,12 +156,23 @@
 				];
 			}
 		});
-		const unsubscribeStatus = handle.status.subscribe((next) => (syncStatus = next));
+		const suggestions = createSuggestionsStore(listId);
+		suggestionStore = suggestions;
+		lastSyncState = null;
+		void suggestions.refresh();
+		const unsubscribeStatus = handle.status.subscribe((next) => {
+			syncStatus = next;
+			if (next.state === 'synced' && lastSyncState !== 'synced') {
+				void suggestions.refresh();
+			}
+			lastSyncState = next.state;
+		});
 		sync = handle;
 		return () => {
 			unsubscribeStatus();
 			handle.stop();
 			if (sync === handle) sync = null;
+			if (suggestionStore === suggestions) suggestionStore = null;
 		};
 	});
 
@@ -214,6 +234,14 @@
 			Paste a list
 		</button>
 	</div>
+
+	{#if suggestionStore}
+		<SuggestedItems
+			suggestions={$suggestionStore ?? []}
+			onconfirm={(s) => void suggestionStore?.confirm(s)}
+			ondismiss={(s) => void suggestionStore?.dismiss(s)}
+		/>
+	{/if}
 
 	<ul class="entries">
 		{#each $active as entry (entry.id)}

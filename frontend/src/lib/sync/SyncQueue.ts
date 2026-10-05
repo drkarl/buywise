@@ -126,7 +126,12 @@ async function postMutation(
  * never roll the baseline backwards.
  */
 async function applySuccess(mutationId: number, res: MutationResponse): Promise<void> {
-  const entry = toLocalEntry(res.entity);
+  // `dismiss_suggestion` (issue #106) is accepted with a null entity — it
+  // records household-scoped evidence and touches no list entry. Such a
+  // response still advances the revision and confirms the mutation, so the
+  // local `list_id` comes from the queued row rather than the entity.
+  const entry = res.entity ? toLocalEntry(res.entity) : null;
+  const listId = entry?.list_id ?? (await db.mutation_queue.get(mutationId))?.list_id;
   await db.transaction(
     'rw',
     db.list_entries,
@@ -134,46 +139,54 @@ async function applySuccess(mutationId: number, res: MutationResponse): Promise<
     db.mutation_queue,
     db.item_categories,
     async () => {
-      // Per-entry monotonic guard (mirrors applyMutationEvent): a delayed POST
-      // response can carry an older entity than one the SSE stream already
-      // applied for the same entry. Only overwrite when the response is at least
-      // as new by `last_updated_revision`, so a stale response can't clobber a
-      // newer row.
-      const existing = await db.list_entries.get(entry.id);
-      if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
-        if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
-        // The mutation entity never carries grouping keys, so derive them from
-        // the cached catalogue (same as the SSE/snapshot apply paths). Without
-        // this a confirmed mutation (e.g. mark_bought) would overwrite a
-        // previously resolved entry with `category_id`/`subcategory_id`
-        // undefined and drop it into "Other" in shopping mode. Fall back to the
-        // existing row's keys so a confirmation during a cold-cache/offline
-        // drain can't clobber a group that was already resolved.
-        await resolveEntryGrouping(entry);
-        if (entry.category_id === undefined && existing?.category_id !== undefined) {
-          entry.category_id = existing.category_id;
+      if (entry) {
+        // Per-entry monotonic guard (mirrors applyMutationEvent): a delayed POST
+        // response can carry an older entity than one the SSE stream already
+        // applied for the same entry. Only overwrite when the response is at least
+        // as new by `last_updated_revision`, so a stale response can't clobber a
+        // newer row.
+        const existing = await db.list_entries.get(entry.id);
+        if (!existing || entry.last_updated_revision >= existing.last_updated_revision) {
+          if (entry.needs_match === undefined) entry.needs_match = existing?.needs_match;
+          // The mutation entity never carries grouping keys, so derive them from
+          // the cached catalogue (same as the SSE/snapshot apply paths). Without
+          // this a confirmed mutation (e.g. mark_bought) would overwrite a
+          // previously resolved entry with `category_id`/`subcategory_id`
+          // undefined and drop it into "Other" in shopping mode. Fall back to the
+          // existing row's keys so a confirmation during a cold-cache/offline
+          // drain can't clobber a group that was already resolved.
+          await resolveEntryGrouping(entry);
+          if (entry.category_id === undefined && existing?.category_id !== undefined) {
+            entry.category_id = existing.category_id;
+          }
+          if (entry.subcategory_id === undefined && existing?.subcategory_id !== undefined) {
+            entry.subcategory_id = existing.subcategory_id;
+          }
+          await db.list_entries.put(entry);
         }
-        if (entry.subcategory_id === undefined && existing?.subcategory_id !== undefined) {
-          entry.subcategory_id = existing.subcategory_id;
-        }
-        await db.list_entries.put(entry);
       }
 
-      const meta = await db.list_meta.get(entry.list_id);
+      if (!listId) {
+        // Defensive: a queued mutation row must exist. Nothing to advance.
+        await db.mutation_queue.update(mutationId, { status: 'confirmed' });
+        return;
+      }
+
+      const meta = await db.list_meta.get(listId);
       if (meta) {
         if (res.server_revision > meta.current_revision) {
-          await db.list_meta.update(entry.list_id, {
+          await db.list_meta.update(listId, {
             current_revision: res.server_revision,
             last_synced_at: new Date().toISOString()
           });
         } else {
-          await db.list_meta.update(entry.list_id, { last_synced_at: new Date().toISOString() });
+          await db.list_meta.update(listId, { last_synced_at: new Date().toISOString() });
         }
       } else {
         // First contact for this list (no GET /api/list/:id yet): seed meta from
         // the response so subsequent reconnects have a `?since=` baseline.
         await db.list_meta.put({
-          id: entry.list_id,
+          id: listId,
           name: '',
           current_revision: res.server_revision,
           last_synced_at: new Date().toISOString()

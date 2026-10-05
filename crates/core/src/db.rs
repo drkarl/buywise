@@ -816,6 +816,9 @@ mod tests {
             "subcategories",
             // Issue #98 (011)
             "household_store_settings",
+            // Purchase suggestions (013, issue #106)
+            "purchase_events",
+            "purchase_dismissals",
         ];
 
         for name in expected {
@@ -1068,8 +1071,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 24,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category and household store settings tables in the file-backed database"
+            count, 26,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category and household store settings tables + purchase suggestion tables in the file-backed database"
         );
 
         pool.close().await;

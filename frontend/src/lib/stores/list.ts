@@ -35,7 +35,8 @@ type OperationType =
   | 'move_to_list'
   | 'delete_item'
   | 'resolve_alias'
-  | 'set_quantity';
+  | 'set_quantity'
+  | 'dismiss_suggestion';
 
 /**
  * Bridges a Dexie `liveQuery` Observable to a Svelte store. The query re-runs
@@ -413,6 +414,64 @@ export async function resolveAlias(
     return true;
   });
   if (enqueued) notifyMutationEnqueued(listId);
+}
+
+/**
+ * Confirms a purchase suggestion by adding its canonical item to the list
+ * (issue #106). Optimistically inserts a RESOLVED active entry and enqueues an
+ * `add_item` mutation carrying the `canonical_item_id`, so the server binds the
+ * item directly (no re-resolution) and dedups against an existing active row.
+ * Returns the new entry id.
+ */
+export async function addCanonicalItem(
+  listId: string,
+  canonicalItemId: string,
+  displayName: string
+): Promise<string> {
+  if (!canonicalItemId) throw new Error('addCanonicalItem: canonicalItemId must not be empty');
+  const text = displayName.trim() || canonicalItemId;
+  const now = new Date().toISOString();
+  const entryId = crypto.randomUUID();
+  const entry: LocalListEntry = {
+    id: entryId,
+    list_id: listId,
+    canonical_item_id: canonicalItemId,
+    resolution_status: 'resolved',
+    raw_text: text,
+    display_name: text,
+    quantity: 1,
+    status: 'active',
+    last_updated_revision: 0,
+    updated_at: now
+  };
+  const mutation = await buildMutation(listId, entryId, 'add_item', {
+    canonical_item_id: canonicalItemId,
+    raw_text: text,
+    display_name: text,
+    quantity: 1
+  });
+
+  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+    await db.list_entries.add(entry);
+    await db.mutation_queue.add(mutation);
+  });
+  notifyMutationEnqueued(listId);
+  return entryId;
+}
+
+/**
+ * Dismisses a purchase suggestion (issue #106), pushing the next suggestion one
+ * typical interval later. A dismissal is household-scoped evidence about a
+ * canonical item, not a list entry, so the mutation carries
+ * `entity_type: 'canonical_item'` and there is NO optimistic Dexie entry to
+ * update — the sync indicator still reflects the queued mutation.
+ */
+export async function dismissSuggestion(listId: string, canonicalItemId: string): Promise<void> {
+  if (!canonicalItemId) throw new Error('dismissSuggestion: canonicalItemId must not be empty');
+  const mutation = await buildMutation(listId, canonicalItemId, 'dismiss_suggestion', {});
+  mutation.entity_type = 'canonical_item';
+  await db.mutation_queue.add(mutation);
+  notifyMutationEnqueued(listId);
 }
 
 /** Soft-deletes an entry (status: 'deleted'); never shown in the UI again. */
