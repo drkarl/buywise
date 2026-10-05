@@ -163,7 +163,7 @@ describe('shopping page', () => {
 	it('shows chosen store items and links to the other trip entries', async () => {
 		await seed();
 		await db.list_entries.bulkPut([
-			entry('e-cream', 'Cream', DAIRY),
+			{ ...entry('e-cream', 'Cream', DAIRY), status: 'bought' as const },
 			entry('e-batteries', 'Batteries', PRODUCE)
 		]);
 		// A two-store trip: Apples (Produce) at Aldi, Milk (Dairy) at Tesco.
@@ -222,7 +222,7 @@ describe('shopping page', () => {
 		// Tesco's list holds only its own allocated item.
 		expect(screen.queryByText('Apples')).toBeNull();
 		const wholeTripLink = screen.getByRole('link', {
-			name: '2 items not in a store list — View whole trip'
+			name: '1 item not in a store list — View whole trip'
 		});
 		expect(wholeTripLink.getAttribute('href')).toBe('/list/list-42/trip');
 

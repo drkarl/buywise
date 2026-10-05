@@ -77,7 +77,8 @@
 		const unallocatedIds = new Set(trip.allocation.unallocated.map((item) => item.entryId));
 		const accountedIds = new Set(trip.allocation.entryIds);
 		return $entries.filter(
-			(entry) => unallocatedIds.has(entry.id) || !accountedIds.has(entry.id)
+			(entry) =>
+				entry.status === 'active' && (unallocatedIds.has(entry.id) || !accountedIds.has(entry.id))
 		).length;
 	});
 
