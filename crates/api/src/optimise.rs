@@ -755,15 +755,15 @@ fn render_reason(
             store_names(&reason.retailers),
             plural(items)
         ),
-        ReasonCode::BrandRule => format!(
-            "{items} item{} held to your brand rule",
-            plural(items)
-        ),
+        ReasonCode::BrandRule => format!("{items} item{} held to your brand rule", plural(items)),
         ReasonCode::Coverage => {
             let total = input.items.len();
             let amount = reason.cents.map(euros).unwrap_or_else(|| "€?".into());
             if items >= total {
-                format!("Prices all {total} basket item{} for {amount}", plural(total))
+                format!(
+                    "Prices all {total} basket item{} for {amount}",
+                    plural(total)
+                )
             } else {
                 format!("Prices {items} of {total} basket items for {amount}")
             }
@@ -782,10 +782,9 @@ fn render_reason(
             "No qualifying price on record anywhere for {items} item{}{suffix}",
             plural(items)
         ),
-        ReasonCode::UnresolvedItems => format!(
-            "Could not match {items} item{} to a product",
-            plural(items)
-        ),
+        ReasonCode::UnresolvedItems => {
+            format!("Could not match {items} item{} to a product", plural(items))
+        }
         ReasonCode::StalePrices => format!(
             "Prices for {items} item{} at {} are not from the latest run",
             plural(items),
@@ -814,9 +813,8 @@ fn render_reason(
             )
         }
         ReasonCode::SplitDropsItems => {
-            let saving = reason.cents.map(euros).unwrap_or_default();
             format!(
-                "Adding {} would save {saving} but leave {items} item{} unpriced, so the single store wins",
+                "Adding {} would leave {items} item{} unpriced, so the single store wins",
                 store_names(&reason.retailers),
                 plural(items)
             )
@@ -843,7 +841,7 @@ fn render_reason(
             ),
         },
         ReasonCode::CoverageDiffers => format!(
-            "{} alone prices a different number of items, so its total is not directly comparable",
+            "{} alone prices a different set of items, so its total is not directly comparable",
             store_names(&reason.retailers)
         ),
         ReasonCode::StoreOff => format!(
