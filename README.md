@@ -9,7 +9,7 @@ Built for two adults and two children. Not a public product.
 - Collaborative shopping list with real-time sync across devices
 - Bilingual entry (English and Spanish resolve to the same item)
 - Weekly price data via BasketWatch (RapidAPI) and Lidl direct
-- Four optimisation plans: best single store, best two-store split, theoretical minimum, and a recommended practical plan
+- Four optimisation plans with plain-language reasons for each recommendation
 - Offline-first PWA: the shopping list works without connectivity in-store, with sync status and pending items shown until the server confirms them
 - Savings ledger: tracks what was actually saved over time
 
