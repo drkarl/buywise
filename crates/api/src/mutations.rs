@@ -753,7 +753,7 @@ async fn apply_mark_bought(
         .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
         .map(|parsed| parsed.with_timezone(&Utc).min(server_now))
         .unwrap_or(server_now)
-        .to_rfc3339();
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
 
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT status, canonical_item_id FROM list_entries WHERE id = ?1 AND list_id = ?2",
