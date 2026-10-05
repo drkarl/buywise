@@ -751,7 +751,7 @@ async fn apply_mark_bought(
         .with_timezone(&Utc);
     let bought_at = string_field(&req.payload, "bought_at")
         .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
-        .map(|parsed| parsed.with_timezone(&Utc).min(server_now.clone()))
+        .map(|parsed| parsed.with_timezone(&Utc).min(server_now))
         .unwrap_or(server_now)
         .to_rfc3339();
 
