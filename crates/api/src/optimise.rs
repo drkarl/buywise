@@ -895,6 +895,10 @@ fn render_reason(
             store_names(&reason.retailers)
         ),
         ReasonCode::PriceAsOf => match reason.snapshot_date.as_deref() {
+            Some(date) if !reason.item_indices.is_empty() => format!(
+                "Prices as of {date}; no snapshot date recorded for {items} item{}",
+                plural(items)
+            ),
             Some(date) => format!("Prices as of {date}"),
             None => "Prices have no recorded snapshot date".to_string(),
         },
@@ -1377,6 +1381,19 @@ mod tests {
         assert_eq!(
             render_reason(&reason, &input(), &categories()),
             "Prices as of 2026-06-01"
+        );
+    }
+
+    #[test]
+    fn price_as_of_mentions_undated_lines() {
+        let reason = PlanReason {
+            item_indices: vec![0, 1],
+            snapshot_date: Some("2026-05-20".to_string()),
+            ..bare(PlanKind::BestSingle, ReasonCode::PriceAsOf)
+        };
+        assert_eq!(
+            render_reason(&reason, &input(), &categories()),
+            "Prices as of 2026-05-20; no snapshot date recorded for 2 items"
         );
     }
 
