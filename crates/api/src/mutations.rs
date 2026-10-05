@@ -172,6 +172,7 @@ pub struct EntityView {
     /// `list_entries.updated_at`.
     pub updated_at: String,
     /// Whether an active, resolved entry lacks an accepted or suggested match.
+    #[serde(default)]
     pub needs_match: bool,
 }
 

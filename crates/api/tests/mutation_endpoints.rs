@@ -338,6 +338,42 @@ async fn same_client_mutation_id_replays_byte_identical_response() {
 }
 
 #[tokio::test]
+async fn legacy_stored_response_without_needs_match_replays() {
+    let pool = setup_pool().await;
+    seed_household(&pool, "hh-a", "Household A").await;
+    seed_user(&pool, "user-a", "a@example.test", "hh-a").await;
+    seed_list(&pool, "list-a", "hh-a", "A's list").await;
+    let s = login(&pool, "a@example.test").await;
+    let body = envelope(
+        "cm-legacy",
+        "list-a",
+        "entry-legacy",
+        "add_item",
+        serde_json::json!({ "raw_text": "Milk", "display_name": "Milk" }),
+    );
+
+    let first = post_mutation(&pool, &s, body.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let bytes = raw_bytes(first).await;
+    let mut legacy_response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    legacy_response["entity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("needs_match");
+    sqlx::query("UPDATE mutations SET response_json = ?1 WHERE client_mutation_id = 'cm-legacy'")
+        .bind(legacy_response.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let replay = post_mutation(&pool, &s, body).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: serde_json::Value = json(replay).await;
+    assert_eq!(replay["entity"]["id"], "entry-legacy");
+    assert_eq!(replay["entity"]["needs_match"], false);
+}
+
+#[tokio::test]
 async fn duplicate_resolved_add_merges_and_increments_quantity() {
     let pool = setup_pool().await;
     seed_household(&pool, "hh-a", "Household A").await;
