@@ -8,9 +8,10 @@
 
 	interface Props {
 		status: SyncStatus;
+		ondismiss?: () => void;
 	}
 
-	let { status }: Props = $props();
+	let { status, ondismiss }: Props = $props();
 
 	const label = $derived(syncStatusLabel(status));
 	const icon = $derived(
@@ -35,6 +36,11 @@
 >
 	<span class="icon" aria-hidden="true">{icon}</span>
 	<span class="text">{label}</span>
+	{#if status.state === 'error' && ondismiss}
+		<button type="button" class="dismiss" aria-label="Dismiss sync errors" onclick={ondismiss}>
+			Dismiss
+		</button>
+	{/if}
 </div>
 
 <style>
@@ -75,6 +81,15 @@
 	}
 	.syncing .icon {
 		animation: sync-spin 1.4s linear infinite;
+	}
+	.dismiss {
+		padding: 0;
+		border: 0;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		text-decoration: underline;
+		cursor: pointer;
 	}
 	@keyframes sync-spin {
 		from {

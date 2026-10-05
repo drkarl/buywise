@@ -44,11 +44,11 @@ export interface SyncStatus {
  * Resolves the indicator state from the live inputs. Precedence:
  *
  *  1. `error`  — a change was terminally rejected; the user must know.
- *  2. `offline`— the browser is offline, OR we cannot reach the server while
- *                changes are queued (captive portal / server down: SSE closed).
+ *  2. `offline`— the browser is offline, the server is unreachable, OR queued
+ *                changes remain after a drain has stopped.
  *                With nothing queued a dropped stream is not "unsynced" — there
  *                is nothing to push — so that case stays `synced`.
- *  3. `syncing`— a drain is in flight or confirmed-pending changes remain.
+ *  3. `syncing`— a drain is in flight.
  *  4. `synced` — online, connected, nothing outstanding.
  */
 export function deriveSyncStatus(input: SyncStatusInput = {}): SyncStatus {
@@ -58,9 +58,9 @@ export function deriveSyncStatus(input: SyncStatusInput = {}): SyncStatus {
   const failed = Math.max(0, Math.trunc(input.failed ?? 0));
   const syncing = input.syncing ?? false;
 
-  const offline = !online || (!connected && pending > 0);
+  const offline = !online || (pending > 0 && (!connected || !syncing));
   const state: SyncState =
-    failed > 0 ? 'error' : offline ? 'offline' : syncing || pending > 0 ? 'syncing' : 'synced';
+    failed > 0 ? 'error' : offline ? 'offline' : syncing ? 'syncing' : 'synced';
 
   return { state, online, connected, pending, failed, syncing };
 }
@@ -81,7 +81,9 @@ export function syncStatusLabel(status: SyncStatus): string {
     case 'syncing':
       return status.pending > 0 ? `Syncing ${countLabel(status.pending)}…` : 'Syncing…';
     case 'offline':
-      return status.pending > 0 ? `Offline — ${countLabel(status.pending)} pending` : 'Offline';
+      return status.pending > 0
+        ? `Offline — ${countLabel(status.pending)} pending`
+        : 'Offline';
     case 'error':
       return `Sync error — ${countLabel(status.failed)} couldn’t be saved`;
   }
@@ -94,8 +96,6 @@ export interface SyncStatusStore {
   setConnected(connected: boolean): void;
   /** A queue drain started or finished. */
   setSyncing(syncing: boolean): void;
-  /** The number of unacknowledged terminally-rejected mutations. */
-  setFailed(count: number): void;
 }
 
 /**
@@ -123,15 +123,16 @@ export function createSyncStatusStore(listId: string): SyncStatusStore {
 
     // The pending count comes straight from the local queue: it rises the
     // instant an edit is enqueued and falls when the drain confirms it.
-    const subscription = liveQuery(() =>
-      db.mutation_queue
-        .where('list_id')
-        .equals(listId)
-        .filter((m) => m.status === 'pending' || m.status === 'sent')
-        .count()
-    ).subscribe({
-      next: (count) => {
-        pending = count;
+    const subscription = liveQuery(async () => {
+      const rows = await db.mutation_queue.where('list_id').equals(listId).toArray();
+      return {
+        pending: rows.filter((m) => m.status === 'pending' || m.status === 'sent').length,
+        failed: rows.filter((m) => m.status === 'failed').length
+      };
+    }).subscribe({
+      next: (counts) => {
+        pending = counts.pending;
+        failed = counts.failed;
         emit();
       },
       error: (err) => console.error('[sync status] queue liveQuery error', err)
@@ -173,9 +174,5 @@ export function createSyncStatusStore(listId: string): SyncStatusStore {
       syncing = value;
       publish?.();
     },
-    setFailed(value) {
-      failed = Math.max(0, Math.trunc(value));
-      publish?.();
-    }
   };
 }

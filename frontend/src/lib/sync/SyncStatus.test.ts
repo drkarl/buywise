@@ -35,10 +35,16 @@ describe('deriveSyncStatus', () => {
     expect(deriveSyncStatus({ online: true, connected: true }).state).toBe('synced');
   });
 
-  it('is syncing while confirmed-pending changes are draining', () => {
-    const status = deriveSyncStatus({ online: true, connected: true, pending: 3 });
+  it('is syncing only while a drain is in flight', () => {
+    const status = deriveSyncStatus({ online: true, connected: true, pending: 3, syncing: true });
     expect(status.state).toBe('syncing');
     expect(syncStatusLabel(status)).toBe('Syncing 3 changes…');
+  });
+
+  it('reports queued changes as offline when the drain has stalled', () => {
+    const status = deriveSyncStatus({ online: true, connected: true, pending: 3 });
+    expect(status.state).toBe('offline');
+    expect(syncStatusLabel(status)).toBe('Offline — 3 changes pending');
   });
 
   it('is syncing while a drain is in flight even with nothing queued', () => {
@@ -88,11 +94,14 @@ describe('createSyncStatusStore', () => {
     try {
       expect(get(store.status).state).toBe('synced');
 
-      // A queued edit (the store's own liveQuery observes Dexie) → syncing.
+      // A queued edit without a drain is stalled; the in-flight flag is the
+      // only state that makes it syncing.
       await db.mutation_queue.add(mutation('e1', 'pending'));
       await vi.waitFor(() =>
-        expect(get(store.status)).toMatchObject({ state: 'syncing', pending: 1 })
+        expect(get(store.status)).toMatchObject({ state: 'offline', pending: 1 })
       );
+      store.setSyncing(true);
+      expect(get(store.status)).toMatchObject({ state: 'syncing', pending: 1 });
 
       // The browser losing its network → offline with the pending count.
       window.dispatchEvent(new Event('offline'));
@@ -109,12 +118,31 @@ describe('createSyncStatusStore', () => {
       await vi.waitFor(() =>
         expect(get(store.status)).toMatchObject({ state: 'synced', pending: 0 })
       );
+      store.setSyncing(false);
 
-      // A terminal failure surfaces the error state until acknowledged.
-      store.setFailed(1);
-      expect(get(store.status).state).toBe('error');
-      store.setFailed(0);
-      expect(get(store.status).state).toBe('synced');
+      // A terminal failure surfaces from persisted queue state and clears when
+      // its row is dismissed from the queue.
+      await db.mutation_queue.add(mutation('e-failed', 'failed'));
+      await vi.waitFor(() => expect(get(store.status)).toMatchObject({ state: 'error', failed: 1 }));
+      await db.mutation_queue.where('status').equals('failed').delete();
+      await vi.waitFor(() => expect(get(store.status).state).toBe('synced'));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('shows a persisted failure when a fresh status store subscribes after reload', async () => {
+    await db.mutation_queue.add(mutation('e-reload-failed', 'failed'));
+
+    const storeAfterReload = createSyncStatusStore(LIST);
+    const unsubscribe = storeAfterReload.status.subscribe(() => {});
+    try {
+      await vi.waitFor(() => {
+        expect(get(storeAfterReload.status)).toMatchObject({ state: 'error', failed: 1 });
+        expect(syncStatusLabel(get(storeAfterReload.status))).toBe(
+          'Sync error — 1 change couldn’t be saved'
+        );
+      });
     } finally {
       unsubscribe();
     }

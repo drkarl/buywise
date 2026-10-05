@@ -81,9 +81,6 @@
 
 	function dismissFailure(clientMutationId: string) {
 		failures = failures.filter((f) => f.client_mutation_id !== clientMutationId);
-		// Acknowledge it in the sync engine too so the indicator's error state
-		// clears along with the notice.
-		sync?.acknowledgeFailure(clientMutationId);
 	}
 
 	// Disambiguation flow (P3-T3). The active entry being clarified and its
@@ -177,7 +174,7 @@
 	<header class="list-header">
 		<h1>Shopping list</h1>
 		<div class="header-meta">
-			<SyncIndicator status={syncStatus} />
+			<SyncIndicator status={syncStatus} ondismiss={() => void sync?.dismissFailures()} />
 			<span class="count" aria-live="polite">{$active.length} item{$active.length === 1 ? '' : 's'}</span>
 			<!-- Navigate to the optimise route, which fires POST /api/optimise on
 			     mount and renders the plan cards. Kept as a plain link so the list
