@@ -10,12 +10,14 @@
 	import AddItemInput from '$lib/components/AddItemInput.svelte';
 	import BulkAddModal from '$lib/components/BulkAddModal.svelte';
 	import ListItem from '$lib/components/ListItem.svelte';
+	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
 	import AmbiguityModal, {
 		type CandidateItem
 	} from '$lib/components/AmbiguityModal.svelte';
 	import {
 		activeEntries,
 		basketEntries,
+		pendingEntityIds,
 		addItem,
 		addItems,
 		markBought,
@@ -26,13 +28,26 @@
 		resolveAlias
 	} from '$lib/stores/list';
 	import { db, type LocalListEntry } from '$lib/db/dexie';
-	import { startSync, type SyncHandle, type FailedMutation } from '$lib/sync';
+	import {
+		startSync,
+		deriveSyncStatus,
+		type SyncHandle,
+		type FailedMutation,
+		type SyncStatus
+	} from '$lib/sync';
 
 	const listId = $derived(page.params.id ?? '');
 
 	// Re-derive the live stores whenever the route id changes.
 	const active = $derived(activeEntries(listId));
 	const basket = $derived(basketEntries(listId));
+	// Entries whose latest edit the server has not confirmed yet — drives the
+	// per-item "not synced yet" marker.
+	const pendingIds = $derived(pendingEntityIds(listId));
+
+	// Live sync/connectivity status for the always-visible indicator. Replaced by
+	// the sync engine's own store on mount.
+	let syncStatus = $state<SyncStatus>(deriveSyncStatus());
 
 	let basketOpen = $state(false);
 	let refreshing = $state(false);
@@ -66,6 +81,9 @@
 
 	function dismissFailure(clientMutationId: string) {
 		failures = failures.filter((f) => f.client_mutation_id !== clientMutationId);
+		// Acknowledge it in the sync engine too so the indicator's error state
+		// clears along with the notice.
+		sync?.acknowledgeFailure(clientMutationId);
 	}
 
 	// Disambiguation flow (P3-T3). The active entry being clarified and its
@@ -132,8 +150,10 @@
 				];
 			}
 		});
+		const unsubscribeStatus = handle.status.subscribe((next) => (syncStatus = next));
 		sync = handle;
 		return () => {
+			unsubscribeStatus();
 			handle.stop();
 			if (sync === handle) sync = null;
 		};
@@ -157,6 +177,7 @@
 	<header class="list-header">
 		<h1>Shopping list</h1>
 		<div class="header-meta">
+			<SyncIndicator status={syncStatus} />
 			<span class="count" aria-live="polite">{$active.length} item{$active.length === 1 ? '' : 's'}</span>
 			<!-- Navigate to the optimise route, which fires POST /api/optimise on
 			     mount and renders the plan cards. Kept as a plain link so the list
@@ -201,6 +222,7 @@
 		{#each $active as entry (entry.id)}
 			<ListItem
 				{entry}
+				pending={$pendingIds.has(entry.id)}
 				onbought={(id) => markBought(listId, id)}
 				onskipped={(id) => markSkipped(listId, id)}
 				ondelete={(id) => deleteItem(listId, id)}
@@ -226,6 +248,7 @@
 					{#each $basket as entry (entry.id)}
 						<ListItem
 							{entry}
+							pending={$pendingIds.has(entry.id)}
 							onbought={(id) => markBought(listId, id)}
 							onskipped={(id) => markSkipped(listId, id)}
 							ondelete={(id) => deleteItem(listId, id)}
@@ -286,6 +309,8 @@
 		display: flex;
 		align-items: baseline;
 		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: 0.5rem;
 	}
 	.list-header h1 {
 		font-size: 1.4rem;
@@ -295,6 +320,8 @@
 		display: flex;
 		align-items: center;
 		gap: 0.75rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
 	}
 	.count {
 		color: #64748b;

@@ -81,6 +81,22 @@ export function basketEntries(listId: string): Readable<LocalListEntry[]> {
   );
 }
 
+/**
+ * Entity ids that currently have a not-yet-confirmed mutation queued for `listId`
+ * (status `pending`/`sent`). Drives the per-item "not synced yet" marker so a
+ * pending change stays visible per item until the server confirms it.
+ */
+export function pendingEntityIds(listId: string): Readable<Set<string>> {
+  return liveStore<Set<string>>(async () => {
+    const pending = await db.mutation_queue
+      .where('list_id')
+      .equals(listId)
+      .filter((m) => m.status === 'pending' || m.status === 'sent')
+      .toArray();
+    return new Set(pending.map((m) => m.entity_id));
+  }, new Set<string>());
+}
+
 /** Resolves the current server revision for a list (0 if unknown). */
 async function currentRevision(listId: string): Promise<number> {
   const meta = await db.list_meta.get(listId);
