@@ -146,6 +146,10 @@ pub enum LlmError {
 ///
 /// `dyn`-compatible via [`async_trait`] so [`crate::AppState`] can hold an
 /// `Arc<dyn LlmClient>` and tests can swap in a fake.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates a must_use future for async trait methods"
+)]
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Whether this client can actually make a call — i.e. the fallback is enabled
@@ -238,6 +242,10 @@ struct ChatMessage {
     content: String,
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates a must_use future for async trait methods"
+)]
 #[async_trait]
 impl LlmClient for ReqwestLlmClient {
     fn is_enabled(&self) -> bool {
