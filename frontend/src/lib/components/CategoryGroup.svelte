@@ -10,11 +10,12 @@
 
 	interface Props {
 		group: CategoryGroup;
+		pendingIds?: Set<string>;
 		/** Check an item off (active → bought). */
 		onbought: (id: string) => void;
 	}
 
-	let { group, onbought }: Props = $props();
+	let { group, pendingIds = new Set<string>(), onbought }: Props = $props();
 
 	// Sections default to open. We do not auto-collapse a fully-bought category:
 	// keeping it open preserves the "see what's done in context" behaviour.
@@ -60,6 +61,9 @@
 						</button>
 					{/if}
 					<span class="name">{item.display_name}</span>
+					{#if pendingIds.has(item.id)}
+						<span class="pending-marker" role="img" aria-label="Not synced yet" title="Not synced yet">•</span>
+					{/if}
 					{#if item.quantity > 1}
 						<span class="qty">×{item.quantity}</span>
 					{/if}
@@ -125,6 +129,12 @@
 	.name {
 		flex: 1;
 		font-size: 1rem;
+	}
+	.pending-marker {
+		flex-shrink: 0;
+		color: #b45309;
+		font-size: 1.1rem;
+		line-height: 1;
 	}
 	.qty {
 		min-width: 1.25rem;

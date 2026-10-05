@@ -12,7 +12,7 @@
 	import CategoryGroup from '$lib/components/CategoryGroup.svelte';
 	import ProgressBar from '$lib/components/ProgressBar.svelte';
 	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
-	import { markBought } from '$lib/stores/list';
+	import { markBought, pendingEntityIds } from '$lib/stores/list';
 	import {
 		shoppingEntries,
 		categories,
@@ -31,6 +31,7 @@
 	// store orders are list-independent (household-wide), but deriving them here
 	// keeps every subscription scoped to this page's lifecycle.
 	const entries = $derived(shoppingEntries(listId));
+	const pendingIds = $derived(pendingEntityIds(listId));
 	const cats = $derived(categories());
 	const subs = $derived(subcategories());
 	const orders = $derived(storeCategoryOrders());
@@ -82,7 +83,7 @@
 	<header class="shopping-header">
 		<h1>Shopping</h1>
 		<div class="shopping-header-meta">
-			<SyncIndicator status={syncStatus} />
+			<SyncIndicator status={syncStatus} ondismiss={() => void sync?.dismissFailures()} />
 			<a class="back" href="/list/{listId}">Back to list</a>
 		</div>
 	</header>
@@ -94,7 +95,11 @@
 	{#if groups.length > 0}
 		<div class="groups">
 			{#each groups as group (group.id)}
-				<CategoryGroup {group} onbought={(id) => markBought(listId, id)} />
+				<CategoryGroup
+					{group}
+					pendingIds={$pendingIds}
+					onbought={(id) => markBought(listId, id)}
+				/>
 			{/each}
 		</div>
 	{:else if total === 0}

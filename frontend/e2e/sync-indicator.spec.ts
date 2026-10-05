@@ -6,7 +6,14 @@
 // own Dexie, driving the real backend exactly as the other sync specs do.
 
 import { test, expect } from '@playwright/test';
-import { SEED, openList, addItem, uniqueName, waitForDrained, activeRow } from './fixtures';
+import {
+  SEED,
+  openList,
+  addItem,
+  uniqueName,
+  waitForDrained,
+  activeRow
+} from './fixtures';
 
 test.describe('sync status indicator', () => {
   test('offline add shows a pending count that clears after reconnect', async ({ browser }) => {
@@ -37,6 +44,28 @@ test.describe('sync status indicator', () => {
       await expect(indicator).toHaveAttribute('data-state', 'synced', { timeout: 30_000 });
       await expect(indicator).toContainText('Synced');
       await expect(page.getByRole('img', { name: 'Not synced yet' })).toHaveCount(0);
+    } finally {
+      await context.close();
+    }
+  });
+
+  test('offline check-off in shopping mode marks the affected item', async ({ browser }) => {
+    const context = await browser.newContext();
+    try {
+      const page = await openList(context);
+      const boughtName = uniqueName();
+      await addItem(page, boughtName);
+      await waitForDrained(page, SEED.listId);
+      await addItem(page, uniqueName());
+      await waitForDrained(page, SEED.listId);
+
+      await page.goto(`${listPath}/shopping`);
+      await expect(page.getByRole('heading', { name: 'Shopping' })).toBeVisible();
+      await context.setOffline(true);
+      await page.getByRole('button', { name: `Check off ${boughtName}` }).click();
+
+      await expect(page.getByRole('img', { name: 'Not synced yet' })).toBeVisible();
+      await expect(page.getByRole('status')).toContainText('Offline — 1 change pending');
     } finally {
       await context.close();
     }

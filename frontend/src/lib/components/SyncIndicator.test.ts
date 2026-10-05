@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import SyncIndicator from './SyncIndicator.svelte';
 import { deriveSyncStatus, type SyncStatusInput } from '$lib/sync/SyncStatus';
 
@@ -16,10 +16,17 @@ describe('SyncIndicator', () => {
   });
 
   it('shows the pending count while syncing', () => {
-    renderIndicator({ online: true, connected: true, pending: 2 });
+    renderIndicator({ online: true, connected: true, pending: 2, syncing: true });
     const el = screen.getByRole('status');
     expect(el.textContent).toContain('Syncing 2 changes…');
     expect(el.getAttribute('data-state')).toBe('syncing');
+  });
+
+  it('shows a stalled queue as offline instead of syncing', () => {
+    renderIndicator({ online: true, connected: true, pending: 2 });
+    const el = screen.getByRole('status');
+    expect(el.textContent).toContain('Offline — 2 changes pending');
+    expect(el.getAttribute('data-state')).toBe('offline');
   });
 
   it('shows offline with the pending count', () => {
@@ -34,6 +41,15 @@ describe('SyncIndicator', () => {
     const el = screen.getByRole('status');
     expect(el.textContent).toContain('Sync error — 1 change couldn’t be saved');
     expect(el.getAttribute('data-state')).toBe('error');
+  });
+
+  it('offers one action to clear persisted sync errors', async () => {
+    const ondismiss = vi.fn();
+    render(SyncIndicator, {
+      props: { status: deriveSyncStatus({ failed: 2 }), ondismiss }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss sync errors' }));
+    expect(ondismiss).toHaveBeenCalledOnce();
   });
 
   it('exposes the state as a polite live region, as text and not colour alone', () => {

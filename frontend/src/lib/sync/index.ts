@@ -58,11 +58,8 @@ export interface SyncHandle {
   stop(): void;
   /** Live sync/connectivity status for the always-visible indicator. */
   status: Readable<SyncStatus>;
-  /**
-   * Acknowledges a surfaced terminal failure (e.g. the user dismissed its
-   * notice) so it stops counting toward the indicator's error state.
-   */
-  acknowledgeFailure(clientMutationId: string): void;
+  /** Clears all persisted terminal failures for this list. */
+  dismissFailures(): Promise<void>;
 }
 
 /**
@@ -201,16 +198,10 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
     }
   });
 
-  // Terminal 4xx failures feed the indicator's error state. Tracked by
-  // client_mutation_id so a replayed drain (which re-reports the same rejection)
-  // cannot inflate the count; `acknowledgeFailure` clears an acknowledged one.
-  const failedMutations = new Set<string>();
   const userOnFailed = options.onFailed;
   const syncOptions: SyncOptions = {
     ...options,
     onFailed: (failure) => {
-      failedMutations.add(failure.client_mutation_id);
-      statusStore.setFailed(failedMutations.size);
       userOnFailed?.(failure);
     }
   };
@@ -274,10 +265,12 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
 
   return {
     status: statusStore.status,
-    acknowledgeFailure(clientMutationId: string) {
-      if (failedMutations.delete(clientMutationId)) {
-        statusStore.setFailed(failedMutations.size);
-      }
+    async dismissFailures() {
+      await db.mutation_queue
+        .where('list_id')
+        .equals(listId)
+        .filter((mutation) => mutation.status === 'failed')
+        .delete();
     },
     async resync() {
       await bootstrap; // ensure the initial pass has wired up before re-draining
