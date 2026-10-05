@@ -496,8 +496,10 @@ optimiser from the basket item) plus the chosen product, so a trip list is a
   "Tesco order", …), each grouped by that store's category order, showing each
   item's quantity and chosen product, plus an explicit **not allocated** section
   carrying the items the plan could not price (unresolved, no valid offer, or held
-  for confirmation) or that are not stocked at its stores. The store lists plus
-  that section account for every active list entry, each entry once.
+  for confirmation) or that are not stocked at its stores. When the plan is chosen,
+  the store lists plus that section account for every active list entry, each entry
+  once. Entries added after plan selection are absent from both views until the
+  shopper chooses a plan again; the trip's stale-plan warning links to the optimiser.
 - Shopping mode (`/list/<id>/shopping`) is scoped to the chosen plan: it offers
   only the plan's stores and shows only the selected store's allocated items.
   A link to the whole trip shows how many active items are outside that store's
