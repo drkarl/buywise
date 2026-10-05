@@ -500,6 +500,8 @@ optimiser from the basket item) plus the chosen product, so a trip list is a
   that section account for every active list entry, each entry once.
 - Shopping mode (`/list/<id>/shopping`) is scoped to the chosen plan: it offers
   only the plan's stores and shows only the selected store's allocated items.
+  A link to the whole trip shows how many active items are outside that store's
+  allocation, including unallocated items and entries added after plan selection.
 - Check-offs in either view reuse the same optimistic `mark_bought` mutation
   (§11), so an offline check-off queues and drains like any other edit and
   converges across devices.
@@ -659,14 +661,14 @@ Build in this sequence to validate assumptions before investing in the polished 
 - Litestream sidecar config → Cloudflare R2
 - Hetzner deployment (systemd service, binary + DB volume)
 
-### Phase 2 — PWA
+### Phase 2 — PWA (implemented)
 - SvelteKit scaffold
 - Dexie schema (local list mirror + mutation queue)
 - Service worker (app shell + offline)
 - Sync loop (drain mutation queue on reconnect; apply SSE updates)
 - Basic list UI: add item, check off, mark skipped
 - **Duplicate warning UX** (ported from Shoppy): when a new item matches an already-active entry, show merge-quantity / add-anyway choice — do not silently deduplicate. Phase 2 uses **dictionary-only local detection** (bundled bilingual dictionary in Dexie, client-side). Matches are used for the in-session warning UI only — no aliases are written to `item_aliases` in Phase 2. The full server-side resolution cascade (§8) is built in Phase 3, at which point confirmed mappings begin persisting to `item_aliases` and the duplicate check is upgraded automatically
-- **Shopping mode**: store-selector switches to store-specific category ordering from `store_category_orders`; items grouped by aisle; progress bar; this view works usefully even when price data is stale
+- **Shopping mode**: store-selector switches to store-specific category ordering from `store_category_orders`; items grouped by aisle; progress bar; this view works usefully even when price data is stale. With a chosen plan, it is scoped to that plan's stores and allocations (§10).
 
 ### Phase 3 — Bilingual matching
 - Alias lookup and resolution cascade in the API (§8)
@@ -674,9 +676,9 @@ Build in this sequence to validate assumptions before investing in the polished 
 - Ambiguity confirmation flow in the PWA
 - `item_aliases` feedback loop (confirmed mappings persist)
 
-### Phase 4 — Optimiser UI
+### Phase 4 — Optimiser UI (implemented)
 - Optimisation endpoint in Axum
-- PWA: basket plan display (4 plans, plain-language recommendation)
+- PWA: basket plan display (4 plans, plain-language recommendation) and per-store trip view (§10)
 - Convenience threshold configuration
 
 ### Phase 5 — Household learning & savings ledger
