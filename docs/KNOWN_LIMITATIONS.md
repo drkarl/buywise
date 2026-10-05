@@ -25,9 +25,10 @@ unallocated, are neither rendered nor check-off-able there. The only affordance 
 "N item(s) not in a store list — View whole trip" link (`:143-151`), whose count is the active
 entries that are unallocated or absent from `allocation.entryIds` (`:75-84`); the stale-plan banner
 lives only on the trip page (`frontend/src/routes/(app)/list/[id]/trip/+page.svelte:153-158`). An
-entry added after choosing is counted by that link but also has no per-item view on the trip page —
-its "Not allocated to a store" section (`trip/+page.svelte:183-212`) carries only the items the plan
-itself left unallocated — so such an entry is reachable only by re-choosing a plan.
+entry added after choosing is counted by that link but has no per-item view in either the trip or
+store-scoped shopping view — its "Not allocated to a store" section (`trip/+page.svelte:183-212`)
+carries only the items the plan itself left unallocated. The entry remains available on the plain
+list page (`frontend/src/routes/(app)/list/[id]/+page.svelte:223-249`), where it can be checked off.
 
 The chosen allocation is a client-side cache in `localStorage` under `buywise:trip:<listId>`
 (`frontend/src/lib/shopping/chosenTrip.ts:33`, `:57`), not server state. It is therefore per device:
@@ -48,9 +49,9 @@ snapshot, and design §10 records the per-device cache, the replace-by-reselecti
 frozen-price snapshot as deliberate volume-one scope; a second stale banner inside shopping mode was
 out of scope.
 
-**Workaround.** Open `/list/<id>/trip` for the whole trip — its stale banner links back to the
-optimiser. Re-optimise and re-choose on each device; the shared entries and their statuses stay in
-sync.
+**Workaround.** Open `/list/<id>` to view and check off an entry added after choosing a plan. Open
+`/list/<id>/trip` for the whole trip — its stale banner links back to the optimiser. Re-optimise and
+re-choose on each device; the shared entries and their statuses stay in sync.
 
 **Follow-up.** Issue #104 follow-up: show the stale-plan warning (or the not-in-a-store-list notice)
 inside store-scoped shopping mode, extend the stale check to quantity and other plan-affecting
