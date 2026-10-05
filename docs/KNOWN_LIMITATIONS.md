@@ -287,10 +287,9 @@ workflow needs it) reflect the rules in shopping-mode grouping.
 
 ### 2. An item the optimiser cannot classify is never excluded
 
-**What happens.** A resolved item whose `canonical_items.category_id` is unset — or an item whose
-category row has gone missing — is allowed at every store, so a category rule cannot exclude it. The
-optimiser only receives an item's category when the API lookup finds one; an unresolved entry is
-already excluded from pricing for other reasons.
+**What happens.** An item whose category row has gone missing is allowed at every store, so a
+category rule cannot exclude it. The optimiser only receives an item's category when the API lookup
+finds its canonical item; an unresolved entry is already excluded from pricing for other reasons.
 
 **Why accepted.** Dropping an unclassifiable item would silently remove it from every plan, which is
 worse than pricing it where we can. The catalogue maps every seeded item (migration 010 backfills
