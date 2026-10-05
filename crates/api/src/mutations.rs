@@ -70,6 +70,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use buywise_core::constraint_hash::effective_constraint_hash;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Sqlite, Transaction};
@@ -745,7 +746,14 @@ async fn apply_mark_bought(
 ) -> Result<ApplyOutcome, StatusCode> {
     let entry_id = require_entry(req)?;
     let now = buywise_core::db::now_iso();
-    let bought_at = string_field(&req.payload, "bought_at").unwrap_or_else(|| now.clone());
+    let server_now = DateTime::parse_from_rfc3339(&now)
+        .expect("now_iso returns RFC3339")
+        .with_timezone(&Utc);
+    let bought_at = string_field(&req.payload, "bought_at")
+        .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc).min(server_now.clone()))
+        .unwrap_or(server_now)
+        .to_rfc3339();
 
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT status, canonical_item_id FROM list_entries WHERE id = ?1 AND list_id = ?2",
@@ -792,6 +800,12 @@ async fn apply_mark_bought(
 
     // Purchase evidence, only for a resolved entry (see this fn's doc comment).
     if let Some(canonical_item_id) = canonical_item_id {
+        sqlx::query("DELETE FROM purchase_events WHERE entry_id = ?1")
+            .bind(&entry_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error("apply_mark_bought.replace_evidence"))?;
+
         sqlx::query(
             "INSERT INTO purchase_events \
                  (id, household_id, canonical_item_id, list_id, entry_id, source, \
@@ -850,6 +864,12 @@ async fn apply_mark_skipped(
     .execute(&mut **tx)
     .await
     .map_err(db_error("apply_mark_skipped.update"))?;
+
+    sqlx::query("DELETE FROM purchase_events WHERE entry_id = ?1")
+        .bind(&entry_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error("apply_mark_skipped.evidence"))?;
 
     Ok(ApplyOutcome::touched(
         Some(entry_id),
