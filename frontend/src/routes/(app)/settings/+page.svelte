@@ -13,12 +13,26 @@
 
 import { retailerLabel } from '$lib/api/optimise';
 import { fetchSettings, updateSettings } from '$lib/api/settings';
-import type { Settings, StoreSetting, StoreStatus } from '$lib/api/settings';
+import type {
+	Category,
+	CategoryRule,
+	Settings,
+	StoreSetting,
+	StoreStatus,
+	Subcategory
+} from '$lib/api/settings';
+import { isAllowed, withScope } from '$lib/settings/categoryRules';
 
 type Status = 'loading' | 'ready' | 'error';
 
 let status = $state<Status>('loading');
 let stores = $state<StoreSetting[]>([]);
+/** Shared category catalogue (ordered) used to render the per-store rules. */
+let categories = $state<Category[]>([]);
+/** Shared sub-category catalogue, grouped by parent for the nested checkboxes. */
+let subcategories = $state<Subcategory[]>([]);
+/** Each store's current category rules, keyed by retailer. */
+let rulesByStore = $state<Record<string, CategoryRule[]>>({});
 /** Convenience thresholds as euro strings for the number inputs ("10.00"). */
 let threshold2Euros = $state('10.00');
 let threshold3Euros = $state('25.00');
@@ -33,11 +47,44 @@ const STATUS_OPTIONS: { value: StoreStatus; label: string }[] = [
 	{ value: 'off', label: 'Off' }
 ];
 
+/** Sub-categories of a category, in catalogue (display) order. */
+function subcategoriesOf(categoryId: string): Subcategory[] {
+	return subcategories.filter((s) => s.category_id === categoryId);
+}
+
 /** Apply a server settings payload to the form state. */
 function applySettings(settings: Settings) {
 	stores = settings.stores;
+	categories = settings.categories;
+	subcategories = settings.subcategories;
+	rulesByStore = Object.fromEntries(
+		settings.stores.map((s) => [s.retailer, s.category_rules])
+	);
 	threshold2Euros = (settings.convenience_threshold_2_cents / 100).toFixed(2);
 	threshold3Euros = (settings.convenience_threshold_3_cents / 100).toFixed(2);
+}
+
+/** The rules currently configured for a store (empty = all categories allowed). */
+function rulesFor(retailer: string): CategoryRule[] {
+	return rulesByStore[retailer] ?? [];
+}
+
+/** Whether the given scope is allowed for a store. */
+function allowedFor(retailer: string, categoryId: string, subcategoryId: string | null = null) {
+	return isAllowed(rulesFor(retailer), categoryId, subcategoryId);
+}
+
+/** Flip one scope's checkbox, normalising the store's rule list. */
+function setAllowed(
+	retailer: string,
+	categoryId: string,
+	subcategoryId: string | null,
+	allowed: boolean
+) {
+	rulesByStore = {
+		...rulesByStore,
+		[retailer]: withScope(rulesFor(retailer), categoryId, subcategoryId, allowed)
+	};
 }
 
 async function load() {
@@ -87,7 +134,8 @@ async function save(event: SubmitEvent) {
 			stores: stores.map((s) => ({
 				retailer: s.retailer,
 				status: s.status,
-				nearby: s.nearby
+				nearby: s.nearby,
+				category_rules: rulesFor(s.retailer)
 			}))
 		});
 		applySettings(updated);
@@ -129,27 +177,84 @@ async function save(event: SubmitEvent) {
 				<ul class="store-list">
 					{#each stores as store (store.retailer)}
 						<li class="store-row">
-							<label class="store-name" for="status-{store.retailer}">
-								{retailerLabel(store.retailer)}
-							</label>
-							<select
-								id="status-{store.retailer}"
-								class="status"
-								aria-label="{retailerLabel(store.retailer)} status"
-								bind:value={store.status}
-							>
-								{#each STATUS_OPTIONS as option (option.value)}
-									<option value={option.value}>{option.label}</option>
-								{/each}
-							</select>
-							<label class="nearby">
-								<input
-									type="checkbox"
-									aria-label="{retailerLabel(store.retailer)} is nearby"
-									bind:checked={store.nearby}
-								/>
-								<span>Nearby</span>
-							</label>
+							<div class="store-controls">
+								<label class="store-name" for="status-{store.retailer}">
+									{retailerLabel(store.retailer)}
+								</label>
+								<select
+									id="status-{store.retailer}"
+									class="status"
+									aria-label="{retailerLabel(store.retailer)} status"
+									bind:value={store.status}
+								>
+									{#each STATUS_OPTIONS as option (option.value)}
+										<option value={option.value}>{option.label}</option>
+									{/each}
+								</select>
+								<label class="nearby">
+									<input
+										type="checkbox"
+										aria-label="{retailerLabel(store.retailer)} is nearby"
+										bind:checked={store.nearby}
+									/>
+									<span>Nearby</span>
+								</label>
+							</div>
+							<details class="store-rules">
+								<summary>Allowed categories</summary>
+								<p class="hint rules-hint">
+									Untick a category to keep this store out of plans for it. Untick a
+									sub-category to refine a broad category.
+								</p>
+								<ul class="category-list">
+									{#each categories as category (category.id)}
+										<li class="category-item">
+											<label class="rule">
+												<input
+													type="checkbox"
+													aria-label="{retailerLabel(store.retailer)} allows {category.name_en}"
+													checked={allowedFor(store.retailer, category.id)}
+													onchange={(event) =>
+														setAllowed(
+															store.retailer,
+															category.id,
+															null,
+															(event.currentTarget as HTMLInputElement).checked
+														)}
+												/>
+												<span>{category.name_en}</span>
+											</label>
+											{#if subcategoriesOf(category.id).length > 0}
+												<ul class="subcategory-list">
+													{#each subcategoriesOf(category.id) as subcategory (subcategory.id)}
+														<li>
+															<label class="rule">
+																<input
+																	type="checkbox"
+																	aria-label="{retailerLabel(store.retailer)} allows {subcategory.name_en}"
+																	checked={allowedFor(
+																		store.retailer,
+																		category.id,
+																		subcategory.id
+																	)}
+																	onchange={(event) =>
+																		setAllowed(
+																			store.retailer,
+																			category.id,
+																			subcategory.id,
+																			(event.currentTarget as HTMLInputElement).checked
+																		)}
+																/>
+																<span>{subcategory.name_en}</span>
+															</label>
+														</li>
+													{/each}
+												</ul>
+											{/if}
+										</li>
+									{/each}
+								</ul>
+							</details>
 						</li>
 					{/each}
 				</ul>
@@ -265,15 +370,54 @@ async function save(event: SubmitEvent) {
 	}
 	.store-row {
 		display: flex;
-		align-items: center;
-		gap: 0.75rem;
+		flex-direction: column;
+		gap: 0.5rem;
 		border: 1px solid #e2e8f0;
 		border-radius: 0.5rem;
 		padding: 0.6rem 0.75rem;
 	}
+	.store-controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
 	.store-name {
 		flex: 1 1 auto;
 		font-weight: 600;
+	}
+	.store-rules summary {
+		cursor: pointer;
+		font-size: 0.9rem;
+		color: #0f766e;
+	}
+	.rules-hint {
+		margin: 0.5rem 0;
+	}
+	.category-list,
+	.subcategory-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+	.category-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+	}
+	.category-item {
+		font-size: 0.9rem;
+	}
+	.subcategory-list {
+		margin-left: 1.4rem;
+		margin-top: 0.3rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+	.rule {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
 	}
 	.status {
 		padding: 0.35rem 0.5rem;

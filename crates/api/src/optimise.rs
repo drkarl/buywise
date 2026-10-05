@@ -377,6 +377,7 @@ async fn build_input_from_list(
         .collect();
     let policies = canonical_item_policies(pool, &ids).await?;
     let constraints_by_id = item_constraints_by_canonical_ids(pool, &ids).await?;
+    let taxonomy_by_id = canonical_item_taxonomy(pool, &ids).await?;
 
     let mut items = Vec::with_capacity(entries.len());
     for (entry_id, canonical_item_id, display_name, quantity) in entries {
@@ -386,6 +387,12 @@ async fn build_input_from_list(
                 constraints_by_id.get(id).cloned(),
             ),
             None => (ConstraintPolicy::Any, None),
+        };
+        // The resolved item's category / sub-category drive the household's
+        // per-store category rules (issue #99). Absent for an unresolved item.
+        let (category_id, subcategory_id) = match canonical_item_id.as_deref() {
+            Some(id) => taxonomy_by_id.get(id).cloned().unwrap_or((None, None)),
+            None => (None, None),
         };
 
         items.push(BasketItem {
@@ -401,6 +408,8 @@ async fn build_input_from_list(
             count: quantity.max(1) as u32,
             constraint_policy: policy,
             constraints,
+            category_id,
+            subcategory_id,
         });
     }
 
@@ -549,10 +558,37 @@ async fn item_constraints_by_canonical_ids(
     Ok(by_id)
 }
 
+/// Bulk-load `(category_id, subcategory_id)` for every given canonical item id,
+/// keyed by id, in chunked `IN (...)` queries (issue #99). Unknown ids are
+/// absent; callers fall back to `(None, None)` so an unclassifiable item is
+/// never excluded by a category rule.
+async fn canonical_item_taxonomy(
+    pool: &sqlx::SqlitePool,
+    ids: &[&str],
+) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>)>, DbError> {
+    let mut by_id = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(by_id);
+    }
+    for chunk in ids.chunks(IN_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, category_id, subcategory_id FROM canonical_items WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(&sql);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        for (id, category_id, subcategory_id) in query.fetch_all(pool).await? {
+            by_id.insert(id, (Some(category_id), subcategory_id));
+        }
+    }
+    Ok(by_id)
+}
+
 // ---------------------------------------------------------------------------
 // offer_snapshot_date
 // ---------------------------------------------------------------------------
-
 /// The latest `source_snapshot_date` among the offers backing the recommended
 /// plan's lines, or `None` if no plan exists or none of its offers carry a date.
 ///
@@ -767,6 +803,10 @@ fn render_plan_explanations(
                         | ReasonCode::NoKnownPriceHere
                         | ReasonCode::NoKnownPriceAnywhere
                         | ReasonCode::UnresolvedItems
+                        // A store skipped by the household's category rules is a
+                        // coverage fact for this plan (issue #99); grouping it here
+                        // guarantees it is surfaced even when the card is full.
+                        | ReasonCode::CategoryExcluded
                 )
             })
             .map(|reason| render_reason(reason, input, categories))
@@ -843,6 +883,7 @@ fn render_plan_explanations(
                     | ReasonCode::CheapestAtStore
                     | ReasonCode::OnlyStoreStocking
                     | ReasonCode::BrandRule
+                    | ReasonCode::CategoryExcluded
                     | ReasonCode::RejectedStore
             ) {
                 continue;
@@ -987,6 +1028,11 @@ fn render_reason(
         ReasonCode::StoreNotOnTrip => format!(
             "{} is occasional and is not marked for today",
             store_names(&reason.retailers)
+        ),
+        ReasonCode::CategoryExcluded => format!(
+            "{} is skipped for {items} item{} by your store category rules",
+            store_names(&reason.retailers),
+            plural(items)
         ),
     }
 }
@@ -1240,6 +1286,8 @@ mod tests {
             count: 1,
             constraint_policy: ConstraintPolicy::Any,
             constraints: None,
+            category_id: None,
+            subcategory_id: None,
         }
     }
 

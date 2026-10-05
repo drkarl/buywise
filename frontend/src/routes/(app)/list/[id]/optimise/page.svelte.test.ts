@@ -185,12 +185,14 @@ describe('optimise page', () => {
 		const fetchMock = stubOptimise(fullResponse(), 200, {
 			convenience_threshold_2_cents: 1000,
 			convenience_threshold_3_cents: 2500,
+			categories: [],
+			subcategories: [],
 			stores: [
-				{ retailer: 'tesco', status: 'active', nearby: false },
-				{ retailer: 'dunnes', status: 'occasional', nearby: false },
-				{ retailer: 'supervalu', status: 'active', nearby: true },
-				{ retailer: 'aldi', status: 'active', nearby: false },
-				{ retailer: 'lidl', status: 'off', nearby: false }
+				{ retailer: 'tesco', status: 'active', nearby: false, category_rules: [] },
+				{ retailer: 'dunnes', status: 'occasional', nearby: false, category_rules: [] },
+				{ retailer: 'supervalu', status: 'active', nearby: true, category_rules: [] },
+				{ retailer: 'aldi', status: 'active', nearby: false, category_rules: [] },
+				{ retailer: 'lidl', status: 'off', nearby: false, category_rules: [] }
 			]
 		});
 		render(Page);

@@ -816,6 +816,8 @@ mod tests {
             "subcategories",
             // Issue #98 (011)
             "household_store_settings",
+            // Issue #99 (013)
+            "household_store_category_rules",
         ];
 
         for name in expected {
@@ -823,8 +825,9 @@ mod tests {
             assert!(sql.is_some(), "table `{name}` should exist after migration");
         }
 
-        // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category
-        // application tables (excluding sqlx bookkeeping).
+        // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category + 1
+        // store-settings + 1 store-category-rules application tables (excluding
+        // sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -1068,8 +1071,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 24,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category and household store settings tables in the file-backed database"
+            count, 25,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, and store category rules tables in the file-backed database"
         );
 
         pool.close().await;
