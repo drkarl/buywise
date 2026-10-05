@@ -1977,14 +1977,14 @@ Build the shopping mode view at `frontend/src/routes/(app)/list/[id]/shopping/+p
 **Behaviour:**
 
 - A store-selector component shows the 5 retailers. Selecting one switches the category ordering to that store's `store_category_orders` from the server (cached in Dexie or a store).
-- Active items are grouped by category, ordered by the store's `display_order`.
-- Items within a category maintain their entry order.
-- Each category shows as a collapsible section with a header (category name + remaining item count).
-- Checked-off items are shown with a strikethrough within their category group (not moved to a separate section in shopping mode — they stay in place so the shopper can see what's done in context).
+- Sections group items by sub-category when one is assigned, ordered by the sub-category's `default_order` within its parent; otherwise they fall back to the parent category. The parent's store `display_order` orders all its sections.
+- Items within a section maintain their entry order.
+- Each section shows as a collapsible group with its category or sub-category name and remaining item count.
+- Checked-off items remain in their section with a strikethrough while that section has active items.
 - A progress bar at the top shows `bought_count / active_count`.
 - This view is fully offline-capable (all data from Dexie).
 
-**Store category orders:** fetched from `GET /api/items` response (include `store_category_orders` for the household) and stored in Dexie. The user can reorder categories per store via drag-and-drop in a settings screen (Phase 5 stretch goal — placeholder only in Phase 2).
+**Store category orders:** fetched with the catalogue from `GET /api/items` and stored in Dexie. Store ordering applies to parent categories; sub-categories use their seeded default order. Per-store aisle layouts, a reorder screen, and learned aisle order are out of scope (issue #101); see [design.md](design.md#7-data-model).
 
 **Files / Areas Touched:**
 - `frontend/src/routes/(app)/list/[id]/shopping/+page.svelte` (create)
