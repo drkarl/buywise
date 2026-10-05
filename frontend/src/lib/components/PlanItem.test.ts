@@ -7,7 +7,9 @@ import type { PlanLine } from '$lib/api/optimise';
 function mockLine(overrides: Partial<PlanLine> = {}): PlanLine {
 	return {
 		item_index: 0,
+		entry_id: 'e-1',
 		display_text: 'Milk 2L',
+		product_name: 'Tesco Whole Milk 2L',
 		canonical_item_id: 'ci-milk',
 		retailer: 'tesco',
 		retailer_product_id: 'rp-1',

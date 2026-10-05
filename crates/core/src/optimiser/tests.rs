@@ -114,6 +114,7 @@ fn product_match(id: &str, item_id: &str, product_id: &str, status: MatchStatus)
 /// A resolved basket item with `Any` policy and no constraints.
 fn item(display: &str, canonical_id: &str, count: u32) -> BasketItem {
     BasketItem {
+        entry_id: None,
         display_text: display.into(),
         canonical_item_id: Some(canonical_id.into()),
         count,
@@ -191,6 +192,33 @@ fn run_with_preferred(
     preferred: BTreeMap<usize, String>,
 ) -> OptimiserOutput {
     build_output(input, &priced, &preferred)
+}
+
+#[test]
+fn output_echoes_all_basket_item_identities_in_input_order() {
+    let mut milk = item("milk", "ci-milk", 1);
+    milk.entry_id = Some("entry-milk".into());
+    let mut bread = item("bread", "ci-bread", 1);
+    bread.entry_id = Some("entry-bread".into());
+    let input = OptimiserInput::new("hh-1", Some(5), vec![milk, bread]);
+
+    let output = run(&input, BTreeMap::new());
+
+    assert_eq!(
+        output.basket_items,
+        vec![
+            BasketItemIdentity {
+                item_index: 0,
+                entry_id: Some("entry-milk".into()),
+                display_text: "milk".into(),
+            },
+            BasketItemIdentity {
+                item_index: 1,
+                entry_id: Some("entry-bread".into()),
+                display_text: "bread".into(),
+            },
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,6 +1409,7 @@ fn size_band_accepts_within_20_percent_and_rejects_outside() {
 fn unresolved_items_excluded_from_total() {
     // Item 0 resolved and priced; item 1 unresolved (no canonical id).
     let unresolved = BasketItem {
+        entry_id: None,
         display_text: "yoghurt".into(),
         canonical_item_id: None,
         count: 1,
@@ -2251,6 +2280,7 @@ fn reason_distinguishes_unpriced_and_unresolved_items() {
     // item0 is priced at Tesco; item1 resolves but has no matches anywhere; item2
     // was never resolved.
     let unresolved_item = BasketItem {
+        entry_id: None,
         display_text: "cream".into(),
         canonical_item_id: None,
         count: 1,

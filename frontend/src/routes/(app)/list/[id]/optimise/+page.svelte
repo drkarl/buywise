@@ -29,6 +29,8 @@
 	import { fetchSettings } from '$lib/api/settings';
 	import { flushPendingMutations } from '$lib/sync';
 	import PlanCard from '$lib/components/PlanCard.svelte';
+	import { allocatePlan } from '$lib/shopping/allocatePlan';
+	import { saveChosenTrip } from '$lib/shopping/chosenTrip';
 	import type { RetailerId } from '$lib/stores/shopping';
 	import {
 		formatEuros,
@@ -37,7 +39,8 @@
 		type CandidateOffer,
 		type NoValidOfferReason,
 		type OptimiseResponse,
-		type PlanKind
+		type PlanKind,
+		type StorePlan
 	} from '$lib/api/optimise';
 
 	const listId = $derived(page.params.id ?? '');
@@ -151,6 +154,47 @@
 	 */
 	function planReasons(kind: PlanKind): string[] {
 		return result?.plan_explanations.find((p) => p.plan === kind)?.reasons ?? [];
+	}
+
+	/** Card title for the recommended plan, reused as the chosen trip's label. */
+	const recommendedTitle = $derived(
+		result?.recommended?.kind === 'two_store' ? 'Recommended split' : 'Recommended store'
+	);
+
+	/**
+	 * The trip link for a routable plan, or `null` when the plan cannot back a
+	 * per-store trip. Only single- and two-store plans qualify (three-store routing
+	 * is a non-goal), and a plan that priced nothing has no list to show.
+	 */
+	function tripHref(plan: StorePlan | null | undefined): string | null {
+		if (!plan || !listId) return null;
+		if (plan.stores.length === 0 || plan.stores.length > 2 || plan.lines.length === 0) return null;
+		return `/list/${listId}/trip`;
+	}
+
+	/**
+	 * Persist the household's choice: allocate the picked plan over the shared list
+	 * entries (issue #104) and cache it for the trip view and store-filtered
+	 * shopping mode. Runs on the "Shop this plan" link's click, before navigation;
+	 * storing is synchronous localStorage, so the trip view reads it on mount.
+	 * No-op without a loaded response.
+	 */
+	function choosePlan(title: string, plan: StorePlan) {
+		if (!result) return;
+		saveChosenTrip({
+			listId,
+			runId: result.run_id,
+			planKind: plan.stores.length > 1 ? 'two_store' : 'single_store',
+			title,
+			allocation: allocatePlan({
+				plan,
+				unresolvedItems: result.unresolved_items,
+				noValidOfferItems: result.no_valid_offer_items,
+				needsConfirmationItems: result.needs_confirmation_items,
+				basketItems: result.basket_items
+			}),
+			savedAt: new Date().toISOString()
+		});
 	}
 
 	/**
@@ -303,11 +347,13 @@
 			{#if result.recommended}
 				<PlanCard
 					plan={result.recommended.plan}
-					title={result.recommended.kind === 'two_store' ? 'Recommended split' : 'Recommended store'}
+					title={recommendedTitle}
 					recommended
 					bestSingleTotalCents={bestSingleTotal}
 					bestSingleItemIndices={bestSingleItemIndices}
 					reasons={planReasons('recommended')}
+					chooseHref={tripHref(result.recommended.plan)}
+					onchoose={() => choosePlan(recommendedTitle, result!.recommended!.plan)}
 				/>
 			{/if}
 			{#if result.best_single}
@@ -316,6 +362,8 @@
 					title="Best single store"
 					bestSingleTotalCents={null}
 					reasons={planReasons('best_single')}
+					chooseHref={tripHref(result.best_single)}
+					onchoose={() => choosePlan('Best single store', result!.best_single!)}
 				/>
 			{/if}
 			{#if result.best_two_store}
@@ -325,6 +373,8 @@
 					bestSingleTotalCents={bestSingleTotal}
 					bestSingleItemIndices={bestSingleItemIndices}
 					reasons={planReasons('best_two_store')}
+					chooseHref={tripHref(result.best_two_store)}
+					onchoose={() => choosePlan('Cheapest two-store split', result!.best_two_store!)}
 				/>
 			{/if}
 			{#if result.theoretical_minimum}

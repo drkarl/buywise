@@ -8,14 +8,20 @@
 
 	interface Props {
 		selected: RetailerId;
+		/**
+		 * The stores to offer. Defaults to all five retailers; the trip-aware
+		 * shopping mode (issue #104) passes just the chosen plan's stores so the
+		 * shopper can only switch between the stores they are actually visiting.
+		 */
+		stores?: readonly { id: RetailerId; label: string }[];
 		onselect: (store: RetailerId) => void;
 	}
 
-	let { selected, onselect }: Props = $props();
+	let { selected, stores = RETAILERS, onselect }: Props = $props();
 </script>
 
 <div class="stores" role="group" aria-label="Choose a store">
-	{#each RETAILERS as retailer (retailer.id)}
+	{#each stores as retailer (retailer.id)}
 		<button
 			type="button"
 			class="store"

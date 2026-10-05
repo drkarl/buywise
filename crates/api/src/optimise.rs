@@ -58,9 +58,9 @@ use serde::{Deserialize, Serialize};
 use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
-    optimise, BasketItem, NeedsConfirmationItem, NoValidOfferItem, OptimiserInput, OptimiserOutput,
-    PlanKind, PlanReason, ReasonCode, Recommendation, RecommendedKind, StorePlan, StoreSetting,
-    UnresolvedItem, DEFAULT_THRESHOLDS,
+    optimise, BasketItem, BasketItemIdentity, NeedsConfirmationItem, NoValidOfferItem,
+    OptimiserInput, OptimiserOutput, PlanKind, PlanReason, ReasonCode, Recommendation,
+    RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -110,8 +110,9 @@ pub struct PlanExplanation {
     pub reasons: Vec<String>,
 }
 
-/// Response for `POST /api/optimise`: the four plans, the resolved/unfulfilled
-/// item lists, the generated explanation, the `run_id`, and the snapshot date.
+/// Response for `POST /api/optimise`: the four plans, all submitted item
+/// identities, the resolved/unfulfilled item lists, the generated explanation,
+/// the `run_id`, and the snapshot date.
 #[derive(Debug, Serialize)]
 pub struct OptimiseResponse {
     /// The persisted `recommendation_runs.id`, for correlation with later
@@ -125,6 +126,8 @@ pub struct OptimiseResponse {
     pub theoretical_minimum: Option<StorePlan>,
     /// The practical recommendation (or `null`).
     pub recommended: Option<Recommendation>,
+    /// Identity and input order for every active list entry sent to the optimiser.
+    pub basket_items: Vec<BasketItemIdentity>,
     /// Items with `resolution_status != 'resolved'` (excluded from every total).
     pub unresolved_items: Vec<UnresolvedItem>,
     /// Resolved items that produced no priceable offer anywhere.
@@ -257,6 +260,7 @@ async fn optimise_list(
         best_two_store: output.best_two_store,
         theoretical_minimum: output.theoretical_minimum,
         recommended: output.recommended,
+        basket_items: output.basket_items,
         unresolved_items: output.unresolved_items,
         no_valid_offer_items: output.no_valid_offer_items,
         needs_confirmation_items: output.needs_confirmation_items,
@@ -339,8 +343,8 @@ async fn build_input_from_list(
     trip_retailers: Vec<Retailer>,
 ) -> Result<OptimiserInput, DbError> {
     // ACTIVE entries only, ordered for determinism (matches lists.rs ordering).
-    let rows = sqlx::query_as::<_, (String, Option<String>, String, i64)>(
-        "SELECT resolution_status, canonical_item_id, display_name, quantity \
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, i64)>(
+        "SELECT id, resolution_status, canonical_item_id, display_name, quantity \
          FROM list_entries \
          WHERE list_id = ?1 AND status = 'active' \
          ORDER BY created_at, id",
@@ -351,14 +355,17 @@ async fn build_input_from_list(
 
     // Normalise each entry to its priceable canonical id up front. Only a fully
     // resolved entry is priceable; ambiguous/unresolved entries drop their
-    // canonical id so the optimiser surfaces them as unresolved.
-    let entries: Vec<(Option<String>, String, i64)> = rows
+    // canonical id so the optimiser surfaces them as unresolved. The entry id is
+    // carried through so the optimiser can echo it back — the client maps a
+    // priced/excluded line back to the household's list entry for the
+    // per-store trip view (issue #104).
+    let entries: Vec<(String, Option<String>, String, i64)> = rows
         .into_iter()
-        .map(|(status, canonical_item_id, display_name, quantity)| {
+        .map(|(id, status, canonical_item_id, display_name, quantity)| {
             let canonical_item_id = (status == "resolved")
                 .then_some(canonical_item_id)
                 .flatten();
-            (canonical_item_id, display_name, quantity)
+            (id, canonical_item_id, display_name, quantity)
         })
         .collect();
 
@@ -366,13 +373,13 @@ async fn build_input_from_list(
     // chunked IN(...) queries each, avoiding a per-entry N+1 round-trip.
     let ids: Vec<&str> = entries
         .iter()
-        .filter_map(|(id, _, _)| id.as_deref())
+        .filter_map(|(_, canonical_item_id, _, _)| canonical_item_id.as_deref())
         .collect();
     let policies = canonical_item_policies(pool, &ids).await?;
     let constraints_by_id = item_constraints_by_canonical_ids(pool, &ids).await?;
 
     let mut items = Vec::with_capacity(entries.len());
-    for (canonical_item_id, display_name, quantity) in entries {
+    for (entry_id, canonical_item_id, display_name, quantity) in entries {
         let (policy, constraints) = match canonical_item_id.as_deref() {
             Some(id) => (
                 policies.get(id).copied().unwrap_or(ConstraintPolicy::Any),
@@ -382,6 +389,9 @@ async fn build_input_from_list(
         };
 
         items.push(BasketItem {
+            // The household's list entry, echoed back so the client can map a
+            // plan line to the entry it fulfils (issue #104 trip view).
+            entry_id: Some(entry_id),
             // Display the stored entry text so the household recognises the line.
             display_text: display_name,
             canonical_item_id,
@@ -1224,6 +1234,7 @@ mod tests {
     /// A resolved basket item with no constraints.
     fn basket_item(canonical_id: &str) -> BasketItem {
         BasketItem {
+            entry_id: None,
             display_text: canonical_id.to_string(),
             canonical_item_id: Some(canonical_id.to_string()),
             count: 1,
@@ -1261,7 +1272,9 @@ mod tests {
                 .iter()
                 .map(|&item_index| buywise_core::optimiser::PlanLine {
                     item_index,
+                    entry_id: None,
                     display_text: format!("item {item_index}"),
+                    product_name: format!("product {item_index}"),
                     canonical_item_id: Some(format!("item-{item_index}")),
                     retailer: Retailer::Tesco,
                     retailer_product_id: format!("product-{item_index}"),

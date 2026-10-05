@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { db } from '$lib/db/dexie';
 import type { OptimiseResponse } from '$lib/api/optimise';
 import type { Settings } from '$lib/api/settings';
+import type { ChosenTrip } from '$lib/shopping/chosenTrip';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
 // the route id under test without a running kit server.
@@ -18,12 +19,20 @@ type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<
 /** A response exercising recommended + all four plans + both excluded buckets. */
 function fullResponse(): OptimiseResponse {
 	return {
+		basket_items: [
+			{ item_index: 0, entry_id: 'e-0', display_text: 'Milk 2L' },
+			{ item_index: 1, entry_id: 'e-1', display_text: 'bread' },
+			{ item_index: 2, entry_id: 'e-2', display_text: 'cream' },
+			{ item_index: 3, entry_id: 'e-3', display_text: 'truffle oil' }
+		],
 		run_id: 'run-1',
 		best_single: {
 			stores: ['tesco'],
 			lines: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
+					product_name: 'Product 0',
 					display_text: 'Milk 2L',
 					canonical_item_id: 'ci-1',
 					retailer: 'tesco',
@@ -44,6 +53,8 @@ function fullResponse(): OptimiseResponse {
 			lines: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
+					product_name: 'Product 0',
 					display_text: 'Milk 2L',
 					canonical_item_id: 'ci-1',
 					retailer: 'aldi',
@@ -78,8 +89,10 @@ function fullResponse(): OptimiseResponse {
 				dunnes_voucher_offer_text: null
 			}
 		},
-		unresolved_items: [{ item_index: 2, display_text: 'cream' }],
-		no_valid_offer_items: [{ item_index: 3, display_text: 'truffle oil', reason: 'no_matches' }],
+		unresolved_items: [{ item_index: 2, entry_id: 'e-2', display_text: 'cream' }],
+		no_valid_offer_items: [
+			{ item_index: 3, entry_id: 'e-3', display_text: 'truffle oil', reason: 'no_matches' }
+		],
 		needs_confirmation_items: [],
 		plain_language_explanation: 'Splitting between Tesco and Aldi saves you the most.',
 		plan_explanations: [
@@ -224,6 +237,25 @@ describe('optimise page', () => {
 		await waitFor(() => expect(screen.getByLabelText(/recommended/i)).toBeTruthy());
 	});
 
+	it('persists plan-specific misses in the chosen trip coverage', async () => {
+		stubOptimise(fullResponse());
+		render(Page);
+
+		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
+		document.addEventListener('click', (event) => event.preventDefault(), {
+			capture: true,
+			once: true
+		});
+		await fireEvent.click(chooseLinks[0]);
+
+		const saved = JSON.parse(localStorage.getItem('buywise:trip:list-42')!) as ChosenTrip;
+		expect(saved.allocation.unallocated).toContainEqual({
+			entryId: 'e-1',
+			reason: 'not_in_plan'
+		});
+		expect(new Set(saved.allocation.entryIds)).toEqual(new Set(['e-0', 'e-1', 'e-2', 'e-3']));
+	});
+
 	it('renders the plain-language explanation', async () => {
 		stubOptimise(fullResponse());
 		render(Page);
@@ -266,6 +298,7 @@ describe('optimise page', () => {
 		response.needs_confirmation_items = [
 			{
 				item_index: 4,
+				entry_id: 'e-4',
 				display_text: 'yoghurt',
 				canonical_item_id: 'ci-yoghurt',
 				candidate_count: 2,
@@ -290,7 +323,7 @@ describe('optimise page', () => {
 			}
 		];
 		response.no_valid_offer_items = [
-			{ item_index: 5, display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
+			{ item_index: 5, entry_id: 'e-5', display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
 		];
 		stubOptimise(response);
 		render(Page);
@@ -329,6 +362,7 @@ describe('optimise page', () => {
 		withAsk.needs_confirmation_items = [
 			{
 				item_index: 0,
+				entry_id: 'e-0',
 				display_text: 'yoghurt',
 				canonical_item_id: 'ci-yoghurt',
 				candidate_count: 1,
@@ -405,6 +439,7 @@ describe('optimise page', () => {
 
 		// Two ask items, one candidate each → two "Choose" buttons.
 		const twoAsk: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-ask',
 			best_single: null,
 			best_two_store: null,
@@ -415,6 +450,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-a',
 					candidate_count: 1,
@@ -431,6 +467,7 @@ describe('optimise page', () => {
 				},
 				{
 					item_index: 1,
+					entry_id: 'e-1',
 					display_text: 'butter',
 					canonical_item_id: 'ci-b',
 					candidate_count: 1,
@@ -530,6 +567,7 @@ describe('optimise page', () => {
 		const { fireEvent } = await import('@testing-library/svelte');
 
 		const twoAsk: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-ask',
 			best_single: null,
 			best_two_store: null,
@@ -540,6 +578,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-a',
 					candidate_count: 1,
@@ -556,6 +595,7 @@ describe('optimise page', () => {
 				},
 				{
 					item_index: 1,
+					entry_id: 'e-1',
 					display_text: 'butter',
 					canonical_item_id: 'ci-b',
 					candidate_count: 1,
@@ -622,6 +662,7 @@ describe('optimise page', () => {
 
 	it('renders an empty-state when every plan is null', async () => {
 		const empty: OptimiseResponse = {
+			basket_items: [],
 			run_id: 'run-empty',
 			best_single: null,
 			best_two_store: null,
@@ -643,6 +684,7 @@ describe('optimise page', () => {
 		// All items held for confirmation → optimiser returns no plans, but the
 		// list is not empty. The generic "add some items" copy would be wrong.
 		const allHeld: OptimiseResponse = {
+			basket_items: [{ item_index: 0, entry_id: 'e-0', display_text: 'yoghurt' }],
 			run_id: 'run-held',
 			best_single: null,
 			best_two_store: null,
@@ -653,6 +695,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-yoghurt',
 					candidate_count: 2,
