@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import PlanCard from './PlanCard.svelte';
 import type { StorePlan } from '$lib/api/optimise';
 
@@ -107,8 +107,48 @@ describe('PlanCard', () => {
 		expect(screen.queryByText(/Saves/)).toBeNull();
 	});
 
-	it('notes missing items excluded from the total', () => {
+	it('notes missing items have no known price here, never claiming unavailability', () => {
 		render(PlanCard, { plan: mockPlan({ missing_count: 2 }), title: 'Best single store' });
-		expect(screen.getByText(/2 items not available here/)).toBeTruthy();
+		const missing = screen.getByText(/no known price here and are excluded from the total/);
+		expect(missing.textContent).toMatch(/^2 items have no known price here/);
+		// We can never prove a store lacks stock — only that we have no qualifying
+		// price on record — so the copy must not claim unavailability.
+		expect(missing.textContent).not.toMatch(/not available/i);
+	});
+
+	it('uses singular grammar for a single missing item', () => {
+		render(PlanCard, { plan: mockPlan({ missing_count: 1 }), title: 'Best single store' });
+		expect(
+			screen.getByText('1 item has no known price here and is excluded from the total')
+		).toBeTruthy();
+	});
+
+	it('renders the supplied reasons in order', () => {
+		render(PlanCard, {
+			plan: mockPlan(),
+			title: 'Best single store',
+			reasons: ['Cheapest overall', 'Only one shop needed']
+		});
+		const list = screen.getByRole('list', { name: 'Why this plan' });
+		expect(within(list).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+			'Cheapest overall',
+			'Only one shop needed'
+		]);
+	});
+
+	it('renders only the first four reasons when more are supplied', () => {
+		render(PlanCard, {
+			plan: mockPlan(),
+			title: 'Best single store',
+			reasons: ['One', 'Two', 'Three', 'Four', 'Five']
+		});
+		const list = screen.getByRole('list', { name: 'Why this plan' });
+		expect(within(list).getAllByRole('listitem')).toHaveLength(4);
+		expect(within(list).queryByText('Five')).toBeNull();
+	});
+
+	it('renders no reasons list when the prop is omitted or empty', () => {
+		render(PlanCard, { plan: mockPlan(), title: 'Best single store' });
+		expect(screen.queryByRole('list', { name: 'Why this plan' })).toBeNull();
 	});
 });
