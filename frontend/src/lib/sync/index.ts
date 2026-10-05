@@ -223,11 +223,11 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
         if (stopped) return; // cancelled during teardown — skip
         // The indicator shows "syncing" for the whole drain, including the
         // snapshot/catalogue work before the first mutation is confirmed.
-        statusStore.setSyncing(true);
+        await statusStore.setSyncing(true);
         try {
           await runSync(listId, syncOptions);
         } finally {
-          statusStore.setSyncing(false);
+          await statusStore.setSyncing(false);
         }
       });
     return syncChain;

@@ -100,7 +100,7 @@ describe('createSyncStatusStore', () => {
       await vi.waitFor(() =>
         expect(get(store.status)).toMatchObject({ state: 'offline', pending: 1 })
       );
-      store.setSyncing(true);
+      await store.setSyncing(true);
       expect(get(store.status)).toMatchObject({ state: 'syncing', pending: 1 });
 
       // The browser losing its network → offline with the pending count.
@@ -115,10 +115,8 @@ describe('createSyncStatusStore', () => {
       // The server confirming the mutation clears the count → synced again.
       const [row] = await db.mutation_queue.toArray();
       await db.mutation_queue.update(row.id!, { status: 'confirmed' });
-      await vi.waitFor(() =>
-        expect(get(store.status)).toMatchObject({ state: 'synced', pending: 0 })
-      );
-      store.setSyncing(false);
+      await store.setSyncing(false);
+      expect(get(store.status)).toMatchObject({ state: 'synced', pending: 0 });
 
       // A terminal failure surfaces from persisted queue state and clears when
       // its row is dismissed from the queue.
