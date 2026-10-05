@@ -288,6 +288,8 @@
 				return 'no matching product found';
 			case 'constraints_eliminated_all':
 				return 'your constraints ruled out every option';
+			case 'store_category_rules_excluded_all':
+				return 'store category rules excluded every option';
 			case 'brand_policy_missing_brand':
 				return 'a brand is required but none was set';
 			case 'strict_no_exact_offer':

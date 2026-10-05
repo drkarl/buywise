@@ -337,6 +337,13 @@ describe('optimise page', () => {
 				display_text: 'San Pellegrino',
 				canonical_item_id: 'ci-5',
 				reason: 'strict_no_exact_offer'
+			},
+			{
+				item_index: 6,
+				entry_id: 'e-6',
+				display_text: 'Apples',
+				canonical_item_id: 'ci-6',
+				reason: 'store_category_rules_excluded_all'
 			}
 		];
 		stubOptimise(response);
@@ -358,6 +365,7 @@ describe('optimise page', () => {
 
 		// strict_no_exact_offer maps to human copy, never the raw wire value.
 		expect(screen.getByText(/San Pellegrino — the exact product has no current offer/)).toBeTruthy();
+		expect(screen.getByText(/Apples — store category rules excluded every option/)).toBeTruthy();
 		expect(screen.queryByText(/strict_no_exact_offer/)).toBeNull();
 	});
 

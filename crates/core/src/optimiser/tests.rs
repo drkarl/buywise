@@ -2464,6 +2464,33 @@ fn unclassified_item_is_not_excluded_by_category_rules() {
     );
 }
 
+#[test]
+fn all_offers_excluded_by_category_rules_have_a_distinct_reason() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item_in("apple", "ci-apple", PRODUCE, None)],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-apple", "ci-apple", "p-apple", MatchStatus::Accepted),
+            product("p-apple", Retailer::Aldi),
+            offer("o-apple", "p-apple", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    assert_eq!(out.no_valid_offer_items.len(), 1);
+    assert_eq!(
+        out.no_valid_offer_items[0].reason,
+        NoOfferReason::StoreCategoryRulesExcludedAll
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Plan reasons (issue #103)
 // ---------------------------------------------------------------------------

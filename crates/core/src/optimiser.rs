@@ -464,6 +464,8 @@ pub enum NoOfferReason {
     NoMatches,
     /// Every candidate was filtered out by the item's constraints.
     ConstraintsEliminatedAll,
+    /// Every candidate was at a store excluded by the item's category rules.
+    StoreCategoryRulesExcludedAll,
     /// `policy = 'brand'` but no brand is configured. A configuration error: we
     /// never silently fall back to `any`, so the item is rejected with a warning.
     BrandPolicyMissingBrand,
@@ -1968,16 +1970,11 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                     // exclude some items it stocks (issue #99): name them so the
                     // household sees why a cheaper store was skipped.
                     let excluded: Vec<usize> = ctx
-                        .comp
-                        .priced_items
+                        .classification
+                        .category_excluded
                         .iter()
-                        .copied()
-                        .filter(|&item| {
-                            ctx.comp
-                                .best_per_item
-                                .get(&item)
-                                .is_some_and(|m| m.contains_key(&retailer))
-                                && !ctx.input.store_allows_item(retailer, item)
+                        .filter_map(|&(item, excluded_retailer)| {
+                            (excluded_retailer == retailer).then_some(item)
                         })
                         .collect();
                     if !excluded.is_empty() {
@@ -2028,6 +2025,8 @@ pub struct Classification {
     pub no_valid_offer: Vec<NoValidOfferItem>,
     /// Resolved, priceable items held back under `substitution_policy = 'ask'`.
     pub needs_confirmation: Vec<NeedsConfirmationItem>,
+    /// Item/store pairs removed by per-store category rules.
+    pub category_excluded: Vec<(usize, Retailer)>,
 }
 
 /// Human-readable pack/size text for a candidate product. Prefers the retailer's
@@ -2112,6 +2111,7 @@ fn classify_items(
     let mut unresolved = Vec::new();
     let mut no_valid_offer = Vec::new();
     let mut needs_confirmation = Vec::new();
+    let mut category_excluded = Vec::new();
 
     for (item_index, item) in input.items.iter().enumerate() {
         // 1a. Unresolved: no canonical item id.
@@ -2147,10 +2147,16 @@ fn classify_items(
         // 1c. Constraint filter. A config error rejects the whole item.
         let mut item_candidates = Vec::new();
         let mut config_error = false;
+        let mut has_category_allowed_offer = false;
         for (m, product, offer) in rows {
             if !input.store_allows_item(product.retailer, item_index) {
+                let excluded = (item_index, product.retailer);
+                if !category_excluded.contains(&excluded) {
+                    category_excluded.push(excluded);
+                }
                 continue;
             }
+            has_category_allowed_offer = true;
             match check_constraints(item.constraint_policy, item.constraints.as_ref(), product) {
                 ConstraintCheck::ConfigError => {
                     config_error = true;
@@ -2186,7 +2192,11 @@ fn classify_items(
                 entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
                 canonical_item_id: canonical_item_id.clone(),
-                reason: NoOfferReason::ConstraintsEliminatedAll,
+                reason: if has_category_allowed_offer {
+                    NoOfferReason::ConstraintsEliminatedAll
+                } else {
+                    NoOfferReason::StoreCategoryRulesExcludedAll
+                },
             });
             continue;
         }
@@ -2264,6 +2274,7 @@ fn classify_items(
             unresolved,
             no_valid_offer,
             needs_confirmation,
+            category_excluded,
         },
     )
 }
