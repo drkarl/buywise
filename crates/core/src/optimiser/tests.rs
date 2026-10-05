@@ -114,6 +114,7 @@ fn product_match(id: &str, item_id: &str, product_id: &str, status: MatchStatus)
 /// A resolved basket item with `Any` policy and no constraints.
 fn item(display: &str, canonical_id: &str, count: u32) -> BasketItem {
     BasketItem {
+        entry_id: None,
         display_text: display.into(),
         canonical_item_id: Some(canonical_id.into()),
         count,
@@ -1353,6 +1354,7 @@ fn size_band_accepts_within_20_percent_and_rejects_outside() {
 fn unresolved_items_excluded_from_total() {
     // Item 0 resolved and priced; item 1 unresolved (no canonical id).
     let unresolved = BasketItem {
+        entry_id: None,
         display_text: "yoghurt".into(),
         canonical_item_id: None,
         count: 1,

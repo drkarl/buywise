@@ -32,6 +32,14 @@
 		 * to follow, and its saving line is suppressed.
 		 */
 		benchmark?: boolean;
+		/**
+		 * When set, the card shows a "Shop this plan" link to this href. The parent
+		 * route builds the chosen-trip allocation in `onchoose` before navigation
+		 * (issue #104); the benchmark card passes none (it is not routable).
+		 */
+		chooseHref?: string | null;
+		/** Persists the chosen trip; run before the `chooseHref` navigation. */
+		onchoose?: (() => void) | null;
 	}
 
 	let {
@@ -39,7 +47,9 @@
 		title,
 		recommended = false,
 		bestSingleTotalCents = null,
-		benchmark = false
+		benchmark = false,
+		chooseHref = null,
+		onchoose = null
 	}: Props = $props();
 
 	// Saving vs the best single-store plan = bestSingle.total − thisPlan.total.
@@ -98,6 +108,10 @@
 			{plan.missing_count} item{plan.missing_count === 1 ? '' : 's'} not available here (excluded
 			from total)
 		</p>
+	{/if}
+
+	{#if chooseHref}
+		<a class="choose" href={chooseHref} onclick={() => onchoose?.()}>Shop this plan</a>
 	{/if}
 </article>
 
@@ -191,5 +205,16 @@
 		margin: 0;
 		font-size: 0.85rem;
 		color: #94a3b8;
+	}
+	.choose {
+		align-self: flex-start;
+		margin-top: 0.1rem;
+		padding: 0.4rem 0.9rem;
+		border-radius: 0.5rem;
+		background: #0f766e;
+		color: #fff;
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-decoration: none;
 	}
 </style>

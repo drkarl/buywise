@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { db } from '$lib/db/dexie';
+import { saveChosenTrip } from '$lib/shopping/chosenTrip';
 
 // `$app/state` is provided by SvelteKit at runtime; mock it so the page can read
 // the route id under test without a running kit server.
@@ -53,6 +54,9 @@ function entry(id: string, display_name: string, category_id: string, subcategor
 beforeEach(async () => {
 	await db.delete();
 	await db.open();
+	// The chosen-trip cache and selected store live in localStorage and would
+	// otherwise leak between tests in this file.
+	localStorage.clear();
 });
 
 describe('shopping page', () => {
@@ -154,5 +158,69 @@ describe('shopping page', () => {
 			.getAllByText(/Pasta & Rice|Tins & Jars|Pantry/)
 			.map((n) => n.textContent);
 		expect(titles).toEqual(['Pasta & Rice', 'Tins & Jars', 'Pantry']);
+	});
+
+	it('shows only the chosen plan’s stores and that store’s items', async () => {
+		await seed();
+		// A two-store trip: Apples (Produce) at Aldi, Milk (Dairy) at Tesco.
+		saveChosenTrip({
+			listId: LIST,
+			runId: 'run-1',
+			planKind: 'two_store',
+			title: 'Recommended split',
+			savedAt: '2026-01-01T00:00:00Z',
+			allocation: {
+				stores: ['tesco', 'aldi'],
+				byStore: [
+					{
+						retailer: 'tesco',
+						lines: [
+							{
+								entryId: 'e-milk',
+								retailer: 'tesco',
+								retailerProductId: 'rp-milk',
+								productName: 'Tesco Whole Milk 2L',
+								unitPriceCents: 120,
+								lineTotalCents: 120,
+								loyaltyApplied: false,
+								freshnessConfidence: 'high'
+							}
+						]
+					},
+					{
+						retailer: 'aldi',
+						lines: [
+							{
+								entryId: 'e-apple',
+								retailer: 'aldi',
+								retailerProductId: 'rp-apple',
+								productName: 'Aldi Gala Apples',
+								unitPriceCents: 90,
+								lineTotalCents: 90,
+								loyaltyApplied: false,
+								freshnessConfidence: 'high'
+							}
+						]
+					}
+				],
+				unallocated: [],
+				entryIds: ['e-milk', 'e-apple']
+			}
+		});
+
+		render(Page);
+
+		// Only the plan's stores are offered; the others are not selectable.
+		await waitFor(() => expect(screen.getByText('Milk')).toBeTruthy());
+		expect(screen.getByRole('button', { name: 'Tesco' })).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Aldi' })).toBeTruthy();
+		expect(screen.queryByRole('button', { name: 'Lidl' })).toBeNull();
+		// Tesco's list holds only its own allocated item.
+		expect(screen.queryByText('Apples')).toBeNull();
+
+		// Switching to Aldi shows only Aldi's allocated item.
+		await fireEvent.click(screen.getByRole('button', { name: 'Aldi' }));
+		await waitFor(() => expect(screen.getByText('Apples')).toBeTruthy());
+		expect(screen.queryByText('Milk')).toBeNull();
 	});
 });

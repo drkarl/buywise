@@ -106,6 +106,12 @@ const DUNNES_VOUCHER_HIGH: Cents = 5000;
 /// every total); `constraints` already has any requested size merged in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BasketItem {
+    /// Caller-supplied identity for the source line this item came from (e.g. a
+    /// `list_entries.id`), echoed back on every output item so the caller can map
+    /// a priced or excluded line back to its origin. `None` when the caller has no
+    /// persisted line (e.g. the CLI costing fixture text). Opaque to the
+    /// optimiser; it never affects pricing or ranking.
+    pub entry_id: Option<String>,
     /// The original display text for this line (surfaced back in the output so
     /// the household recognises the item).
     pub display_text: String,
@@ -256,8 +262,15 @@ impl Candidate {
 pub struct PlanLine {
     /// Index of the basket item (into `OptimiserInput::items`).
     pub item_index: usize,
+    /// The source list entry this line fulfils, echoed from the [`BasketItem`]
+    /// (`None` for callers without a persisted line). Lets a per-store view map
+    /// the priced line back to the household's list entry.
+    pub entry_id: Option<String>,
     /// The item's display text (copied for convenience).
     pub display_text: String,
+    /// The chosen retailer product's display name (e.g. "Tesco Whole Milk 2L"),
+    /// so the household can see which product was matched on the plan line.
+    pub product_name: String,
     /// The resolved canonical item id this line prices. Always `Some` for a
     /// priced line (an unpriced/unresolved item never produces a `PlanLine`), so
     /// the UI can pair it with `retailer_product_id` to accept/reject the
@@ -345,6 +358,10 @@ pub struct Recommendation {
 pub struct UnresolvedItem {
     /// Index into `OptimiserInput::items`.
     pub item_index: usize,
+    /// The source list entry, echoed from the [`BasketItem`] (`None` for callers
+    /// without a persisted line). Lets the UI keep unallocated items attached to
+    /// their household entry.
+    pub entry_id: Option<String>,
     /// The original display text.
     pub display_text: String,
 }
@@ -382,6 +399,9 @@ pub enum NoOfferReason {
 pub struct NoValidOfferItem {
     /// Index into `OptimiserInput::items`.
     pub item_index: usize,
+    /// The source list entry, echoed from the [`BasketItem`] (`None` for callers
+    /// without a persisted line).
+    pub entry_id: Option<String>,
     /// The original display text.
     pub display_text: String,
     /// Structured reason for the warning.
@@ -432,6 +452,9 @@ pub struct CandidateOffer {
 pub struct NeedsConfirmationItem {
     /// Index into `OptimiserInput::items`.
     pub item_index: usize,
+    /// The source list entry, echoed from the [`BasketItem`] (`None` for callers
+    /// without a persisted line).
+    pub entry_id: Option<String>,
     /// The original display text.
     pub display_text: String,
     /// The resolved canonical item id, so the UI can submit a `prefer` choice
@@ -772,7 +795,9 @@ fn plan_line(input: &OptimiserInput, cand: &Candidate) -> PlanLine {
     let line_total = unit_price * i64::from(item.count);
     PlanLine {
         item_index: cand.item_index,
+        entry_id: item.entry_id.clone(),
         display_text: item.display_text.clone(),
+        product_name: cand.product.name.clone(),
         canonical_item_id: item.canonical_item_id.clone(),
         retailer: cand.retailer,
         retailer_product_id: cand.product.id.clone(),
@@ -1198,6 +1223,7 @@ fn classify_items(
         if item.canonical_item_id.is_none() {
             unresolved.push(UnresolvedItem {
                 item_index,
+                entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
             });
             continue;
@@ -1207,6 +1233,7 @@ fn classify_items(
         let Some(rows) = priced_inputs.get(&item_index).filter(|r| !r.is_empty()) else {
             no_valid_offer.push(NoValidOfferItem {
                 item_index,
+                entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
                 reason: NoOfferReason::NoMatches,
             });
@@ -1238,6 +1265,7 @@ fn classify_items(
         if config_error {
             no_valid_offer.push(NoValidOfferItem {
                 item_index,
+                entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
                 reason: NoOfferReason::BrandPolicyMissingBrand,
             });
@@ -1247,6 +1275,7 @@ fn classify_items(
         if item_candidates.is_empty() {
             no_valid_offer.push(NoValidOfferItem {
                 item_index,
+                entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
                 reason: NoOfferReason::ConstraintsEliminatedAll,
             });
@@ -1276,6 +1305,7 @@ fn classify_items(
                 if item_candidates.is_empty() {
                     no_valid_offer.push(NoValidOfferItem {
                         item_index,
+                        entry_id: item.entry_id.clone(),
                         display_text: item.display_text.clone(),
                         reason: NoOfferReason::StrictNoExactOffer,
                     });
@@ -1310,6 +1340,7 @@ fn classify_items(
                             .expect("resolved item has a canonical id");
                         needs_confirmation.push(NeedsConfirmationItem {
                             item_index,
+                            entry_id: item.entry_id.clone(),
                             display_text: item.display_text.clone(),
                             canonical_item_id,
                             candidate_count: item_candidates.len(),

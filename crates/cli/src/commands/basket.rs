@@ -109,6 +109,7 @@ pub async fn build_optimiser_input(
         };
 
         items.push(BasketItem {
+            entry_id: None,
             display_text: line.raw.clone(),
             canonical_item_id,
             count: line.count,

@@ -76,6 +76,19 @@ export function shoppingEntries(listId: string): Readable<LocalListEntry[]> {
   );
 }
 
+/**
+ * Every entry for a list in ANY status, including `deleted` tombstones. Used by
+ * the trip view (issue #104) to detect when the list has changed since a plan was
+ * chosen: comparing all non-deleted entry ids against the plan's coverage avoids
+ * false "stale" warnings when a check-off only changes an entry's status.
+ */
+export function allEntries(listId: string): Readable<LocalListEntry[]> {
+  return liveStore<LocalListEntry[]>(
+    () => db.list_entries.where('list_id').equals(listId).toArray(),
+    []
+  );
+}
+
 /** The cached category catalogue (names, icons, default order). */
 export function categories(): Readable<LocalCategory[]> {
   return liveStore<LocalCategory[]>(() => db.categories.toArray(), []);

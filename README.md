@@ -145,6 +145,7 @@ Useful screens once logged in:
 | `/list/<id>` | Shopping list (add items, paste a list, real-time sync) |
 | `/list/<id>/shopping` | In-store shopping mode |
 | `/list/<id>/optimise` | The four optimisation plans |
+| `/list/<id>/trip` | Per-store lists for the chosen plan (plus unallocated items) |
 | `/settings` | Household store preferences and convenience thresholds |
 | `/savings` | Savings ledger |
 

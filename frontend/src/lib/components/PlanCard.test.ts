@@ -10,7 +10,9 @@ function mockPlan(overrides: Partial<StorePlan> = {}): StorePlan {
 		lines: [
 			{
 				item_index: 0,
+				entry_id: 'e-1',
 				display_text: 'Milk 2L',
+				product_name: 'Tesco Whole Milk 2L',
 				canonical_item_id: 'ci-1',
 				retailer: 'tesco',
 				retailer_product_id: 'rp-1',
@@ -22,7 +24,9 @@ function mockPlan(overrides: Partial<StorePlan> = {}): StorePlan {
 			},
 			{
 				item_index: 1,
+				entry_id: 'e-2',
 				display_text: 'Bread',
+				product_name: 'Tesco White Bread 800g',
 				canonical_item_id: 'ci-2',
 				retailer: 'tesco',
 				retailer_product_id: 'rp-2',

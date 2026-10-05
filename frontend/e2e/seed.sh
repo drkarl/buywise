@@ -71,4 +71,55 @@ SQL
 # stdin; the plaintext is never a CLI argument).
 printf '%s\n' "$PASSWORD" | "$CLI" set-password "$EMAIL" --db "$DB" >/dev/null
 
-echo "seed.sh: seeded user=$EMAIL list=$LIST_ID into $DB"
+# --- Per-store trip fixture (issue #104) -----------------------------------
+# Seed a tiny, deterministic two-store basket so the optimiser returns a real
+# two-store plan: Milk is far cheaper at Aldi, Bread far cheaper at Tesco, so
+# the split clears the €10 convenience threshold. A third, UNRESOLVED entry
+# exercises the trip view's explicit "not allocated" section. The list entries
+# are inserted already RESOLVED (with their canonical ids) so the plan does not
+# depend on the resolution cascade, keeping the e2e deterministic.
+# `store_category_orders` is not seeded for this household (migration 004 seeds
+# only the default household); category grouping falls back to each category's
+# default_order, which is fine for the two categories used here.
+sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=5000;
+INSERT OR REPLACE INTO canonical_items
+  (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at)
+VALUES
+  ('e2e-ci-milk',  '$HOUSEHOLD_ID', 'Milk',  'Leche',  'c1000000-0000-0000-0000-000000000003', 'any', '$NOW'),
+  ('e2e-ci-bread', '$HOUSEHOLD_ID', 'Bread', 'Pan',    'c1000000-0000-0000-0000-000000000004', 'any', '$NOW');
+
+INSERT OR REPLACE INTO retailer_products
+  (id, source, retailer, external_id, name, pack_count, first_seen_at, last_seen_at)
+VALUES
+  ('e2e-rp-milk-aldi',  'manual', 'aldi',  NULL, 'Brooklea Whole Milk 2L', 1, '$NOW', '$NOW'),
+  ('e2e-rp-milk-tesco', 'manual', 'tesco', NULL, 'Tesco Whole Milk 2L',    1, '$NOW', '$NOW'),
+  ('e2e-rp-bread-aldi', 'manual', 'aldi',  NULL, 'Ballymore Bread 800g',   1, '$NOW', '$NOW'),
+  ('e2e-rp-bread-tesco','manual', 'tesco', NULL, 'Tesco White Bread 800g', 1, '$NOW', '$NOW');
+
+INSERT OR REPLACE INTO product_offers
+  (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, source_confidence_at_ingest)
+VALUES
+  ('e2e-of-milk-aldi',   'e2e-rp-milk-aldi',   100,  '2026-07-01', '$NOW', 'high'),
+  ('e2e-of-milk-tesco',  'e2e-rp-milk-tesco',  1500, '2026-07-01', '$NOW', 'high'),
+  ('e2e-of-bread-aldi',  'e2e-rp-bread-aldi',  1300, '2026-07-01', '$NOW', 'high'),
+  ('e2e-of-bread-tesco', 'e2e-rp-bread-tesco', 150,  '2026-07-01', '$NOW', 'high');
+
+INSERT OR REPLACE INTO product_matches
+  (id, household_id, canonical_item_id, retailer_product_id, status, matched_by, created_at, updated_at)
+VALUES
+  ('e2e-match-milk-aldi',   '$HOUSEHOLD_ID', 'e2e-ci-milk',  'e2e-rp-milk-aldi',   'accepted', 'system', '$NOW', '$NOW'),
+  ('e2e-match-milk-tesco',  '$HOUSEHOLD_ID', 'e2e-ci-milk',  'e2e-rp-milk-tesco',  'accepted', 'system', '$NOW', '$NOW'),
+  ('e2e-match-bread-aldi',  '$HOUSEHOLD_ID', 'e2e-ci-bread', 'e2e-rp-bread-aldi',  'accepted', 'system', '$NOW', '$NOW'),
+  ('e2e-match-bread-tesco', '$HOUSEHOLD_ID', 'e2e-ci-bread', 'e2e-rp-bread-tesco', 'accepted', 'system', '$NOW', '$NOW');
+
+INSERT OR REPLACE INTO list_entries
+  (id, list_id, canonical_item_id, resolution_status, raw_text, display_name, added_by,
+   quantity, status, effective_constraint_hash, last_updated_revision, created_at, updated_at)
+VALUES
+  ('e2e-entry-milk',  '$LIST_ID', 'e2e-ci-milk',  'resolved',   'Milk',  'Milk',  '$USER_ID', 2, 'active', 'default', 0, '$NOW', '$NOW'),
+  ('e2e-entry-bread', '$LIST_ID', 'e2e-ci-bread', 'resolved',   'Bread', 'Bread', '$USER_ID', 1, 'active', 'default', 0, '$NOW', '$NOW'),
+  ('e2e-entry-mystery', '$LIST_ID', NULL, 'unresolved', 'Mystery sauce', 'Mystery sauce', '$USER_ID', 1, 'active', 'unresolved:e2e-entry-mystery', 0, '$NOW', '$NOW');
+SQL
+
+echo "seed.sh: seeded two-store trip fixture into $DB"

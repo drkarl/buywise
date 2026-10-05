@@ -24,6 +24,8 @@ function fullResponse(): OptimiseResponse {
 			lines: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
+					product_name: 'Product 0',
 					display_text: 'Milk 2L',
 					canonical_item_id: 'ci-1',
 					retailer: 'tesco',
@@ -44,6 +46,8 @@ function fullResponse(): OptimiseResponse {
 			lines: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
+					product_name: 'Product 0',
 					display_text: 'Milk 2L',
 					canonical_item_id: 'ci-1',
 					retailer: 'aldi',
@@ -78,8 +82,10 @@ function fullResponse(): OptimiseResponse {
 				dunnes_voucher_offer_text: null
 			}
 		},
-		unresolved_items: [{ item_index: 2, display_text: 'cream' }],
-		no_valid_offer_items: [{ item_index: 3, display_text: 'truffle oil', reason: 'no_matches' }],
+		unresolved_items: [{ item_index: 2, entry_id: 'e-2', display_text: 'cream' }],
+		no_valid_offer_items: [
+			{ item_index: 3, entry_id: 'e-3', display_text: 'truffle oil', reason: 'no_matches' }
+		],
 		needs_confirmation_items: [],
 		plain_language_explanation: 'Splitting between Tesco and Aldi saves you the most.',
 		offer_snapshot_date: '2026-06-07'
@@ -238,6 +244,7 @@ describe('optimise page', () => {
 		response.needs_confirmation_items = [
 			{
 				item_index: 4,
+				entry_id: 'e-4',
 				display_text: 'yoghurt',
 				canonical_item_id: 'ci-yoghurt',
 				candidate_count: 2,
@@ -262,7 +269,7 @@ describe('optimise page', () => {
 			}
 		];
 		response.no_valid_offer_items = [
-			{ item_index: 5, display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
+			{ item_index: 5, entry_id: 'e-5', display_text: 'San Pellegrino', reason: 'strict_no_exact_offer' }
 		];
 		stubOptimise(response);
 		render(Page);
@@ -301,6 +308,7 @@ describe('optimise page', () => {
 		withAsk.needs_confirmation_items = [
 			{
 				item_index: 0,
+				entry_id: 'e-0',
 				display_text: 'yoghurt',
 				canonical_item_id: 'ci-yoghurt',
 				candidate_count: 1,
@@ -387,6 +395,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-a',
 					candidate_count: 1,
@@ -403,6 +412,7 @@ describe('optimise page', () => {
 				},
 				{
 					item_index: 1,
+					entry_id: 'e-1',
 					display_text: 'butter',
 					canonical_item_id: 'ci-b',
 					candidate_count: 1,
@@ -511,6 +521,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-a',
 					candidate_count: 1,
@@ -527,6 +538,7 @@ describe('optimise page', () => {
 				},
 				{
 					item_index: 1,
+					entry_id: 'e-1',
 					display_text: 'butter',
 					canonical_item_id: 'ci-b',
 					candidate_count: 1,
@@ -622,6 +634,7 @@ describe('optimise page', () => {
 			needs_confirmation_items: [
 				{
 					item_index: 0,
+					entry_id: 'e-0',
 					display_text: 'yoghurt',
 					canonical_item_id: 'ci-yoghurt',
 					candidate_count: 2,

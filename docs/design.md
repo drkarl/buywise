@@ -485,6 +485,32 @@ store such as SuperValu needs a smaller saving to be added than the default €1
 
 List entries with `resolution_status = 'unresolved'` or `'ambiguous'` have no `canonical_item_id` and therefore no `product_matches`. The optimiser **excludes these entries from all priced plan totals**. They are surfaced separately in the recommendation output as "unresolved items" so the household knows the total is a partial estimate. Once the user resolves them (via the clarification flow in §8), the optimiser can be re-run to produce a complete plan.
 
+### Per-store trip view (issue #104)
+
+Choosing a plan from the optimise page allocates it to per-store trips. Each priced
+plan line carries the household list entry it fulfils (`entry_id`, echoed by the
+optimiser from the basket item) plus the chosen product, so a trip list is a
+**view over the shared list entries, never a copy**:
+
+- `/list/<id>/trip` renders one list per store in the chosen plan ("Lidl trip",
+  "Tesco order", …), each grouped by that store's category order, showing each
+  item's quantity and chosen product, plus an explicit **not allocated** section
+  carrying the items the plan could not price (unresolved, no valid offer, or held
+  for confirmation). The two store lists plus that section account for the whole
+  list, each entry once.
+- Shopping mode (`/list/<id>/shopping`) is scoped to the chosen plan: it offers
+  only the plan's stores and shows only the selected store's allocated items.
+- Check-offs in either view reuse the same optimistic `mark_bought` mutation
+  (§11), so an offline check-off queues and drains like any other edit and
+  converges across devices.
+
+The chosen allocation is a small client-side cache (per device, `localStorage`),
+not server state. Volume one replaces the allocation by re-selecting a plan — there
+is no per-line manual reassignment — and three-store routing is a non-goal. When
+the list gains an item the plan does not cover, the trip view shows a stale-plan
+warning linking back to the optimiser; plan prices are a snapshot and a
+re-optimise refreshes them.
+
 ### Recommendation output (plain language)
 
 ```
@@ -597,6 +623,9 @@ Offline capabilities:
 - Add new items (queued as mutations)
 - Paste a multi-line list to preview, edit and add several items at once (queued as mutations)
 - Add quick notes
+- View the chosen plan's per-store trip lists and check items off within a store
+  (issue #104) — the allocation is a cached view over the same entries, so it
+  needs no network
 
 Service worker caches the SvelteKit app shell. Dexie holds the local list mirror and mutation queue. On reconnect, the mutation queue drains against the server in order.
 

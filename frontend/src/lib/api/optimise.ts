@@ -16,7 +16,19 @@ export type FreshnessConfidence = 'high' | 'low' | 'unknown';
 /** One priced line in a store plan (one resolved list item at a retailer). */
 export interface PlanLine {
 	item_index: number;
+	/**
+	 * The household list entry this line fulfils, echoed from the optimiser's
+	 * basket item. Always present for a plan built from a stored list; `null` only
+	 * for a caller that had no persisted line. The per-store trip view (issue #104)
+	 * joins on this to render a plan line against its live list entry.
+	 */
+	entry_id: string | null;
 	display_text: string;
+	/**
+	 * The chosen retailer product's display name (e.g. "Tesco Whole Milk 2L"), so
+	 * a trip list can show which product was matched (issue #104).
+	 */
+	product_name: string;
 	/**
 	 * The resolved canonical item id this line prices. Always present for a priced
 	 * line (unresolved items never appear in a plan); paired with
@@ -58,6 +70,8 @@ export interface Recommendation {
 /** A list item the optimiser could not resolve to a catalogue item. */
 export interface UnresolvedItem {
 	item_index: number;
+	/** The source list entry (see {@link PlanLine.entry_id}); `null` if none. */
+	entry_id: string | null;
 	display_text: string;
 }
 
@@ -73,6 +87,8 @@ export type NoValidOfferReason =
 /** A resolved item that produced no valid offer, with the reason. */
 export interface NoValidOfferItem {
 	item_index: number;
+	/** The source list entry (see {@link PlanLine.entry_id}); `null` if none. */
+	entry_id: string | null;
 	display_text: string;
 	reason: NoValidOfferReason;
 }
@@ -102,6 +118,8 @@ export interface CandidateOffer {
  */
 export interface NeedsConfirmationItem {
 	item_index: number;
+	/** The source list entry (see {@link PlanLine.entry_id}); `null` if none. */
+	entry_id: string | null;
 	display_text: string;
 	canonical_item_id: string;
 	candidate_count: number;

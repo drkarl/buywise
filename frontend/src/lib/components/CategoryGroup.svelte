@@ -11,11 +11,18 @@
 	interface Props {
 		group: CategoryGroup;
 		pendingIds?: Set<string>;
+		/**
+		 * Optional entry-id → chosen product label (e.g. "Tesco Whole Milk 2L").
+		 * The per-store trip view (issue #104) passes the optimiser's chosen
+		 * products so each line shows what to actually pick up; shopping mode
+		 * passes nothing and renders just the item name.
+		 */
+		products?: Record<string, string>;
 		/** Check an item off (active → bought). */
 		onbought: (id: string) => void;
 	}
 
-	let { group, pendingIds = new Set<string>(), onbought }: Props = $props();
+	let { group, pendingIds = new Set<string>(), products = {}, onbought }: Props = $props();
 
 	// Sections default to open. We do not auto-collapse a fully-bought category:
 	// keeping it open preserves the "see what's done in context" behaviour.
@@ -61,6 +68,9 @@
 						</button>
 					{/if}
 					<span class="name">{item.display_name}</span>
+					{#if products[item.id]}
+						<span class="product">{products[item.id]}</span>
+					{/if}
 					{#if pendingIds.has(item.id)}
 						<span class="pending-marker" role="img" aria-label="Not synced yet" title="Not synced yet">•</span>
 					{/if}
@@ -129,6 +139,16 @@
 	.name {
 		flex: 1;
 		font-size: 1rem;
+	}
+	.product {
+		flex-shrink: 1;
+		max-width: 45%;
+		font-size: 0.78rem;
+		color: #64748b;
+		text-align: right;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.pending-marker {
 		flex-shrink: 0;
