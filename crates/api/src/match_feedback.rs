@@ -26,6 +26,12 @@
 //!     over alternatives), so it maps to `accepted` for routing while the
 //!     `match_feedback.action` keeps the verbatim `prefer` so the signal is not
 //!     lost from history.
+//!   * `undo`    → status `pending` (issue #108). Unlike the others, `undo`
+//!     corrects a decision that already exists: it requires a `product_matches`
+//!     row for the triple (a 404 otherwise) and returns it to the neutral
+//!     undecided state, so the product is no longer auto-priced and is proposed
+//!     again as a candidate. The prior accept/reject rows are NOT deleted — an
+//!     `undo` feedback row is appended, keeping the trail append-only.
 //!
 //! Authorisation: the request body carries no `household_id`. Rather than assume a
 //! single household (the limitation `settings.rs` documents), the household is
@@ -105,6 +111,11 @@ fn db_error(context: &'static str) -> impl Fn(sqlx::Error) -> StatusCode {
 /// The `product_matches.status` an action maps to, or `None` for an unknown action
 /// (a 422 at the boundary). `match_feedback.action` keeps the verbatim string; only
 /// the routing status is derived here. See the module docs for the `prefer` choice.
+///
+/// `undo` resets a decided match to `pending` — the product then counts as
+/// undecided, is no longer auto-priced, and is proposed again as a candidate.
+/// It is the deliberate reset that lets a rejected suggestion recur (issue #108);
+/// unlike the other actions it requires an existing `product_matches` row.
 fn status_for_action(action: &str) -> Option<&'static str> {
     match action {
         "accept" => Some("accepted"),
@@ -112,7 +123,20 @@ fn status_for_action(action: &str) -> Option<&'static str> {
         // `prefer` is a stronger accept — no dedicated status exists, so route it
         // as `accepted` while the verbatim `prefer` survives in match_feedback.
         "prefer" => Some("accepted"),
+        "undo" => Some("pending"),
         _ => None,
+    }
+}
+
+/// The `product_matches.matched_by` an action is attributed to. A user's
+/// accept/reject/prefer is `user`; an `undo` returns the row to the neutral
+/// `system` state (no product has been matched), while the `match_feedback` row
+/// still records which user performed the undo.
+fn matched_by_for_action(action: &str) -> &'static str {
+    if action == "undo" {
+        "system"
+    } else {
+        "user"
     }
 }
 
@@ -157,13 +181,31 @@ async fn post_match_feedback(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // 3. Upsert the match + append the feedback row, atomically.
+    // 3. `undo` corrects existing state, so it requires a match to undo. Accept/
+    //    reject/prefer may introduce one (they are the first decision on the
+    //    triple). An undo of a never-decided product is a 404, never a silent
+    //    insert of a pending row.
+    if req.action == "undo"
+        && !product_match_exists(
+            pool,
+            &household_id,
+            &req.canonical_item_id,
+            &req.retailer_product_id,
+        )
+        .await
+        .map_err(db_error("post_match_feedback.undo_lookup"))?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // 4. Upsert the match + append the feedback row, atomically.
     let mut tx = pool
         .begin()
         .await
         .map_err(db_error("post_match_feedback.begin"))?;
 
-    let product_match_id = upsert_product_match(&mut tx, &household_id, &req, status)
+    let matched_by = matched_by_for_action(&req.action);
+    let product_match_id = upsert_product_match(&mut tx, &household_id, &req, status, matched_by)
         .await
         .map_err(db_error("post_match_feedback.upsert"))?;
 
@@ -231,6 +273,27 @@ async fn retailer_product_exists(
     Ok(row.is_some())
 }
 
+/// True if a `product_matches` row already exists for the triple. Used to gate
+/// `undo` (there must be a decision to correct); accept/reject/prefer do not need
+/// it because the upsert may legitimately introduce the first row.
+async fn product_match_exists(
+    pool: &sqlx::SqlitePool,
+    household_id: &str,
+    canonical_item_id: &str,
+    retailer_product_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM product_matches \
+         WHERE household_id = ?1 AND canonical_item_id = ?2 AND retailer_product_id = ?3",
+    )
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .bind(retailer_product_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Upsert the `product_matches` row for the unique
 /// `(household_id, canonical_item_id, retailer_product_id)` triple and return its
 /// id. `ON CONFLICT ... DO UPDATE` updates `status`/`matched_by`/`updated_at` in
@@ -239,15 +302,17 @@ async fn retailer_product_exists(
 /// id on both the insert and the update path, so it is the correct FK to record in
 /// `match_feedback`.
 ///
-/// `matched_by` is set to `user` — this is a user-driven match decision. On insert
-/// both `created_at` and `updated_at` are stamped to now; on update only
-/// `updated_at` is bumped (the original `created_at` is preserved by not being in
-/// the `DO UPDATE` set).
+/// `matched_by` is `user` for a user-driven match decision and `system` for an
+/// `undo`, which returns the row to the neutral undecided state (see
+/// [`matched_by_for_action`]). On insert both `created_at` and `updated_at` are
+/// stamped to now; on update only `updated_at` is bumped (the original
+/// `created_at` is preserved by not being in the `DO UPDATE` set).
 async fn upsert_product_match(
     tx: &mut Transaction<'_, Sqlite>,
     household_id: &str,
     req: &MatchFeedbackRequest,
     status: &str,
+    matched_by: &str,
 ) -> Result<String, sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = db::now_iso();
@@ -255,7 +320,7 @@ async fn upsert_product_match(
         "INSERT INTO product_matches \
              (id, household_id, canonical_item_id, retailer_product_id, status, matched_by, \
               created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?6) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
          ON CONFLICT(household_id, canonical_item_id, retailer_product_id) DO UPDATE SET \
              status = excluded.status, \
              matched_by = excluded.matched_by, \
@@ -267,6 +332,7 @@ async fn upsert_product_match(
     .bind(&req.canonical_item_id)
     .bind(&req.retailer_product_id)
     .bind(status)
+    .bind(matched_by)
     .bind(&now)
     .fetch_one(&mut **tx)
     .await

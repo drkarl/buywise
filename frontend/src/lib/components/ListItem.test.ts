@@ -259,3 +259,35 @@ describe('ListItem remove + move-back controls', () => {
 		expect(ondelete).toHaveBeenCalledWith('e1');
 	});
 });
+
+describe('ListItem match prompt (issue #108)', () => {
+	it('promotes the item link to "Match" when a resolved entry needs a match', () => {
+		render(
+			ListItem,
+			props({
+				entry: mockEntry({
+					resolution_status: 'resolved',
+					canonical_item_id: 'ci-milk',
+					needs_match: true
+				})
+			})
+		);
+		const link = screen.getByRole('link', { name: 'Match a product to Milk' });
+		expect(link).toBeTruthy();
+		expect(link.getAttribute('href')).toBe('/items/ci-milk/preferences?list=list-1');
+	});
+
+	it('keeps the plain "Prefs" link when no match is needed', () => {
+		render(
+			ListItem,
+			props({
+				entry: mockEntry({
+					resolution_status: 'resolved',
+					canonical_item_id: 'ci-milk'
+				})
+			})
+		);
+		expect(screen.queryByRole('link', { name: 'Match a product to Milk' })).toBeNull();
+		expect(screen.getByRole('link', { name: 'Preferences for Milk' })).toBeTruthy();
+	});
+});

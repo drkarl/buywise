@@ -122,6 +122,13 @@ pub struct EntryView {
     pub created_at: String,
     /// `list_entries.updated_at` (ISO-8601 UTC).
     pub updated_at: String,
+    /// Whether the entry is resolved but has no usable product match, so no price
+    /// can be produced for it (issue #108). Surfaces missing matching coverage on
+    /// the list itself, so an unmatched staple prompts for a match instead of
+    /// silently having no price. Always `false` for unresolved/ambiguous entries
+    /// (matching cannot apply) and for non-active entries; the client still reads
+    /// it only for active ones.
+    pub needs_match: bool,
 }
 
 /// Full state of a single list: metadata, a top-level `current_revision`, and
@@ -662,9 +669,27 @@ async fn load_detail(pool: &sqlx::SqlitePool, row: ListRow) -> Result<ListDetail
     .fetch_all(pool)
     .await?;
 
+    // Canonical items in this household that already have a usable product match.
+    // Reading it once means `needs_match` costs one extra query per snapshot, not
+    // one per entry (issue #108).
+    let matched_canonical: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT DISTINCT canonical_item_id FROM product_matches \
+         WHERE household_id = ?1 AND status IN ('accepted', 'suggested')",
+    )
+    .bind(&household_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+
     let entries = entry_rows
         .into_iter()
         .map(|r| EntryView {
+            needs_match: r.9 == "active"
+                && r.3 == "resolved"
+                && r.2
+                    .as_deref()
+                    .is_some_and(|c| !matched_canonical.contains(c)),
             id: r.0,
             list_id: r.1,
             canonical_item_id: r.2,

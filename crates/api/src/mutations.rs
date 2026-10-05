@@ -136,7 +136,9 @@ pub struct MutationResponse {
 }
 
 /// A `list_entries` row as returned in [`MutationResponse::entity`]. Mirrors the
-/// `EntryView` shape `lists.rs` returns so a client decodes both identically.
+/// `EntryView` shape `lists.rs` returns so a client decodes both identically —
+/// except `EntryView.needs_match` (issue #108), which is a catalogue-wide fact
+/// computed only for the list snapshot and absent from a single mutation's entity.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EntityView {
     /// `list_entries.id`.

@@ -466,7 +466,8 @@
 							<span>{item.display_text} — {reasonText(item.reason)}</span>
 							<a
 								class="clarify"
-								href="/items/{item.canonical_item_id}/preferences?list={listId}">Set preferences</a
+								href="/items/{item.canonical_item_id}/preferences?list={listId}"
+								>{item.reason === 'no_matches' ? 'Find a match' : 'Set preferences'}</a
 							>
 							<a class="clarify" href="/list/{listId}">Review on your list</a>
 						</li>

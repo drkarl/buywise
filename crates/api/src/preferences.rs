@@ -49,9 +49,12 @@ use serde::{Deserialize, Serialize};
 
 use buywise_core::db;
 use buywise_core::domain::{
-    ConstraintPolicy, MatchStatus, Retailer, SizeBasis, SubstitutionPolicy,
+    ConstraintPolicy, MatchStatus, Retailer, RetailerProduct, SizeBasis, SourceConfidence,
+    SubstitutionPolicy, UnitPriceBasis,
 };
+use buywise_core::product_matching::{rank_candidates, ItemProfile, ScoredProduct};
 
+use crate::llm::LlmError;
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
 
@@ -136,6 +139,52 @@ pub struct MatchView {
     pub size_text: Option<String>,
 }
 
+/// One proposed retailer product a household can match to the item (issue #108),
+/// carrying the product identity and the price provenance the decision is based on.
+///
+/// A candidate is surfaced only when it has a current offer (so every proposal is
+/// priceable) and is not already accepted/suggested/rejected for the item — the
+/// `matches` list owns decided products. A rejected product therefore does not
+/// recur here unless its decision is deliberately undone through `match-feedback`.
+#[derive(Debug, Serialize)]
+pub struct CandidateView {
+    /// `retailer_products.id`.
+    pub retailer_product_id: String,
+    /// `retailer_products.retailer`.
+    pub retailer: Retailer,
+    /// `retailer_products.name`.
+    pub name: String,
+    /// `retailer_products.brand`.
+    pub brand: Option<String>,
+    /// Pack size as shown on the shelf (`pack_size_text`, else composed from
+    /// `size_value`/`size_unit`), or `None` when the product carries neither.
+    pub size_text: Option<String>,
+    /// `retailer_products.pack_count`.
+    pub pack_count: Option<i32>,
+    /// Deterministic relevance score (higher is a better fit). Ordering within a
+    /// retailer is by this score.
+    pub score: i32,
+    /// Stable codes for the signals that contributed to the score: `name`,
+    /// `brand`, `size`.
+    pub signals: Vec<String>,
+    /// Latest offer's shelf price in cents.
+    pub price_cents: i64,
+    /// Latest offer's loyalty price in cents, when one applies.
+    pub loyalty_price_cents: Option<i64>,
+    /// Loyalty scheme behind `loyalty_price_cents` (`clubcard` / `real_rewards`).
+    pub loyalty_scheme: Option<String>,
+    /// Unit price in micros, when the retailer publishes one.
+    pub unit_price_eur_micros: Option<i64>,
+    /// Basis the unit price is quoted against.
+    pub unit_price_basis: Option<UnitPriceBasis>,
+    /// The offer's source snapshot date (provenance).
+    pub offer_snapshot_date: Option<String>,
+    /// When the offer was fetched (provenance).
+    pub fetched_at: String,
+    /// The offer's ingest confidence (`high` / `medium` / `low`).
+    pub source_confidence: SourceConfidence,
+}
+
 /// Response for `GET` and `PUT /api/items/{id}/preferences`.
 #[derive(Debug, Serialize)]
 pub struct PreferencesResponse {
@@ -151,6 +200,9 @@ pub struct PreferencesResponse {
     pub constraints: PreferencesConstraints,
     /// Every product match for the item, in a deterministic order.
     pub matches: Vec<MatchView>,
+    /// Proposed products per retailer (issue #108), best match first within each
+    /// retailer. Empty when the catalogue holds no plausible product.
+    pub candidates: Vec<CandidateView>,
     /// Stable warning codes for data the optimiser cannot evaluate (see the module
     /// docs): `brand_policy_missing_brand`, `allowed_set_empty`,
     /// `no_usable_matches`.
@@ -184,7 +236,7 @@ async fn get_preferences(
 ) -> Result<Json<PreferencesResponse>, StatusCode> {
     let pool = &state.pool;
     let household_id = authorised_household(pool, &user.user_id, &canonical_item_id).await?;
-    let response = load_preferences(pool, &household_id, &canonical_item_id)
+    let response = load_preferences(&state, &household_id, &canonical_item_id)
         .await
         .map_err(db_error("get_preferences.load"))?;
     Ok(Json(response))
@@ -256,7 +308,7 @@ async fn put_preferences(
         .await
         .map_err(db_error("put_preferences.commit"))?;
 
-    let response = load_preferences(pool, &household_id, &canonical_item_id)
+    let response = load_preferences(&state, &household_id, &canonical_item_id)
         .await
         .map_err(db_error("put_preferences.reload"))?;
     Ok(Json(response))
@@ -403,12 +455,13 @@ async fn authorised_household(
 }
 
 /// Read the item's name/policy, its constraints row (defaults when absent), its
-/// matches, and derive the warning codes.
+/// matches, its proposed candidates, and derive the warning codes.
 async fn load_preferences(
-    pool: &sqlx::SqlitePool,
+    state: &AppState,
     household_id: &str,
     canonical_item_id: &str,
 ) -> Result<PreferencesResponse, sqlx::Error> {
+    let pool = &state.pool;
     let (name_en, name_es, policy) = sqlx::query_as::<_, (String, String, ConstraintPolicy)>(
         "SELECT name_en, name_es, default_constraint_policy FROM canonical_items WHERE id = ?1",
     )
@@ -418,6 +471,15 @@ async fn load_preferences(
 
     let constraints = load_constraints(pool, canonical_item_id).await?;
     let matches = load_matches(pool, household_id, canonical_item_id).await?;
+    let candidates = load_candidates(
+        state,
+        household_id,
+        canonical_item_id,
+        &name_en,
+        &name_es,
+        &constraints,
+    )
+    .await?;
     let warnings = warnings(policy, &constraints, &matches);
 
     Ok(PreferencesResponse {
@@ -427,6 +489,7 @@ async fn load_preferences(
         default_constraint_policy: policy,
         constraints,
         matches,
+        candidates,
         warnings,
     })
 }
@@ -526,6 +589,206 @@ async fn load_matches(
             },
         )
         .collect())
+}
+
+/// Propose retailer products for the item (issue #108).
+///
+/// Loads the item's profile (names, aliases, brand/size rules), every priced
+/// retailer product, ranks them with [`rank_candidates`], optionally reorders the
+/// result with the LLM fallback, and attaches each candidate's latest offer as
+/// price provenance. Products already decided for the item (accepted, suggested
+/// or rejected) are excluded up front, so a rejected suggestion never recurs
+/// unless its decision is deliberately undone.
+async fn load_candidates(
+    state: &AppState,
+    household_id: &str,
+    canonical_item_id: &str,
+    name_en: &str,
+    name_es: &str,
+    constraints: &PreferencesConstraints,
+) -> Result<Vec<CandidateView>, sqlx::Error> {
+    let pool = &state.pool;
+
+    let decided: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT retailer_product_id FROM product_matches \
+         WHERE household_id = ?1 AND canonical_item_id = ?2 \
+           AND status IN ('accepted', 'suggested', 'rejected')",
+    )
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+
+    let aliases: Vec<String> = sqlx::query_scalar(
+        "SELECT alias FROM item_aliases WHERE household_id = ?1 AND canonical_item_id = ?2",
+    )
+    .bind(household_id)
+    .bind(canonical_item_id)
+    .fetch_all(pool)
+    .await?;
+
+    let profile = ItemProfile {
+        name_en: name_en.to_string(),
+        name_es: name_es.to_string(),
+        aliases,
+        brand: constraints.brand.clone(),
+        allowed_brands: constraints.allowed_brands.clone(),
+        excluded_brands: constraints.excluded_brands.clone(),
+        preferred_size: match (
+            constraints.preferred_size_value,
+            constraints.preferred_size_basis,
+        ) {
+            (Some(value), Some(basis)) => Some((value, basis)),
+            _ => None,
+        },
+    };
+
+    // Only products that have ever been priced can be a useful proposal (the
+    // household must be able to see what it would pay).
+    let products: Vec<RetailerProduct> = sqlx::query_as::<_, RetailerProduct>(
+        "SELECT rp.* FROM retailer_products rp \
+         WHERE EXISTS (SELECT 1 FROM product_offers po WHERE po.retailer_product_id = rp.id)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let candidates: Vec<RetailerProduct> = products
+        .into_iter()
+        .filter(|p| !decided.contains(&p.id))
+        .collect();
+
+    let scored = rank_candidates(&profile, &candidates);
+    let scored = llm_reorder(state, name_en, scored).await;
+
+    let mut out = Vec::with_capacity(scored.len());
+    for candidate in scored {
+        // Latest offer, mirroring `db::latest_offer_for_product` (which returns a
+        // `DbError`); queried directly here so this loader keeps the single
+        // `sqlx::Error` type the handler maps to a 500.
+        let offer: Option<buywise_core::domain::ProductOffer> = sqlx::query_as(
+            "SELECT * FROM product_offers \
+             WHERE retailer_product_id = ?1 \
+             ORDER BY fetched_at DESC LIMIT 1",
+        )
+        .bind(&candidate.product.id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(offer) = offer else {
+            continue;
+        };
+        let size_text = pack_size_text(&candidate.product);
+        out.push(CandidateView {
+            retailer_product_id: candidate.product.id,
+            retailer: candidate.product.retailer,
+            name: candidate.product.name,
+            brand: candidate.product.brand,
+            size_text,
+            pack_count: candidate.product.pack_count,
+            score: candidate.score,
+            signals: candidate
+                .signals
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            price_cents: offer.price_cents,
+            loyalty_price_cents: offer.loyalty_price_cents,
+            loyalty_scheme: offer.loyalty_scheme,
+            unit_price_eur_micros: offer.unit_price_eur_micros,
+            unit_price_basis: offer.unit_price_basis,
+            offer_snapshot_date: offer.source_snapshot_date,
+            fetched_at: offer.fetched_at,
+            source_confidence: offer.source_confidence_at_ingest,
+        });
+    }
+    Ok(out)
+}
+
+/// Human-readable pack size for a candidate: the retailer's own `pack_size_text`
+/// when present, else a composed `size_value` + `size_unit`. `None` when neither
+/// exists, so the UI omits the size rather than showing an empty token.
+fn pack_size_text(product: &RetailerProduct) -> Option<String> {
+    if let Some(text) = product.pack_size_text.as_deref() {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    match (product.size_value, product.size_unit.as_deref()) {
+        (Some(value), Some(unit)) => {
+            let value = if value.fract() == 0.0 {
+                format!("{}", value as i64)
+            } else {
+                format!("{value}")
+            };
+            Some(format!("{value}{unit}"))
+        }
+        _ => None,
+    }
+}
+
+/// Reorder candidates with the LLM fallback when it is enabled (issue #108).
+///
+/// Best-effort and advisory: the deterministic order is always the baseline, the
+/// model can only reorder the candidates it was given (never add one), and any
+/// error or unparseable answer falls back silently. A call that was actually made
+/// is recorded in `api_usage_events` for cost tracking, mirroring the resolution
+/// cascade.
+async fn llm_reorder(
+    state: &AppState,
+    item_description: &str,
+    scored: Vec<ScoredProduct>,
+) -> Vec<ScoredProduct> {
+    if scored.is_empty() || !state.llm_client.is_enabled() {
+        return scored;
+    }
+    let labels: Vec<String> = scored.iter().map(candidate_label).collect();
+    match state
+        .llm_client
+        .rank_candidates(item_description, &labels)
+        .await
+    {
+        Ok(order) => {
+            crate::resolution::record_llm_usage(&state.pool).await;
+            match order {
+                Some(order) => reorder_by_labels(scored, &order),
+                None => scored,
+            }
+        }
+        // Disabled/unconfigured: nothing was attempted; keep the order silently.
+        Err(LlmError::Disabled) => scored,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "preferences: LLM candidate ranking failed; using deterministic order"
+            );
+            scored
+        }
+    }
+}
+
+/// The label the model sees for a candidate, and the exact string it must echo
+/// back to reorder it. `name | retailer` is stable and readable.
+fn candidate_label(candidate: &ScoredProduct) -> String {
+    format!(
+        "{} | {}",
+        candidate.product.name,
+        candidate.product.retailer.as_db_str()
+    )
+}
+
+/// Stable reorder: candidates the model ranked come first in the model's order,
+/// every candidate it omitted keeps its deterministic relative order after them.
+fn reorder_by_labels(mut scored: Vec<ScoredProduct>, order: &[String]) -> Vec<ScoredProduct> {
+    let rank =
+        |candidate: &ScoredProduct| order.iter().position(|l| l == &candidate_label(candidate));
+    scored.sort_by(|a, b| match (rank(a), rank(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    scored
 }
 
 /// Stable warning codes for data the optimiser cannot evaluate. See the module docs.
@@ -631,6 +894,45 @@ mod tests {
             ]),
             vec!["Heinz".to_string(), "Branston".to_string()]
         );
+    }
+
+    #[test]
+    fn reorder_puts_ranked_candidates_first_and_keeps_the_rest_stable() {
+        use buywise_core::domain::{Retailer, Source};
+
+        let scored = |id: &str, retailer: Retailer, name: &str| ScoredProduct {
+            product: RetailerProduct {
+                id: id.into(),
+                source: Source::Manual,
+                retailer,
+                external_id: None,
+                url: None,
+                name: name.into(),
+                brand: None,
+                category: None,
+                pack_size_text: None,
+                size_value: None,
+                size_unit: None,
+                pack_count: None,
+                form_factor: None,
+                dietary_flags: None,
+                first_seen_at: "t".into(),
+                last_seen_at: "t".into(),
+            },
+            score: 50,
+            signals: vec![buywise_core::product_matching::MatchSignal::Name],
+        };
+
+        let a = scored("a", Retailer::Tesco, "A");
+        let b = scored("b", Retailer::Aldi, "B");
+        let c = scored("c", Retailer::Dunnes, "C");
+        let input = vec![a.clone(), b.clone(), c.clone()];
+
+        // Model ranks B then A, omitting C.
+        let order = vec![candidate_label(&b), candidate_label(&a)];
+        let out = reorder_by_labels(input, &order);
+        let ids: Vec<&str> = out.iter().map(|s| s.product.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
     }
 
     #[test]

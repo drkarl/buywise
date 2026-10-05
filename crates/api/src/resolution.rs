@@ -298,7 +298,7 @@ async fn persist_alias(
 /// because that helper takes the `Source` enum (basketwatch/lidl_direct/manual);
 /// `'llm'` is a valid plain-TEXT value for this table (no CHECK constraint) but is
 /// outside that enum.
-async fn record_llm_usage(pool: &sqlx::SqlitePool) {
+pub(crate) async fn record_llm_usage(pool: &sqlx::SqlitePool) {
     let now = buywise_core::db::now_iso();
     // `month_year` is the `YYYY-MM` prefix of the ISO timestamp (matches the ingest
     // quota bookkeeping convention).

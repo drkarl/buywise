@@ -170,4 +170,43 @@ INSERT OR IGNORE INTO list_entries
           '$USER_ID', 1, 'active', 'default', 0, '$NOW', '$NOW');
 SQL
 
+# ---------------------------------------------------------------------------
+# Product-matching fixture (issue #108)
+# ---------------------------------------------------------------------------
+# A dedicated list with one resolved item ("Basmati rice") that has NO product
+# match yet, plus a plausible product at Tesco and Aldi. The product-match spec
+# proves the item is unpriced until the household matches a candidate from the
+# app, then priced on the next optimisation. Kept on its own list so it does not
+# perturb the totals the beans/trip specs assert on list-e2e.
+sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=5000;
+INSERT OR IGNORE INTO canonical_items
+  (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at)
+  VALUES ('e2e-ci-rice', '$HOUSEHOLD_ID', 'Basmati rice', 'Arroz basmati',
+          'c1000000-0000-0000-0000-000000000005', 'any', '$NOW');
+INSERT OR IGNORE INTO retailer_products
+  (id, source, retailer, external_id, name, brand, pack_size_text, size_value, size_unit, pack_count, first_seen_at, last_seen_at)
+  VALUES ('e2e-rp-rice-tesco', 'basketwatch', 'tesco', 'e2e-rice-tesco',
+          'Tesco Basmati Rice 1kg', 'Tesco', '1kg', 1000, 'g', 1, '$NOW', '$NOW');
+INSERT OR IGNORE INTO retailer_products
+  (id, source, retailer, external_id, name, brand, pack_size_text, size_value, size_unit, pack_count, first_seen_at, last_seen_at)
+  VALUES ('e2e-rp-rice-aldi', 'basketwatch', 'aldi', 'e2e-rice-aldi',
+          'Aldi Basmati Rice 1kg', 'Aldi', '1kg', 1000, 'g', 1, '$NOW', '$NOW');
+INSERT OR IGNORE INTO product_offers
+  (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, source_confidence_at_ingest)
+  VALUES ('off-e2e-rice-tesco', 'e2e-rp-rice-tesco', 249, '2026-07-01', '$NOW', 'high');
+INSERT OR IGNORE INTO product_offers
+  (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, source_confidence_at_ingest)
+  VALUES ('off-e2e-rice-aldi', 'e2e-rp-rice-aldi', 199, '2026-07-01', '$NOW', 'high');
+INSERT OR IGNORE INTO shopping_lists (id, household_id, name, status, current_revision, created_at)
+  VALUES ('list-e2e-match', '$HOUSEHOLD_ID', 'Match test', 'active', 0, '$NOW');
+INSERT OR IGNORE INTO list_entries
+  (id, list_id, canonical_item_id, resolution_status, raw_text, display_name, added_by,
+   quantity, status, effective_constraint_hash, last_updated_revision, created_at, updated_at)
+  VALUES ('e2e-entry-rice', 'list-e2e-match', 'e2e-ci-rice', 'resolved', 'basmati rice', 'Basmati rice',
+          '$USER_ID', 1, 'active', 'default', 0, '$NOW', '$NOW');
+SQL
+
+echo "seed.sh: seeded product-matching fixture (list-e2e-match) into $DB"
+
 echo "seed.sh: seeded user=$EMAIL list=$LIST_ID into $DB"

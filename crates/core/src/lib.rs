@@ -5,5 +5,6 @@ pub mod matching;
 pub mod normalise;
 pub mod optimiser;
 pub mod password;
+pub mod product_matching;
 
 pub use domain::*;

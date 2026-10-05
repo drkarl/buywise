@@ -176,15 +176,70 @@ the unenforced columns.
 
 **What happens.** The screen's "Known products" list is exactly the item's `product_matches` rows
 (joined to `retailer_products`). Rejecting or restoring a product writes through
-`POST /api/match-feedback`. A product that has never been matched to the item cannot be added from
-this screen, so an item with no matches only shows the `no_usable_matches` warning and cannot be
-constrained against a specific product until matching data exists.
+`POST /api/match-feedback`. Products the matching helper proposes now appear in the "Suggested
+products" section (issue #108) and can be matched or rejected there, but there is no way to search
+the catalogue and add an arbitrary retailer product that no label similarity surfaced.
 
-**Why accepted.** The product-matching helper (issue #108) is a separate, later piece of work; #102
-reuses the existing match/feedback path and leaves matching to it.
+**Why accepted.** Candidate generation (issue #108) covers the household-staples flow; a free-text
+catalogue search is a larger surface and was out of scope for both #102 and the version-one matching
+helper.
 
-**Workaround.** Confirm a candidate from the optimise screen's "Waiting for your confirmation"
-section (which creates a match), then manage it here.
+**Workaround.** Match or reject a proposed candidate. If the exact product is not among the
+proposals, there is no in-app way to add it yet.
 
-**Follow-up.** Build the product-matching helper (#108) and let the preferences screen search/add
-retailer products directly.
+**Follow-up.** Add product search (by name or barcode) so the screen can add any retailer product
+directly.
+
+## Product candidate matching
+
+### 1. Barcode assistance is out of scope for version one
+
+Proposes retailer products for an item with no match so a household can accept or reject them in the
+app (issue #108). Candidates are ranked by deterministic name/size/brand similarity over the
+existing `retailer_products` rows; the LLM fallback (off by default) may only reorder them.
+
+**What happens.** Matching is textual. A household cannot scan a product's barcode to bind it
+directly, so a product whose name does not look like the item's name/aliases will not be proposed
+even when its barcode would identify it exactly.
+
+**Why accepted.** The captain's version-one scope excludes a mandatory barcode scanner; text, size
+and brand similarity cover the staples flow, and `retailer_products.external_id` is not universally
+populated across sources.
+
+**Workaround.** None in-app for a product the similarity pass misses; match it only if it appears
+among the proposals.
+
+**Follow-up.** Add optional barcode lookup (`retailer_products.external_id`) as a fast path that
+surfaces an exact product alongside the ranked candidates. Tracked as a version-one follow-up for
+issue #108.
+
+### 2. The list's "Match" prompt is snapshot-only and matching does not bump the list revision
+
+**What happens.** `needs_match` (issue #108) is computed only for the full list snapshot
+(`GET /api/list/:id` and the SSE `full_snapshot`); a single mutation's `entity` omits the field.
+`POST /api/match-feedback` writes `product_matches`, not `list_entries`, so matching emits no SSE
+`mutation` event. After a household matches an item, the list row's "Match" prompt clears only on the
+next full snapshot (a navigation/reload or a resync), not immediately.
+
+**Why accepted.** Matching is a catalogue-level, online action independent of the offline list
+mutation stream; folding it into the list revision would couple two separate pipelines for a
+cosmetic refresh.
+
+**Workaround.** Reload the list (or navigate away and back) to refresh the prompt.
+
+**Follow-up.** Carry a per-item match-coverage flag on mutation entities, or bump the list revision
+when a match decision changes, so the prompt updates live.
+
+### 3. Candidates are drawn from every store, including retailers the household switched off
+
+**What happens.** Candidate generation ranks every priced `retailer_products` row; it does not filter
+by the household's `household_store_settings`. A store the household marked "off" (or "occasional"
+with no trip today) can still have a product proposed. Accepting it does not add a plan line while
+that store is excluded by the optimiser.
+
+**Why accepted.** Version-one candidate generation runs over the shared catalogue; scoping proposals
+to store settings was out of scope.
+
+**Workaround.** Reject the unwanted store's candidate (it does not recur) or leave it unmatched.
+
+**Follow-up.** Filter candidates by the household's active/nearby stores before ranking.
