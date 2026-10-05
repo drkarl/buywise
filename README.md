@@ -142,7 +142,7 @@ Useful screens once logged in:
 
 | Path | Screen |
 |---|---|
-| `/list/<id>` | Shopping list (add items, real-time sync) |
+| `/list/<id>` | Shopping list (add items, paste a list, real-time sync) |
 | `/list/<id>/shopping` | In-store shopping mode |
 | `/list/<id>/optimise` | The four optimisation plans |
 | `/savings` | Savings ledger |

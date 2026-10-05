@@ -287,13 +287,135 @@ function spacedNumberUnit(numToken: string, unitToken: string): RequestedSize | 
   return { value: value * basis[1], basis: basis[0] };
 }
 
-/** Build a {@link ParsedInput} from the chosen token and residual tokens. */
+/** A whitespace-delimited token with its character range inside the trimmed input. */
+interface OffsetToken {
+  value: string;
+  start: number;
+  end: number;
+}
+
+/** Tokenise `trimmed` into non-whitespace runs, recording each one's char range. */
+function tokenize(trimmed: string): OffsetToken[] {
+  const tokens: OffsetToken[] = [];
+  const re = /\S+/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(trimmed)) !== null) {
+    tokens.push({ value: match[0], start: match.index, end: match.index + match[0].length });
+  }
+  return tokens;
+}
+
+/** Build a {@link ParsedInput} from the chosen token and residual token values. */
 function build(original: string, residual: string[], token: Token | null): ParsedInput {
   let count = 1;
   let requestedSize: RequestedSize | null = null;
   if (token?.kind === "count") count = token.count;
   else if (token?.kind === "size") requestedSize = token.size;
   return { text: normalize(residual.join(" ")), count, requestedSize, original };
+}
+
+/**
+ * A {@link ParsedInput} plus the character ranges of the tokens the parser
+ * consumed, relative to `input.trim()`. `countSpan` / `sizeSpan` are `null` when
+ * no token of that kind was stripped. Offsets index the TRIMMED input, so callers
+ * slice `input.trim()`, not the raw string.
+ */
+export interface ParsedInputSpans extends ParsedInput {
+  countSpan: [number, number] | null;
+  sizeSpan: [number, number] | null;
+}
+
+/** Shared implementation behind the two public parse entry points. */
+function parseWithSpans(input: string): ParsedInputSpans {
+  const trimmed = input.trim();
+  if (trimmed === "") {
+    return {
+      text: "",
+      count: 1,
+      requestedSize: null,
+      original: input,
+      countSpan: null,
+      sizeSpan: null,
+    };
+  }
+
+  const tokens = tokenize(trimmed);
+
+  // Spaced "<number> <unit>" pairs; the leading pair takes precedence over the
+  // trailing pair (mirrors the first-then-last strategy).
+  if (tokens.length >= 2) {
+    const leading = spacedNumberUnit(tokens[0].value, tokens[1].value);
+    if (leading) {
+      return {
+        ...build(
+          input,
+          tokens.slice(2).map((t) => t.value),
+          { kind: "size", size: leading }
+        ),
+        countSpan: null,
+        sizeSpan: [tokens[0].start, tokens[1].end],
+      };
+    }
+
+    const last = tokens.length - 1;
+    const trailing = spacedNumberUnit(tokens[last - 1].value, tokens[last].value);
+    if (trailing) {
+      return {
+        ...build(
+          input,
+          tokens.slice(0, last - 1).map((t) => t.value),
+          { kind: "size", size: trailing }
+        ),
+        countSpan: null,
+        sizeSpan: [tokens[last - 1].start, tokens[last].end],
+      };
+    }
+  }
+
+  // First token. A lone count is really an item name ("two", "2"); only strip a
+  // leading count when residual text follows. A lone size is always honoured.
+  const first = classifyToken(tokens[0].value);
+  if (first && (tokens.length > 1 || first.kind === "size")) {
+    return {
+      ...build(
+        input,
+        tokens.slice(1).map((t) => t.value),
+        first
+      ),
+      countSpan: first.kind === "count" ? [tokens[0].start, tokens[0].end] : null,
+      sizeSpan: first.kind === "size" ? [tokens[0].start, tokens[0].end] : null,
+    };
+  }
+
+  // Last token (only with at least two tokens).
+  if (tokens.length >= 2) {
+    const last = tokens.length - 1;
+    const lastToken = classifyToken(tokens[last].value);
+    if (lastToken) {
+      return {
+        ...build(
+          input,
+          tokens.slice(0, last).map((t) => t.value),
+          lastToken
+        ),
+        countSpan:
+          lastToken.kind === "count" ? [tokens[last].start, tokens[last].end] : null,
+        sizeSpan:
+          lastToken.kind === "size" ? [tokens[last].start, tokens[last].end] : null,
+      };
+    }
+  }
+
+  // No count/size recognised: the whole line is text, count 1.
+  return {
+    ...build(
+      input,
+      tokens.map((t) => t.value),
+      null
+    ),
+    countSpan: null,
+    sizeSpan: null,
+  };
 }
 
 /**
@@ -312,40 +434,19 @@ function build(original: string, residual: string[], token: Token | null): Parse
  * is always honoured (`"500g"` → text `""`).
  */
 export function parseQuantityAndUnit(input: string): ParsedInput {
-  const trimmed = input.trim();
-  if (trimmed === "") {
-    return { text: "", count: 1, requestedSize: null, original: input };
-  }
+  // Strip the span bookkeeping so the returned object is exactly `ParsedInput`
+  // (callers/tests pin the shape with `toEqual`).
+  const { countSpan: _countSpan, sizeSpan: _sizeSpan, ...parsed } = parseWithSpans(input);
+  return parsed;
+}
 
-  const tokens = trimmed.split(/\s+/);
-
-  // Spaced "<number> <unit>" pairs; the leading pair takes precedence over the
-  // trailing pair (mirrors the first-then-last strategy).
-  if (tokens.length >= 2) {
-    const leading = spacedNumberUnit(tokens[0], tokens[1]);
-    if (leading) return build(input, tokens.slice(2), { kind: "size", size: leading });
-
-    const last = tokens.length - 1;
-    const trailing = spacedNumberUnit(tokens[last - 1], tokens[last]);
-    if (trailing) {
-      return build(input, tokens.slice(0, last - 1), { kind: "size", size: trailing });
-    }
-  }
-
-  // First token. A lone count is really an item name ("two", "2"); only strip a
-  // leading count when residual text follows. A lone size is always honoured.
-  const first = classifyToken(tokens[0]);
-  if (first && (tokens.length > 1 || first.kind === "size")) {
-    return build(input, tokens.slice(1), first);
-  }
-
-  // Last token (only with at least two tokens).
-  if (tokens.length >= 2) {
-    const last = tokens.length - 1;
-    const lastToken = classifyToken(tokens[last]);
-    if (lastToken) return build(input, tokens.slice(0, last), lastToken);
-  }
-
-  // No count/size recognised: the whole line is text, count 1.
-  return build(input, tokens, null);
+/**
+ * {@link parseQuantityAndUnit} plus the character ranges of the count/size tokens
+ * the parser stripped. The bulk-add preview uses `countSpan` to lift a leading or
+ * trailing count ("2x eggs") into a separate editable quantity while leaving a
+ * size ("500g mince") in the item text — the shared parser stays the single
+ * source of truth for what counts as a count or a size.
+ */
+export function parseQuantityAndUnitSpans(input: string): ParsedInputSpans {
+  return parseWithSpans(input);
 }

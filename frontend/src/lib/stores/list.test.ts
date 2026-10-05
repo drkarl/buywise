@@ -3,6 +3,7 @@ import { get } from 'svelte/store';
 import { db } from '$lib/db/dexie';
 import {
 	addItem,
+	addItems,
 	markBought,
 	markSkipped,
 	moveToList,
@@ -555,5 +556,68 @@ describe('setQuantity', () => {
 		expect(entry?.status).toBe('deleted');
 		expect(entry?.quantity).toBe(1);
 		expect(await db.mutation_queue.count()).toBe(before);
+	});
+});
+
+describe('addItems (bulk add)', () => {
+	it('enqueues one entry and one add_item mutation per item', async () => {
+		const ids = await addItems(LIST, [{ rawText: 'Milk', quantity: 2 }, { rawText: 'Bread' }]);
+
+		expect(ids).toHaveLength(2);
+		const entries = await db.list_entries.where('list_id').equals(LIST).toArray();
+		expect(entries).toHaveLength(2);
+		expect(
+			Object.fromEntries(entries.map((e) => [e.display_name, e.quantity]))
+		).toEqual({ Milk: 2, Bread: 1 });
+		expect(entries.every((e) => e.status === 'active' && e.resolution_status === 'unresolved')).toBe(
+			true
+		);
+
+		const muts = await db.mutation_queue.toArray();
+		expect(muts).toHaveLength(2);
+		expect(muts.every((m) => m.operation_type === 'add_item' && m.status === 'pending')).toBe(true);
+		// Stable, DISTINCT idempotency keys: the reconnect/replay dedupe depends on
+		// each queued add keeping one `client_mutation_id` for its whole lifetime.
+		expect(new Set(muts.map((m) => m.client_mutation_id)).size).toBe(2);
+		expect(muts.map((m) => m.payload)).toEqual([
+			{ raw_text: 'Milk', display_name: 'Milk', quantity: 2 },
+			{ raw_text: 'Bread', display_name: 'Bread', quantity: 1 }
+		]);
+		// Each mutation targets a distinct entity id, matching the returned ids.
+		expect(new Set(muts.map((m) => m.entity_id))).toEqual(new Set(ids));
+	});
+
+	it('clamps non-positive and non-finite quantities to 1', async () => {
+		await addItems(LIST, [
+			{ rawText: 'Zero', quantity: 0 },
+			{ rawText: 'Negative', quantity: -3 },
+			{ rawText: 'NaN', quantity: Number.NaN }
+		]);
+
+		const entries = await db.list_entries.where('list_id').equals(LIST).toArray();
+		expect(Object.fromEntries(entries.map((e) => [e.display_name, e.quantity]))).toEqual({
+			Zero: 1,
+			Negative: 1,
+			NaN: 1
+		});
+	});
+
+	it('is a no-op for an empty batch', async () => {
+		expect(await addItems(LIST, [])).toEqual([]);
+		expect(await db.list_entries.count()).toBe(0);
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+
+	it('rejects empty text and writes nothing (whole batch validated first)', async () => {
+		await expect(addItems(LIST, [{ rawText: 'Milk' }, { rawText: '   ' }])).rejects.toThrow();
+		expect(await db.list_entries.count()).toBe(0);
+		expect(await db.mutation_queue.count()).toBe(0);
+	});
+
+	it('uses list_meta.current_revision as the shared base_revision', async () => {
+		await db.list_meta.put({ id: LIST, name: 'Groceries', current_revision: 5 });
+		await addItems(LIST, [{ rawText: 'A' }, { rawText: 'B' }]);
+		const muts = await db.mutation_queue.toArray();
+		expect(muts.map((m) => m.base_revision)).toEqual([5, 5]);
 	});
 });
