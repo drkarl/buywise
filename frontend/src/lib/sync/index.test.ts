@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { get } from 'svelte/store';
 import { db, type LocalMutation } from '$lib/db/dexie';
 import { startSync, fetchSnapshot, notifyMutationEnqueued } from './index';
 import type { ListSnapshot, MutationResponse, ServerListEntry } from './types';
@@ -527,6 +528,47 @@ describe('runSync reconcile-on-failure', () => {
     expect(await db.list_entries.get('phantom')).toBeUndefined(); // phantom removed
     expect((await db.mutation_queue.get(1))?.status).toBe('failed');
     handle.stop();
+  });
+
+  it('reconciles a rejected add before dismissing its error state', async () => {
+    await db.list_meta.put({ id: LIST, name: 'L', current_revision: 5 });
+    await enqueueOp('phantom', 'add_item', 'active');
+
+    let snapshotGets = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url === '/api/items') return emptyCatalogueResponse();
+      if (url.startsWith('/api/list/')) {
+        snapshotGets += 1;
+        if (snapshotGets === 1) return new Response('unavailable', { status: 503 });
+        return new Response(
+          JSON.stringify({ id: LIST, name: 'L', current_revision: 5, entries: [] }),
+          { status: 200 }
+        );
+      }
+      return new Response('item not allowed', { status: 422 });
+    }) as unknown as typeof fetch;
+
+    const handle = startSync(LIST, { fetchFn, sse: { eventSourceFactory: () => fakeSse() } });
+    const unsubscribe = handle.status.subscribe(() => {});
+    try {
+      await handle.resync();
+      expect((await db.mutation_queue.get(1))?.status).toBe('failed');
+      expect(await db.list_entries.get('phantom')).toBeDefined();
+      await vi.waitFor(() =>
+        expect(get(handle.status)).toMatchObject({ state: 'error', failed: 1 })
+      );
+
+      await handle.dismissFailures();
+
+      expect(await db.list_entries.get('phantom')).toBeUndefined();
+      expect(await db.mutation_queue.get(1)).toBeUndefined();
+      await vi.waitFor(() =>
+        expect(get(handle.status)).toMatchObject({ state: 'synced', failed: 0, pending: 0 })
+      );
+    } finally {
+      unsubscribe();
+      handle.stop();
+    }
   });
 
   it('reverts a rejected mark_bought to the server-authoritative active row', async () => {
