@@ -8,6 +8,7 @@
 
 	import { page } from '$app/state';
 	import AddItemInput from '$lib/components/AddItemInput.svelte';
+	import BulkAddModal from '$lib/components/BulkAddModal.svelte';
 	import ListItem from '$lib/components/ListItem.svelte';
 	import AmbiguityModal, {
 		type CandidateItem
@@ -16,6 +17,7 @@
 		activeEntries,
 		basketEntries,
 		addItem,
+		addItems,
 		markBought,
 		markSkipped,
 		moveToList,
@@ -34,6 +36,10 @@
 
 	let basketOpen = $state(false);
 	let refreshing = $state(false);
+
+	// Bulk paste flow (issue #115): the modal parses pasted lines into editable
+	// proposals and, on confirm, queues the accepted batch through `addItems`.
+	let bulkOpen = $state(false);
 
 	// Server-rejected mutations surfaced by the sync engine. runSync has already
 	// reconciled the optimistic local state away/reverted for these, so the notice
@@ -179,12 +185,17 @@
 		</div>
 	{/if}
 
-	<AddItemInput
-		activeItems={$active}
-		onadd={async (text) => {
-			await addItem(listId, text);
-		}}
-	/>
+	<div class="add-tools">
+		<AddItemInput
+			activeItems={$active}
+			onadd={async (text) => {
+				await addItem(listId, text);
+			}}
+		/>
+		<button type="button" class="paste-list" onclick={() => (bulkOpen = true)}>
+			Paste a list
+		</button>
+	</div>
 
 	<ul class="entries">
 		{#each $active as entry (entry.id)}
@@ -234,6 +245,17 @@
 			onkeep={() => (clarifying = null)}
 		/>
 	{/if}
+
+	{#if bulkOpen}
+		<BulkAddModal
+			activeItems={$active}
+			onconfirm={async (items) => {
+				await addItems(listId, items);
+				bulkOpen = false;
+			}}
+			oncancel={() => (bulkOpen = false)}
+		/>
+	{/if}
 </main>
 
 <style>
@@ -244,6 +266,21 @@
 		display: flex;
 		flex-direction: column;
 		gap: 1rem;
+	}
+	.add-tools {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.paste-list {
+		align-self: flex-start;
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: #0f766e;
+		background: transparent;
+		border: 1px solid #0f766e;
+		border-radius: 0.4rem;
+		padding: 0.3rem 0.6rem;
 	}
 	.list-header {
 		display: flex;

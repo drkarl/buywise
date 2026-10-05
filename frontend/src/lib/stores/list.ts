@@ -109,6 +109,74 @@ async function buildMutation(
   };
 }
 
+/** One item to enqueue through the offline mutation queue (bulk-add input). */
+export interface NewItem {
+  rawText: string;
+  quantity?: number;
+}
+
+/**
+ * Adds a batch of items from raw text in ONE Dexie transaction: each gets a fresh
+ * `unresolved` active entry and a pending `add_item` mutation carrying its own
+ * stable `client_mutation_id`. That id is the server's idempotency key, so an
+ * offline confirm that is later replayed on reconnect can never add the same
+ * entry twice (design §11). Queuing the whole batch atomically keeps the local UI
+ * and the mutation queue from diverging part-way through, and a single
+ * `notifyMutationEnqueued` lets a running sync engine flush it in one drain.
+ *
+ * Used by the bulk paste flow; {@link addItem} is the single-item wrapper.
+ */
+export async function addItems(listId: string, items: NewItem[]): Promise<string[]> {
+  if (!listId) throw new Error('addItems: listId must not be empty');
+
+  const now = new Date().toISOString();
+  const entries: LocalListEntry[] = [];
+  const mutations: LocalMutation[] = [];
+
+  for (const item of items) {
+    const text = item.rawText.trim();
+    if (!text) throw new Error('addItems: rawText must not be empty');
+
+    // Clamp to a sane positive integer; the UI never sends < 1 but a programmatic
+    // caller could, and a non-positive (or non-finite) quantity is meaningless for
+    // an add. Mirrors `addItem`'s historical clamping, hardened for NaN/Infinity.
+    const floored = Math.floor(item.quantity ?? 1);
+    const quantity = Number.isFinite(floored) ? Math.max(1, floored) : 1;
+
+    const entryId = crypto.randomUUID();
+    entries.push({
+      id: entryId,
+      list_id: listId,
+      canonical_item_id: undefined,
+      resolution_status: 'unresolved',
+      raw_text: text,
+      display_name: text,
+      quantity,
+      status: 'active',
+      last_updated_revision: 0,
+      updated_at: now
+    });
+    mutations.push(
+      await buildMutation(listId, entryId, 'add_item', {
+        raw_text: text,
+        display_name: text,
+        quantity
+      })
+    );
+  }
+
+  if (entries.length === 0) return [];
+
+  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
+    await db.list_entries.bulkAdd(entries);
+    await db.mutation_queue.bulkAdd(mutations);
+  });
+
+  // Committed — let a running sync engine flush the batch now.
+  notifyMutationEnqueued(listId);
+  return entries.map((entry) => entry.id);
+}
+
 /**
  * Adds an item from raw text. `quantity` defaults to 1. Optimistically inserts
  * an `unresolved` active entry and enqueues an `add_item` mutation, both inside
@@ -119,43 +187,7 @@ export async function addItem(
   rawText: string,
   quantity = 1
 ): Promise<string> {
-  const text = rawText.trim();
-  if (!text) throw new Error('addItem: rawText must not be empty');
-  if (!listId) throw new Error('addItem: listId must not be empty');
-
-  // Clamp to a sane positive integer; the UI never sends < 1 but a programmatic
-  // caller could, and a non-positive quantity is meaningless for an add.
-  const safeQuantity = Math.max(1, Math.floor(quantity));
-
-  const entryId = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  const entry: LocalListEntry = {
-    id: entryId,
-    list_id: listId,
-    canonical_item_id: undefined,
-    resolution_status: 'unresolved',
-    raw_text: text,
-    display_name: text,
-    quantity: safeQuantity,
-    status: 'active',
-    last_updated_revision: 0,
-    updated_at: now
-  };
-
-  const mutation = await buildMutation(listId, entryId, 'add_item', {
-    raw_text: text,
-    display_name: text,
-    quantity: safeQuantity
-  });
-
-  await db.transaction('rw', db.list_entries, db.mutation_queue, async () => {
-    await db.list_entries.add(entry);
-    await db.mutation_queue.add(mutation);
-  });
-
-  // Committed — let a running sync engine flush it now.
-  notifyMutationEnqueued(listId);
+  const [entryId] = await addItems(listId, [{ rawText, quantity }]);
   return entryId;
 }
 

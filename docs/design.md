@@ -558,6 +558,7 @@ Offline capabilities:
 - Check off items
 - Mark skipped
 - Add new items (queued as mutations)
+- Paste a multi-line list to preview, edit and add several items at once (queued as mutations)
 - Add quick notes
 
 Service worker caches the SvelteKit app shell. Dexie holds the local list mirror and mutation queue. On reconnect, the mutation queue drains against the server in order.
