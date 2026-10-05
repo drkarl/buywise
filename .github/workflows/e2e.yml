@@ -1,11 +1,12 @@
 # Playwright end-to-end suite for the P2-T4 client sync loop (issue #63).
 #
-# The repo has no pre-existing CI, so this is a self-contained workflow: it
-# builds the Rust backend (which serves BOTH the JSON API and the built SPA on
-# one origin), builds the SvelteKit SPA, installs the Playwright browser, and
-# runs the two-context offline/reconnect sync specs. `e2e/run-server.sh` (the
-# Playwright `webServer`) boots the release `buywise-api` on a fresh SQLite file,
-# lets it migrate, and seeds a user + household + list (the backend has no
+# This workflow complements `.github/workflows/ci.yml` with browser-level
+# coverage. It builds the Rust backend (which serves BOTH the JSON API and the
+# built SPA on one origin), builds the SvelteKit SPA, installs the Playwright
+# browser, and runs the two-context offline/reconnect sync specs.
+# `e2e/run-server.sh` (the Playwright `webServer`) boots the release
+# `buywise-api` on a fresh SQLite file, lets it migrate, and seeds a user +
+# household + list (the backend has no
 # register endpoint — see e2e/seed.sh), so no separate DB service is needed.
 name: e2e
 
