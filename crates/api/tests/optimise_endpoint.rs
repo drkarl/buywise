@@ -466,13 +466,11 @@ async fn optimise_returns_four_plans_persists_run_and_explains() {
     }
     for entry in explanations {
         let reasons = entry["reasons"].as_array().expect("reasons array");
+        assert!(!reasons.is_empty(), "plan {} has no reasons", entry["plan"]);
         assert!(
-            !reasons.is_empty(),
-            "plan {} has no reasons",
-            entry["plan"]
-        );
-        assert!(
-            reasons.iter().all(|r| r.as_str().is_some_and(|s| !s.is_empty())),
+            reasons
+                .iter()
+                .all(|r| r.as_str().is_some_and(|s| !s.is_empty())),
             "empty reason text for {}",
             entry["plan"]
         );
@@ -493,7 +491,10 @@ async fn optimise_returns_four_plans_persists_run_and_explains() {
     // subtotal covers two of the three basket lines (the ambiguous one is not).
     assert!(joined.contains("Tesco"), "got: {joined}");
     assert!(joined.contains("Dairy"), "got: {joined}");
-    assert!(joined.contains("Prices 2 of 3 basket items"), "got: {joined}");
+    assert!(
+        joined.contains("Prices 2 of 3 basket items"),
+        "got: {joined}"
+    );
     assert!(joined.contains("Prices as of 2026-06-01"), "got: {joined}");
 
     // offer_snapshot_date is the latest among the recommended plan's offers.
