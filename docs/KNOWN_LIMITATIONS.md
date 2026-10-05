@@ -216,16 +216,17 @@ issue #108.
 ### 2. Matching does not bump the list revision
 
 **What happens.** `needs_match` (issue #108) is computed for list snapshots and current mutation
-entities. However, `POST /api/match-feedback` writes `product_matches`, not `list_entries`, so a
-match decision emits no SSE `mutation` event. After a household matches an item, the list row's
-"Match" prompt clears only on the next full snapshot (a navigation/reload or a resync), not
-immediately.
+entities. The preferences flow explicitly reconciles its linked list after a successful match
+decision. However, `POST /api/match-feedback` writes `product_matches`, not `list_entries`, so a
+match decision emits no SSE `mutation` event; other connected clients can keep a stale prompt until
+they fetch and apply an authoritative snapshot.
 
 **Why accepted.** Matching is a catalogue-level, online action independent of the offline list
 mutation stream; folding it into the list revision would couple two separate pipelines for a
 cosmetic refresh.
 
-**Workaround.** Reload the list (or navigate away and back) to refresh the prompt.
+**Workaround.** Make the decision from the item's preferences page to refresh the linked list on
+that client. Ordinary navigation does not guarantee a refresh on other clients.
 
 **Follow-up.** Bump the list revision or otherwise refresh match coverage when a match decision
 changes, so the prompt updates live.

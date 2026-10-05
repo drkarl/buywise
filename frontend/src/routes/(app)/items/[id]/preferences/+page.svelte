@@ -25,6 +25,7 @@
 		type SubstitutionPolicy
 	} from '$lib/api/preferences';
 	import { formatEuros, retailerLabel, sendMatchFeedback } from '$lib/api/optimise';
+	import { fetchSnapshot } from '$lib/sync';
 
 	const canonicalItemId = $derived(page.params.id ?? '');
 	/** The list to return to, threaded through from the list/optimise links. */
@@ -153,6 +154,7 @@
 				action
 			});
 			if (ok) {
+				if (returnListId) await fetchSnapshot(returnListId, fetch, { reconcile: true });
 				applyPreferences(await fetchPreferences(canonicalItemId));
 			} else {
 				saveError = 'Couldn’t save your product choice. Please try again.';

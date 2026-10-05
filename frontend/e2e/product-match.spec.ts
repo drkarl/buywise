@@ -46,12 +46,27 @@ test('matching an unmatched item makes it priced on the next optimisation', asyn
 		await expect(page.locator('section[aria-label="Products"]')).toContainText(
 			'Tesco Basmati Rice 1kg'
 		);
+		await page.goto(`/list/${MATCH_LIST}`);
+		await expect(
+			page.getByRole('link', { name: 'Preferences for Basmati rice' })
+		).toBeVisible();
 
 		// After matching, nothing is left out of the totals and the item is priced.
 		await page.goto(`/list/${MATCH_LIST}/optimise`);
 		await expect(page.locator('section.unresolved')).toHaveCount(0);
 		await expect(page.getByText('Basmati rice').first()).toBeVisible();
 		await expect(page.getByText('€2.49').first()).toBeVisible();
+
+		// Undoing the match makes the prompt return on the linked list.
+		await page.goto(PREFERENCES_PATH);
+		const heinz = page.locator('section[aria-label="Products"] li.product', {
+			hasText: 'Tesco Basmati Rice 1kg'
+		});
+		await heinz.getByRole('button', { name: 'Undo' }).click();
+		await page.goto(`/list/${MATCH_LIST}`);
+		await expect(
+			page.getByRole('link', { name: 'Match a product to Basmati rice' })
+		).toBeVisible();
 	} finally {
 		await context.close();
 	}
