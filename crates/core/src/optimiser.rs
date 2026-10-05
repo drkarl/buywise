@@ -39,7 +39,7 @@
 //! a price. Size comparison (the ±20% band) is the only place `f64` appears, and
 //! only for the dimensionless size values that already live as `REAL` columns.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -484,6 +484,110 @@ pub struct NeedsConfirmationItem {
     pub candidates: Vec<CandidateOffer>,
 }
 
+/// Which published plan a [`PlanReason`] belongs to. The serde names match the
+/// plan fields on [`OptimiserOutput`] so a caller can group reasons by the card
+/// it renders (issue #103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanKind {
+    /// [`OptimiserOutput::recommended`].
+    Recommended,
+    /// [`OptimiserOutput::best_single`].
+    BestSingle,
+    /// [`OptimiserOutput::best_two_store`].
+    BestTwoStore,
+    /// [`OptimiserOutput::theoretical_minimum`] (a benchmark, never routed).
+    TheoreticalMinimum,
+}
+
+/// Stable machine-readable code for a [`PlanReason`].
+///
+/// The code carries the *meaning*; the human sentence is rendered by the caller
+/// (category names and euro formatting are presentation concerns the pure core
+/// does not own). Callers must tolerate codes they do not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    /// `item_indices` are priced at `retailers[0]`, the cheapest *eligible* store
+    /// for each of them (the store the theoretical minimum would choose).
+    CheapestAtStore,
+    /// `item_indices` are priced only at `retailers[0]`; no other eligible store
+    /// has a qualifying price on record for them. Absence of a price elsewhere is
+    /// not proof the item is out of stock — only that we have no known price.
+    OnlyStoreStocking,
+    /// `item_indices` carry a brand constraint (policy or brand lists), so the
+    /// store's qualifying product is the one the household's brand rule allows.
+    BrandRule,
+    /// Plan-wide coverage: `item_indices` are the lines this plan prices and
+    /// `cents` is its total. Always present when the plan has lines, so a subtotal
+    /// never looks like a complete basket.
+    Coverage,
+    /// `item_indices` have a known price elsewhere but none at this plan's stores.
+    /// This is *no known price here*, not proof of unavailability in-store.
+    NoKnownPriceHere,
+    /// `item_indices` resolved but no eligible store yielded a qualifying offer.
+    NoKnownPriceAnywhere,
+    /// `item_indices` could not be resolved to a catalogue item at all.
+    UnresolvedItems,
+    /// `item_indices` are lines at `retailers` whose price is not from the latest
+    /// successful source run.
+    StalePrices,
+    /// `snapshot_date` is the oldest known source snapshot date among this
+    /// plan's offers. `item_indices` lists plan lines with no recorded date.
+    PriceAsOf,
+    /// The recommended two-store split's saving (`cents`) clears the convenience
+    /// bar (`threshold_cents`) for the store(s) it adds in `retailers`.
+    ThresholdCleared,
+    /// The best split would have saved `cents`, below the `threshold_cents` bar,
+    /// so the single store was kept. `retailers` are the stores it would add.
+    ThresholdNotCleared,
+    /// The best split would drop `item_indices`, so the more complete single
+    /// store was kept. `retailers` are the stores it would add.
+    SplitDropsItems,
+    /// The recommended split reaches `item_indices` the best single store cannot,
+    /// which is why the extra stop is worth it even below the saving bar.
+    MoreComplete,
+    /// A whole-store alternative `retailers[0]` was considered; `cents` is
+    /// `plan.total − that_store_alone.total` (positive: the store alone is
+    /// cheaper; negative: it would cost that much more). Only emitted when the two
+    /// plans price the same coverage, so the figures are like-for-like.
+    RejectedStore,
+    /// `retailers[0]` alone would price a different set of items, so its total
+    /// is not comparable with this plan's; no saving is reported.
+    CoverageDiffers,
+    /// `retailers[0]` is switched off in the household's store settings, so it is
+    /// never planned for.
+    StoreOff,
+    /// `retailers[0]` is an occasional store not marked for today's trip, so it is
+    /// left out of this run.
+    StoreNotOnTrip,
+}
+
+/// One deterministic, plan-specific reason explaining a plan (issue #103).
+///
+/// A reason is a structured fact, never free text: it names the basket items and
+/// retailers it covers, the money it quantifies, the convenience bar it compares
+/// against, and the price date it refers to. It is derived purely from the plan's
+/// actual lines plus the run's constraints, threshold and known price dates, so
+/// it is reproducible and traceable (no LLM, no randomness).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanReason {
+    /// The plan card this reason explains.
+    pub plan: PlanKind,
+    /// What the reason means (see [`ReasonCode`]).
+    pub code: ReasonCode,
+    /// Basket item indices this reason covers (empty = plan-wide).
+    pub item_indices: Vec<usize>,
+    /// Retailers this reason refers to; semantics depend on the code.
+    pub retailers: Vec<Retailer>,
+    /// Money this reason quantifies (saving, overspend, or plan total), in cents.
+    pub cents: Option<Cents>,
+    /// The convenience bar this reason compares against, in cents, when relevant.
+    pub threshold_cents: Option<Cents>,
+    /// ISO-8601 source snapshot date this reason refers to, when relevant.
+    pub snapshot_date: Option<String>,
+}
+
 /// The full optimiser result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimiserOutput {
@@ -509,6 +613,10 @@ pub struct OptimiserOutput {
     /// their `substitution_policy = 'ask'` (Backlog-T1). Excluded from every
     /// plan and from all totals until the household chooses.
     pub needs_confirmation_items: Vec<NeedsConfirmationItem>,
+    /// Deterministic, plan-specific reasons for all four published plans (issue
+    /// #103), ordered most-important-first within each [`PlanKind`]. Callers
+    /// render up to four per plan card.
+    pub reasons: Vec<PlanReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +786,24 @@ pub struct CorePlans {
     pub theoretical_minimum: Option<StorePlan>,
 }
 
+/// The pure core's full computation, retained so [`build_reasons`] can explain
+/// the chosen plans from the same inputs without recomputing them.
+struct CoreComputation {
+    /// The three ranked plans.
+    plans: CorePlans,
+    /// Every genuine two-store candidate (spans exactly two stores), for the
+    /// recommendation's threshold comparison.
+    two_store_candidates: Vec<StorePlan>,
+    /// Every eligible single-store plan, one per store, for the "rejected store"
+    /// reasons (the best is `plans.best_single`).
+    single_plans: Vec<StorePlan>,
+    /// Cheapest candidate per (item, retailer) — the source of truth for a
+    /// line's offer date and for which eligible stores price an item at all.
+    best_per_item: BTreeMap<usize, HashMap<Retailer, Candidate>>,
+    /// Basket item indices with at least one candidate anywhere.
+    priced_items: Vec<usize>,
+}
+
 /// Run the optimiser over already-fetched, constraint-passing candidate data.
 ///
 /// This is the pure, database-free core. [`optimise`] is the thin wrapper that
@@ -697,14 +823,14 @@ pub fn optimise_core(
     candidates: &[Candidate],
     no_offer_count: usize,
 ) -> CorePlans {
-    optimise_core_with_candidates(input, candidates, no_offer_count).0
+    optimise_core_with_candidates(input, candidates, no_offer_count).plans
 }
 
 fn optimise_core_with_candidates(
     input: &OptimiserInput,
     candidates: &[Candidate],
     no_offer_count: usize,
-) -> (CorePlans, Vec<StorePlan>) {
+) -> CoreComputation {
     // Group candidates by item, keeping the cheapest per (item, retailer).
     // Map: item_index -> retailer -> best candidate.
     let mut best_per_item_retailer: BTreeMap<usize, HashMap<Retailer, Candidate>> = BTreeMap::new();
@@ -748,7 +874,7 @@ fn optimise_core_with_candidates(
             )
         })
         .collect();
-    let best_single = pick_best_plan(single_plans);
+    let best_single = pick_best_plan(single_plans.clone());
 
     // ---- Two-store plans: every unordered pair, each item taken at whichever of
     // the two stores is cheaper. Ranked by the same fulfilment rule, but only
@@ -778,18 +904,21 @@ fn optimise_core_with_candidates(
         no_offer_count,
     );
 
-    let genuine_two_store_candidates = two_store_plans
+    let genuine_two_store_candidates: Vec<StorePlan> = two_store_plans
         .into_iter()
         .filter(|plan| plan.stores.len() == 2)
         .collect();
-    (
-        CorePlans {
+    CoreComputation {
+        plans: CorePlans {
             best_single,
             best_two_store,
             theoretical_minimum,
         },
-        genuine_two_store_candidates,
-    )
+        two_store_candidates: genuine_two_store_candidates,
+        single_plans,
+        best_per_item: best_per_item_retailer,
+        priced_items,
+    }
 }
 
 /// Whether candidate `a` is strictly preferable to `b` for the same item, using
@@ -942,10 +1071,19 @@ fn build_theoretical_minimum(
         // The globally cheapest candidate for this item among eligible stores.
         // An ineligible store (off, or occasional without a trip today) is never
         // routed, so it cannot appear in the benchmark either (issue #98).
+        //
+        // The final retailer tie-break keeps the choice independent of HashMap
+        // iteration order: the benchmark names one store per item, and the reasons
+        // derived from it must be reproducible run to run (issue #103).
         let cheapest = by_retailer
             .values()
             .filter(|c| input.is_eligible(c.retailer))
-            .reduce(|acc, c| if is_cheaper(c, acc) { c } else { acc });
+            .min_by(|a, b| {
+                a.effective_unit_price()
+                    .cmp(&b.effective_unit_price())
+                    .then_with(|| b.accepted.cmp(&a.accepted))
+                    .then_with(|| a.retailer.as_db_str().cmp(b.retailer.as_db_str()))
+            });
         let Some(cheapest) = cheapest else {
             // No eligible store prices this item; it is missing from the
             // benchmark (and counted missing via `priced_items.len()`).
@@ -1051,8 +1189,51 @@ fn dunnes_voucher_text(lines: &[PlanLine]) -> Option<String> {
     }
 }
 
+/// A two-store split that was considered but not recommended, with the facts the
+/// reason generator needs to explain the rejection.
+#[derive(Debug, Clone, PartialEq)]
+struct RejectedSplit {
+    /// Stores the split would add beyond the chosen single-store plan.
+    stores: Vec<Retailer>,
+    /// Items the chosen single-store plan prices that the split would drop.
+    dropped_items: Vec<usize>,
+    /// `single.total − split.total`: positive means the split is cheaper.
+    saving_cents: Cents,
+    /// The effective convenience bar the split failed to clear. Only meaningful
+    /// when the split prices the same items (otherwise coverage, not cost,
+    /// decided and no like-for-like saving may be reported).
+    threshold_cents: Cents,
+    /// The split prices exactly the same items as the single store, so its total
+    /// is directly comparable (a like-for-like saving).
+    same_items: bool,
+    /// The split reaches fewer items than the single-store plan.
+    less_complete: bool,
+}
+
+/// The recommendation plus the decision context the reason generator needs.
+///
+/// Kept separate from the wire-facing [`Recommendation`] so the extra explanation
+/// inputs (effective bar, rejected split, gained items) never leak into the
+/// persisted plan JSON or the API contract.
+#[derive(Debug, Clone, PartialEq)]
+struct RecommendationDecision {
+    /// The chosen recommendation, or `None` when no plan could be priced.
+    recommendation: Option<Recommendation>,
+    /// The effective second-store bar applied to the decisive comparison, in
+    /// cents (the lower nearby bar when a nearby store was added).
+    threshold_cents: Cents,
+    /// True when that bar is the lower nearby one (`threshold_cents` below the
+    /// household's stored bar).
+    nearby_applied: bool,
+    /// The best split that was rejected, when the single store was recommended.
+    rejected_split: Option<RejectedSplit>,
+    /// Items the recommended split reaches that the best single store cannot —
+    /// why an extra stop is worth it even when the saving is below the bar.
+    gained_items: Vec<usize>,
+}
+
 /// Apply the convenience threshold to choose between the best single store and
-/// the best two-store split.
+/// the best two-store split, and record why the alternative lost.
 ///
 /// Completeness comes first: a two-store split is only ever preferred when it is
 /// *at least as complete* as the single store (`missing_count` no greater). Only
@@ -1062,76 +1243,651 @@ fn dunnes_voucher_text(lines: &[PlanLine]) -> Option<String> {
 ///
 /// `nearby` lists the retailers the household marked as close by (issue #98).
 /// The lower bar applies only to stores added beyond the single-store plan.
-fn recommend(
-    best_single: Option<StorePlan>,
-    best_two_store: Option<StorePlan>,
-    two_store_candidates: Vec<StorePlan>,
+fn decide_recommendation(
+    plans: &CorePlans,
+    two_store_candidates: &[StorePlan],
     threshold_2_cents: Cents,
     nearby: &[Retailer],
-) -> Option<Recommendation> {
-    match (best_single, best_two_store) {
+) -> RecommendationDecision {
+    // The nearby-aware bar for a split relative to the chosen single store, and
+    // whether the lower nearby bar is the one in force.
+    let bar_for = |single: &StorePlan, two: &StorePlan| -> (Cents, bool) {
+        let added_store_is_nearby = two
+            .stores
+            .iter()
+            .filter(|store| !single.stores.contains(store))
+            .any(|store| nearby.contains(store));
+        if added_store_is_nearby {
+            (threshold_2_cents.min(NEARBY_THRESHOLD_2_CENTS), true)
+        } else {
+            (threshold_2_cents, false)
+        }
+    };
+
+    match (&plans.best_single, &plans.best_two_store) {
         (Some(single), Some(best_two)) => {
             let best_saving = single.total_cents - best_two.total_cents;
             let qualifying_two = two_store_candidates
-                .into_iter()
+                .iter()
                 .filter_map(|two| {
                     let saving = single.total_cents - two.total_cents;
                     let more_complete = two.missing_count < single.missing_count;
                     let equal_complete = two.missing_count == single.missing_count;
-                    let added_store_is_nearby = two
-                        .stores
-                        .iter()
-                        .filter(|store| !single.stores.contains(store))
-                        .any(|store| nearby.contains(store));
-                    let threshold = if added_store_is_nearby {
-                        threshold_2_cents.min(NEARBY_THRESHOLD_2_CENTS)
-                    } else {
-                        threshold_2_cents
-                    };
-                    let clears_threshold = saving > threshold;
+                    let single_items: BTreeSet<usize> =
+                        single.lines.iter().map(|l| l.item_index).collect();
+                    let two_items: BTreeSet<usize> =
+                        two.lines.iter().map(|l| l.item_index).collect();
+                    let same_items = single_items == two_items;
+                    let (threshold, nearby_applied) = bar_for(single, two);
+                    let clears_threshold = same_items && saving > threshold;
                     (more_complete || (equal_complete && clears_threshold)).then_some((
                         two,
                         saving,
                         equal_complete && clears_threshold,
+                        threshold,
+                        nearby_applied,
+                        same_items,
                     ))
                 })
-                .min_by(|(a, _, _), (b, _, _)| {
+                .min_by(|(a, ..), (b, ..)| {
                     a.missing_count
                         .cmp(&b.missing_count)
                         .then(a.total_cents.cmp(&b.total_cents))
                 });
 
-            if let Some((plan, saving, clears_convenience_threshold)) = qualifying_two {
-                Some(Recommendation {
-                    kind: RecommendedKind::TwoStore,
-                    plan,
-                    clears_convenience_threshold,
-                    two_store_saving_cents: saving,
-                })
+            if let Some((two, saving, clears, threshold, nearby_applied, same_items)) =
+                qualifying_two
+            {
+                let gained_items: Vec<usize> = two
+                    .lines
+                    .iter()
+                    .map(|l| l.item_index)
+                    .filter(|i| !single.lines.iter().any(|sl| sl.item_index == *i))
+                    .collect();
+                RecommendationDecision {
+                    recommendation: Some(Recommendation {
+                        kind: RecommendedKind::TwoStore,
+                        plan: two.clone(),
+                        clears_convenience_threshold: clears,
+                        two_store_saving_cents: if same_items { saving } else { 0 },
+                    }),
+                    threshold_cents: threshold,
+                    nearby_applied,
+                    rejected_split: None,
+                    gained_items: if clears { Vec::new() } else { gained_items },
+                }
             } else {
-                Some(Recommendation {
-                    kind: RecommendedKind::SingleStore,
-                    plan: single,
-                    clears_convenience_threshold: false,
-                    two_store_saving_cents: best_saving,
-                })
+                let (threshold, nearby_applied) = bar_for(single, best_two);
+                let single_items: BTreeSet<usize> =
+                    single.lines.iter().map(|l| l.item_index).collect();
+                let two_items: BTreeSet<usize> =
+                    best_two.lines.iter().map(|l| l.item_index).collect();
+                let dropped_items: Vec<usize> =
+                    single_items.difference(&two_items).copied().collect();
+                let added_stores: Vec<Retailer> = best_two
+                    .stores
+                    .iter()
+                    .copied()
+                    .filter(|store| !single.stores.contains(store))
+                    .collect();
+                RecommendationDecision {
+                    recommendation: Some(Recommendation {
+                        kind: RecommendedKind::SingleStore,
+                        plan: single.clone(),
+                        clears_convenience_threshold: false,
+                        two_store_saving_cents: if single_items == two_items {
+                            best_saving
+                        } else {
+                            0
+                        },
+                    }),
+                    threshold_cents: threshold,
+                    nearby_applied,
+                    rejected_split: Some(RejectedSplit {
+                        stores: added_stores,
+                        dropped_items,
+                        saving_cents: if single_items == two_items {
+                            best_saving
+                        } else {
+                            0
+                        },
+                        threshold_cents: threshold,
+                        same_items: single_items == two_items,
+                        less_complete: best_two.missing_count > single.missing_count,
+                    }),
+                    gained_items: Vec::new(),
+                }
             }
         }
-        (Some(single), None) => Some(Recommendation {
-            kind: RecommendedKind::SingleStore,
-            // No two-store option: saving is undefined; report 0.
-            two_store_saving_cents: 0,
-            plan: single,
-            clears_convenience_threshold: false,
-        }),
-        (None, Some(two)) => Some(Recommendation {
-            kind: RecommendedKind::TwoStore,
-            two_store_saving_cents: 0,
-            plan: two,
-            clears_convenience_threshold: false,
-        }),
-        (None, None) => None,
+        (Some(single), None) => RecommendationDecision {
+            recommendation: Some(Recommendation {
+                kind: RecommendedKind::SingleStore,
+                // No two-store option: saving is undefined; report 0.
+                two_store_saving_cents: 0,
+                plan: single.clone(),
+                clears_convenience_threshold: false,
+            }),
+            threshold_cents: threshold_2_cents,
+            nearby_applied: false,
+            rejected_split: None,
+            gained_items: Vec::new(),
+        },
+        (None, Some(two)) => RecommendationDecision {
+            recommendation: Some(Recommendation {
+                kind: RecommendedKind::TwoStore,
+                two_store_saving_cents: 0,
+                plan: two.clone(),
+                clears_convenience_threshold: false,
+            }),
+            threshold_cents: threshold_2_cents,
+            nearby_applied: false,
+            rejected_split: None,
+            gained_items: Vec::new(),
+        },
+        (None, None) => RecommendationDecision {
+            recommendation: None,
+            threshold_cents: threshold_2_cents,
+            nearby_applied: false,
+            rejected_split: None,
+            gained_items: Vec::new(),
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plan reasons (issue #103)
+// ---------------------------------------------------------------------------
+
+/// Construct one [`PlanReason`] (keeps the call sites readable).
+#[allow(clippy::too_many_arguments)]
+fn reason(
+    plan: PlanKind,
+    code: ReasonCode,
+    item_indices: Vec<usize>,
+    retailers: Vec<Retailer>,
+    cents: Option<Cents>,
+    threshold_cents: Option<Cents>,
+    snapshot_date: Option<String>,
+) -> PlanReason {
+    PlanReason {
+        plan,
+        code,
+        item_indices,
+        retailers,
+        cents,
+        threshold_cents,
+        snapshot_date,
+    }
+}
+
+/// The eligible stores that price `item`, in `as_db_str` order. Empty when the
+/// item has no candidate at all.
+fn eligible_stores_for(
+    input: &OptimiserInput,
+    best_per_item: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
+    item: usize,
+) -> Vec<Retailer> {
+    let mut stores: Vec<Retailer> = best_per_item
+        .get(&item)
+        .map(|by_retailer| {
+            by_retailer
+                .keys()
+                .copied()
+                .filter(|r| input.is_eligible(*r))
+                .collect()
+        })
+        .unwrap_or_default();
+    stores.sort_by_key(|r| r.as_db_str());
+    stores
+}
+
+/// Whether `item` carries a brand constraint (policy or brand lists), so a plan
+/// line for it is explained by the household's brand rule.
+fn has_brand_rule(item: &BasketItem) -> bool {
+    matches!(
+        item.constraint_policy,
+        ConstraintPolicy::Brand | ConstraintPolicy::AllowedSet | ConstraintPolicy::OwnLabel
+    ) || item.constraints.as_ref().is_some_and(|c| {
+        c.brand.is_some()
+            || c.allowed_brands.as_ref().is_some_and(|b| !b.is_empty())
+            || c.excluded_brands.as_ref().is_some_and(|b| !b.is_empty())
+    })
+}
+
+/// Stores in `stores` that are not part of the single-store baseline — the stops
+/// a split would add.
+fn added_stores(
+    stores: impl Iterator<Item = Retailer>,
+    single: Option<&StorePlan>,
+) -> Vec<Retailer> {
+    let single_stores: &[Retailer] = single.map(|p| p.stores.as_slice()).unwrap_or(&[]);
+    stores.filter(|s| !single_stores.contains(s)).collect()
+}
+
+/// Shared inputs for per-plan reason generation.
+struct ReasonContext<'a> {
+    input: &'a OptimiserInput,
+    comp: &'a CoreComputation,
+    decision: &'a RecommendationDecision,
+    classification: &'a Classification,
+    /// Item → globally cheapest eligible store (from the theoretical minimum).
+    theo_store: BTreeMap<usize, Retailer>,
+}
+
+/// Build the deterministic reasons for all published plans (issue #103).
+///
+/// Each plan's reasons are ordered most-important-first.
+/// Reasons are derived from the plan's actual lines plus the run's
+/// constraints, threshold and known price dates, so they are traceable and
+/// reproducible — never generated text.
+fn build_reasons(
+    input: &OptimiserInput,
+    comp: &CoreComputation,
+    decision: &RecommendationDecision,
+    classification: &Classification,
+) -> Vec<PlanReason> {
+    let theo_store: BTreeMap<usize, Retailer> = comp
+        .plans
+        .theoretical_minimum
+        .as_ref()
+        .map(|p| p.lines.iter().map(|l| (l.item_index, l.retailer)).collect())
+        .unwrap_or_default();
+    let ctx = ReasonContext {
+        input,
+        comp,
+        decision,
+        classification,
+        theo_store,
+    };
+
+    let mut reasons: Vec<PlanReason> = Vec::new();
+    if let Some(rec) = decision.recommendation.as_ref() {
+        reasons.extend(reasons_for_plan(PlanKind::Recommended, &rec.plan, &ctx));
+    }
+    if let Some(plan) = comp.plans.best_single.as_ref() {
+        reasons.extend(reasons_for_plan(PlanKind::BestSingle, plan, &ctx));
+    }
+    if let Some(plan) = comp.plans.best_two_store.as_ref() {
+        reasons.extend(reasons_for_plan(PlanKind::BestTwoStore, plan, &ctx));
+    }
+    if let Some(plan) = comp.plans.theoretical_minimum.as_ref() {
+        reasons.extend(reasons_for_plan(PlanKind::TheoreticalMinimum, plan, &ctx));
+    }
+    reasons
+}
+
+/// The ordered reasons for one plan. See [`build_reasons`] for the contract.
+fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Vec<PlanReason> {
+    let mut out: Vec<PlanReason> = Vec::new();
+    let single = ctx.comp.plans.best_single.as_ref();
+    let line_items: BTreeSet<usize> = plan.lines.iter().map(|l| l.item_index).collect();
+
+    // ---- Why this plan was chosen (the recommendation card only). ----------
+    if kind == PlanKind::Recommended {
+        if let Some(rec) = ctx.decision.recommendation.as_ref() {
+            match rec.kind {
+                RecommendedKind::TwoStore => {
+                    let added = added_stores(rec.plan.stores.iter().copied(), single);
+                    if rec.clears_convenience_threshold {
+                        out.push(reason(
+                            kind,
+                            ReasonCode::ThresholdCleared,
+                            Vec::new(),
+                            added,
+                            Some(rec.two_store_saving_cents),
+                            Some(ctx.decision.threshold_cents),
+                            None,
+                        ));
+                    } else if !ctx.decision.gained_items.is_empty() {
+                        // Chosen below the bar because it reaches items the single
+                        // store cannot — the extra stop buys completeness, not cost.
+                        out.push(reason(
+                            kind,
+                            ReasonCode::MoreComplete,
+                            ctx.decision.gained_items.clone(),
+                            added,
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+                RecommendedKind::SingleStore => {
+                    if let Some(rejected) = ctx.decision.rejected_split.as_ref() {
+                        if rejected.less_complete && !rejected.dropped_items.is_empty() {
+                            out.push(reason(
+                                kind,
+                                ReasonCode::SplitDropsItems,
+                                rejected.dropped_items.clone(),
+                                rejected.stores.clone(),
+                                None,
+                                None,
+                                None,
+                            ));
+                        } else if rejected.same_items {
+                            // Like-for-like: the same items, so the saving is honest.
+                            out.push(reason(
+                                kind,
+                                ReasonCode::ThresholdNotCleared,
+                                Vec::new(),
+                                rejected.stores.clone(),
+                                Some(rejected.saving_cents),
+                                Some(rejected.threshold_cents),
+                                None,
+                            ));
+                        } else {
+                            // Equal counts are not the same basket: no saving claim.
+                            out.push(reason(
+                                kind,
+                                ReasonCode::CoverageDiffers,
+                                Vec::new(),
+                                rejected.stores.clone(),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Which stores are cheapest for which of the plan's lines. ----------
+    for &retailer in &plan.stores {
+        let cheapest: Vec<usize> = plan
+            .lines
+            .iter()
+            .filter(|l| l.retailer == retailer)
+            .map(|l| l.item_index)
+            .filter(|i| {
+                // Only when a rival store could have stocked it: otherwise the
+                // stronger "only store we have a price for" reason covers it.
+                ctx.theo_store.get(i) == Some(&retailer)
+                    && eligible_stores_for(ctx.input, &ctx.comp.best_per_item, *i).len() > 1
+            })
+            .collect();
+        if !cheapest.is_empty() {
+            out.push(reason(
+                kind,
+                ReasonCode::CheapestAtStore,
+                cheapest,
+                vec![retailer],
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+
+    // ---- Lines only one eligible store prices at all. ----------------------
+    for &retailer in &plan.stores {
+        let only: Vec<usize> = plan
+            .lines
+            .iter()
+            .filter(|l| l.retailer == retailer)
+            .map(|l| l.item_index)
+            .filter(|i| {
+                let stores = eligible_stores_for(ctx.input, &ctx.comp.best_per_item, *i);
+                stores.len() == 1 && stores[0] == retailer
+            })
+            .collect();
+        if !only.is_empty() {
+            out.push(reason(
+                kind,
+                ReasonCode::OnlyStoreStocking,
+                only,
+                vec![retailer],
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+
+    // ---- Coverage: how much of the basket this plan actually prices. -------
+    out.push(reason(
+        kind,
+        ReasonCode::Coverage,
+        plan.lines.iter().map(|l| l.item_index).collect(),
+        plan.stores.clone(),
+        Some(plan.total_cents),
+        None,
+        None,
+    ));
+
+    // ---- Items this plan cannot price, distinguishing the two cases. -------
+    let missing_here: Vec<usize> = ctx
+        .comp
+        .priced_items
+        .iter()
+        .copied()
+        .filter(|i| !line_items.contains(i))
+        .collect();
+    if !missing_here.is_empty() {
+        out.push(reason(
+            kind,
+            ReasonCode::NoKnownPriceHere,
+            missing_here,
+            plan.stores.clone(),
+            None,
+            None,
+            None,
+        ));
+    }
+    let no_offer: Vec<usize> = ctx
+        .classification
+        .no_valid_offer
+        .iter()
+        .map(|i| i.item_index)
+        .collect();
+    if !no_offer.is_empty() {
+        out.push(reason(
+            kind,
+            ReasonCode::NoKnownPriceAnywhere,
+            no_offer,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+    }
+    let unresolved: Vec<usize> = ctx
+        .classification
+        .unresolved
+        .iter()
+        .map(|i| i.item_index)
+        .collect();
+    if !unresolved.is_empty() {
+        out.push(reason(
+            kind,
+            ReasonCode::UnresolvedItems,
+            unresolved,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+    }
+
+    // ---- Lines governed by the household's brand rule. ---------------------
+    let brand_items: Vec<usize> = plan
+        .lines
+        .iter()
+        .map(|l| l.item_index)
+        .filter(|i| ctx.input.items.get(*i).is_some_and(has_brand_rule))
+        .collect();
+    if !brand_items.is_empty() {
+        out.push(reason(
+            kind,
+            ReasonCode::BrandRule,
+            brand_items,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+    }
+
+    // ---- Whole-store alternatives considered and rejected. -----------------
+    if matches!(kind, PlanKind::Recommended | PlanKind::BestSingle) {
+        for single_plan in &ctx.comp.single_plans {
+            let Some(&retailer) = single_plan.stores.first() else {
+                continue;
+            };
+            if plan.stores.contains(&retailer) {
+                continue;
+            }
+            let single_items: BTreeSet<usize> =
+                single_plan.lines.iter().map(|l| l.item_index).collect();
+            let plan_items: BTreeSet<usize> = plan.lines.iter().map(|l| l.item_index).collect();
+            if single_items == plan_items {
+                // Like-for-like: report the difference (negative = it would cost
+                // more than this plan).
+                out.push(reason(
+                    kind,
+                    ReasonCode::RejectedStore,
+                    Vec::new(),
+                    vec![retailer],
+                    Some(plan.total_cents - single_plan.total_cents),
+                    None,
+                    None,
+                ));
+            } else {
+                out.push(reason(
+                    kind,
+                    ReasonCode::CoverageDiffers,
+                    Vec::new(),
+                    vec![retailer],
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+
+    // ---- Price freshness: the date the plan's prices are from, plus any line
+    // behind the latest successful source run. ------------------------------
+    let snapshots: Vec<(usize, Option<String>)> = plan
+        .lines
+        .iter()
+        .map(|line| {
+            let snapshot = ctx
+                .comp
+                .best_per_item
+                .get(&line.item_index)
+                .and_then(|by_retailer| by_retailer.get(&line.retailer))
+                .and_then(|candidate| candidate.offer.source_snapshot_date.clone());
+            (line.item_index, snapshot)
+        })
+        .collect();
+    let as_of = snapshots
+        .iter()
+        .filter_map(|(_, snapshot)| snapshot.as_deref())
+        .min()
+        .map(str::to_owned);
+    let undated_items = snapshots
+        .iter()
+        .filter_map(|(item_index, snapshot)| snapshot.is_none().then_some(*item_index))
+        .collect();
+    out.push(reason(
+        kind,
+        ReasonCode::PriceAsOf,
+        undated_items,
+        Vec::new(),
+        None,
+        None,
+        as_of,
+    ));
+
+    let stale_lines: Vec<&PlanLine> = plan
+        .lines
+        .iter()
+        .filter(|line| {
+            let Some(offer) = ctx
+                .comp
+                .best_per_item
+                .get(&line.item_index)
+                .and_then(|by_retailer| by_retailer.get(&line.retailer))
+                .map(|candidate| &candidate.offer)
+            else {
+                return false;
+            };
+            match (
+                ctx.input.current_source_run_number,
+                offer.source_successful_run_number_at_fetch,
+            ) {
+                (Some(current), Some(fetched)) => current > fetched,
+                _ => false,
+            }
+        })
+        .collect();
+    if !stale_lines.is_empty() {
+        let stale_retailers: Vec<Retailer> = stale_lines.iter().map(|line| line.retailer).fold(
+            Vec::new(),
+            |mut retailers, retailer| {
+                if !retailers.contains(&retailer) {
+                    retailers.push(retailer);
+                }
+                retailers
+            },
+        );
+        out.push(reason(
+            kind,
+            ReasonCode::StalePrices,
+            stale_lines.iter().map(|line| line.item_index).collect(),
+            stale_retailers,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    // ---- Stores left out by the household's eligibility settings. ----------
+    if kind == PlanKind::Recommended {
+        for retailer in Retailer::ALL {
+            match ctx.input.store_status(retailer) {
+                StoreStatus::Off => out.push(reason(
+                    kind,
+                    ReasonCode::StoreOff,
+                    Vec::new(),
+                    vec![retailer],
+                    None,
+                    None,
+                    None,
+                )),
+                StoreStatus::Occasional if !ctx.input.trip_retailers.contains(&retailer) => out
+                    .push(reason(
+                        kind,
+                        ReasonCode::StoreNotOnTrip,
+                        Vec::new(),
+                        vec![retailer],
+                        None,
+                        None,
+                        None,
+                    )),
+                _ => {}
+            }
+        }
+    }
+
+    out.sort_by_key(|reason| match reason.code {
+        ReasonCode::ThresholdCleared
+        | ReasonCode::ThresholdNotCleared
+        | ReasonCode::SplitDropsItems
+        | ReasonCode::MoreComplete => 0,
+        ReasonCode::CoverageDiffers | ReasonCode::RejectedStore => 1,
+        ReasonCode::Coverage => 2,
+        ReasonCode::NoKnownPriceHere
+        | ReasonCode::NoKnownPriceAnywhere
+        | ReasonCode::UnresolvedItems => 3,
+        ReasonCode::PriceAsOf | ReasonCode::StalePrices => 4,
+        ReasonCode::BrandRule => 4,
+        ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip => 5,
+        ReasonCode::CheapestAtStore | ReasonCode::OnlyStoreStocking => 6,
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,19 +2211,20 @@ fn build_output(
     // Resolved-but-unpriceable items are missing at every store, so they fold into
     // every plan's missing_count as a constant (see StorePlan::missing_count).
     let no_offer_count = classification.no_valid_offer.len();
-    let (core, two_store_candidates) =
-        optimise_core_with_candidates(input, &candidates, no_offer_count);
+    let comp = optimise_core_with_candidates(input, &candidates, no_offer_count);
     let nearby: Vec<Retailer> = Retailer::ALL
         .into_iter()
         .filter(|r| input.is_nearby(*r))
         .collect();
-    let recommended = recommend(
-        core.best_single.clone(),
-        core.best_two_store.clone(),
-        two_store_candidates,
+    let decision = decide_recommendation(
+        &comp.plans,
+        &comp.two_store_candidates,
         input.threshold_2_cents,
         &nearby,
     );
+    // Reasons are derived from the same computation that produced the plans, so
+    // each card's explanation cannot drift from the lines it describes.
+    let reasons = build_reasons(input, &comp, &decision, &classification);
     OptimiserOutput {
         basket_items: input
             .items
@@ -1479,13 +2236,14 @@ fn build_output(
                 display_text: item.display_text.clone(),
             })
             .collect(),
-        best_single: core.best_single,
-        best_two_store: core.best_two_store,
-        theoretical_minimum: core.theoretical_minimum,
-        recommended,
+        best_single: comp.plans.best_single,
+        best_two_store: comp.plans.best_two_store,
+        theoretical_minimum: comp.plans.theoretical_minimum,
+        recommended: decision.recommendation,
         unresolved_items: classification.unresolved,
         no_valid_offer_items: classification.no_valid_offer,
         needs_confirmation_items: classification.needs_confirmation,
+        reasons,
     }
 }
 

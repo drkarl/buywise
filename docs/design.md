@@ -513,23 +513,20 @@ the list gains an item the plan does not cover, the trip view shows a stale-plan
 warning linking back to the optimiser; plan prices are a snapshot and a
 re-optimise refreshes them.
 
-### Recommendation output (plain language)
+### Plan explanations
 
-```
-Recommended: Aldi + Dunnes
+The optimisation screen shows two to four deterministic, plan-specific reasons on
+each plan card. Reasons describe the plan's actual lines and may identify cheaper
+categories, household brand constraints, coverage and missing prices, price dates
+and stale source runs, the convenience-threshold decision, and eligible whole-store
+alternatives. A missing qualifying price is presented as missing data, not proof
+that a product is unavailable in-store. Unresolved entries remain separately
+visible and are excluded from priced totals.
 
-Estimated total:          €132.40
-Best single-store option: Dunnes €149.20
-Estimated saving:         €16.80
-
-Why:
-  Aldi is cheaper for flexible staples (rice, own-brand coffee, cleaning).
-  Dunnes is better for the branded items and your spend may trigger the €50 voucher threshold.
-  Lidl was not recommended: would only save an extra €3.20.
-
-Missing / low-confidence items: 2 items have no current price data (flagged below).
-Unresolved items (excluded from total): yoghurt, cheese slices — tap to clarify.
-```
+The recommended total is compared with the best single-store total only when both
+plans price the same set of items. Otherwise the screen says the totals are not
+directly comparable. See the optimisation screen for the rendered explanation;
+the response carries ordered reasons per plan in `plan_explanations`.
 
 ---
 

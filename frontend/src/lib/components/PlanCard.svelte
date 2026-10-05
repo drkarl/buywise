@@ -26,12 +26,19 @@
 		 * line. Null when there is no single-store baseline (then we show no saving).
 		 */
 		bestSingleTotalCents?: number | null;
+		/** Item indices priced by the best single-store plan. */
+		bestSingleItemIndices?: number[];
 		/**
 		 * True for the theoretical-minimum card: a costing benchmark that is never
 		 * routed (may split across many stores). Labelled as a reference, not a plan
 		 * to follow, and its saving line is suppressed.
 		 */
 		benchmark?: boolean;
+		/**
+		 * Plain-language reasons for this plan (issue #103), ordered most important
+		 * first. At most four are shown; absent/empty renders nothing extra.
+		 */
+		reasons?: string[];
 		/**
 		 * When set, the card shows a "Shop this plan" link to this href. The parent
 		 * route builds the chosen-trip allocation in `onchoose` before navigation
@@ -47,7 +54,9 @@
 		title,
 		recommended = false,
 		bestSingleTotalCents = null,
+		bestSingleItemIndices = [],
 		benchmark = false,
+		reasons = [],
 		chooseHref = null,
 		onchoose = null
 	}: Props = $props();
@@ -55,11 +64,23 @@
 	// Saving vs the best single-store plan = bestSingle.total − thisPlan.total.
 	// Only meaningful when a single-store baseline exists and this isn't that very
 	// baseline or the never-routed benchmark. May be <= 0 (a split can cost more).
-	const savingCents = $derived(
-		bestSingleTotalCents === null || benchmark ? null : bestSingleTotalCents - plan.total_cents
-	);
+	const savingCents = $derived.by(() => {
+		if (bestSingleTotalCents === null || benchmark) return null;
+		const baselineItems = [...bestSingleItemIndices].sort((a, b) => a - b);
+		const planItems = plan.lines.map((line) => line.item_index).sort((a, b) => a - b);
+		if (
+			baselineItems.length !== planItems.length ||
+			baselineItems.some((item, index) => item !== planItems[index])
+		) {
+			return null;
+		}
+		return bestSingleTotalCents - plan.total_cents;
+	});
 
 	const storeNames = $derived(plan.stores.map(retailerLabel).join(' + '));
+
+	// The server prioritizes reasons and sends at most four for this plan.
+	const shownReasons = $derived(reasons.slice(0, 4));
 </script>
 
 <article
@@ -97,6 +118,14 @@
 		<p class="voucher">🎟️ Dunnes voucher: {plan.dunnes_voucher_offer_text}</p>
 	{/if}
 
+	{#if shownReasons.length > 0}
+		<ul class="reasons" aria-label="Why this plan">
+			{#each shownReasons as reason, index (index)}
+				<li>{reason}</li>
+			{/each}
+		</ul>
+	{/if}
+
 	<ul class="lines">
 		{#each plan.lines as line (line.item_index)}
 			<PlanItem {line} />
@@ -105,8 +134,10 @@
 
 	{#if plan.missing_count > 0}
 		<p class="missing">
-			{plan.missing_count} item{plan.missing_count === 1 ? '' : 's'} not available here (excluded
-			from total)
+			{plan.missing_count} item{plan.missing_count === 1 ? '' : 's'} {plan.missing_count === 1
+				? 'has'
+				: 'have'} no known price here and {plan.missing_count === 1 ? 'is' : 'are'} excluded from
+			the total
 		</p>
 	{/if}
 
@@ -190,6 +221,16 @@
 		border: 1px solid #fde68a;
 		border-radius: 0.5rem;
 		padding: 0.4rem 0.6rem;
+	}
+	.reasons {
+		margin: 0;
+		padding-left: 1.1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		font-size: 0.85rem;
+		line-height: 1.4;
+		color: #475569;
 	}
 	.lines {
 		list-style: none;

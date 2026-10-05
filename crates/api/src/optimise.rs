@@ -47,7 +47,7 @@
 //! them today, and `off` stores never do. The request's `trip_retailers` has no
 //! effect on `active`/`off` stores.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -59,8 +59,8 @@ use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
     optimise, BasketItem, BasketItemIdentity, NeedsConfirmationItem, NoValidOfferItem,
-    OptimiserInput, OptimiserOutput, Recommendation, RecommendedKind, StorePlan, StoreSetting,
-    UnresolvedItem, DEFAULT_THRESHOLDS,
+    OptimiserInput, OptimiserOutput, PlanKind, PlanReason, ReasonCode, Recommendation,
+    RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -96,6 +96,20 @@ pub struct OptimiseRequest {
     pub trip_retailers: Option<Vec<Retailer>>,
 }
 
+/// Plain-language reasons for one published plan (issue #103).
+///
+/// `plan` names the response field this explanation belongs to (`recommended`,
+/// `best_single`, `best_two_store` or `theoretical_minimum`); `reasons` is
+/// ordered most-important-first and already rendered to English, so the UI can
+/// print the first few without re-deriving anything.
+#[derive(Debug, Serialize)]
+pub struct PlanExplanation {
+    /// Which plan card these reasons belong to.
+    pub plan: PlanKind,
+    /// Ordered, human-readable reasons (two to four are shown per card).
+    pub reasons: Vec<String>,
+}
+
 /// Response for `POST /api/optimise`: the four plans, all submitted item
 /// identities, the resolved/unfulfilled item lists, the generated explanation,
 /// the `run_id`, and the snapshot date.
@@ -128,6 +142,9 @@ pub struct OptimiseResponse {
     /// Deterministic, human-readable summary naming which stores are cheaper for
     /// which categories (not produced by the core; generated here).
     pub plain_language_explanation: String,
+    /// Per-plan plain-language reasons (issue #103), ordered most-important-first.
+    /// The UI renders two to four of each plan's reasons on its card.
+    pub plan_explanations: Vec<PlanExplanation>,
     /// Latest `source_snapshot_date` among the offers backing the recommended
     /// plan (nullable: offers may not carry a snapshot date).
     pub offer_snapshot_date: Option<String>,
@@ -225,7 +242,6 @@ async fn optimise_list(
     let explanation = build_explanation(pool, &input, &output)
         .await
         .map_err(db_error("optimise_list.explanation"))?;
-
     let run_id = persist_run(
         pool,
         &body.list_id,
@@ -248,7 +264,8 @@ async fn optimise_list(
         unresolved_items: output.unresolved_items,
         no_valid_offer_items: output.no_valid_offer_items,
         needs_confirmation_items: output.needs_confirmation_items,
-        plain_language_explanation: explanation,
+        plain_language_explanation: explanation.summary,
+        plan_explanations: explanation.plans,
         offer_snapshot_date,
     }))
 }
@@ -584,24 +601,36 @@ async fn latest_offer_snapshot_date(
 // plain_language_explanation
 // ---------------------------------------------------------------------------
 
-/// Build the deterministic plain-language explanation.
+/// The deterministic explanation payload: the one-paragraph summary plus the
+/// per-plan reasons (issue #103).
+struct Explanation {
+    /// The existing `plain_language_explanation` summary paragraph.
+    summary: String,
+    /// Rendered reasons grouped by plan, in card order.
+    plans: Vec<PlanExplanation>,
+}
+
+/// Build the deterministic plain-language explanation and the per-plan reasons.
 ///
-/// The acceptance criterion requires the text to mention which stores are cheaper
-/// for which categories. We derive that from the *theoretical minimum* plan —
-/// the only plan that prices every item at its globally cheapest store, so its
-/// per-line retailer is exactly "the cheapest store for this item". Grouping
-/// those lines by the item's category yields, per category, the set of stores
-/// that win cheapest there; we name them.
+/// The summary is the original cheaper-for paragraph: the acceptance criterion
+/// requires the text to mention which stores are cheaper for which categories. We
+/// derive that from the *theoretical minimum* plan — the only plan that prices
+/// every item at its globally cheapest store, so its per-line retailer is exactly
+/// "the cheapest store for this item". Grouping those lines by the item's
+/// category yields, per category, the set of stores that win cheapest there; we
+/// name them. The summary then states the recommended plan: its store(s), total,
+/// and the saving versus the best single store.
 ///
-/// The text then states the recommended plan: its store(s), total, and the saving
-/// versus the best single store, so the household sees both the per-category
-/// detail and the bottom line. Everything is sourced from the plans + a single
-/// category lookup, so it is fully deterministic and testable.
+/// The per-plan reasons extend that same path: the core emits structured,
+/// plan-specific [`PlanReason`]s (issue #103) and this function renders each to
+/// English using the category names and retailer labels, so both the summary and
+/// the cards come from one deterministic source. Everything is sourced from the
+/// plans + categories, so it is fully deterministic and testable.
 async fn build_explanation(
     pool: &sqlx::SqlitePool,
     input: &OptimiserInput,
     output: &OptimiserOutput,
-) -> Result<String, DbError> {
+) -> Result<Explanation, DbError> {
     // Category names keyed by canonical_item_id, for every resolved basket item.
     let categories = category_names_by_item(pool, input).await?;
 
@@ -652,17 +681,8 @@ async fn build_explanation(
             "Recommended: shop at {stores} for a total of {}",
             euros(rec.plan.total_cents)
         ));
-        let single = output.best_single.as_ref().map(|p| p.total_cents);
-        if let Some(single_total) = single {
-            let saving = (single_total - rec.plan.total_cents).max(0);
-            if saving > 0 {
-                out.push_str(&format!(
-                    ", saving {} versus the best single store",
-                    euros(saving)
-                ));
-            } else {
-                out.push_str(", the cheapest single store overall");
-            }
+        if let Some(best_single) = output.best_single.as_ref() {
+            out.push_str(&recommendation_comparison(&rec.plan, best_single));
         }
         out.push('.');
     } else {
@@ -672,7 +692,364 @@ async fn build_explanation(
         }
     }
 
-    Ok(out)
+    // Per-plan reasons, rendered from the same category lookup as the summary.
+    let plans = render_plan_explanations(&output.reasons, input, &categories);
+    Ok(Explanation {
+        summary: out,
+        plans,
+    })
+}
+
+fn recommendation_comparison(recommended: &StorePlan, best_single: &StorePlan) -> String {
+    let recommended_items: BTreeSet<_> = recommended
+        .lines
+        .iter()
+        .map(|line| line.item_index)
+        .collect();
+    let single_items: BTreeSet<_> = best_single
+        .lines
+        .iter()
+        .map(|line| line.item_index)
+        .collect();
+    if recommended_items != single_items {
+        return ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store".to_string();
+    }
+
+    let saving = (best_single.total_cents - recommended.total_cents).max(0);
+    if saving > 0 {
+        format!(", saving {} versus the best single store", euros(saving))
+    } else {
+        ", the cheapest single store overall".to_string()
+    }
+}
+
+/// Render the core's structured [`PlanReason`]s into per-plan English sentences.
+///
+/// Reasons are grouped by [`PlanKind`] in card order. Choice, coverage, missing
+/// price, and freshness facts are combined or prioritized before the four-card
+/// limit is applied.
+fn render_plan_explanations(
+    reasons: &[PlanReason],
+    input: &OptimiserInput,
+    categories: &std::collections::HashMap<String, String>,
+) -> Vec<PlanExplanation> {
+    const ORDER: [PlanKind; 4] = [
+        PlanKind::Recommended,
+        PlanKind::BestSingle,
+        PlanKind::BestTwoStore,
+        PlanKind::TheoreticalMinimum,
+    ];
+    let mut plans = Vec::new();
+    for kind in ORDER {
+        let plan_reasons: Vec<&PlanReason> = reasons.iter().filter(|r| r.plan == kind).collect();
+        let mut rendered = Vec::new();
+
+        let choice = plan_reasons.iter().copied().find(|reason| {
+            matches!(
+                reason.code,
+                ReasonCode::ThresholdCleared
+                    | ReasonCode::ThresholdNotCleared
+                    | ReasonCode::SplitDropsItems
+                    | ReasonCode::MoreComplete
+                    | ReasonCode::CoverageDiffers
+            )
+        });
+        if let Some(choice) = choice {
+            rendered.push(render_reason(choice, input, categories));
+        }
+
+        let coverage_and_gaps = plan_reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::Coverage
+                        | ReasonCode::NoKnownPriceHere
+                        | ReasonCode::NoKnownPriceAnywhere
+                        | ReasonCode::UnresolvedItems
+                )
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        if !coverage_and_gaps.is_empty() {
+            rendered.push(coverage_and_gaps.join("; "));
+        }
+
+        let freshness = plan_reasons
+            .iter()
+            .filter(|reason| matches!(reason.code, ReasonCode::PriceAsOf | ReasonCode::StalePrices))
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        if !freshness.is_empty() {
+            rendered.push(freshness.join("; "));
+        }
+
+        let routing = plan_reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::CheapestAtStore
+                        | ReasonCode::OnlyStoreStocking
+                        | ReasonCode::BrandRule
+                )
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        let alternatives = plan_reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code,
+                    ReasonCode::RejectedStore | ReasonCode::CoverageDiffers
+                ) && !choice.is_some_and(|chosen| std::ptr::eq(chosen, **reason))
+            })
+            .map(|reason| render_reason(reason, input, categories))
+            .collect::<Vec<_>>();
+        let routing_and_alternatives = match (routing.is_empty(), alternatives.is_empty()) {
+            (false, false) => Some(format!(
+                "{}; Alternatives considered: {}",
+                routing.join("; "),
+                alternatives.join("; ")
+            )),
+            (false, true) => Some(routing.join("; ")),
+            (true, false) => Some(format!(
+                "Alternatives considered: {}",
+                alternatives.join("; ")
+            )),
+            (true, true) => None,
+        };
+        if let Some(reason) = routing_and_alternatives {
+            rendered.push(reason);
+        }
+
+        for reason in &plan_reasons {
+            if rendered.len() == 4 {
+                break;
+            }
+            if matches!(
+                reason.code,
+                ReasonCode::ThresholdCleared
+                    | ReasonCode::ThresholdNotCleared
+                    | ReasonCode::SplitDropsItems
+                    | ReasonCode::MoreComplete
+                    | ReasonCode::CoverageDiffers
+                    | ReasonCode::Coverage
+                    | ReasonCode::NoKnownPriceHere
+                    | ReasonCode::NoKnownPriceAnywhere
+                    | ReasonCode::UnresolvedItems
+                    | ReasonCode::PriceAsOf
+                    | ReasonCode::StalePrices
+                    | ReasonCode::CheapestAtStore
+                    | ReasonCode::OnlyStoreStocking
+                    | ReasonCode::BrandRule
+                    | ReasonCode::RejectedStore
+            ) {
+                continue;
+            }
+            rendered.push(render_reason(reason, input, categories));
+        }
+        rendered.truncate(4);
+        if !rendered.is_empty() {
+            plans.push(PlanExplanation {
+                plan: kind,
+                reasons: rendered,
+            });
+        }
+    }
+    plans
+}
+
+/// Render one structured reason to a plain-language sentence.
+///
+/// Every sentence is built only from the reason's own facts (`item_indices`,
+/// `retailers`, `cents`, `threshold_cents`, `snapshot_date`) plus the category
+/// names, so it cannot describe anything the plan's lines do not support.
+fn render_reason(
+    reason: &PlanReason,
+    input: &OptimiserInput,
+    categories: &std::collections::HashMap<String, String>,
+) -> String {
+    let items = reason.item_indices.len();
+    let suffix = category_suffix(&category_names_for(reason, input, categories));
+    match reason.code {
+        ReasonCode::CheapestAtStore => format!(
+            "{} is cheapest for {items} item{}{suffix}",
+            store_names(&reason.retailers),
+            plural(items)
+        ),
+        ReasonCode::OnlyStoreStocking => format!(
+            "{} is the only store we have a price for on {items} item{}{suffix}",
+            store_names(&reason.retailers),
+            plural(items)
+        ),
+        ReasonCode::BrandRule => format!("{items} item{} held to your brand rule", plural(items)),
+        ReasonCode::Coverage => {
+            let total = input.items.len();
+            let amount = reason.cents.map(euros).unwrap_or_else(|| "€?".into());
+            if items >= total {
+                format!(
+                    "Prices all {total} basket item{} for {amount}",
+                    plural(total)
+                )
+            } else {
+                format!("Prices {items} of {total} basket items for {amount}")
+            }
+        }
+        ReasonCode::NoKnownPriceHere => {
+            // Never imply the item is unavailable: our data may simply lack a
+            // qualifying price, which is not proof of no stock.
+            let unavailable = if items == 1 { "it is" } else { "they are" };
+            format!(
+                "No known price at {} for {items} item{}{suffix} - missing data, not proof {unavailable} unavailable",
+                store_names(&reason.retailers),
+                plural(items)
+            )
+        }
+        ReasonCode::NoKnownPriceAnywhere => format!(
+            "No qualifying price on record anywhere for {items} item{}{suffix}",
+            plural(items)
+        ),
+        ReasonCode::UnresolvedItems => {
+            format!("Could not match {items} item{} to a product", plural(items))
+        }
+        ReasonCode::StalePrices => format!(
+            "Prices for {items} item{} at {} are not from the latest run",
+            plural(items),
+            store_names(&reason.retailers)
+        ),
+        ReasonCode::PriceAsOf => match reason.snapshot_date.as_deref() {
+            Some(date) if !reason.item_indices.is_empty() => format!(
+                "Prices as of {date}; no snapshot date recorded for {items} item{}",
+                plural(items)
+            ),
+            Some(date) => format!("Prices as of {date}"),
+            None => "Prices have no recorded snapshot date".to_string(),
+        },
+        ReasonCode::ThresholdCleared => {
+            let bar = reason.threshold_cents.map(euros).unwrap_or_default();
+            let nearby = nearby_suffix(reason, input);
+            let saving = reason.cents.map(euros).unwrap_or_default();
+            format!(
+                "Adding {} saves {saving}, above your {bar}{nearby} bar",
+                store_names(&reason.retailers)
+            )
+        }
+        ReasonCode::ThresholdNotCleared => {
+            let bar = reason.threshold_cents.map(euros).unwrap_or_default();
+            let nearby = nearby_suffix(reason, input);
+            let saving = reason.cents.map(euros).unwrap_or_default();
+            format!(
+                "Adding {} would save {saving}, below your {bar}{nearby} bar, so one store is enough",
+                store_names(&reason.retailers)
+            )
+        }
+        ReasonCode::SplitDropsItems => {
+            format!(
+                "Adding {} would leave {items} item{} unpriced, so the single store wins",
+                store_names(&reason.retailers),
+                plural(items)
+            )
+        }
+        ReasonCode::MoreComplete => format!(
+            "{} also covers {items} item{} one store cannot, so the extra stop earns its place",
+            store_names(&reason.retailers),
+            plural(items)
+        ),
+        ReasonCode::RejectedStore => match reason.cents {
+            Some(delta) if delta > 0 => format!(
+                "Shopping at {} alone would save {}",
+                store_names(&reason.retailers),
+                euros(delta)
+            ),
+            Some(0) => format!(
+                "Shopping at {} alone would cost the same",
+                store_names(&reason.retailers)
+            ),
+            Some(delta) => format!(
+                "Shopping at {} alone would cost {} more",
+                store_names(&reason.retailers),
+                euros(-delta)
+            ),
+            None => format!(
+                "{} was considered as a single store",
+                store_names(&reason.retailers)
+            ),
+        },
+        ReasonCode::CoverageDiffers => format!(
+            "{} alone prices a different set of items, so its total is not directly comparable",
+            store_names(&reason.retailers)
+        ),
+        ReasonCode::StoreOff => format!(
+            "{} is switched off in your store settings",
+            store_names(&reason.retailers)
+        ),
+        ReasonCode::StoreNotOnTrip => format!(
+            "{} is occasional and is not marked for today",
+            store_names(&reason.retailers)
+        ),
+    }
+}
+
+/// The category names behind a reason's items, de-duplicated and in line order.
+fn category_names_for(
+    reason: &PlanReason,
+    input: &OptimiserInput,
+    categories: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for &index in &reason.item_indices {
+        let Some(item) = input.items.get(index) else {
+            continue;
+        };
+        let Some(canonical_id) = item.canonical_item_id.as_deref() else {
+            continue;
+        };
+        let Some(name) = categories.get(canonical_id) else {
+            continue;
+        };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// `" (Dairy, Bakery)"` for a reason's categories, capped at three with a count
+/// of the rest so a long basket cannot produce an unreadable line.
+fn category_suffix(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1..=3 => format!(" ({})", names.join(", ")),
+        _ => format!(" ({}, and {} more)", names[..3].join(", "), names.len() - 3),
+    }
+}
+
+/// Mark a threshold reason as using the lower nearby-store bar: the only way the
+/// effective bar falls below the household's stored threshold.
+fn nearby_suffix(reason: &PlanReason, input: &OptimiserInput) -> &'static str {
+    match reason.threshold_cents {
+        Some(bar) if bar < input.threshold_2_cents => " nearby-store",
+        _ => "",
+    }
+}
+
+/// `"s"` for any count other than one.
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Comma-joined retailer labels for a reason's stores.
+fn store_names(retailers: &[Retailer]) -> String {
+    retailers
+        .iter()
+        .map(|r| store_label(*r))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Look up the English category name for every resolved basket item, keyed by
@@ -846,4 +1223,432 @@ fn sql_placeholders(n: usize) -> String {
         s.push('?');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buywise_core::optimiser::BasketItem;
+    use std::collections::HashMap;
+
+    /// A resolved basket item with no constraints.
+    fn basket_item(canonical_id: &str) -> BasketItem {
+        BasketItem {
+            entry_id: None,
+            display_text: canonical_id.to_string(),
+            canonical_item_id: Some(canonical_id.to_string()),
+            count: 1,
+            constraint_policy: ConstraintPolicy::Any,
+            constraints: None,
+        }
+    }
+
+    /// An input with three items across two categories.
+    fn input() -> OptimiserInput {
+        OptimiserInput::new(
+            "hh-1",
+            Some(1),
+            vec![
+                basket_item("ci-milk"),
+                basket_item("ci-cheese"),
+                basket_item("ci-bread"),
+            ],
+        )
+    }
+
+    /// Category names for [`input`]: milk/cheese are Dairy, bread is Bakery.
+    fn categories() -> HashMap<String, String> {
+        HashMap::from([
+            ("ci-milk".to_string(), "Dairy".to_string()),
+            ("ci-cheese".to_string(), "Dairy".to_string()),
+            ("ci-bread".to_string(), "Bakery".to_string()),
+        ])
+    }
+
+    fn plan_with_items(item_indices: &[usize], total_cents: Cents) -> StorePlan {
+        StorePlan {
+            stores: vec![Retailer::Tesco],
+            lines: item_indices
+                .iter()
+                .map(|&item_index| buywise_core::optimiser::PlanLine {
+                    item_index,
+                    entry_id: None,
+                    display_text: format!("item {item_index}"),
+                    product_name: format!("product {item_index}"),
+                    canonical_item_id: Some(format!("item-{item_index}")),
+                    retailer: Retailer::Tesco,
+                    retailer_product_id: format!("product-{item_index}"),
+                    offer_id: format!("offer-{item_index}"),
+                    unit_price_cents: 100,
+                    line_total_cents: 100,
+                    loyalty_applied: false,
+                    freshness_confidence: buywise_core::domain::FreshnessConfidence::High,
+                })
+                .collect(),
+            total_cents,
+            missing_count: 0,
+            dunnes_voucher_offer_text: None,
+        }
+    }
+
+    /// A reason with the given code and nothing else set.
+    fn bare(plan: PlanKind, code: ReasonCode) -> PlanReason {
+        PlanReason {
+            plan,
+            code,
+            item_indices: Vec::new(),
+            retailers: Vec::new(),
+            cents: None,
+            threshold_cents: None,
+            snapshot_date: None,
+        }
+    }
+
+    #[test]
+    fn cheapest_at_store_names_the_store_count_and_categories() {
+        let reason = PlanReason {
+            item_indices: vec![0, 1],
+            retailers: vec![Retailer::Aldi],
+            ..bare(PlanKind::BestSingle, ReasonCode::CheapestAtStore)
+        };
+        assert_eq!(
+            render_reason(&reason, &input(), &categories()),
+            "Aldi is cheapest for 2 items (Dairy)"
+        );
+    }
+
+    #[test]
+    fn coverage_reports_partial_and_full_baskets() {
+        let partial = PlanReason {
+            item_indices: vec![0, 1],
+            cents: Some(320),
+            ..bare(PlanKind::BestSingle, ReasonCode::Coverage)
+        };
+        assert_eq!(
+            render_reason(&partial, &input(), &categories()),
+            "Prices 2 of 3 basket items for €3.20"
+        );
+
+        let full = PlanReason {
+            item_indices: vec![0, 1, 2],
+            cents: Some(500),
+            ..bare(PlanKind::BestSingle, ReasonCode::Coverage)
+        };
+        assert_eq!(
+            render_reason(&full, &input(), &categories()),
+            "Prices all 3 basket items for €5.00"
+        );
+    }
+
+    #[test]
+    fn recommendation_comparison_requires_identical_priced_items() {
+        let best_single = plan_with_items(&[0, 1], 3_000);
+
+        let more_complete = plan_with_items(&[0, 1, 2], 2_800);
+        assert_eq!(
+            recommendation_comparison(&more_complete, &best_single),
+            ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store"
+        );
+
+        let costlier_more_complete = plan_with_items(&[0, 1, 2], 3_200);
+        assert_eq!(
+            recommendation_comparison(&costlier_more_complete, &best_single),
+            ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store"
+        );
+
+        let same_items = plan_with_items(&[1, 0], 2_800);
+        assert_eq!(
+            recommendation_comparison(&same_items, &best_single),
+            ", saving €2.00 versus the best single store"
+        );
+    }
+
+    #[test]
+    fn no_known_price_never_claims_the_item_is_unavailable() {
+        // Singular and plural: neither sentence may assert unavailability.
+        for (items, expected) in [
+            (
+                vec![0],
+                "No known price at Tesco for 1 item (Dairy) - missing data, not proof it is unavailable",
+            ),
+            (
+                vec![0, 1],
+                "No known price at Tesco for 2 items (Dairy) - missing data, not proof they are unavailable",
+            ),
+        ] {
+            let reason = PlanReason {
+                item_indices: items,
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::BestSingle, ReasonCode::NoKnownPriceHere)
+            };
+            let text = render_reason(&reason, &input(), &categories());
+            assert_eq!(text, expected);
+            assert!(
+                !text.contains("not available"),
+                "must not claim unavailability: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_reasons_name_the_store_saving_and_bar() {
+        let reason = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(999),
+            threshold_cents: Some(1000),
+            ..bare(PlanKind::Recommended, ReasonCode::ThresholdNotCleared)
+        };
+        assert_eq!(
+            render_reason(&reason, &input(), &categories()),
+            "Adding Tesco would save €9.99, below your €10.00 bar, so one store is enough"
+        );
+
+        let cleared = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(1200),
+            threshold_cents: Some(1000),
+            ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+        };
+        assert_eq!(
+            render_reason(&cleared, &input(), &categories()),
+            "Adding Tesco saves €12.00, above your €10.00 bar"
+        );
+    }
+
+    #[test]
+    fn nearby_bar_is_called_out_when_it_lowered_the_threshold() {
+        let reason = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(700),
+            threshold_cents: Some(500),
+            ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+        };
+        let text = render_reason(&reason, &input(), &categories());
+        assert!(text.contains("€5.00 nearby-store bar"), "got: {text}");
+    }
+
+    #[test]
+    fn rejected_store_reports_a_saving_or_an_overspend() {
+        let cheaper = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(250),
+            ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+        };
+        assert_eq!(
+            render_reason(&cheaper, &input(), &categories()),
+            "Shopping at Tesco alone would save €2.50"
+        );
+
+        let costlier = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(-250),
+            ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+        };
+        assert_eq!(
+            render_reason(&costlier, &input(), &categories()),
+            "Shopping at Tesco alone would cost €2.50 more"
+        );
+
+        let tied = PlanReason {
+            retailers: vec![Retailer::Tesco],
+            cents: Some(0),
+            ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+        };
+        assert_eq!(
+            render_reason(&tied, &input(), &categories()),
+            "Shopping at Tesco alone would cost the same"
+        );
+    }
+
+    #[test]
+    fn price_as_of_reports_the_snapshot_date() {
+        let reason = PlanReason {
+            snapshot_date: Some("2026-06-01".to_string()),
+            ..bare(PlanKind::BestSingle, ReasonCode::PriceAsOf)
+        };
+        assert_eq!(
+            render_reason(&reason, &input(), &categories()),
+            "Prices as of 2026-06-01"
+        );
+    }
+
+    #[test]
+    fn price_as_of_mentions_undated_lines() {
+        let reason = PlanReason {
+            item_indices: vec![0, 1],
+            snapshot_date: Some("2026-05-20".to_string()),
+            ..bare(PlanKind::BestSingle, ReasonCode::PriceAsOf)
+        };
+        assert_eq!(
+            render_reason(&reason, &input(), &categories()),
+            "Prices as of 2026-05-20; no snapshot date recorded for 2 items"
+        );
+    }
+
+    #[test]
+    fn groups_rendered_reasons_by_plan_in_card_order() {
+        // Deliberately out of order, with two reasons for one plan to prove
+        // intra-plan ordering is preserved.
+        let reasons = vec![
+            PlanReason {
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::BestTwoStore, ReasonCode::Coverage)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                ..bare(PlanKind::Recommended, ReasonCode::Coverage)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Aldi],
+                ..bare(PlanKind::Recommended, ReasonCode::CheapestAtStore)
+            },
+            PlanReason {
+                ..bare(PlanKind::BestSingle, ReasonCode::Coverage)
+            },
+        ];
+        let plans = render_plan_explanations(&reasons, &input(), &categories());
+        let kinds: Vec<PlanKind> = plans.iter().map(|p| p.plan).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PlanKind::Recommended,
+                PlanKind::BestSingle,
+                PlanKind::BestTwoStore
+            ]
+        );
+        assert_eq!(plans[0].reasons.len(), 2);
+        assert_eq!(plans[0].reasons[0], "Prices 1 of 3 basket items for €?");
+        assert_eq!(plans[0].reasons[1], "Aldi is cheapest for 1 item (Dairy)");
+    }
+
+    #[test]
+    fn card_reasons_keep_choice_coverage_gaps_and_freshness_with_many_candidates() {
+        let mut basket = input();
+        basket.items[2].canonical_item_id = None;
+        basket.threshold_2_cents = 400;
+        let reasons = vec![
+            PlanReason {
+                retailers: vec![Retailer::Aldi],
+                cents: Some(500),
+                threshold_cents: Some(400),
+                ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::NoKnownPriceHere)
+            },
+            PlanReason {
+                item_indices: vec![1],
+                ..bare(PlanKind::Recommended, ReasonCode::NoKnownPriceAnywhere)
+            },
+            PlanReason {
+                item_indices: vec![2],
+                ..bare(PlanKind::Recommended, ReasonCode::UnresolvedItems)
+            },
+            PlanReason {
+                item_indices: vec![0, 1],
+                cents: Some(300),
+                ..bare(PlanKind::Recommended, ReasonCode::Coverage)
+            },
+            PlanReason {
+                ..bare(PlanKind::Recommended, ReasonCode::PriceAsOf)
+            },
+            PlanReason {
+                item_indices: vec![0, 1],
+                retailers: vec![Retailer::Aldi, Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::StalePrices)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Aldi],
+                ..bare(PlanKind::Recommended, ReasonCode::CheapestAtStore)
+            },
+        ];
+
+        let plans = render_plan_explanations(&reasons, &basket, &categories());
+        let card = &plans[0].reasons;
+        assert_eq!(card.len(), 4);
+        assert!(card[0].contains("above your €4.00 bar"), "{card:?}");
+        assert!(card[1].contains("Prices 2 of 3 basket items"));
+        assert!(card[1].contains("No known price at Tesco"));
+        assert!(card[1].contains("No qualifying price on record anywhere"));
+        assert!(card[1].contains("Could not match 1 item"));
+        assert!(card[2].contains("Prices have no recorded snapshot date"));
+        assert!(card[2].contains("not from the latest run"));
+        assert!(card[2].contains("at Aldi, Tesco"));
+    }
+
+    #[test]
+    fn recommended_split_reserves_routing_and_merges_rejected_stores() {
+        let reasons = vec![
+            PlanReason {
+                retailers: vec![Retailer::Tesco],
+                cents: Some(1500),
+                threshold_cents: Some(1000),
+                ..bare(PlanKind::Recommended, ReasonCode::ThresholdCleared)
+            },
+            PlanReason {
+                item_indices: vec![0, 1, 2],
+                cents: Some(1000),
+                ..bare(PlanKind::Recommended, ReasonCode::Coverage)
+            },
+            PlanReason {
+                snapshot_date: Some("2026-06-01".to_string()),
+                ..bare(PlanKind::Recommended, ReasonCode::PriceAsOf)
+            },
+            PlanReason {
+                item_indices: vec![0],
+                retailers: vec![Retailer::Aldi],
+                ..bare(PlanKind::Recommended, ReasonCode::CheapestAtStore)
+            },
+            PlanReason {
+                item_indices: vec![1],
+                retailers: vec![Retailer::Tesco],
+                ..bare(PlanKind::Recommended, ReasonCode::OnlyStoreStocking)
+            },
+            PlanReason {
+                item_indices: vec![2],
+                ..bare(PlanKind::Recommended, ReasonCode::BrandRule)
+            },
+            PlanReason {
+                retailers: vec![Retailer::Dunnes],
+                cents: Some(200),
+                ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+            },
+            PlanReason {
+                retailers: vec![Retailer::Lidl],
+                cents: Some(-125),
+                ..bare(PlanKind::Recommended, ReasonCode::RejectedStore)
+            },
+            PlanReason {
+                retailers: vec![Retailer::SuperValu],
+                ..bare(PlanKind::Recommended, ReasonCode::CoverageDiffers)
+            },
+        ];
+
+        let plans = render_plan_explanations(&reasons, &input(), &categories());
+        let card = &plans[0].reasons;
+        assert_eq!(card.len(), 4);
+        assert!(card[0].contains("above your €10.00 bar"));
+        assert!(card[1].contains("Prices all 3 basket items"));
+        assert!(card[2].contains("Prices as of 2026-06-01"));
+        assert!(card[3].contains("Aldi is cheapest for 1 item"));
+        assert!(card[3].contains("Tesco is the only store we have a price for"));
+        assert!(card[3].contains("1 item held to your brand rule"));
+        assert!(card[3].contains("Shopping at Dunnes alone would save €2.00"));
+        assert!(card[3].contains("Shopping at Lidl alone would cost €1.25 more"));
+        assert!(card[3].contains("SuperValu alone prices a different set of items"));
+        assert_eq!(
+            card.iter()
+                .filter(|line| line.contains("Shopping at"))
+                .count(),
+            1
+        );
+        assert!(
+            card[3].find("Aldi is cheapest") < card[3].find("Alternatives considered"),
+            "routing should precede rejected-store notes: {card:?}"
+        );
+    }
 }

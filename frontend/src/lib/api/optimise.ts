@@ -133,6 +133,20 @@ export interface NeedsConfirmationItem {
 	candidates: CandidateOffer[];
 }
 
+/** Which rendered plan card a set of reasons belongs to (serde lowercase). */
+export type PlanKind = 'recommended' | 'best_single' | 'best_two_store' | 'theoretical_minimum';
+
+/**
+ * Plain-language reasons for one plan, mirroring the serde serialisation of the
+ * Rust `PlanExplanation` in `crates/api/src/optimise.rs` (issue #103). `plan`
+ * identifies the card this belongs to; `reasons` is ordered most important
+ * first, and each rendered card shows between two and four of them.
+ */
+export interface PlanExplanation {
+	plan: PlanKind;
+	reasons: string[];
+}
+
 /** The full `POST /api/optimise` 200 response body. */
 export interface OptimiseResponse {
 	basket_items: BasketItemIdentity[];
@@ -152,6 +166,10 @@ export interface OptimiseResponse {
 	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;
+	// Issue #103: plain-language reasons per plan card, keyed by `plan`. Ordering
+	// is most important first; the UI renders at most four per card, and a plan
+	// with no (or no entry's) reasons renders nothing extra. May be empty.
+	plan_explanations: PlanExplanation[];
 }
 
 /** Lowercase retailer id → display label (reuses the shopping store's table). */

@@ -39,6 +39,7 @@
 		type CandidateOffer,
 		type NoValidOfferReason,
 		type OptimiseResponse,
+		type PlanKind,
 		type StorePlan
 	} from '$lib/api/optimise';
 
@@ -142,6 +143,18 @@
 	 * render a redundant "Same price as best single store" line.
 	 */
 	const bestSingleTotal = $derived(result?.best_single?.total_cents ?? null);
+	const bestSingleItemIndices = $derived(
+		result?.best_single?.lines.map((line) => line.item_index) ?? []
+	);
+
+	/**
+	 * Plain-language reasons for the card of a given plan kind (issue #103). The
+	 * optimiser may omit a plan entirely or send it with no reasons, so both fall
+	 * back to an empty list and the card renders nothing extra.
+	 */
+	function planReasons(kind: PlanKind): string[] {
+		return result?.plan_explanations.find((p) => p.plan === kind)?.reasons ?? [];
+	}
 
 	/** Card title for the recommended plan, reused as the chosen trip's label. */
 	const recommendedTitle = $derived(
@@ -337,6 +350,8 @@
 					title={recommendedTitle}
 					recommended
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
+					reasons={planReasons('recommended')}
 					chooseHref={tripHref(result.recommended.plan)}
 					onchoose={() => choosePlan(recommendedTitle, result!.recommended!.plan)}
 				/>
@@ -346,6 +361,7 @@
 					plan={result.best_single}
 					title="Best single store"
 					bestSingleTotalCents={null}
+					reasons={planReasons('best_single')}
 					chooseHref={tripHref(result.best_single)}
 					onchoose={() => choosePlan('Best single store', result!.best_single!)}
 				/>
@@ -355,6 +371,8 @@
 					plan={result.best_two_store}
 					title="Cheapest two-store split"
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
+					reasons={planReasons('best_two_store')}
 					chooseHref={tripHref(result.best_two_store)}
 					onchoose={() => choosePlan('Cheapest two-store split', result!.best_two_store!)}
 				/>
@@ -365,6 +383,8 @@
 					title="Theoretical minimum"
 					benchmark
 					bestSingleTotalCents={bestSingleTotal}
+					bestSingleItemIndices={bestSingleItemIndices}
+					reasons={planReasons('theoretical_minimum')}
 				/>
 			{/if}
 			{#if !result.recommended && !result.best_single && !result.best_two_store && !result.theoretical_minimum}
