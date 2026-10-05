@@ -435,17 +435,27 @@ For every compiled list, the optimiser generates:
 
 ### Convenience threshold
 
-A multi-store split is recommended only if the cost saving over the best single-store option exceeds the threshold:
+A two-store candidate is recommended only if its saving over the best single-store
+option exceeds its applicable second-store threshold. The optimiser evaluates
+each candidate separately and selects the best qualifying split; a cheaper
+non-qualifying split does not suppress a qualifying alternative:
 
 ```
-best_single_store_cost - split_cost > convenience_threshold
+best_single_store_cost - split_cost > applicable_second_store_threshold
 ```
 
-Configurable defaults:
-- Second store: must save at least **€10–€15** over best single store
+The household-configurable default second-store threshold is **€10**. If any
+store added beyond the best single-store plan is marked nearby, the applicable
+threshold is the lower of the configured threshold and **€5**. A nearby store
+already in the single-store plan does not lower the bar for adding a distant
+store. See [Household store settings](#household-store-settings) for the setting
+and API contract.
+
+Other configurable defaults:
 - Third store: must save at least **€25–€30** total, or **€20** incremental over the two-store plan
 
-If the split does not clear the threshold, the recommendation defaults to the best single store.
+If no two-store candidate clears its applicable threshold, the recommendation
+defaults to the best single store.
 
 ### Household store settings
 

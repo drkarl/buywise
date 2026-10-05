@@ -91,7 +91,7 @@ Phase 3 tasks (P3):
 Phase 4 tasks (P4):
   P3 complete
     └─► P4-T1  POST /api/optimise endpoint (four plans)
-          └─► P4-T2  convenience threshold configuration endpoint
+          └─► P4-T2  convenience threshold configuration endpoint (complete; `GET`/`PATCH /api/settings`)
           └─► P4-T3  basket plan display in PWA (four plans + plain-language recommendation)
 
 Phase 5 tasks (P5):
