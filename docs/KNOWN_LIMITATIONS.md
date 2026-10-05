@@ -304,4 +304,3 @@ nothing is added to the list without confirmation.
 
 **Follow-up.** Add a "don't suggest this again" (permanent opt-out) option and a way to review or
 undo dismissals.
-
