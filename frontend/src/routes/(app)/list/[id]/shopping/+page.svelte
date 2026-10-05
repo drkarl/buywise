@@ -15,6 +15,7 @@
 	import {
 		shoppingEntries,
 		categories,
+		subcategories,
 		storeCategoryOrders,
 		loadSelectedStore,
 		saveSelectedStore,
@@ -30,6 +31,7 @@
 	// keeps every subscription scoped to this page's lifecycle.
 	const entries = $derived(shoppingEntries(listId));
 	const cats = $derived(categories());
+	const subs = $derived(subcategories());
 	const orders = $derived(storeCategoryOrders());
 
 	let selectedStore = $state<RetailerId>(loadSelectedStore());
@@ -39,12 +41,13 @@
 		saveSelectedStore(store);
 	}
 
-	// Group + order items for the selected store. Categories with zero ACTIVE
-	// items are HIDDEN (product decision, AC #5): once everything in a category is
-	// bought, the section disappears so the shopper focuses on what's left.
-	// Bought items in a still-active category remain visible struck-through.
+	// Group + order items for the selected store. Broad categories split into
+	// their sub-categories (issue #101); sections with zero ACTIVE items are
+	// HIDDEN (product decision, AC #5): once everything in a section is bought,
+	// it disappears so the shopper focuses on what's left. Bought items in a
+	// still-active section remain visible struck-through.
 	const groups = $derived(
-		sortByStoreOrder($entries, $orders, selectedStore, $cats).filter(
+		sortByStoreOrder($entries, $orders, selectedStore, $cats, $subs).filter(
 			(g) => g.remaining > 0
 		)
 	);
@@ -82,7 +85,7 @@
 
 	{#if groups.length > 0}
 		<div class="groups">
-			{#each groups as group (group.category_id)}
+			{#each groups as group (group.id)}
 				<CategoryGroup {group} onbought={(id) => markBought(listId, id)} />
 			{/each}
 		</div>

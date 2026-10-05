@@ -476,3 +476,90 @@ async fn mutations_operation_type_check_accepts_move_to_list() {
         "move_to_list must be accepted after migration 009"
     );
 }
+
+/// Migration 010 seeds the shared sub-category catalogue and backfills
+/// `canonical_items.subcategory_id` from the name-keyed seed mapping (issue #101).
+///
+/// The contract: every seeded item in a split category (Pantry, Drinks,
+/// Household) is mapped to a sub-category that belongs to its OWN parent
+/// category, so shopping mode can split a large section; items in unsplit
+/// categories keep `subcategory_id = NULL` and fall back to the parent category.
+#[tokio::test]
+async fn migration_010_seeds_subcategories_and_backfills_items() {
+    let pool = migrated_pool().await;
+
+    const PANTRY: &str = "c1000000-0000-0000-0000-000000000005";
+    const DRINKS: &str = "c1000000-0000-0000-0000-000000000008";
+    const HOUSEHOLD: &str = "c1000000-0000-0000-0000-000000000010";
+    const PRODUCE: &str = "c1000000-0000-0000-0000-000000000001";
+
+    // 14 shared sub-categories: 6 Pantry + 4 Drinks + 4 Household.
+    let subcategories: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subcategories")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(subcategories, 14, "6 Pantry + 4 Drinks + 4 Household");
+
+    // Every sub-category hangs off a real category and has a positive order.
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM subcategories s \
+         LEFT JOIN categories c ON c.id = s.category_id \
+         WHERE c.id IS NULL OR s.default_order < 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphans, 0, "sub-categories must reference a real parent");
+
+    // A broad category now splits into several smaller groups: every Pantry item
+    // the seed ships is mapped, and the 31 items span exactly 6 sub-categories.
+    for (category, expected_subcategories, what) in [
+        (PANTRY, 6, "Pantry"),
+        (DRINKS, 4, "Drinks"),
+        (HOUSEHOLD, 4, "Household"),
+    ] {
+        let unmapped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM canonical_items \
+             WHERE category_id = ?1 AND subcategory_id IS NULL",
+        )
+        .bind(category)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unmapped, 0, "every seeded {what} item must be mapped");
+
+        let distinct: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT subcategory_id) FROM canonical_items WHERE category_id = ?1",
+        )
+        .bind(category)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            distinct, expected_subcategories,
+            "{what} must split into {expected_subcategories} sub-categories"
+        );
+    }
+
+    // A mapped sub-category always belongs to the item's own parent category.
+    let cross_category: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM canonical_items ci \
+         JOIN subcategories s ON s.id = ci.subcategory_id \
+         WHERE s.category_id != ci.category_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cross_category, 0, "backfill must not cross categories");
+
+    // Unsplit categories keep NULL, so their items fall back to the parent
+    // category instead of disappearing.
+    let produce_mapped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM canonical_items WHERE category_id = ?1 AND subcategory_id IS NOT NULL",
+    )
+    .bind(PRODUCE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(produce_mapped, 0, "Produce is not split and must stay NULL");
+}

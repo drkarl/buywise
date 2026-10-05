@@ -352,6 +352,22 @@ pub struct Category {
     pub default_order: i32,
 }
 
+/// An optional sub-category beneath a [`Category`] (issue #101). Row of
+/// `subcategories`.
+///
+/// Shopping mode splits a broad category (e.g. Pantry) into several smaller
+/// sections using these; `default_order` orders the split within its parent
+/// `category_id`. Shared reference data like `Category` (not household-scoped),
+/// and bilingual to match it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Subcategory {
+    pub id: String,
+    pub category_id: String,
+    pub name_en: String,
+    pub name_es: String,
+    pub default_order: i32,
+}
+
 /// A household's canonical item. Row of `canonical_items`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct CanonicalItem {
@@ -360,6 +376,9 @@ pub struct CanonicalItem {
     pub name_en: String,
     pub name_es: String,
     pub category_id: String,
+    /// Optional sub-category. `None` for items with no mapping; consumers fall
+    /// back to `category_id` so the item never disappears from a section.
+    pub subcategory_id: Option<String>,
     pub default_constraint_policy: ConstraintPolicy,
     pub created_at: String,
 }
@@ -630,6 +649,7 @@ mod tests {
             name_en: "Milk".into(),
             name_es: "Leche".into(),
             category_id: "dairy".into(),
+            subcategory_id: None,
             default_constraint_policy: ConstraintPolicy::OwnLabel,
             created_at: "2026-05-01T00:00:00Z".into(),
         };
@@ -762,5 +782,19 @@ mod tests {
             .await
             .expect("query categories");
         assert_eq!(categories.len(), 11);
+    }
+
+    /// Reads the 14 seeded sub-categories via `query_as` to prove `FromRow` works
+    /// against real data (issue #101).
+    #[tokio::test]
+    async fn query_as_reads_seeded_subcategories() {
+        let pool = db::connect("sqlite::memory:").await.expect("connect");
+        db::run_migrations(&pool).await.expect("migrate");
+
+        let subcategories = sqlx::query_as::<_, Subcategory>("SELECT * FROM subcategories")
+            .fetch_all(&pool)
+            .await
+            .expect("query subcategories");
+        assert_eq!(subcategories.len(), 14);
     }
 }

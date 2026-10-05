@@ -34,7 +34,7 @@ async function seed() {
 	]);
 }
 
-function entry(id: string, display_name: string, category_id: string) {
+function entry(id: string, display_name: string, category_id: string, subcategory_id?: string) {
 	return {
 		id,
 		list_id: LIST,
@@ -44,6 +44,7 @@ function entry(id: string, display_name: string, category_id: string) {
 		quantity: 1,
 		status: 'active' as const,
 		category_id,
+		subcategory_id,
 		last_updated_revision: 0,
 		updated_at: '2026-01-01T00:00:00Z'
 	};
@@ -109,5 +110,49 @@ describe('shopping page', () => {
 		// while Dairy (still active) stays.
 		await waitFor(() => expect(screen.queryByText('Produce')).toBeNull());
 		expect(screen.queryByText('Dairy')).not.toBeNull();
+	});
+
+	it('splits a broad category into smaller sub-category sections', async () => {
+		const PANTRY = 'cat-pantry';
+		await db.categories.bulkPut([
+			{
+				id: PANTRY,
+				name_en: 'Pantry',
+				name_es: 'Despensa',
+				icon: 'package',
+				default_order: 5
+			}
+		]);
+		await db.subcategories.bulkPut([
+			{
+				id: 'sub-pasta',
+				category_id: PANTRY,
+				name_en: 'Pasta & Rice',
+				name_es: 'Pasta y Arroz',
+				default_order: 1
+			},
+			{
+				id: 'sub-tins',
+				category_id: PANTRY,
+				name_en: 'Tins & Jars',
+				name_es: 'Conservas y Tarros',
+				default_order: 2
+			}
+		]);
+		await db.list_entries.bulkPut([
+			entry('e-pasta', 'Pasta', PANTRY, 'sub-pasta'),
+			entry('e-beans', 'Beans', PANTRY, 'sub-tins'),
+			// No sub-category: falls back to the parent Pantry section.
+			entry('e-flour', 'Flour', PANTRY)
+		]);
+
+		render(Page);
+
+		// One long Pantry section becomes three smaller ones, in default order.
+		await waitFor(() => expect(screen.getByText('Pasta & Rice')).toBeTruthy());
+		const titles = screen
+			.getAllByText(/Pasta & Rice|Tins & Jars|Pantry/)
+			.map((n) => n.textContent);
+		expect(titles).toEqual(['Pasta & Rice', 'Tins & Jars', 'Pantry']);
 	});
 });

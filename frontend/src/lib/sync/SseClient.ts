@@ -14,7 +14,7 @@
 
 import { db } from '$lib/db/dexie';
 import {
-  resolveCategoryId,
+  resolveEntryGrouping,
   toLocalEntry,
   type SseMutationData,
   type SseSnapshotData
@@ -55,10 +55,11 @@ export interface SseClientOptions {
 export async function applyMutationEvent(data: SseMutationData): Promise<void> {
   const entry = toLocalEntry(data.entity);
   await db.transaction('rw', db.list_entries, db.list_meta, db.item_categories, async () => {
-    // Derive category_id from the cached catalogue (P2-T6) so shopping mode can
-    // bucket this synced entry. A cache miss leaves it undefined ("Other"); a
-    // later catalogue (re)fetch backfills it (see catalogue.ts backfill).
-    await resolveCategoryId(entry);
+    // Derive the grouping keys (category + sub-category) from the cached
+    // catalogue (P2-T6, issue #101) so shopping mode can bucket this synced
+    // entry. A cache miss leaves them undefined ("Other"); a later catalogue
+    // (re)fetch backfills them (see catalogue.ts backfill).
+    await resolveEntryGrouping(entry);
     // Per-entry monotonic guard: only overwrite the local row if the incoming
     // entity is at least as new (by `last_updated_revision`). Events for the same
     // entry can arrive out of order across the SSE and drain paths (e.g. an SSE
@@ -187,11 +188,12 @@ export async function applySnapshotEvent(
 
   const txTables = [db.list_entries, db.list_meta, db.mutation_queue, db.item_categories] as const;
   await db.transaction('rw', txTables, async () => {
-    // Resolve each entry's category_id from the cached catalogue (P2-T6) before
-    // any write, so both the wholesale bulkPut and the stale-path revert persist
-    // the grouped category. Cache misses leave it undefined ("Other") until a
-    // catalogue (re)fetch backfills it.
-    for (const e of entries) await resolveCategoryId(e);
+    // Resolve each entry's grouping keys (category + sub-category) from the
+    // cached catalogue (P2-T6, issue #101) before any write, so both the
+    // wholesale bulkPut and the stale-path revert persist the grouped category.
+    // Cache misses leave them undefined ("Other") until a catalogue (re)fetch
+    // backfills them.
+    for (const e of entries) await resolveEntryGrouping(e);
 
     const meta = await db.list_meta.get(listId);
 

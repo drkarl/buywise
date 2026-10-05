@@ -8,7 +8,8 @@ import {
 import type {
 	LocalCategory,
 	LocalListEntry,
-	LocalStoreCategoryOrder
+	LocalStoreCategoryOrder,
+	LocalSubcategory
 } from '$lib/db/dexie';
 
 // Three real category ids (mirror the seeded UUIDs' role, values are arbitrary
@@ -27,7 +28,8 @@ const categories: LocalCategory[] = [
 function entry(
 	id: string,
 	category_id: string | undefined,
-	status: LocalListEntry['status'] = 'active'
+	status: LocalListEntry['status'] = 'active',
+	subcategory_id?: string
 ): LocalListEntry {
 	return {
 		id,
@@ -38,6 +40,7 @@ function entry(
 		quantity: 1,
 		status,
 		category_id,
+		subcategory_id,
 		last_updated_revision: 0,
 		updated_at: '2026-01-01T00:00:00Z'
 	};
@@ -48,8 +51,8 @@ function order(store: string, category_id: string, display_order: number): Local
 	return { id: `sco-${store}-${category_id}`, store, category_id, display_order };
 }
 
-/** Convenience: the ordered list of category ids in the result. */
-const ids = (groups: CategoryGroup[]) => groups.map((g) => g.category_id);
+/** Convenience: the ordered list of section ids in the result. */
+const ids = (groups: CategoryGroup[]) => groups.map((g) => g.id);
 
 describe('sortByStoreOrder', () => {
 	it('returns an empty array for empty inputs', () => {
@@ -198,5 +201,93 @@ describe('sortByStoreOrder', () => {
 			categories
 		);
 		expect(groups[0].category?.name_en).toBe('Dairy');
+	});
+});
+
+describe('sortByStoreOrder sub-categories (issue #101)', () => {
+	const PANTRY = 'cat-pantry';
+	const PASTA = 'sub-pasta';
+	const TINS = 'sub-tins';
+
+	const pantryCategories: LocalCategory[] = [
+		{ id: PRODUCE, name_en: 'Produce', name_es: 'Frutas', icon: 'carrot', default_order: 1 },
+		{ id: PANTRY, name_en: 'Pantry', name_es: 'Despensa', icon: 'package', default_order: 5 }
+	];
+
+	const subcategories: LocalSubcategory[] = [
+		{
+			id: TINS,
+			category_id: PANTRY,
+			name_en: 'Tins & Jars',
+			name_es: 'Conservas y Tarros',
+			default_order: 2
+		},
+		{
+			id: PASTA,
+			category_id: PANTRY,
+			name_en: 'Pasta & Rice',
+			name_es: 'Pasta y Arroz',
+			default_order: 1
+		}
+	];
+
+	it('splits a broad category into sub-sections in default_order', () => {
+		const items = [entry('beans', PANTRY, 'active', TINS), entry('pasta', PANTRY, 'active', PASTA)];
+
+		const groups = sortByStoreOrder(items, [], 'tesco', pantryCategories, subcategories);
+
+		// Pasta (order 1) before Tins (order 2), even though beans arrived first.
+		expect(ids(groups)).toEqual([PASTA, TINS]);
+		expect(groups[0].subcategory?.name_en).toBe('Pasta & Rice');
+		expect(groups[0].subcategory?.name_es).toBe('Pasta y Arroz');
+		// Each sub-section still carries its parent category for ordering/context.
+		expect(groups[0].category_id).toBe(PANTRY);
+		expect(groups[0].category?.name_en).toBe('Pantry');
+	});
+
+	it('keeps the sub-sections inside the parent category store slot', () => {
+		const items = [
+			entry('apple', PRODUCE),
+			entry('pasta', PANTRY, 'active', PASTA),
+			entry('beans', PANTRY, 'active', TINS)
+		];
+		// Store curates Pantry (1) BEFORE Produce (2): both Pantry sub-sections
+		// must stay contiguous under that slot.
+		const orders = [order('tesco', PANTRY, 1), order('tesco', PRODUCE, 2)];
+
+		const groups = sortByStoreOrder(items, orders, 'tesco', pantryCategories, subcategories);
+		expect(ids(groups)).toEqual([PASTA, TINS, PRODUCE]);
+	});
+
+	it('falls back to the parent category for an item with no sub-category', () => {
+		// One mapped item and one unmapped item in the same parent category.
+		const items = [entry('flour', PANTRY), entry('pasta', PANTRY, 'active', PASTA)];
+
+		const groups = sortByStoreOrder(items, [], 'tesco', pantryCategories, subcategories);
+		// Split sub-category first; the unmapped item keeps the parent category id.
+		expect(ids(groups)).toEqual([PASTA, PANTRY]);
+		expect(groups[1].subcategory).toBeUndefined();
+		expect(groups[1].category?.name_en).toBe('Pantry');
+		expect(groups[1].items.map((i) => i.id)).toEqual(['flour']);
+	});
+
+	it('ignores a stale subcategory_id absent from the catalogue', () => {
+		// The entry references a sub-category the client has not cached (e.g. a
+		// newer split than the cached catalogue): fall back to the parent category
+		// rather than dropping the item.
+		const items = [entry('mystery', PANTRY, 'active', 'sub-missing')];
+
+		const groups = sortByStoreOrder(items, [], 'tesco', pantryCategories, subcategories);
+		expect(ids(groups)).toEqual([PANTRY]);
+	});
+
+	it('keeps entries with no category at all in the uncategorised bucket last', () => {
+		const items = [
+			entry('u', undefined),
+			entry('pasta', PANTRY, 'active', PASTA)
+		];
+
+		const groups = sortByStoreOrder(items, [], 'tesco', pantryCategories, subcategories);
+		expect(ids(groups)).toEqual([PASTA, UNCATEGORISED_ID]);
 	});
 });

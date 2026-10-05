@@ -255,11 +255,21 @@ categories          (id, name_en, name_es, icon, default_order)
                      -- seeded with 11 categories: PRODUCE, MEAT_FISH, DAIRY, BAKERY, PANTRY,
                      --   FROZEN, SNACKS, DRINKS, BABY, HOUSEHOLD, TOILETRIES
                      -- canonical_items.category_id FK → categories.id
+subcategories       (id, category_id, name_en, name_es, default_order)
+                     -- issue #101: one optional split level beneath a broad category, so
+                     --   shopping mode shows several smaller sections (e.g. Pantry → Pasta &
+                     --   Rice, Tins & Jars, Sauces, Breakfast, Baking, Spices). Shared
+                     --   reference data like `categories`, bilingual, ordered within its
+                     --   parent by default_order. Seeded by migration 010.
+                     -- canonical_items.subcategory_id FK → subcategories.id (NULLABLE: NULL
+                     --   means shopping mode falls back to the parent category)
 store_category_orders (id, household_id, store,    -- tesco | dunnes | supervalu | aldi | lidl
                        category_id, display_order,  -- per-store aisle ordering for shopping mode
                        updated_at)
                      -- unique(household_id, store, category_id)
                      -- defaults seeded per store; household can drag-reorder in settings
+                     -- orders PARENT categories only; per-store sub-category layouts are
+                     --   out of scope (issue #101), sub-categories use their default_order
 
 -- Price data
 retailer_products   (id, source,          -- basketwatch | lidl_direct | manual

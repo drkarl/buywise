@@ -1,24 +1,47 @@
-// Pure grouping/ordering for shopping mode (P2-T6). No Dexie, Svelte, or DOM
-// here so it is trivially unit-testable: it takes plain arrays in and returns
-// plain category groups out. The page layer feeds it live data from Dexie.
+// Pure grouping/ordering for shopping mode (P2-T6, sub-categories from issue
+// #101). No Dexie, Svelte, or DOM here so it is trivially unit-testable: it
+// takes plain arrays in and returns plain groups out. The page layer feeds it
+// live data from Dexie.
 //
 // Source of truth for field names: crates/core/src/domain.rs (`Category`,
-// `Retailer`) and migrations/003_phase1_schema.sql (`store_category_orders`).
+// `Subcategory`, `Retailer`) and migrations/003_phase1_schema.sql
+// (`store_category_orders`) + migrations/010_subcategories.sql (`subcategories`).
 
 import type {
   LocalCategory,
   LocalListEntry,
-  LocalStoreCategoryOrder
+  LocalStoreCategoryOrder,
+  LocalSubcategory
 } from '$lib/db/dexie';
 
-/** One category section in shopping mode, with its items already grouped. */
+/**
+ * One section in shopping mode, with its items already grouped.
+ *
+ * A section is a sub-category when the item's catalogue entry carries one
+ * (issue #101); otherwise it is the parent category. Entries whose item has no
+ * resolvable grouping at all bucket under `UNCATEGORISED_ID`.
+ */
 export interface CategoryGroup {
+  /**
+   * Identity of this section: the sub-category id when split, else the parent
+   * category id, else `UNCATEGORISED_ID`. Unique within a result, so it is safe
+   * as a rendering key.
+   */
+  id: string;
+  /**
+   * The parent category id. `UNCATEGORISED_ID` when the entry has no resolvable
+   * category. Drives the store-specific aisle ordering.
+   */
   category_id: string;
-  /** The matching `LocalCategory`, or `undefined` for uncategorised items. */
+  /** Set when this section is one sub-category of `category_id`. */
+  subcategory_id?: string;
+  /** The parent `LocalCategory`, or `undefined` for uncategorised items. */
   category?: LocalCategory;
-  /** Entries in this category, preserving their incoming (entry) order. */
+  /** The matching `LocalSubcategory`, or `undefined` for unsplit sections. */
+  subcategory?: LocalSubcategory;
+  /** Entries in this section, preserving their incoming (entry) order. */
   items: LocalListEntry[];
-  /** Active (not yet bought/skipped) items remaining in this category. */
+  /** Active (not yet bought/skipped) items remaining in this section. */
   remaining: number;
 }
 
@@ -81,14 +104,30 @@ function displayOrderFor(
 }
 
 /**
- * Groups list entries by category and orders the groups by the selected store's
- * aisle ordering (`store_category_orders.display_order`).
+ * Sentinel ordering value for a section that has no sub-category of its own: the
+ * parent-category fallback section sorts AFTER every sub-category of its parent
+ * (and before the next parent category).
+ */
+const NO_SUBCATEGORY_ORDER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Groups list entries by sub-category when the catalogue supplies one, and by
+ * category otherwise, then orders the sections by the selected store's aisle
+ * ordering (`store_category_orders.display_order`) and the sub-category's
+ * `default_order` within its parent.
  *
- * - Items keep their incoming order within a category (callers pass entries
+ * - Items keep their incoming order within a section (callers pass entries
  *   oldest-first, matching the main list view).
+ * - A broad category (e.g. Pantry) splits into its sub-categories in
+ *   `default_order`; an item whose entry carries no known sub-category falls
+ *   back to a single section keyed by its parent category, so nothing
+ *   disappears.
+ * - The parent category drives store ordering: every sub-category of a curated
+ *   category inherits that category's (store, display_order) slot. Per-store
+ *   layouts for sub-categories are out of scope (issue #101).
  * - Categories not present in `orders` for `storeId` fall back to the category
- *   `default_order`, then to a stable `category_id` tiebreak; entries with no
- *   `category_id` are bucketed under `UNCATEGORISED_ID` and always sort last.
+ *   `default_order`, then to a stable id tiebreak; entries with no grouping at
+ *   all are bucketed under `UNCATEGORISED_ID` and always sort last.
  * - Pure and total: empty inputs yield an empty array.
  *
  * The page layer is responsible for hiding zero-`remaining` groups (the
@@ -99,7 +138,8 @@ export function sortByStoreOrder(
   items: LocalListEntry[],
   orders: LocalStoreCategoryOrder[],
   storeId: string,
-  categories: LocalCategory[] = []
+  categories: LocalCategory[] = [],
+  subcategories: LocalSubcategory[] = []
 ): CategoryGroup[] {
   // Per-store display_order lookup for the selected store only.
   const storeOrder = new Map<string, number>();
@@ -114,33 +154,68 @@ export function sortByStoreOrder(
     defaultOrder.set(c.id, c.default_order);
   }
 
-  // Bucket entries by category, preserving incoming order within each bucket.
-  const buckets = new Map<string, LocalListEntry[]>();
+  const subcategoryById = new Map<string, LocalSubcategory>();
+  for (const s of subcategories) subcategoryById.set(s.id, s);
+
+  // Bucket entries, preserving incoming order within each bucket. An entry with
+  // a known sub-category buckets by it; anything else (no sub-category id, or a
+  // stale id absent from the catalogue) buckets by parent category.
+  const buckets = new Map<
+    string,
+    { category_id: string; subcategory_id?: string; items: LocalListEntry[] }
+  >();
   for (const item of items) {
-    const key = item.category_id ?? UNCATEGORISED_ID;
+    const subcategory =
+      item.subcategory_id === undefined ? undefined : subcategoryById.get(item.subcategory_id);
+    const key = subcategory ? subcategory.id : (item.category_id ?? UNCATEGORISED_ID);
     const bucket = buckets.get(key);
-    if (bucket) bucket.push(item);
-    else buckets.set(key, [item]);
+    if (bucket) {
+      bucket.items.push(item);
+    } else {
+      buckets.set(key, {
+        category_id: subcategory ? subcategory.category_id : (item.category_id ?? UNCATEGORISED_ID),
+        subcategory_id: subcategory?.id,
+        items: [item]
+      });
+    }
   }
 
   const groups: CategoryGroup[] = [];
-  for (const [categoryId, bucketItems] of buckets) {
+  for (const [id, bucket] of buckets) {
     groups.push({
-      category_id: categoryId,
-      category: categoryById.get(categoryId),
-      items: bucketItems,
-      remaining: bucketItems.filter((i) => i.status === 'active').length
+      id,
+      category_id: bucket.category_id,
+      subcategory_id: bucket.subcategory_id,
+      category: categoryById.get(bucket.category_id),
+      subcategory:
+        bucket.subcategory_id === undefined
+          ? undefined
+          : subcategoryById.get(bucket.subcategory_id),
+      items: bucket.items,
+      remaining: bucket.items.filter((i) => i.status === 'active').length
     });
   }
 
-  // Order groups by the store key, with a stable category_id tiebreak so the
-  // result is fully deterministic for equal keys (and for the fallback bucket).
+  // Order sections by the store key, then by sub-category display order within a
+  // parent, with a stable id tiebreak so the result is fully deterministic.
+  const orderValues = new Map<string, { order: OrderKey; suborder: number }>();
+  for (const group of groups) {
+    orderValues.set(group.id, {
+      order: displayOrderFor(group.category_id, storeOrder, defaultOrder),
+      suborder:
+        group.subcategory_id === undefined
+          ? NO_SUBCATEGORY_ORDER
+          : (subcategoryById.get(group.subcategory_id)?.default_order ?? NO_SUBCATEGORY_ORDER)
+    });
+  }
+
   groups.sort((a, b) => {
-    const oa = displayOrderFor(a.category_id, storeOrder, defaultOrder);
-    const ob = displayOrderFor(b.category_id, storeOrder, defaultOrder);
-    if (oa.tier !== ob.tier) return oa.tier - ob.tier;
-    if (oa.value !== ob.value) return oa.value - ob.value;
-    return a.category_id < b.category_id ? -1 : a.category_id > b.category_id ? 1 : 0;
+    const ka = orderValues.get(a.id)!;
+    const kb = orderValues.get(b.id)!;
+    if (ka.order.tier !== kb.order.tier) return ka.order.tier - kb.order.tier;
+    if (ka.order.value !== kb.order.value) return ka.order.value - kb.order.value;
+    if (ka.suborder !== kb.suborder) return ka.suborder - kb.suborder;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
 
   return groups;
