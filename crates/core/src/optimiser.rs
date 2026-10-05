@@ -497,8 +497,8 @@ pub enum ReasonCode {
     /// `item_indices` are lines at `retailers` whose price is not from the latest
     /// successful source run.
     StalePrices,
-    /// `snapshot_date` is the latest source snapshot date among this plan's
-    /// offers, or `None` when none of them has a recorded date.
+    /// `snapshot_date` is the oldest known source snapshot date among this
+    /// plan's offers. `item_indices` lists plan lines with no recorded date.
     PriceAsOf,
     /// The recommended two-store split's saving (`cents`) clears the convenience
     /// bar (`threshold_cents`) for the store(s) it adds in `retailers`.
@@ -1729,21 +1729,32 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
 
     // ---- Price freshness: the date the plan's prices are from, plus any line
     // behind the latest successful source run. ------------------------------
-    let as_of = plan
+    let snapshots: Vec<(usize, Option<String>)> = plan
         .lines
         .iter()
-        .filter_map(|l| {
-            ctx.comp
+        .map(|line| {
+            let snapshot = ctx
+                .comp
                 .best_per_item
-                .get(&l.item_index)
-                .and_then(|by_retailer| by_retailer.get(&l.retailer))
-                .and_then(|c| c.offer.source_snapshot_date.clone())
+                .get(&line.item_index)
+                .and_then(|by_retailer| by_retailer.get(&line.retailer))
+                .and_then(|candidate| candidate.offer.source_snapshot_date.clone());
+            (line.item_index, snapshot)
         })
-        .max();
+        .collect();
+    let as_of = snapshots
+        .iter()
+        .filter_map(|(_, snapshot)| snapshot.as_deref())
+        .min()
+        .map(str::to_owned);
+    let undated_items = snapshots
+        .iter()
+        .filter_map(|(item_index, snapshot)| snapshot.is_none().then_some(*item_index))
+        .collect();
     out.push(reason(
         kind,
         ReasonCode::PriceAsOf,
-        Vec::new(),
+        undated_items,
         Vec::new(),
         None,
         None,

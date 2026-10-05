@@ -2489,11 +2489,43 @@ fn reason_reports_price_date_and_stale_lines() {
     let out = run(&input, priced);
     let as_of =
         reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf).expect("price-as-of reason");
-    assert_eq!(as_of.snapshot_date.as_deref(), Some("2026-06-01"));
+    assert_eq!(as_of.snapshot_date.as_deref(), Some("2026-05-20"));
     let stale = reason_with(&out, PlanKind::BestSingle, ReasonCode::StalePrices)
         .expect("stale-prices reason");
     assert_eq!(stale.item_indices, vec![1]);
     assert_eq!(stale.retailers, vec![Retailer::Tesco]);
+}
+
+#[test]
+fn price_as_of_marks_lines_without_a_snapshot_date() {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item("milk", "ci-milk", 1), item("bread", "ci-bread", 1)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m1", "ci-milk", "p1", MatchStatus::Accepted),
+            product("p1", Retailer::Tesco),
+            offer_dated("o1", "p1", 100, Some(5), Some("2026-06-01")),
+        )],
+    );
+    priced.insert(
+        1,
+        vec![(
+            product_match("m2", "ci-bread", "p2", MatchStatus::Accepted),
+            product("p2", Retailer::Tesco),
+            offer("o2", "p2", 200, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let as_of =
+        reason_with(&out, PlanKind::BestSingle, ReasonCode::PriceAsOf).expect("price-as-of reason");
+    assert_eq!(as_of.snapshot_date.as_deref(), Some("2026-06-01"));
+    assert_eq!(as_of.item_indices, vec![1]);
 }
 
 #[test]
