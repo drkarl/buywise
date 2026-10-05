@@ -58,7 +58,7 @@ export interface SyncHandle {
   stop(): void;
   /** Live sync/connectivity status for the always-visible indicator. */
   status: Readable<SyncStatus>;
-  /** Clears all persisted terminal failures for this list. */
+  /** Reconciles and clears persisted terminal failures for this list. */
   dismissFailures(): Promise<void>;
 }
 
@@ -266,11 +266,25 @@ export function startSync(listId: string, options: SyncOptions = {}): SyncHandle
   return {
     status: statusStore.status,
     async dismissFailures() {
-      await db.mutation_queue
+      const failures = await db.mutation_queue
         .where('list_id')
         .equals(listId)
         .filter((mutation) => mutation.status === 'failed')
-        .delete();
+        .toArray();
+      if (failures.length === 0) return;
+
+      const snapshot = await fetchSnapshot(listId, options.fetchFn ?? fetch, {
+        reconcile: true,
+        removeEntityIds: failures
+          .filter((mutation) => mutation.operation_type === 'add_item')
+          .map((mutation) => mutation.entity_id),
+        revertEntityIds: failures
+          .filter((mutation) => mutation.operation_type !== 'add_item')
+          .map((mutation) => mutation.entity_id)
+      });
+      if (!snapshot) return;
+
+      await db.mutation_queue.bulkDelete(failures.map((mutation) => mutation.id!));
     },
     async resync() {
       await bootstrap; // ensure the initial pass has wired up before re-draining
