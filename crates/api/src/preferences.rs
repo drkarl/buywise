@@ -285,7 +285,11 @@ struct ValidatedPreferences {
 /// would silently weaken a rule.
 fn validate(body: PutPreferencesRequest) -> Result<ValidatedPreferences, StatusCode> {
     let brand = normalise_optional_brand(body.brand);
-    let allowed_brands = normalise_brand_list(body.allowed_brands);
+    let allowed_brands = if body.default_constraint_policy == ConstraintPolicy::AllowedSet {
+        normalise_brand_list(body.allowed_brands)
+    } else {
+        Vec::new()
+    };
     let excluded_brands = normalise_brand_list(body.excluded_brands);
 
     // A size is all-or-nothing and must be positive: the optimiser compares it
@@ -582,6 +586,21 @@ mod tests {
             validate(body).unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    #[test]
+    fn allowed_brands_are_cleared_outside_allowed_set_policy() {
+        let body = PutPreferencesRequest {
+            default_constraint_policy: ConstraintPolicy::Any,
+            brand: None,
+            allowed_brands: vec!["Branston".into()],
+            excluded_brands: vec![],
+            preferred_size_value: None,
+            preferred_size_basis: None,
+            substitution_policy: SubstitutionPolicy::Any,
+        };
+
+        assert!(validate(body).unwrap().allowed_brands.is_empty());
     }
 
     #[test]
