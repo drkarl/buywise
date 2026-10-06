@@ -234,9 +234,14 @@ async fn delete_household(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let counts = household_data::delete_household(&state.pool, &household_id, false)
-        .await
-        .map_err(core_error("household.delete"))?;
+    let counts = household_data::delete_household(
+        &state.pool,
+        &household_id,
+        false,
+        &state.receipt_config.dir,
+    )
+    .await
+    .map_err(core_error("household.delete"))?;
     let removed_rows: u64 = counts.iter().map(|(_, count)| count).sum();
 
     // End the caller's session. `delete_household` already removed the session
@@ -335,7 +340,9 @@ async fn remove_member(
 /// Refuse with 403 unless `user_id` is a member of `household_id`.
 ///
 /// A DB error is a logged 500 (fail closed), never treated as "not a member".
-async fn require_member(
+/// Shared with the receipt-image routes ([`crate::receipts`]), which are scoped
+/// to the path's household the same way.
+pub(crate) async fn require_member(
     state: &AppState,
     user_id: &str,
     household_id: &str,
@@ -377,6 +384,13 @@ fn core_error(context: &'static str) -> impl Fn(HouseholdDataError) -> StatusCod
     move |err| match err {
         HouseholdDataError::NoSuchHousehold(_) => StatusCode::NOT_FOUND,
         HouseholdDataError::Sqlx(err) => {
+            tracing::error!(error = %err, "{context}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        // Only the household-delete path can raise this, and only when a
+        // receipt-image file could not be unlinked (the transaction then rolls
+        // back, so nothing was deleted): a logged 500 to retry.
+        HouseholdDataError::Receipts(err) => {
             tracing::error!(error = %err, "{context}");
             StatusCode::INTERNAL_SERVER_ERROR
         }

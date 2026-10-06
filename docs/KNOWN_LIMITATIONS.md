@@ -549,8 +549,9 @@ Issue #119, roadmap #114. The authoritative policy, behaviour, procedures and ex
 
 Open follow-ups:
 
-- When receipt ingestion is implemented, enforce a per-upload processing choice, provider
-  disclosure, no-publication/no-training terms, image expiry and deletion.
+- **Receipt images are stored, but nothing reads them.** The reading slice still owes provider
+  disclosure and the no-publication/no-training terms, and the local OCR itself; storage, the
+  per-upload processing choice, expiry and deletion are implemented (see "Receipt images" below).
 - Decide backup encryption and key custody; verify the deployed R2 token scope and record a restore
   rehearsal (retention is now explicit at 7 days and the rehearsal is a required runbook step —
   issue #142).
@@ -558,6 +559,106 @@ Open follow-ups:
   for deleted SQLite pages.
 - Revisit deletion of aggregate usage counters if they become household-attributable.
 - Consider an encrypted export option for the point-in-time JSON snapshot.
+
+## Receipt images
+
+Issue #149, roadmap #114. A member photographs a receipt after a shop and keeps it privately on the
+household's own server for 30 days. Storage layout, limits, the per-upload processing choice, the
+expiry sweep and how deletion and export treat the images are described in
+[`docs/data-flows.md`](data-flows.md) §4; the export key is in
+[`docs/household-export.md`](household-export.md). Reading the image is **not** implemented: there is
+no OCR, the images are not linked to purchase records, and no external service is called.
+
+### 1. The image bytes are stored verbatim, so EXIF (including a location tag) survives
+
+**What happens.** An upload is written to disk exactly as it arrived. A phone camera usually writes
+EXIF, which can include the capture time and GPS coordinates of the shop, and occasionally the
+device model; all of it stays in the stored file and is served back with it.
+
+**Why accepted.** Stripping EXIF means decoding and re-encoding the image, which this slice
+deliberately does not do: the acceptance criteria are storage, limits, expiry and deletion, and a
+re-encode would change the bytes (and therefore the stored checksum) and introduce an image codec
+into the request path. The household's own members are the only readers, and the file is served with
+`Cache-Control: private, no-store` from the household's own server.
+
+**Workaround.** On the phone, deny the camera app location permission or turn off "save location"
+for the photo, so nothing sensitive is written in the first place. Deleting a receipt removes the
+file (subject to item 3).
+
+**Follow-up.** Strip or normalise metadata when the reading slice decodes the image, so a later
+version stops storing what it does not need.
+
+### 2. Receipt images are not in the database backup, and a restore can leave records without files
+
+**What happens.** Litestream replicates `/var/lib/buywise/buywise.db` only
+(`docs/data-flows.md` §2.4). The receipt directory is a separate filesystem tree that is neither
+replicated to R2 nor backed up elsewhere, so a disaster restore brings back `receipt_images` rows but
+not the bytes. Those records read as `404` and the daily sweep removes them (tolerating the missing
+file); the pictures themselves are gone and the export carries metadata only.
+
+**Why accepted.** A growing image tree is not something the single-file SQLite replication path can
+carry, and this slice's contract is the 30-day local retention itself — the images are deliberately
+short-lived, not an archive. Extending backup scope to a directory is a deployment decision, not
+something to slip into this slice.
+
+**Workaround.** A household that wants to keep a picture saves it from the Receipts page before its
+30 days are up. An operator who wants the directory backed up must add it to their own backup scope,
+and should still expect restored rows without files to read as missing.
+
+**Follow-up.** Decide whether the receipt directory is backed up alongside the database, and record
+the answer in the runbook next to the restore rehearsal (issue #142).
+
+### 3. The sweep runs daily, and unlinking a file is not secure erasure
+
+**What happens.** `expires_at` is exact (30 days after upload), but the timer that enforces it runs
+once a day, so an image can outlive its expiry by up to a day; a host that was off at the scheduled
+time sweeps on the next boot (the timer is `Persistent`). Deletion unlinks the file: the blocks are
+freed but the bytes may remain readable on the disk until overwritten. There is no application-level
+encryption of the receipt directory at rest, just as there is none of the database.
+
+**Why accepted.** A daily sweep bounds the retention window to "30 days plus less than a day", which
+is what the policy asks for; a continuously running pruner would add a background process for no
+practical gain. Secure erasure of individual files is not achievable on a running filesystem without
+encryption at rest, which is a host-level decision (issue #142).
+
+**Workaround.** Run `buywise-cli expire-receipts --db <db>` by hand to enforce expiry immediately
+(for example before a maintenance window). Rely on full-disk encryption for an at-rest guarantee.
+
+**Follow-up.** None until backup encryption and key custody are decided (issue #142); revisit if the
+household owner asks for encrypted storage of receipt images.
+
+### 4. Nothing reads the image, and an image is not linked to the purchases it documents
+
+**What happens.** The photo is stored and shown, but no code reads it: there is no OCR, so no line
+items are extracted, and `purchase_events.source = 'receipt'` (which the schema allows) is never
+written from an image. An image is also not attached to any purchase or list line, so a receipt sits
+beside the household's purchase records rather than proving them.
+
+**Why accepted.** Reading an image well is a much larger slice (text detection, layout, product
+matching, correction UI) and the owner asked for storage with retention and deletion first. Linking
+images to lines without reading them would be guesswork.
+
+**Workaround.** None: purchases are recorded by checking items off the list, which is the existing
+purchase record.
+
+**Follow-up.** Add reading (local first, per the owner's recorded decisions) and then an explicit
+image↔purchase link. An offline upload queue and image editing are also out of this slice.
+
+### 5. An upload is one request, with no resume and no offline queue
+
+**What happens.** The Receipts page sends the whole file in a single `POST` and the choice is held in
+the page only while the request is in flight. A dropped connection or a closed tab loses the attempt,
+and the member picks the photo again.
+
+**Why accepted.** The existing offline machinery is the mutation queue for list edits; receipt bytes
+do not fit its JSON payload model, and offline queueing of image uploads was explicitly out of scope
+for this slice.
+
+**Workaround.** Upload where the connection is reasonable; the page reports the failure and the file
+input can simply be used again.
+
+**Follow-up.** Consider an offline upload queue (and chunked upload) if members report failures on
+shop wifi; it would need a local store for the pending image under the existing PWA rules.
 
 ## HTTPS reverse proxy (deploy runbook)
 

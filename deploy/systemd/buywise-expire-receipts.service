@@ -1,0 +1,43 @@
+[Unit]
+Description=BuyWise daily receipt-expiry sweep (delete receipt images and rows past their 30-day expiry)
+# No [Install] section on purpose: this is a oneshot job triggered by
+# buywise-expire-receipts.timer, not a long-running unit that should start at
+# boot. `systemctl enable` the *timer*, never this service.
+#
+# What it does: deletes the receipt image files and their receipt_images rows
+# whose 30-day expiry has passed. Receipt images are retained for 30 days by
+# policy (issue #149, docs/data-flows.md §4) and then removed by this daily
+# sweep. The subcommand is safe to run repeatedly: a second run finds nothing
+# left to remove and prints an empty summary.
+#
+# No network access is required or used: the job only touches the local SQLite
+# database and the on-disk receipt image directory, so unlike the weekly ingest
+# there is no After=network-online.target ordering.
+#
+# Type=oneshot: systemd runs the ExecStart line, waits for the process to exit,
+# and marks the unit "active (exited)" / "failed" instead of keeping it running.
+# Each daily trigger is a single sweep.
+#
+# Concurrent-writer note: the sweep deletes from the same SQLite file the API
+# uses (/var/lib/buywise/buywise.db). SQLite in WAL mode serialises writers (one
+# at a time) alongside concurrent readers, so the sweep can briefly contend with
+# buywise-api and the weekly ingest; SQLite's busy-timeout governs how long a
+# blocked writer waits. Litestream replicates the WAL, so a batch writer beside
+# the API is safe, with at most brief lock waits.
+
+[Service]
+Type=oneshot
+User=buywise
+WorkingDirectory=/var/lib/buywise
+EnvironmentFile=/etc/buywise/buywise.env
+# Deleting image files plus rows can exceed the default ~90s start timeout if a
+# large backlog has built up. Allow up to 5 minutes; the unit normally finishes
+# far sooner.
+TimeoutStartSec=300
+# The expiry subcommand takes a filesystem PATH (it builds the sqlite:// URL
+# internally), not the sqlite:// DATABASE_URL from the env file. Pass the
+# canonical DB path used everywhere else in deploy (litestream.yml/README).
+# The receipt image directory defaults to $RECEIPT_DIR when that variable is set
+# in the env file, else to <db dir>/receipts; pass --receipt-dir explicitly only
+# if the images live somewhere else.
+ExecStart=/usr/local/bin/buywise-cli expire-receipts --db /var/lib/buywise/buywise.db

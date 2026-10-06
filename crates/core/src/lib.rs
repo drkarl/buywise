@@ -9,6 +9,7 @@ pub mod optimiser;
 pub mod password;
 pub mod product_matching;
 pub mod purchase_ledger;
+pub mod receipts;
 pub mod suggestions;
 
 pub use domain::*;

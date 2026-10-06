@@ -7,9 +7,10 @@ replicates the SQLite database to Cloudflare R2.
 
 ## Architecture
 
-Two long-running systemd services run side by side, plus an optional weekly
-ingest timer (disabled by default) and, once you serve the app to phones, the
-optional Caddy reverse proxy from section 7:
+Two long-running systemd services run side by side, plus a daily receipt-expiry
+timer (installed and enabled by `setup.sh`), an optional weekly ingest timer
+(disabled by default) and, once you serve the app to phones, the optional Caddy
+reverse proxy from section 7:
 
 - `buywise.service` — runs `/usr/local/bin/buywise-api` as the `buywise` user.
 - `litestream.service` — runs `/usr/local/bin/litestream replicate` against the
@@ -19,6 +20,11 @@ optional Caddy reverse proxy from section 7:
   `ingest-lidl`) to refresh offer data. `setup.sh` installs it **without enabling
   it**; the first deploy runs without price ingest. See "Weekly price ingest"
   below for when and how to turn it on.
+- `buywise-expire-receipts.timer` → `buywise-expire-receipts.service` — daily
+  oneshot that deletes receipt image files and `receipt_images` rows once their
+  30-day expiry has passed. `setup.sh` installs **and enables** it, so the
+  retention policy is enforced from the first deploy with no operator action.
+  See "Daily receipt-expiry sweep" below.
 
 | Item | Value |
 | --- | --- |
@@ -32,7 +38,7 @@ optional Caddy reverse proxy from section 7:
 
 ## Environment variables
 
-All variables live in `/etc/buywise/buywise.env`, loaded by both services.
+All variables live in `/etc/buywise/buywise.env`, loaded by the services.
 
 **`buywise-api` (the application):**
 
@@ -62,6 +68,15 @@ above are the in-code defaults read by `crates/api/src/main.rs`.
 
 Leave all three unset while the ingest stays disabled; see "Weekly price ingest"
 below for when to enable it.
+
+**Receipt expiry (`buywise-expire-receipts.service`; installed and enabled):**
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `RECEIPT_DIR` | no | `<directory of the DB>/receipts` (`/var/lib/buywise/receipts`) | Directory holding the receipt image files the daily sweep deletes. Set it only if you store receipt images somewhere other than the default next to the database. |
+
+Leave it unset to use the default directory; see "Daily receipt-expiry sweep"
+below.
 
 **LLM resolution fallback (`buywise-api`; optional, default off):**
 
@@ -200,16 +215,21 @@ sudo ./setup.sh
 - creates the `buywise` no-login system user (if missing);
 - creates `/var/lib/buywise/` owned by `buywise`;
 - creates `/etc/buywise/` and a `buywise.env` template (mode 600) if absent;
-- installs the systemd units to `/etc/systemd/system/`, **including** the
-  optional `buywise-ingest.service` and `buywise-ingest.timer` — installed but
-  deliberately **not** enabled (see "Weekly price ingest");
+- installs the systemd units to `/etc/systemd/system/`, **including**
+  `buywise-expire-receipts.service` and `buywise-expire-receipts.timer` (the
+  daily receipt-expiry sweep) and the optional `buywise-ingest.service` and
+  `buywise-ingest.timer`;
 - installs `litestream.yml` to `/etc/litestream.yml`;
 - runs `systemctl daemon-reload`;
-- enables **nothing**: `buywise`, `litestream` and the weekly ingest timer are all
-  left for you to enable once the binaries and the env file are in place. The
-  ingest timer in particular stays disabled until you turn it on on purpose — it
-  is `Persistent=true`, so an enabled timer left unconfigured fires a catch-up
-  run at the next boot and reds the ingest with `MissingApiKey`;
+- **installs and enables** `buywise-expire-receipts.timer`, so the 30-day
+  receipt-expiry sweep runs from the first deploy without operator action (see
+  "Daily receipt-expiry sweep"). On a host without a running systemd it prints a
+  warning instead of failing; enable the timer by hand there;
+- enables no long-running unit: `buywise`, `litestream` and the weekly ingest
+  timer are all left for you to enable once the binaries and the env file are in
+  place. The ingest timer in particular stays disabled until you turn it on on
+  purpose — it is `Persistent=true`, so an enabled timer left unconfigured fires
+  a catch-up run at the next boot and reds the ingest with `MissingApiKey`;
 - installs the Caddy HTTPS reverse proxy, enables `caddy.service`, and restarts
   it to load the config **only** once you have set the hostname in
   `deploy/Caddyfile` and installed Caddy — an opt-in step that never enables the
@@ -282,6 +302,10 @@ without the price ingest, so do not enable or start `buywise-ingest.timer`.
 live-savings validation, issue #109), what it needs, and how to check it
 produced offers.
 
+The daily receipt-expiry timer needs no step here: `setup.sh` already installed
+**and enabled** `buywise-expire-receipts.timer`, so the 30-day receipt retention
+is enforced from the first deploy (see "Daily receipt-expiry sweep").
+
 Then run the first-deploy steps in section 6.
 
 ## 6. First deploy: create the household and verify the deploy
@@ -310,9 +334,11 @@ account, so it cannot be used to add a second household. See
 > owner here → verify (§6.2) → optionally serve over HTTPS (§7). The weekly price
 > ingest comes **later**: leave `buywise-ingest.timer` disabled until the
 > live-savings validation (issue #109) has confirmed supplier access, terms and
-> cost (see "Weekly price ingest"). The external AI fallback also stays off — its
-> default — for the first deploy; if it is ever turned on, the raw list term and
-> the household's canonical item names leave the server (see
+> cost (see "Weekly price ingest"). The daily receipt-expiry timer needs nothing
+> here — `setup.sh` already enabled it, so the 30-day retention runs from the
+> first deploy (see "Daily receipt-expiry sweep"). The external AI fallback also
+> stays off — its default — for the first deploy; if it is ever turned on, the
+> raw list term and the household's canonical item names leave the server (see
 > `docs/data-flows.md` §2.6).
 
 ### 6.2 Smoke test (matches acceptance criteria)
@@ -716,18 +742,80 @@ sudo systemctl start buywise-ingest.service
 journalctl -u buywise-ingest -f
 ```
 
+## Daily receipt-expiry sweep (installed and enabled by default)
+
+Receipt photos are kept for 30 days by policy (issue #149,
+[`docs/data-flows.md`](../docs/data-flows.md) §4) and then deleted. `setup.sh`
+installs **and enables** `buywise-expire-receipts.timer`, so from the first
+deploy that retention is enforced automatically — there is nothing to configure
+and no operator action to take. The sweep needs no network access and no
+credentials beyond the local environment file.
+
+**What it does.** `buywise-expire-receipts.service` (`Type=oneshot`) runs as the
+`buywise` user with `/etc/buywise/buywise.env` loaded:
+
+- `buywise-cli expire-receipts --db /var/lib/buywise/buywise.db` — deletes the
+  receipt image files and their `receipt_images` rows whose 30-day expiry has
+  passed, then prints a summary of the rows and files removed. It is safe to run
+  repeatedly: a second run finds nothing left to remove and reports an empty
+  summary.
+
+The image directory defaults to `$RECEIPT_DIR` when that variable is set in
+`/etc/buywise/buywise.env`, otherwise to `<directory of the DB>/receipts` (i.e.
+`/var/lib/buywise/receipts`). Set `RECEIPT_DIR` only if you store receipt images
+somewhere else. Like the ingest, the subcommand takes the DB as a filesystem
+PATH, not the `sqlite://` `DATABASE_URL`.
+
+**When it runs.** `buywise-expire-receipts.timer` fires **daily at 03:30** local
+time (a low-traffic overnight window). A daily sweep is enough because expiry is
+measured in whole days: anything that has expired is gone within a day, and a
+daily run keeps each sweep small instead of letting a backlog build up. The
+timer is `Persistent=true`, so a run missed while the host was down fires once on
+the next boot instead of waiting another day.
+
+**Verify expired rows and files are gone** (the run's summary says what it
+removed; these confirm the result):
+
+```bash
+# Expired rows must be zero after a sweep. julianday() parses the ISO-8601
+# `expires_at` text, so it compares correctly against now.
+sqlite3 /var/lib/buywise/buywise.db \
+  "SELECT count(*) FROM receipt_images WHERE julianday(expires_at) <= julianday('now');"
+# Every surviving row should still have its file, and vice versa: these two
+# counts should agree.
+sqlite3 /var/lib/buywise/buywise.db "SELECT count(*) FROM receipt_images;"
+ls -1 /var/lib/buywise/receipts | wc -l
+```
+
+**Inspect or trigger it:**
+
+```bash
+systemctl list-timers buywise-expire-receipts.timer
+sudo systemctl start buywise-expire-receipts.service   # run a sweep now
+journalctl -u buywise-expire-receipts -n 50 --no-pager
+```
+
+> The sweep writes to the same `/var/lib/buywise/buywise.db` the API uses.
+> SQLite WAL serialises writers, so the delete briefly contends with the API at
+> most; Litestream replicates the WAL. It is safe beside the running API.
+
 ## Logs and troubleshooting
 
 ```bash
 journalctl -u buywise -f
 journalctl -u litestream -f
 journalctl -u buywise-ingest -f
+journalctl -u buywise-expire-receipts -f
 ```
 
 - `buywise-api` logs at `RUST_LOG` level to the journal (`StandardOutput=journal`).
 - A red weekly ingest means `ingest-basketwatch` failed (Lidl is best-effort and
   cannot fail the unit). Check `journalctl -u buywise-ingest` and confirm
   `/usr/local/bin/buywise-cli` exists and the DB path is writable by `buywise`.
+- A red receipt-expiry sweep means `expire-receipts` failed. Check
+  `journalctl -u buywise-expire-receipts` and confirm `/usr/local/bin/buywise-cli`
+  exists, the DB path is writable by `buywise`, and `RECEIPT_DIR` (if set) points
+  at a directory the `buywise` user can read and write.
 - If `buywise` fails to start, check `DATABASE_URL` points at a writable path
   owned by the `buywise` user.
 - If `litestream` fails, check the R2 credentials in `buywise.env` and the
@@ -736,20 +824,22 @@ journalctl -u buywise-ingest -f
 ## Disaster recovery (restore from R2)
 
 If the server is lost, restore the database from R2 **before** `buywise` runs.
-This is order-sensitive: both `buywise-api` and the weekly ingest (`buywise-cli`)
-open the DB with `create_if_missing`, so if either starts before the restore
-completes it will create an empty DB and race the restore. The restore must run
-into an empty path, so `buywise` **and** the ingest timer must be **stopped and
-disabled** first. The timer matters even when no run is due: `Persistent=true`
-fires a missed run on the next boot, which can land mid-restore.
+This is order-sensitive: both `buywise-api` and the `buywise-cli` jobs (the
+weekly ingest and the daily receipt-expiry sweep) open the DB with
+`create_if_missing`, so if any of them starts before the restore completes it
+will create an empty DB and race the restore. The restore must run into an empty
+path, so `buywise` **and** both enabled timers must be **stopped and disabled**
+first. Both timers matter even when no run is due: `Persistent=true` fires a
+missed run on the next boot, which can land mid-restore.
 
 ```bash
 # 1. Stop AND disable every writer so none can start (now or at the next boot)
 #    and race the restore by re-creating an empty DB. This covers buywise,
-#    litestream, and the weekly ingest timer; the explicit `stop` of the ingest
-#    service also kills a run that may already be in progress.
-sudo systemctl disable --now buywise litestream buywise-ingest.timer
-sudo systemctl stop buywise-ingest.service
+#    litestream, the daily receipt-expiry timer (enabled by default) and the
+#    weekly ingest timer; the explicit `stop` of the oneshot services also kills
+#    a sweep/ingest that may already be in progress.
+sudo systemctl disable --now buywise litestream buywise-expire-receipts.timer buywise-ingest.timer
+sudo systemctl stop buywise-expire-receipts.service buywise-ingest.service
 
 # 2. Make sure the target path is empty so restore writes a fresh copy.
 sudo rm -f /var/lib/buywise/buywise.db /var/lib/buywise/buywise.db-wal /var/lib/buywise/buywise.db-shm
@@ -763,18 +853,19 @@ sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -co
 sudo chown buywise:buywise /var/lib/buywise/buywise.db
 
 # 5. Re-enable and start the units that were enabled before, only AFTER the
-#    restore is done: `buywise` and `litestream` always; the weekly ingest timer
-#    only if you had deliberately enabled it (it is disabled by default).
+#    restore is done: `buywise` and `litestream` always; the daily receipt-expiry
+#    timer was enabled by setup.sh and should stay enabled; the weekly ingest
+#    timer only if you had deliberately enabled it (it is disabled by default).
 sudo systemctl enable --now buywise litestream
+sudo systemctl enable --now buywise-expire-receipts.timer   # enabled by setup.sh
 # sudo systemctl enable --now buywise-ingest.timer   # only if it was enabled before
 ```
 
-> Do not run `litestream restore` while `buywise` or the ingest timer is enabled
+> Do not run `litestream restore` while `buywise` or either timer is enabled
 > or active — the `After=buywise.service`/`Wants=buywise.service` ordering on
 > `litestream.service` governs normal startup, but it does not protect a manual
-> restore from an already-running app, and nothing orders the weekly ingest
-> against a restore. Disabling buywise and `buywise-ingest.timer` (step 1) is
-> what guards the restore.
+> restore from an already-running app, and nothing orders the CLI jobs against a
+> restore. Disabling buywise and both timers (step 1) is what guards the restore.
 
 ### Restore rehearsal (required)
 

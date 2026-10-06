@@ -124,6 +124,10 @@ const HOUSEHOLD_ROW_COUNTS: &[(&str, &str)] = &[
         "SELECT COUNT(*) FROM store_category_orders WHERE household_id = ?1",
     ),
     (
+        "receipt_images",
+        "SELECT COUNT(*) FROM receipt_images WHERE household_id = ?1",
+    ),
+    (
         "household_members",
         "SELECT COUNT(*) FROM household_members WHERE household_id = ?1",
     ),
@@ -144,6 +148,32 @@ async fn exec(pool: &SqlitePool, sql: &str) {
         .execute(pool)
         .await
         .expect("seed statement");
+}
+
+/// One receipt image each for household A and household B, with a real file on
+/// disk under `dir`, so a household delete has bytes to remove as well as rows.
+///
+/// The keys are fixed (32 hex characters plus the extension) so the test can
+/// name the files it expects to survive or disappear; upload mints random ones.
+async fn seed_receipt_rows(pool: &SqlitePool, dir: &std::path::Path) {
+    const KEY_A: &str = "aaaabbbbccccddddeeeeffff00001111.png";
+    const KEY_B: &str = "11112222333344445555666677778888.jpg";
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO receipt_images \
+             (id, household_id, uploaded_by, uploaded_at, expires_at, content_type, \
+              byte_size, sha256_hex, storage_key, processing) VALUES \
+             ('ri-a', '{HH_A}', 'u-a', '{T}', '2030-02-01T00:00:00Z', 'image/png', \
+              4, 'aa', '{KEY_A}', 'local'), \
+             ('ri-b', '{HH_B}', 'u-b', '{T}', '2030-02-01T00:00:00Z', 'image/jpeg', \
+              4, 'bb', '{KEY_B}', 'local')"
+        ),
+    )
+    .await;
+    for key in [KEY_A, KEY_B] {
+        buywise_core::receipts::write_file(dir, key, b"img!").expect("write receipt file");
+    }
 }
 
 /// Seed two households that exercise every table the commands touch.
@@ -422,6 +452,8 @@ fn array_len(value: &Value, pointer: &str) -> usize {
 async fn export_contains_the_documented_household_records_with_intact_links() {
     let pool = setup_pool().await;
     seed_fixture(&pool).await;
+    let receipts_dir = tempfile::tempdir().expect("tempdir");
+    seed_receipt_rows(&pool, receipts_dir.path()).await;
     let doc = export_document(&pool, HH_A).await;
 
     assert_eq!(doc["format"], household::EXPORT_FORMAT);
@@ -493,6 +525,16 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
     assert_eq!(tx["lines"][0]["match_status"], "matched");
     assert_eq!(array_len(tx, "/revisions"), 1);
     assert_eq!(tx["revisions"][0]["revision"], 1);
+
+    // Receipt-image metadata is exported; bytes and the internal file name are not.
+    assert_eq!(array_len(&doc, "/receipt_images"), 1);
+    let receipt = &doc["receipt_images"][0];
+    assert_eq!(receipt["id"], "ri-a");
+    assert_eq!(receipt["content_type"], "image/png");
+    assert_eq!(receipt["processing"], "local");
+    assert_eq!(receipt["uploaded_by"], "u-a");
+    assert!(receipt["expires_at"].is_string());
+    assert!(receipt.get("storage_key").is_none(), "the internal file name must not be exported");
 
     // Reference data the links resolve against is embedded, not assumed.
     let category_ids: Vec<&str> = doc["reference_data"]["categories"]
@@ -579,6 +621,12 @@ async fn export_rejects_an_unknown_household() {
 async fn delete_removes_only_the_target_household() {
     let pool = setup_pool().await;
     seed_fixture(&pool).await;
+    let receipts_dir = tempfile::tempdir().expect("tempdir");
+    let receipts_dir = receipts_dir.path();
+    seed_receipt_rows(&pool, receipts_dir).await;
+    let key_a = receipts_dir.join("aaaabbbbccccddddeeeeffff00001111.png");
+    let key_b = receipts_dir.join("11112222333344445555666677778888.jpg");
+    assert!(key_a.exists() && key_b.exists());
 
     let before_a = counts(&pool, HH_A).await;
     let before_b = counts(&pool, HH_B).await;
@@ -586,8 +634,8 @@ async fn delete_removes_only_the_target_household() {
         assert!(*n > 0, "fixture must seed at least one {table} row for A");
     }
 
-    // Dry run executes the real statements and rolls back.
-    let dry = household::delete_household(&pool, HH_A, true)
+    // Dry run executes the real statements and rolls back, and touches no file.
+    let dry = household::delete_household(&pool, HH_A, true, receipts_dir)
         .await
         .expect("dry run");
     assert_eq!(
@@ -600,9 +648,14 @@ async fn delete_removes_only_the_target_household() {
         before_b,
         "dry run must not delete"
     );
+    assert!(
+        key_a.exists(),
+        "a dry run must not remove receipt image files"
+    );
     let reported: BTreeMap<&str, u64> = dry.iter().copied().collect();
     assert_eq!(reported["shopping_lists"], 1);
     assert_eq!(reported["households"], 1);
+    assert_eq!(reported["receipt_images"], 1);
     assert_eq!(
         reported["users"], 1,
         "only the user left without a household"
@@ -616,7 +669,7 @@ async fn delete_removes_only_the_target_household() {
         );
     }
 
-    household::delete_household(&pool, HH_A, false)
+    household::delete_household(&pool, HH_A, false, receipts_dir)
         .await
         .expect("delete");
 
@@ -628,6 +681,16 @@ async fn delete_removes_only_the_target_household() {
         counts(&pool, HH_B).await,
         before_b,
         "household B must be untouched"
+    );
+
+    // Receipt images: A's file and row go with the household; B's stay.
+    assert!(
+        !key_a.exists(),
+        "the deleted household's receipt image must be gone from disk"
+    );
+    assert!(
+        key_b.exists(),
+        "another household's receipt image must survive"
     );
 
     // Members: the orphan goes with their session; a shared member survives with
@@ -715,7 +778,7 @@ async fn delete_removes_only_the_target_household() {
 
 #[tokio::test]
 async fn delete_refuses_without_confirmation() {
-    let err = household::delete_run("/nonexistent/buywise.db", HH_A, false, false)
+    let err = household::delete_run("/nonexistent/buywise.db", HH_A, false, false, None)
         .expect_err("a bare delete must refuse");
     assert!(err.to_string().contains("--confirm"), "got {err}");
 }
@@ -724,7 +787,7 @@ async fn delete_refuses_without_confirmation() {
 async fn delete_rejects_an_unknown_household() {
     let pool = setup_pool().await;
     seed_fixture(&pool).await;
-    let err = household::delete_household(&pool, "hh-missing", false)
+    let err = household::delete_household(&pool, "hh-missing", false, std::path::Path::new("/tmp"))
         .await
         .expect_err("unknown household must fail");
     assert!(err.to_string().contains("no household"), "got {err}");
@@ -766,7 +829,7 @@ fn run_wrappers_write_the_export_file_and_gate_the_delete() {
     assert_eq!(written["household"]["id"], HH_A);
     assert_eq!(written["format"], household::EXPORT_FORMAT);
 
-    household::delete_run(db_path, HH_A, false, true).expect("dry run");
+    household::delete_run(db_path, HH_A, false, true, None).expect("dry run");
     assert_eq!(
         block_on(scalar(
             &pool,
@@ -776,7 +839,7 @@ fn run_wrappers_write_the_export_file_and_gate_the_delete() {
         "a dry run must leave the household in place"
     );
 
-    household::delete_run(db_path, HH_A, true, false).expect("confirmed delete");
+    household::delete_run(db_path, HH_A, true, false, None).expect("confirmed delete");
     assert_eq!(
         block_on(scalar(
             &pool,

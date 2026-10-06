@@ -60,6 +60,12 @@ No `sessionStorage`, no analytics or telemetry SDK, no error-reporting service, 
 CDN, no third-party script, no web font. Every asset is served from the same
 origin. Credentials are never stored in IndexedDB or localStorage.
 
+The Receipts page (issue #149) keeps the photo the member chooses in memory only
+until the upload request carries it; it is never written to IndexedDB or
+localStorage, and receipt-image responses are outside the service worker's cache
+rules (`frontend/vite.config.ts`) and marked `Cache-Control: private, no-store` by
+the API, so a viewed receipt is re-fetched from the server each time.
+
 ### 2.2 Server: the SQLite database
 
 One file, `/var/lib/buywise/buywise.db` (override with `DATABASE_URL`). All
@@ -80,6 +86,13 @@ in `migrations/`, and serves; the CLI and the weekly ingest open the same file.
 | `product_matches`, `match_feedback` | accepted/rejected/suggested canonical↔retailer-product links, and accept/reject/prefer/undo feedback | price matching + learning |
 | `purchase_events`, `purchase_dismissals` | one row per observed purchase (`check_off` today), and per-item "not now" dismissals | purchase suggestions |
 | `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links) and their superseded revisions | the purchase ledger — what the household actually bought (issue #148) |
+| `receipt_images` | metadata for each stored receipt photo: household, uploader, upload and expiry timestamps, detected content type, size, SHA-256, storage key and processing choice | §4; the image **bytes are not here** — they are files in the receipt directory |
+
+**Receipt-image bytes live outside this file.** `receipt_images.storage_key` names
+one file in the receipt directory (`RECEIPT_DIR`, else `receipts/` beside this
+database — §4.1), which is not part of the SQLite file and therefore **not part of
+any database backup** (§2.4). Losing the directory leaves records whose bytes are
+gone; the API answers `404` for them and the expiry sweep removes them.
 
 **Shared, not household-identifiable tables** (no `household_id`, or keyed by a
 global id): `categories`, `subcategories`, `retailer_products`, `product_offers`,
@@ -161,6 +174,12 @@ S3-compatible Cloudflare R2 bucket `buywise-backup`, prefix `db`.
   deleted on the server can still exist in R2 for up to about 7 days. See §5.3.
 - No automatic restore verification is configured (`validation-interval` is unset,
   hence disabled). The operator's manual restore drill is in `deploy/README.md`.
+- **Receipt images are not in the backup.** The replica carries the SQLite file
+  only; the receipt directory (§4.1) is a separate filesystem tree that is not
+  replicated to R2 or anywhere else, so a disaster restore brings back the
+  `receipt_images` rows but not their bytes. Those records read as `404` and the
+  next expiry sweep removes them (§4.4). Backing the directory up is a deliberate
+  operator choice outside this repository.
 
 ### 2.5 Retailer price requests (outbound, no household data)
 
@@ -233,43 +252,102 @@ Turning it **on** is what makes the §2.6 payload leave the server, so it should
 a deliberate operator decision recorded in the env file, with `LLM_API_KEY`,
 `LLM_MODEL` and (if not OpenAI) `LLM_BASE_URL` set.
 
-## 4. Raw-receipt retention (policy for a feature that does not exist yet)
+## 4. Receipt images: local storage with 30-day retention
 
-**There is no receipt ingestion, no OCR and no receipt-image storage in this
-codebase today.** `purchase_events.source` already allows `'receipt'`
-(`migrations/013_purchase_suggestions.sql:39-47`) so a future import can record a
-purchase without double-counting, but nothing writes it. This section is therefore
-*policy and a gate*, not a description of running code.
+**Implemented** (issue #149, roadmap #114). A household member photographs a
+receipt after a shop and keeps it privately on the household's own server for 30
+days; nothing is sent anywhere to read it. The household owner's recorded
+decisions are what this section describes and what the code now does: receipt
+reading is local by default and external processing only a deliberate per-upload
+choice; raw images are kept 30 days with the derived purchase lines kept as
+ordinary purchase records; no community publication and no model training.
+**Reading the image is not implemented** — this slice stores and serves the photo;
+OCR, linking an image to purchase lines and an offline upload queue are not part
+of it (§4.6).
 
-Proposed policy, for the household owner to decide before any receipt feature
-ships:
+### 4.1 Where the bytes live
 
-1. **Upload is an explicit external-processing choice.** A receipt upload must ask
-   the member, per upload, whether the image may be sent to a processing provider,
-   and name the provider. No default-on, no bundled consent, no "continue implies
-   consent".
-2. **No community publication and no model training.** A receipt image must never
-   be published to other households and must not be used to train or improve any
-   model. That must be the documented default and, where the provider offers it,
-   a contractual setting the operator records.
-3. **Local-first processing where it is good enough.** Prefer on-device or
-   server-local OCR, and offer an external provider only as an opt-in upgrade. See
-   the decision below.
-4. **Raw images are short-lived; derived lines are not.** Proposed: delete the raw
-   image **30 days** after the receipt is accepted, keeping the extracted line
-   items (which are the household's own purchase records and are exported and
-   deleted like any other record). Rationale: long enough for the household to
-   contest a bad extraction or re-run OCR after a fix; short enough that the
-   highest-risk artefact — a photograph that can carry a name, address, card
-   fragment or loyalty number — is not warehoused indefinitely. The derived lines
-   are what make suggestions better; the image is not needed for that.
-5. **Deletion must cover images.** When images exist, `delete-household` must
-   remove them too, and the retention job must enforce the 30-day expiry even for
-   households that were never deleted.
+- **On the server filesystem, never in SQLite.** Each image is one file in the
+  receipt directory: `RECEIPT_DIR` if set, else a `receipts/` directory beside the
+  database (`/var/lib/buywise/receipts` for the documented deployment). The
+  directory is created on the first upload with mode `0700` and each file written
+  with mode `0600`, owned by the `buywise` service user.
+- **Under a random name carrying no household or user data**: a UUID v4 plus the
+  extension implied by the detected type (e.g. `9f1c…e2.jpg`). The original file
+  name is never used.
+- **Never served from a static path.** No route maps a file in the receipt
+  directory. The only read path is the authenticated handler
+  `GET /api/household/{id}/receipts/{receipt_id}`, which requires a member of that
+  household and answers with the stored content type,
+  `Content-Disposition: inline` with a fixed generated file name,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
+- **One `receipt_images` row per image** (§2.2): household, uploader, `uploaded_at`,
+  `expires_at`, the content type **detected from the file signature** (never the
+  client's `Content-Type` or file name), byte size, SHA-256 of the bytes, storage
+  key, and the processing choice. Accepted signatures are JPEG, PNG, WebP and
+  HEIC/HEIF; anything else is refused with `415` and nothing is written. The bytes
+  are stored verbatim: no parsing, no re-encoding, no metadata rewriting.
 
-**Decisions needed** (owner): the retention period above; whether OCR is local or
-external by default; and whether the image is stored on this server (then
-encrypted-at-rest in §6 matters) or only held transiently during processing.
+### 4.2 The per-upload processing choice
+
+Reading stays local: no external service is called, and none is configured. The
+choice is stored per upload as `processing = 'local'`.
+`processing=external` is **refused with `501` and a message saying external
+processing is not available yet**, rather than stored as if it had happened — so a
+household can never believe an image was sent out when it was not, or that it
+stayed in when it did not. There is no publication path and no model-training path
+in the code.
+
+### 4.3 Limits
+
+Documented constants, each with an environment override:
+
+| Limit | Default | Override |
+| --- | --- | --- |
+| Per image | 10 MiB | `RECEIPT_MAX_IMAGE_BYTES` |
+| Images per household | 200 | `RECEIPT_MAX_IMAGES_PER_HOUSEHOLD` |
+| Total bytes per household | 500 MiB | `RECEIPT_MAX_TOTAL_BYTES_PER_HOUSEHOLD` |
+
+A body over the per-image limit is rejected (`413`) before it is buffered whole;
+the count and total-size limits are checked against the household's stored rows
+(`409`). An unparsable override falls back to the default rather than removing the
+guardrail.
+
+### 4.4 Retention: 30 days, swept daily
+
+`expires_at` is `uploaded_at + 30 days`. The sweep is
+`buywise-cli expire-receipts --db <db> [--receipt-dir <dir>]`, run daily by
+`buywise-expire-receipts.timer` (installed **and enabled** by `deploy/setup.sh`;
+see `deploy/README.md`). For each expired record it deletes the **file first**,
+then the row, so the sweep can be run repeatedly and safely on a database restored
+without its images: a file that is already gone is counted, not treated as an
+error. Nothing else about the household changes — derived purchase records are
+ordinary records and are not touched by expiry.
+
+### 4.5 Deletion and export
+
+- **Household delete** removes the household's receipt files as well as the rows,
+  in the same transaction (`delete-household` and the app's own delete,
+  §5.1/§5.1a): the files are unlinked before the transaction commits, so a failed
+  unlink aborts the delete (leaving the records to retry) instead of orphaning an
+  image.
+- **Single-image delete** (`DELETE /api/household/{id}/receipts/{receipt_id}`) is
+  available to any member of the household and removes the file, then the row.
+- **The export lists the metadata, not the images**
+  ([`docs/household-export.md`](household-export.md)): a household's JSON export
+  carries each image's id, uploader, upload and expiry timestamps, detected type,
+  size, checksum and processing choice — not the bytes, and not the internal
+  storage key. **The images themselves stay on the server and are retrievable
+  through the app until they expire**, so the export is not a copy of them: a
+  household that needs the pictures saves them from the Receipts page before the
+  30 days are up.
+
+### 4.6 Not in this slice
+
+No reading (OCR) of the image, no external processing, no offline upload queueing,
+no image editing or EXIF stripping (a camera's EXIF, including any location tag,
+is stored verbatim — see [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md)), and
+no link between an image and the purchase records it documents.
 
 ## 5. Retention and deletion
 
@@ -281,6 +359,7 @@ buywise-cli export-household --db /var/lib/buywise/buywise.db --household-id <uu
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --dry-run
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --confirm
 buywise-cli import-purchases --db /var/lib/buywise/buywise.db --household-id <uuid> --file purchases.json
+buywise-cli expire-receipts --db /var/lib/buywise/buywise.db [--receipt-dir <dir>]
 ```
 
 `bootstrap-household` (issue #139) creates the very first household and its owner
@@ -295,6 +374,11 @@ exists, so it is a one-time command; the owner adds everyone else from the app
 run without `--confirm`, and `--dry-run` executes the real statements inside a
 transaction and rolls it back, printing exactly what a run would remove. Neither
 export nor delete runs migrations or creates a missing database file.
+
+`expire-receipts` is the retention sweep (§4.4): it deletes receipt images and
+their rows that are past their 30-day expiry and prints what it removed. It takes
+no confirmation flag because it only removes records already past their documented
+expiry, and it is run daily by `buywise-expire-receipts.timer`.
 
 ### 5.1a The member-facing controls
 
@@ -343,11 +427,14 @@ In one transaction, in dependency order: `list_entry_events`, `savings_events`,
 `shopping_lists`, `match_feedback`, `product_matches`, `item_constraints`,
 `item_aliases`, `purchase_dismissals`, `canonical_items`,
 `household_store_category_rules`, `household_store_settings`,
-`household_settings`, `store_category_orders`, `household_members`,
-`households`, then `sessions` and `users` for members left with **no other
-household** (`crates/core/src/household_data.rs`, `HOUSEHOLD_TABLES`). A member
-who also belongs to another household keeps their account, their other membership
-and their session; only the deleted household's membership goes.
+`household_settings`, `store_category_orders`, `receipt_images`,
+`household_members`, `households`, then `sessions` and `users` for members left
+with **no other household** (`crates/core/src/household_data.rs`,
+`HOUSEHOLD_TABLES`). The household's receipt-image **files** are unlinked inside
+the same transaction, before it commits, so the rows never outlive their bytes on
+a successful delete (§4.5). A member who also belongs to another household keeps
+their account, their other membership and their session; only the deleted
+household's membership goes.
 
 Deliberately kept, because it is not household-identifiable: the shared
 `categories`, `subcategories`, `retailer_products`, `product_offers`,
@@ -392,8 +479,20 @@ immediate nor complete in the backup (§2.4):
     the already-deleted local database. **This destroys every recovery point
     older than the purge**, so it is a deliberate operator action, not part of the
     delete command.
-- Receipt images do not exist yet; when they do, they are not in the SQLite file
-  and will need their own deletion and expiry (§4.5).
+- **Receipt images are outside the database and outside its backup** (§2.4, §4.5).
+  The replica carries the SQLite file only, so an image deleted from disk is not
+  resurrected by a restore — and, in the other direction, a restore that predates
+  an expiry brings back a `receipt_images` row whose file may already be gone:
+  such a record reads as `404` and the next sweep removes it, tolerating the
+  missing file. Two consequences worth stating plainly:
+  - *Unlinking is not secure erasure.* `delete-receipt`, the household delete and
+    the expiry sweep unlink files; the blocks are freed but the bytes may remain
+    readable on the disk until overwritten. A household that needs that stronger
+    guarantee needs full-disk encryption or a wiped volume, not a delete command.
+  - *The sweep runs daily*, so an image can outlive its exact 30-day expiry by less
+    than a day, and a host that is off at 03:30 sweeps on the next boot (the timer
+    is `Persistent`). Running `buywise-cli expire-receipts` by hand enforces it
+    immediately.
 
 ### 5.4 Recommended operator sequence for a household leaving
 
@@ -438,8 +537,8 @@ The R2 token scope and the explicit backup `retention` are decided and shipped
 
 | # | Decision | Options | Recommendation |
 | --- | --- | --- | --- |
-| 1 | Receipt OCR: local or external? | (a) server-local OCR, external never used; (b) external opt-in per upload; (c) external by default | (a) as the default with (b) as an explicit per-upload upgrade, per §4. |
-| 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | 30 days, per §4.4, with derived lines kept as ordinary purchase records. |
+| 1 | Receipt OCR: local or external? | (a) server-local OCR, external never used; (b) external opt-in per upload; (c) external by default | **Decided (owner) and reflected in code:** reading is local, and external processing is only ever a deliberate per-upload choice. Reading itself is not implemented yet; the upload path stores `processing = 'local'` and refuses `external` with `501` until an external path exists (§4.2). |
+| 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | **Decided (owner) and shipped (issue #149):** 30 days, enforced by the daily `expire-receipts` sweep (§4.4), with derived lines kept as ordinary purchase records. |
 | 3 | Backup encryption and key custody | R2-managed keys; or Litestream `age` with a household-held key | **Decided for now:** use provider-managed R2 keys. Revisit client-side encryption only if key custody and restore procedures are agreed. |
 | 4 | R2 token scope and backup retention | account token vs bucket-scoped read/write token; default 24 h vs an explicit policy | **Decided and shipped (issues #136/#142):** bucket-scoped token; `retention: 168h` (7 days) set explicitly. |
 | 5 | Do aggregate usage counters count as household data? | leave `api_usage_events` (no household id) in place; or delete the household's share | Leaving unattributable totals is harmless; revisit if per-household attribution is added. |
@@ -448,7 +547,8 @@ The R2 token scope and the explicit backup `retention` are decided and shipped
 ## 8. Known gaps and follow-ups
 
 Recorded in [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) under "Household
-data controls" and "Household member management": receipt ingestion and its
-external-processing gate being policy-only, deletion not reaching backups
-immediately, no receipt-image path to delete yet, member roles not being
-changeable (no promote/demote), and no self-registration or invite flow.
+data controls", "Receipt images" and "Household member management": reading a
+receipt (OCR) and the external-processing provider terms still to come, receipt
+images stored verbatim (EXIF) and outside the database backup, deletion not
+reaching backups immediately, member roles not being changeable (no
+promote/demote), and no self-registration or invite flow.

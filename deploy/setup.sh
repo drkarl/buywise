@@ -5,13 +5,16 @@
 # Idempotent: safe to re-run. It creates the service user and data directory,
 # installs the systemd units and the Litestream config, runs `daemon-reload`,
 # and prints the env vars you must set in /etc/buywise/buywise.env before
-# enabling the services. It enables NOTHING: the long-running buywise/litestream
-# units are left for the operator to enable once the binaries are in place, and
-# the optional weekly ingest timer (buywise-ingest.timer) is installed but
-# deliberately left disabled — the first deploy runs without price ingest, and a
-# Persistent=true timer enabled before BASKETWATCH_API_KEY is set would fire a
-# catch-up run and red the ingest with MissingApiKey. The operator enables the
-# timer on purpose later (deploy/README.md, "Weekly price ingest"). It also
+# enabling the services. It enables no long-running unit: the buywise/litestream
+# units are left for the operator to enable once the binaries are in place. It
+# DOES install and enable the daily receipt-expiry timer
+# (buywise-expire-receipts.timer), which needs no operator configuration and so
+# enforces the 30-day receipt retention from the first deploy. The optional
+# weekly ingest timer (buywise-ingest.timer) is installed but deliberately left
+# disabled — the first deploy runs without price ingest, and a Persistent=true
+# timer enabled before BASKETWATCH_API_KEY is set would fire a catch-up run and
+# red the ingest with MissingApiKey. The operator enables the timer on purpose
+# later (deploy/README.md, "Weekly price ingest"). It also
 # installs and enables the Caddy HTTPS reverse proxy, then restarts it to load
 # the installed config, but ONLY once the operator has replaced the <hostname>
 # placeholder in Caddyfile and Caddy is already installed (see deploy/README.md
@@ -62,6 +65,8 @@ install -m 0644 "${SCRIPT_DIR}/systemd/buywise.service" "${SYSTEMD_DIR}/buywise.
 install -m 0644 "${SCRIPT_DIR}/systemd/litestream.service" "${SYSTEMD_DIR}/litestream.service"
 install -m 0644 "${SCRIPT_DIR}/systemd/buywise-ingest.service" "${SYSTEMD_DIR}/buywise-ingest.service"
 install -m 0644 "${SCRIPT_DIR}/systemd/buywise-ingest.timer" "${SYSTEMD_DIR}/buywise-ingest.timer"
+install -m 0644 "${SCRIPT_DIR}/systemd/buywise-expire-receipts.service" "${SYSTEMD_DIR}/buywise-expire-receipts.service"
+install -m 0644 "${SCRIPT_DIR}/systemd/buywise-expire-receipts.timer" "${SYSTEMD_DIR}/buywise-expire-receipts.timer"
 
 echo "==> Installing Litestream config to ${LITESTREAM_CONFIG}"
 # 0644 is intentional: litestream.yml contains no secrets (only placeholders);
@@ -70,6 +75,18 @@ install -m 0644 "${SCRIPT_DIR}/litestream.yml" "${LITESTREAM_CONFIG}"
 
 echo "==> Reloading systemd"
 systemctl daemon-reload
+
+# Enable the daily receipt-expiry timer. Unlike the weekly ingest timer, this
+# one is enabled automatically: it needs no operator configuration (only the
+# local DB and receipt directory), so the 30-day receipt retention is enforced
+# from the first deploy. `enable --now` starts the timer, not the service — the
+# first sweep runs at the next 03:30 (or on the next boot if that was missed).
+# Guarded like the Caddy step so a host without a running systemd only warns
+# instead of failing under `set -e`.
+echo "==> Enabling buywise-expire-receipts.timer (daily receipt-expiry sweep)"
+systemctl enable --now buywise-expire-receipts.timer \
+    && echo "==> Installed and enabled buywise-expire-receipts.timer; the daily receipt-expiry sweep runs without operator action" \
+    || echo "WARN: could not enable/start buywise-expire-receipts.timer (no running systemd?); enable it manually: systemctl enable --now buywise-expire-receipts.timer" >&2
 
 # Create the env file with restrictive permissions only if it does not exist,
 # so re-running setup.sh never clobbers operator-provided secrets.
@@ -111,6 +128,15 @@ BASKETWATCH_API_KEY=
 # and no verified Lidl feed yet. If unset, the Lidl half of the weekly ingest is
 # best-effort and is skipped without failing the timer; BasketWatch always runs.
 LIDL_FEED_URL=
+
+# --- receipt expiry (buywise-expire-receipts.service / .timer; enabled) ---
+# The daily receipt-expiry timer is installed and ENABLED by setup.sh, so the
+# 30-day receipt retention runs with no operator action; the sweep itself needs
+# no configuration. Receipt images are kept for 30 days and then deleted.
+# Optional. Directory holding the receipt image files. Defaults to a `receipts/`
+# directory next to the database (/var/lib/buywise/receipts) when unset; set it
+# only if you store receipt images somewhere else.
+#RECEIPT_DIR=/var/lib/buywise/receipts
 
 # --- LLM resolution fallback (buywise-api; OPTIONAL, default OFF) ---
 # When enabled, the API falls back to a cheap LLM call to resolve a list term
@@ -223,7 +249,7 @@ Next steps:
 
 2. Ensure the binaries are installed:
        /usr/local/bin/buywise-api
-       /usr/local/bin/buywise-cli   (needed by the weekly ingest timer)
+       /usr/local/bin/buywise-cli   (needed by the ingest and receipt-expiry timers)
        /usr/local/bin/litestream
 
    And the built frontend is in place at
@@ -241,6 +267,17 @@ Next steps:
        sudo systemctl enable --now buywise-ingest.timer
        sudo systemctl start buywise-ingest.service   # run an ingest now
        journalctl -u buywise-ingest -n 50 --no-pager
+
+   The daily receipt-expiry timer (buywise-expire-receipts.timer) was installed
+   and ENABLED by this script: it deletes receipt images and rows past their
+   30-day expiry every day at 03:30 and needs no configuration. If receipt
+   images live outside the default directory (/var/lib/buywise/receipts), set
+   RECEIPT_DIR in ${ENV_FILE} (see deploy/README.md, "Daily receipt-expiry
+   sweep"). Inspect or trigger it with:
+
+       systemctl list-timers buywise-expire-receipts.timer
+       sudo systemctl start buywise-expire-receipts.service   # sweep now
+       journalctl -u buywise-expire-receipts -n 50 --no-pager
 
 4. Verify:
 

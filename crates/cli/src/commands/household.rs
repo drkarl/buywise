@@ -4,12 +4,15 @@
 //! records the BuyWise server holds for it:
 //!
 //! * `export-household --db <db> --household-id <uuid> [--out <path>]` — write
-//!   every household-scoped record as one JSON document.
-//! * `delete-household --db <db> --household-id <uuid> [--confirm] [--dry-run]`
-//!   — remove every household-scoped record in one transaction. `--dry-run`
-//!   runs the whole delete inside a transaction and ROLLS IT BACK, so it reports
-//!   the exact rows a real run would remove without guessing at per-table
-//!   predicates; a real run still refuses without `--confirm`.
+//!   every household-scoped record as one JSON document (receipt-image metadata
+//!   included; the image bytes are not records and are not in the document).
+//! * `delete-household --db <db> --household-id <uuid> [--confirm] [--dry-run]
+//!   [--receipt-dir <dir>]` — remove every household-scoped record in one
+//!   transaction, unlinking the household's receipt-image files in the same
+//!   transaction. `--dry-run` runs the whole delete inside a transaction and
+//!   ROLLS IT BACK, so it reports the exact rows a real run would remove without
+//!   guessing at per-table predicates — and removes no file; a real run still
+//!   refuses without `--confirm`.
 //!
 //! The export layout and the delete semantics live in
 //! [`buywise_core::household_data`], shared with the member-facing API endpoints
@@ -61,8 +64,17 @@ async fn export_run_async(db_path: &str, household_id: &str, out: Option<&str>) 
 /// Entry point for `buywise-cli delete-household`.
 ///
 /// Refuses unless `--confirm` is given (a real delete) or `--dry-run` is given,
-/// so the command is never destructive by accident.
-pub fn delete_run(db_path: &str, household_id: &str, confirm: bool, dry_run: bool) -> Result<()> {
+/// so the command is never destructive by accident. `receipt_dir_override` is
+/// `--receipt-dir`; the resolved directory (that override, else `RECEIPT_DIR`,
+/// else beside the database) holds the household's receipt images, whose files
+/// are removed with their records.
+pub fn delete_run(
+    db_path: &str,
+    household_id: &str,
+    confirm: bool,
+    dry_run: bool,
+    receipt_dir_override: Option<&str>,
+) -> Result<()> {
     if !confirm && !dry_run {
         bail!(
             "refusing to delete household {household_id}: pass --confirm to delete, \
@@ -73,13 +85,25 @@ pub fn delete_run(db_path: &str, household_id: &str, confirm: bool, dry_run: boo
     // up a reactor.
     require_existing_db(db_path)?;
     let runtime = tokio::runtime::Runtime::new().context("building tokio runtime")?;
-    runtime.block_on(delete_run_async(db_path, household_id, dry_run))
+    runtime.block_on(delete_run_async(
+        db_path,
+        household_id,
+        dry_run,
+        receipt_dir_override,
+    ))
 }
 
-async fn delete_run_async(db_path: &str, household_id: &str, dry_run: bool) -> Result<()> {
+async fn delete_run_async(
+    db_path: &str,
+    household_id: &str,
+    dry_run: bool,
+    receipt_dir_override: Option<&str>,
+) -> Result<()> {
     let pool = connect(db_path).await?;
+    let receipt_config =
+        buywise_core::receipts::ReceiptConfig::for_database(db_path, receipt_dir_override);
     let household = household_name(&pool, household_id).await?;
-    let counts = delete_household(&pool, household_id, dry_run).await?;
+    let counts = delete_household(&pool, household_id, dry_run, &receipt_config.dir).await?;
 
     let verb = if dry_run { "would delete" } else { "deleted" };
     println!("household {household_id} ({household}): {verb} rows");

@@ -153,9 +153,20 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
     "revisions": [ { "id", "transaction_id", "revision", "retailer", "purchase_date",
                      "currency", "total_cents", "source_payload", "lines_json",
                      "superseded_at" } ]
-  } ]
+  } ],
+  "receipt_images": [ { "id", "uploaded_by", "uploaded_at", "expires_at",
+                        "content_type", "byte_size", "sha256_hex", "processing" } ]
 }
 ```
+
+`receipt_images` is metadata only: one entry per stored receipt photo, ordered by
+upload time. `expires_at` is the moment the daily expiry sweep removes the image
+(30 days after upload); `content_type` is the type detected from the file
+signature, not the type the client claimed; `processing` is the per-upload reading
+choice, `local` (see `docs/data-flows.md` §4). The image itself is not in the
+document: it stays on the server, and the app retrieves it by this `id` until it
+expires, so a household that wants the pictures saves them from the Receipts page
+before then.
 
 ## What is not in the document
 
@@ -170,8 +181,9 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
   shared retail-price catalogue and aggregate counters, not household records;
   they are not exported. `retailer_products` is limited to the products this
   household's own `product_matches` reference.
-- **Receipt images.** None exist yet; when receipt ingestion lands they must be
-  exported (or their absence documented) alongside the purchase records.
+- **Receipt image bytes.** Each stored photo is a file on the server, named by an
+  internal `storage_key`; neither the bytes nor that key are in the document.
+  `receipt_images` (see the layout above) carries the image **metadata** instead.
 
 ## Reading the links
 
@@ -195,6 +207,7 @@ The document is internally closed — the ids a record references resolve inside
 | `purchase_transactions[].lines[].transaction_id` / `revisions[].transaction_id` | → | `purchase_transactions[].id` |
 | `purchase_transactions[].lines[].retailer_product_id` | → | `retailer_products[].id` (null until matched) |
 | `purchase_transactions[].lines[].canonical_item_id` | → | `catalogue[].id` (null until matched) |
+| `receipt_images[].uploaded_by` | → | `members[].user_id` (null if the uploader account was deleted) |
 | `preferences.purchase_dismissals[].canonical_item_id` | → | `catalogue[].id` |
 | `preferences.*[].category_id` / `subcategory_id` | → | `reference_data` |
 
