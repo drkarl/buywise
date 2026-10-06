@@ -19,6 +19,8 @@
 //!   * `unreconciled` — the two plans price different lines, so no saving is
 //!     claimed. The stored gross figure is kept for audit but never presented or
 //!     aggregated as saved money.
+//!   * `unchecked` — a pre-guard row whose comparability was never checked; no
+//!     saving is claimed.
 //!   * `legacy_total_only` — a manual whole-basket actual-spend total compared
 //!     against the best single store estimate. Quantities and purchases are
 //!     unverified; travel is included where entered; service and data costs are
@@ -64,6 +66,8 @@ pub const STATUS_ESTIMATED: &str = "estimated";
 /// The plans price different lines, so the stored gross figure is not a saving
 /// and is never aggregated as one.
 pub const STATUS_UNRECONCILED: &str = "unreconciled";
+/// A pre-guard row whose comparability was never checked.
+pub const STATUS_UNCHECKED: &str = "unchecked";
 /// A manual whole-basket actual-spend total: a total-only basket variance.
 pub const STATUS_LEGACY_TOTAL_ONLY: &str = "legacy_total_only";
 
@@ -79,6 +83,7 @@ fn status_label(status: &str) -> &'static str {
         STATUS_VERIFIED => "Verified saving",
         STATUS_ESTIMATED => "Estimated opportunity (not verified)",
         STATUS_UNRECONCILED => "Not comparable — plans price different lines",
+        STATUS_UNCHECKED => "Comparability not checked",
         STATUS_LEGACY_TOTAL_ONLY => "Legacy total-only basket variance",
         _ => "Unverified",
     }
@@ -90,6 +95,7 @@ fn coverage_label(status: &str) -> &'static str {
         STATUS_VERIFIED => "Lines and quantities reconciled",
         STATUS_ESTIMATED => "Both plans price the same lines; quantities not reconciled",
         STATUS_UNRECONCILED => "No saving claimed: the plans price different lines",
+        STATUS_UNCHECKED => "No saving claimed: comparability not checked",
         STATUS_LEGACY_TOTAL_ONLY => "Whole-basket total only; quantities and purchases unverified",
         _ => "Coverage unknown",
     }
@@ -295,8 +301,8 @@ pub struct ListOutcome {
     /// The archive (shop) date, ISO-8601 UTC — the grouping date, never the row
     /// creation timestamp.
     pub archived_at: String,
-    /// The stored status: `estimated`, `unreconciled`, or `legacy_total_only`
-    /// (`verified` is reserved and never produced by this slice).
+    /// The stored status: `estimated`, `unreconciled`, `unchecked`, or
+    /// `legacy_total_only` (`verified` is reserved and never produced here).
     pub status: String,
     /// Short human label for `status`.
     pub status_label: String,

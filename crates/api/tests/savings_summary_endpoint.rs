@@ -9,8 +9,8 @@
 //!     (`saved.cumulative_cents` / `saved.monthly`), which today is empty;
 //!   * presents `legacy_total_only` (manual whole-basket) events separately
 //!     under `legacy`, with their original figures — never as saved money;
-//!   * excludes `estimated` and `unreconciled` events from both aggregates'
-//!     saved totals (an estimate or a refused comparison is not saved money);
+//!   * excludes `estimated`, `unreconciled`, and `unchecked` events from both
+//!     aggregates (none is verified or a total-only variance);
 //!   * groups both aggregates by the list's ARCHIVE date (`shopping_lists.
 //!     archived_at`), not the row's creation timestamp;
 //!   * lists each event's outcome newest-archive-date-first, carrying the status
@@ -487,6 +487,48 @@ async fn outcomes_carry_status_labels_and_are_archive_ordered() {
             "Travel included where entered; service and data costs excluded."
         );
     }
+}
+
+#[tokio::test]
+async fn unchecked_rows_are_labelled_and_excluded_from_aggregates() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-unchecked",
+        "Unchecked shop",
+        "2026-05-03T10:00:00Z",
+    )
+    .await;
+    seed_event(
+        &pool,
+        "ev-unchecked",
+        "list-unchecked",
+        "2026-05-03T10:00:00Z",
+        "unchecked",
+        5000,
+        3000,
+        None,
+        None,
+    )
+    .await;
+
+    let resp = get_summary(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["saved"]["cumulative_cents"], 0);
+    assert!(body["saved"]["monthly"].as_array().unwrap().is_empty());
+    assert_eq!(body["legacy"]["cumulative_cents"], 0);
+    assert!(body["legacy"]["monthly"].as_array().unwrap().is_empty());
+    let outcome = &body["lists"][0];
+    assert_eq!(outcome["status"], "unchecked");
+    assert_eq!(outcome["status_label"], "Comparability not checked");
+    assert_eq!(
+        outcome["coverage_label"],
+        "No saving claimed: comparability not checked"
+    );
 }
 
 /// Scoping: another household's savings events never appear in the caller's

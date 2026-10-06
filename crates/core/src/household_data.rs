@@ -274,7 +274,7 @@ pub async fn export_household(
                     s.chosen_basket_cost_cents, s.chosen_plan, s.chosen_stores, \
                     s.gross_saving_cents, s.accepted_savings_cents, s.rejected_savings_cents, \
                     s.travel_cost_cents, s.subscription_cost_alloc_cents, s.net_saving_cents, \
-                    s.created_at \
+                    s.status, s.created_at \
              FROM savings_events s JOIN shopping_lists sl ON sl.id = s.list_id \
              WHERE sl.household_id = ?1 ORDER BY s.id",
             household_id,

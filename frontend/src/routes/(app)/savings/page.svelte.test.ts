@@ -94,6 +94,29 @@ afterEach(() => {
 });
 
 describe('savings dashboard', () => {
+	it('labels unchecked historical comparability without claiming a saving', async () => {
+		const summary = fullSummary();
+		summary.lists.push({
+			id: 'ev-unchecked',
+			list_id: 'list-unchecked',
+			list_name: 'Unchecked shop',
+			archived_at: '2026-03-01T10:00:00Z',
+			status: 'unchecked',
+			status_label: 'Comparability not checked',
+			coverage_label: 'No saving claimed: comparability not checked',
+			...META,
+			gross_saving_cents: 2000,
+			chosen_basket_cost_cents: null,
+			basket_variance_cents: null
+		});
+		stubSummary(summary);
+		render(Page);
+
+		expect(await screen.findByText('Unchecked shop')).toBeTruthy();
+		expect(screen.getByText('Comparability not checked')).toBeTruthy();
+		expect(screen.getByText('No saving claimed: comparability not checked')).toBeTruthy();
+	});
+
 	it('claims no saved money and shows the verified empty state', async () => {
 		stubSummary(fullSummary());
 		render(Page);

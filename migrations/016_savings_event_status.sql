@@ -17,9 +17,9 @@
 --                           price the same lines) with no actual spend yet.
 --   * `unreconciled`      — the plans price different lines, so no saving is
 --                           claimed; the stored gross figure is kept for audit
---                           but never presented as a saving. Also the backfill
---                           for pre-guard rows without an actual-spend total,
---                           whose comparability was never checked.
+--                           but never presented as a saving.
+--   * `unchecked`         — a pre-guard row whose comparability was never
+--                           checked. No saving is claimed.
 --   * `legacy_total_only` — a manual whole-basket actual-spend total compared
 --                           against the best single store estimate. Quantities
 --                           and purchases are unverified; travel is included
@@ -34,11 +34,11 @@
 
 PRAGMA foreign_keys = ON;
 
-ALTER TABLE savings_events ADD COLUMN status TEXT NOT NULL DEFAULT 'unreconciled';
+ALTER TABLE savings_events ADD COLUMN status TEXT NOT NULL DEFAULT 'unchecked';
 
 -- Pre-guard rows: a row with a manual actual-spend total is the legacy
--- total-only basket variance; one without was never coverage-checked, so it
--- stays `unreconciled` (the ALTER's default).
+-- total-only basket variance; one without stays `unchecked` because its
+-- comparability was never checked.
 UPDATE savings_events
    SET status = 'legacy_total_only'
  WHERE chosen_basket_cost_cents IS NOT NULL;
