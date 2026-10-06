@@ -296,16 +296,18 @@ async fn saved_aggregate_counts_only_verified_rows() {
     assert_eq!(saved_monthly[0]["net_cents"], 2500);
     assert_eq!(saved_monthly[0]["lists"], 1, "only the verified row");
 
-    // Legacy: only the total-only row, with its original figures.
+    // Legacy: only the total-only row, with baseline, manual costs and variance.
     assert_eq!(body["legacy"]["cumulative_cents"], 700);
     let legacy_monthly = body["legacy"]["monthly"]
         .as_array()
         .expect("legacy monthly");
     assert_eq!(legacy_monthly.len(), 1);
     assert_eq!(legacy_monthly[0]["month"], "2026-05");
-    assert_eq!(legacy_monthly[0]["gross_cents"], 3000);
-    assert_eq!(legacy_monthly[0]["accepted_cents"], 200); // 5000 − 4800
-    assert_eq!(legacy_monthly[0]["net_cents"], 700);
+    assert_eq!(legacy_monthly[0]["baseline_cents"], 5000);
+    assert_eq!(legacy_monthly[0]["manual_total_cents"], 4800);
+    assert_eq!(legacy_monthly[0]["travel_cents"], 0);
+    assert_eq!(legacy_monthly[0]["variance_cents"], 700);
+    assert!(legacy_monthly[0].get("gross_cents").is_none());
     assert_eq!(legacy_monthly[0]["lists"], 1, "only the total-only row");
 }
 
@@ -350,7 +352,13 @@ async fn manual_total_never_appears_as_saved_money() {
     );
     // It is shown, honestly, as a legacy basket variance.
     assert_eq!(body["legacy"]["cumulative_cents"], 1000);
-    assert_eq!(body["legacy"]["monthly"][0]["net_cents"], 1000);
+    assert_eq!(body["legacy"]["monthly"][0]["baseline_cents"], 5000);
+    assert_eq!(body["legacy"]["monthly"][0]["manual_total_cents"], 1000);
+    assert_eq!(body["legacy"]["monthly"][0]["travel_cents"], 0);
+    assert_eq!(body["legacy"]["monthly"][0]["variance_cents"], 1000);
+    assert!(body["legacy"]["monthly"][0]
+        .get("gross_cents")
+        .is_none());
 }
 
 /// Realised figures group by the list's archive date, not the row's creation
@@ -581,7 +589,11 @@ async fn summary_is_scoped_to_caller_household() {
     assert_eq!(body["legacy"]["cumulative_cents"], 2500);
     let monthly = body["legacy"]["monthly"].as_array().unwrap();
     assert_eq!(monthly.len(), 1);
-    assert_eq!(monthly[0]["gross_cents"], 3000);
+    assert_eq!(monthly[0]["baseline_cents"], 5000);
+    assert_eq!(monthly[0]["manual_total_cents"], 4500);
+    assert_eq!(monthly[0]["travel_cents"], 0);
+    assert_eq!(monthly[0]["variance_cents"], 2500);
+    assert!(monthly[0].get("gross_cents").is_none());
     assert_eq!(monthly[0]["lists"], 1);
     let lists = body["lists"].as_array().unwrap();
     assert_eq!(lists.len(), 1);
@@ -669,7 +681,11 @@ async fn summary_picks_single_household_for_multi_household_user() {
     assert_eq!(body["legacy"]["cumulative_cents"], 2500);
     let monthly = body["legacy"]["monthly"].as_array().unwrap();
     assert_eq!(monthly.len(), 1);
-    assert_eq!(monthly[0]["gross_cents"], 3000);
+    assert_eq!(monthly[0]["baseline_cents"], 5000);
+    assert_eq!(monthly[0]["manual_total_cents"], 4500);
+    assert_eq!(monthly[0]["travel_cents"], 0);
+    assert_eq!(monthly[0]["variance_cents"], 2500);
+    assert!(monthly[0].get("gross_cents").is_none());
     assert_eq!(monthly[0]["lists"], 1);
     let lists = body["lists"].as_array().unwrap();
     assert_eq!(lists.len(), 1);
@@ -910,8 +926,11 @@ async fn actual_spend_becomes_legacy_variance_through_summary() {
     assert_eq!(monthly.len(), 1, "one month");
     let expected_month = chrono::Utc::now().format("%Y-%m").to_string();
     assert_eq!(monthly[0]["month"], expected_month);
-    assert_eq!(monthly[0]["accepted_cents"], FLOW_BASELINE - chosen); // 500
-    assert_eq!(monthly[0]["net_cents"], expected_variance);
+    assert_eq!(monthly[0]["baseline_cents"], FLOW_BASELINE);
+    assert_eq!(monthly[0]["manual_total_cents"], chosen);
+    assert_eq!(monthly[0]["travel_cents"], travel);
+    assert_eq!(monthly[0]["variance_cents"], expected_variance);
+    assert!(monthly[0].get("gross_cents").is_none());
 
     // The outcome is labelled as a legacy total-only variance.
     let lists = body["lists"].as_array().unwrap();
