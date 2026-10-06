@@ -47,7 +47,7 @@
 //! them today, and `off` stores never do. The request's `trip_retailers` has no
 //! effect on `active`/`off` stores.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -58,9 +58,10 @@ use serde::{Deserialize, Serialize};
 use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
-    optimise, AldiComparison, BasketItem, BasketItemIdentity, NeedsConfirmationItem,
-    NoValidOfferItem, OptimiserInput, OptimiserOutput, PlanKind, PlanReason, ReasonCode,
-    Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
+    optimise, prices_same_lines, AldiComparison, BasketItem, BasketItemIdentity,
+    NeedsConfirmationItem, NoValidOfferItem, OptimiserInput, OptimiserOutput, PlanKind, PlanReason,
+    ReasonCode, Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem,
+    DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -755,17 +756,14 @@ async fn build_explanation(
 }
 
 fn recommendation_comparison(recommended: &StorePlan, best_single: &StorePlan) -> String {
-    let recommended_items: BTreeSet<_> = recommended
-        .lines
-        .iter()
-        .map(|line| line.item_index)
-        .collect();
-    let single_items: BTreeSet<_> = best_single
-        .lines
-        .iter()
-        .map(|line| line.item_index)
-        .collect();
-    if recommended_items != single_items {
+    // One shared comparability rule: the recommended plan and the best single
+    // store must price the same basket lines, or their totals are not
+    // like-for-like and no saving may be stated. The savings ledger refuses to
+    // record a saving on the same rule (`lists::record_savings_event`).
+    if !prices_same_lines(
+        recommended.lines.iter().map(|line| &line.item_index),
+        best_single.lines.iter().map(|line| &line.item_index),
+    ) {
         return ", the recommendation covers a different set of items, so its total is not directly comparable with the best single store".to_string();
     }
 

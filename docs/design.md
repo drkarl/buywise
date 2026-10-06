@@ -576,6 +576,55 @@ aggregate it yet (see `docs/KNOWN_LIMITATIONS.md`).
 
 ---
 
+### Savings ledger and honest labels (issue #117, roadmap #114)
+
+The ledger must claim only what its evidence proves. Every `savings_events` row
+carries a `status` (migration 016) and the dashboard labels each figure with its
+baseline, evidence coverage, date, and included costs:
+
+* **`verified`** — line- and quantity-reconciled evidence. **Reserved**: no
+  production path writes it yet (it needs the purchase ledger of #116), so the
+  aggregate the API calls `saved` is empty today and shows an honest empty state.
+  Only `verified` rows may ever be counted as saved or net savings.
+* **`estimated`** — the best single store and the recommended plan price the same
+  lines, so `baseline − recommended` is a like-for-like *opportunity estimate*,
+  not a realised saving.
+* **`unreconciled`** — the two plans price different lines. The stored gross
+  figure is kept for audit but never presented or aggregated as a saving. This is
+  the coverage guard at archive time, reusing the same line-set comparison the
+  optimise explanation uses to refuse a cross-plan cost comparison
+  (`optimiser::prices_same_lines`).
+* **`legacy_total_only`** — a manual whole-basket actual-spend total compared
+  against the best single store estimate. Quantities and purchases are
+  unverified; travel is included where entered; service and data costs are
+  excluded. It is shown separately as a legacy basket variance and is never saved
+  money. Realised figures group by the list's archive date
+  (`shopping_lists.archived_at`), not the row's creation timestamp.
+
+**Accepted rules (household owner, from the #117 methodology report).** Every
+displayed saving names its baseline, evidence coverage, date and included costs.
+Partial or unreconciled results are labelled and never aggregated as verified
+savings. Old total-only events become a clearly labelled legacy variance, kept
+for audit and never relabelled as verified. Buying fewer items must never create
+a claimed optimisation saving. The fixture report's theoretical €77.96/month
+(`docs/phase0-results.md`) and the recommended plan's approximately €45.59/month
+before costs must never be described as practical live savings.
+
+**Decisions.**
+
+1. **Usual-shop baseline.** The household's written "usual shop" profile is the
+   primary baseline for the live evaluation (#109); the best-single-store estimate
+   remains the anchor for the stored recommendation comparison. No new baseline is
+   implemented in this slice.
+2. **Strict pack-size rule.** Only verified equivalent units up to the planned
+   amount count as matching the plan; extra stock (buying a larger pack, or more
+   units than planned) is shown separately and never claimed as saving.
+3. **Legacy total-only label.** Existing total-only events are relabelled
+   `legacy_total_only` and presented under their own heading with their original
+   figures, rather than being migrated or silently re-presented as verified.
+
+---
+
 ## 11. Sync Protocol
 
 The client maintains a local Dexie database mirroring the server's list state and an append-only mutation queue.

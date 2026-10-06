@@ -1,7 +1,9 @@
 <script lang="ts">
-	// Savings dashboard (P5-T4). Shows the household how much the app has saved
-	// them: a cumulative net figure since first use, a per-month breakdown (gross
-	// / accepted / net), and a table of archived lists with their outcomes.
+	// Savings dashboard (P5-T4, relabelled in #117). Shows the household what the
+	// ledger can honestly claim: a verified-only "saved" headline (empty until
+	// line-level reconciliation exists), the legacy total-only basket variance
+	// shown separately under its own label, and a per-event table where every
+	// figure names its baseline, evidence coverage, date and included costs.
 	//
 	// Like the optimise view this page is intrinsically online — it reads
 	// server-aggregated `savings_events` via `GET /api/savings/summary` on mount.
@@ -9,9 +11,8 @@
 	// fetch only runs in the browser.
 	//
 	// All money is integer cents from the server; we never compute totals here.
-	// Lists whose `chosen_basket_cost_cents` is null haven't had their actual
-	// post-shop spend entered yet, so we show an "Enter actual spend" prompt that
-	// links back to the list (the actual-spend entry lives on the list view).
+	// The baseline/coverage/costs copy comes from the server so the labels stay
+	// one vocabulary with the API.
 
 	import { formatEuros } from '$lib/api/optimise';
 	import { fetchSavingsSummary, type SavingsSummary } from '$lib/api/savings';
@@ -92,19 +93,20 @@
 			<button type="button" class="retry" onclick={retry}>Try again</button>
 		</div>
 	{:else if summary}
-		<section class="cumulative" aria-label="Cumulative saving">
-			<p class="cumulative-label">Saved since you started</p>
-			<p class="cumulative-amount">{formatEuros(summary.cumulative_net_cents)}</p>
-			<p class="cumulative-note">Net of travel costs.</p>
+		<section class="cumulative" aria-label="Verified savings">
+			<p class="cumulative-label">{summary.saved.label}</p>
+			<p class="cumulative-amount">{formatEuros(summary.saved.cumulative_cents)}</p>
+			<p class="cumulative-note">{summary.saved.note}</p>
+			<p class="figure-meta">{summary.saved.baseline_label} · {summary.saved.costs_note}</p>
 		</section>
 
-		<section class="monthly" aria-label="Monthly savings">
+		<section class="monthly" aria-label="Verified savings by month">
 			<h2>By month</h2>
-			{#if summary.monthly.length === 0}
-				<p class="empty">No savings yet — archive a list with a recommendation to start tracking.</p>
+			{#if summary.saved.monthly.length === 0}
+				<p class="empty">No verified savings by month yet — nothing here is counted as saved.</p>
 			{:else}
 				<ul class="month-list">
-					{#each summary.monthly as m (m.month)}
+					{#each summary.saved.monthly as m (m.month)}
 						<li class="month-card">
 							<div class="month-head">
 								<span class="month-name">{monthLabel(m.month)}</span>
@@ -130,6 +132,39 @@
 			{/if}
 		</section>
 
+		<section class="legacy" aria-label="Legacy total-only basket variance">
+			<h2>{summary.legacy.label}</h2>
+			<p class="legacy-note">{summary.legacy.note}</p>
+			<p class="figure-meta">{summary.legacy.baseline_label} · {summary.legacy.costs_note}</p>
+			<p class="legacy-total">{formatEuros(summary.legacy.cumulative_cents)}</p>
+			{#if summary.legacy.monthly.length > 0}
+				<ul class="month-list">
+					{#each summary.legacy.monthly as m (m.month)}
+						<li class="month-card">
+							<div class="month-head">
+								<span class="month-name">{monthLabel(m.month)}</span>
+								<span class="month-lists">{m.lists} {m.lists === 1 ? 'list' : 'lists'}</span>
+							</div>
+							<dl class="month-figures">
+								<div>
+									<dt>Gross estimate</dt>
+									<dd>{formatEuros(m.gross_cents)}</dd>
+								</div>
+								<div>
+									<dt>Basket total diff.</dt>
+									<dd>{formatEuros(m.accepted_cents)}</dd>
+								</div>
+								<div>
+									<dt>Net variance</dt>
+									<dd class="net">{formatEuros(m.net_cents)}</dd>
+								</div>
+							</dl>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
+
 		<section class="lists" aria-label="Archived lists">
 			<h2>Archived lists</h2>
 			{#if summary.lists.length === 0}
@@ -140,18 +175,26 @@
 						<li class="outcome-card">
 							<div class="outcome-head">
 								<span class="outcome-name">{l.list_name}</span>
-								<span class="outcome-date">{dateLabel(l.created_at)}</span>
+								<span class="outcome-date">{dateLabel(l.archived_at)}</span>
 							</div>
+							<p class="outcome-status">{l.status_label}</p>
+							<p class="figure-meta">{l.baseline_label} · {l.coverage_label} · {l.costs_note}</p>
 							<div class="outcome-body">
-								<span class="outcome-gross">Gross saving {formatEuros(l.gross_saving_cents)}</span>
+								{#if l.status === 'legacy_total_only' && l.basket_variance_cents !== null}
+									<span class="outcome-net"
+										>Basket variance {formatEuros(l.basket_variance_cents)}</span
+									>
+								{:else if l.status === 'estimated'}
+									<span class="outcome-gross"
+										>Estimated difference {formatEuros(l.gross_saving_cents)}</span
+									>
+								{:else}
+									<span class="outcome-gross"
+										>Stored figure {formatEuros(l.gross_saving_cents)} (no saving claimed)</span
+									>
+								{/if}
 								{#if l.chosen_basket_cost_cents === null}
 									<a class="enter-spend" href="/list/{l.list_id}">Enter actual spend</a>
-								{:else}
-									<!-- In this branch chosen is non-null; actual-spend writes chosen
-									     and net together, so net is non-null too (?? 0 unreachable). -->
-									<span class="outcome-net"
-										>Net {formatEuros(l.net_saving_cents ?? 0)}</span
-									>
 								{/if}
 							</div>
 						</li>
@@ -231,6 +274,22 @@
 		font-size: 0.8rem;
 		color: #64748b;
 	}
+	.legacy {
+		border: 1px dashed #cbd5e1;
+		border-radius: 0.6rem;
+		padding: 1rem;
+	}
+	.legacy-note {
+		margin: 0 0 0.5rem;
+		font-size: 0.85rem;
+		color: #64748b;
+	}
+	.legacy-total {
+		margin: 0;
+		font-size: 1.3rem;
+		font-weight: 600;
+		color: #334155;
+	}
 	h2 {
 		font-size: 1.05rem;
 		margin: 0 0 0.6rem;
@@ -238,6 +297,11 @@
 	.empty {
 		color: #64748b;
 		font-size: 0.9rem;
+	}
+	.figure-meta {
+		margin: 0.35rem 0 0;
+		font-size: 0.75rem;
+		color: #94a3b8;
 	}
 	.month-list,
 	.outcome-list {
@@ -291,12 +355,19 @@
 		font-weight: 600;
 		color: #134e4a;
 	}
+	.outcome-status {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: #0f766e;
+	}
 	.outcome-body {
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
 		gap: 0.75rem;
 		font-size: 0.9rem;
+		margin-top: 0.35rem;
 	}
 	.outcome-gross {
 		color: #475569;

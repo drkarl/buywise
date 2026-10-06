@@ -389,6 +389,93 @@ new category genuinely holds fresh food.
 **Follow-up.** Expose `is_fresh` on the settings catalogue so a household can set it without SQL,
 and make the CLI's fixture mode load the category taxonomy.
 
+## Savings ledger
+
+Issue #117, roadmap #114. The status model, accepted rules and the three decisions are in
+[`docs/design.md`](design.md) §10 ("Savings ledger and honest labels"). Migration 016 adds the
+`savings_events.status` column. The remaining limitations are:
+
+### 1. Nothing is verified yet — there is no line-level reconciliation
+
+**What happens.** `GET /api/savings/summary` has a `saved` aggregate that counts only `verified`
+events, and no production path writes `verified` (it needs the purchase ledger of #116). So the
+dashboard's verified headline reads €0.00 with an empty state, and each event is labelled
+`estimated` (a like-for-like opportunity estimate) or `unreconciled` (the plans price different
+lines, so no saving is claimed). A manual whole-basket actual spend is labelled
+`legacy_total_only` and shown separately as a basket variance. Buying fewer items therefore never
+appears as saved money.
+
+**Why accepted.** Issue #117's slice is honest labels and a verified-only aggregation guard;
+automatic line reconciliation is explicitly deferred until the purchase-ledger experiment
+supports it.
+
+**Workaround.** Read each event's status and coverage label: an `estimated` row is a theoretical
+opportunity, a `legacy_total_only` row a total-only basket difference — neither is a realised
+saving.
+
+**Follow-up.** #116/#117: reconcile planned versus purchased quantities/products (extra, skipped,
+substituted, unmatched lines) to produce `verified` events.
+
+### 2. The estimate's price/run evidence is not frozen
+
+**What happens.** An event stores the plan totals and a `recommendation_run_id`, but not an
+immutable snapshot of the priced offers behind them, so there is no frozen receipt of the prices
+the household saw for a given estimate.
+
+**Why accepted.** Frozen run evidence is out of scope for this slice (issue #117 lists
+"Preserve the recommendation/price snapshot"; the roadmap defers the snapshot itself).
+
+**Workaround.** Treat the stored totals as the record; `recommendation_run_id` points at the run
+for audit.
+
+**Follow-up.** Add frozen run/price evidence snapshots (issue #117, roadmap #114).
+
+### 3. No usual-shop baseline
+
+**What happens.** The best single store estimate remains the comparison anchor for stored events.
+The household's written "usual shop" profile — recorded as the primary baseline for the live
+evaluation in `docs/design.md` §10 — is not implemented, so no saving is measured against what the
+household would normally have spent.
+
+**Why accepted.** This slice adds no new baselines.
+
+**Workaround.** None; the dashboard always names the baseline it does use ("Baseline: best single
+store estimate").
+
+**Follow-up.** #109: implement the usual-shop written profile as the primary live-evaluation
+baseline.
+
+### 4. No receipt links and no automatic purchase matching
+
+**What happens.** Purchase records and receipts are not linked to recommendations or lists; the
+only realised input remains a manual whole-basket total, which is why every reconciled-by-hand
+event is `legacy_total_only`.
+
+**Why accepted.** Receipt capture is a bounded validation experiment (#116), not a prerequisite
+for the manual evaluation.
+
+**Workaround.** Enter actual spend manually to get a legacy basket variance; it is labelled as
+unverified.
+
+**Follow-up.** #116 purchase ledger: link receipts/purchases to lists and recommendations, and
+support multiple receipts per shop without double-counting.
+
+### 5. The coverage guard compares priced lines, not quantities or pack sizes
+
+**What happens.** The archive-time guard (`optimiser::prices_same_lines`) compares the set of
+basket item indices both plans price — the same rule the optimise explanation uses to refuse a
+cross-plan cost comparison. Plan lines carry no quantity, so buying a larger pack or extra units is
+not detected as a coverage difference; the strict pack-size decision recorded in `docs/design.md`
+§10 is not enforced in this slice.
+
+**Why accepted.** Quantities are not part of a stored plan line; enforcing the pack-size rule needs
+the line-level reconciliation of the follow-up work.
+
+**Workaround.** Treat an `estimated` row as a line-coverage-only opportunity estimate.
+
+**Follow-up.** Include quantities and equivalent pack sizes in the comparison when reconciliation
+lands (issue #117).
+
 ## Household data controls
 
 Issue #119, roadmap #114. The authoritative policy, behaviour, procedures and export layout are in

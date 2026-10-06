@@ -41,8 +41,10 @@ use serde::{Deserialize, Serialize};
 
 use buywise_core::db::{self, DbError};
 use buywise_core::domain::Cents;
+use buywise_core::optimiser::prices_same_lines;
 
 use crate::middleware::AuthenticatedUser;
+use crate::savings::{STATUS_ESTIMATED, STATUS_UNRECONCILED};
 use crate::AppState;
 
 /// Build the list-management routes as a `Router<AppState>`.
@@ -371,11 +373,23 @@ fn db_error<E: std::fmt::Display>(context: &'static str) -> impl Fn(E) -> Status
 #[derive(Debug, Deserialize)]
 struct PlansJsonView {
     #[serde(default)]
-    best_single: Option<PlanTotal>,
+    best_single: Option<PlanView>,
     #[serde(default)]
     theoretical_minimum: Option<PlanTotal>,
     #[serde(default)]
     recommended: Option<RecommendedView>,
+}
+
+/// A plan reduced to its `total_cents` and priced lines (the only figures the
+/// ledger needs).
+#[derive(Debug, Deserialize)]
+struct PlanView {
+    total_cents: Cents,
+    /// The plan's priced lines; only `item_index` is read, so the other line
+    /// fields are ignored (`#[serde(default)]` tolerates a plan stored without
+    /// lines, which then compares as an empty line set).
+    #[serde(default)]
+    lines: Vec<PlanLineView>,
 }
 
 /// A plan reduced to its `total_cents` (the only figure the ledger needs).
@@ -384,11 +398,17 @@ struct PlanTotal {
     total_cents: Cents,
 }
 
+/// One plan line reduced to the basket item it prices.
+#[derive(Debug, Deserialize)]
+struct PlanLineView {
+    item_index: usize,
+}
+
 /// The recommended plan as stored: a `kind` plus a nested `plan` carrying the
-/// total. Mirrors `optimiser::Recommendation`'s serialised shape.
+/// total and lines. Mirrors `optimiser::Recommendation`'s serialised shape.
 #[derive(Debug, Deserialize)]
 struct RecommendedView {
-    plan: PlanTotal,
+    plan: PlanView,
 }
 
 /// Record a `savings_events` row for a just-archived list, IF a usable
@@ -418,6 +438,15 @@ struct RecommendedView {
 /// household ACTUALLY shopped (post-shop, paired with `chosen_basket_cost_cents`
 /// per docs/design.md §savings); archive does not know that yet, so they stay
 /// NULL here. The recommendation linkage is preserved via `recommendation_run_id`.
+///
+/// **Coverage guard (issue #117).** A gross figure is only a like-for-like
+/// saving when the best single store and the recommended plan price the same
+/// lines. When they do not, the row is still created — `baseline_cost_cents`
+/// and `recommended_cost_cents` are known plan totals, and every cost column is
+/// NOT NULL, so we keep the computed gross for audit rather than writing a zero
+/// for an unknown saving — but its `status` is `unreconciled`, so the summary
+/// never presents or aggregates it as a saving. A comparable row is `estimated`
+/// (an opportunity estimate, never `verified`; see `crate::savings`).
 async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<(), DbError> {
     // Idempotency guard: never create a second row for the same list.
     let existing: Option<i64> =
@@ -464,6 +493,20 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
     let theoretical_minimum_cost_cents = theoretical_minimum.total_cents;
     let gross_saving_cents = baseline_cost_cents - recommended_cost_cents;
 
+    // Coverage guard (issue #117): the gross figure is only a saving when both
+    // plans price the same lines. This is the same comparison the optimise
+    // explanation uses to refuse a cross-plan cost comparison
+    // (`optimise::recommendation_comparison`), so the two paths cannot drift.
+    let comparable = prices_same_lines(
+        best_single.lines.iter().map(|line| &line.item_index),
+        recommended.plan.lines.iter().map(|line| &line.item_index),
+    );
+    let status = if comparable {
+        STATUS_ESTIMATED
+    } else {
+        STATUS_UNRECONCILED
+    };
+
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = db::now_iso();
 
@@ -477,8 +520,9 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
              (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
               theoretical_minimum_cost_cents, chosen_basket_cost_cents, chosen_plan, \
               chosen_stores, gross_saving_cents, accepted_savings_cents, rejected_savings_cents, \
-              travel_cost_cents, subscription_cost_alloc_cents, net_saving_cents, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL, NULL, NULL, NULL, NULL, ?8) \
+              travel_cost_cents, subscription_cost_alloc_cents, net_saving_cents, created_at, \
+              status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL, NULL, NULL, NULL, NULL, ?8, ?9) \
          ON CONFLICT(list_id) DO NOTHING",
     )
     .bind(&id)
@@ -489,6 +533,7 @@ async fn record_savings_event(pool: &sqlx::SqlitePool, list_id: &str) -> Result<
     .bind(theoretical_minimum_cost_cents)
     .bind(gross_saving_cents)
     .bind(&created_at)
+    .bind(status)
     .execute(pool)
     .await?;
 
