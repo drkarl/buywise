@@ -648,3 +648,58 @@ async fn migration_010_seeds_subcategories_and_backfills_items() {
     .unwrap();
     assert_eq!(produce_mapped, 0, "Produce is not split and must stay NULL");
 }
+
+/// Migration 013 creates `household_store_category_rules` with no back-filled
+/// rows, so a household that configures nothing allows every category at every
+/// store — the pre-#99 planning behaviour (issue #99).
+#[tokio::test]
+async fn migration_014_store_category_rules_start_empty() {
+    let pool = migrated_pool().await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM household_store_category_rules")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no rules are seeded; the default is allow-all");
+}
+
+/// A whole-category rule and a sub-category refinement of the same category can
+/// coexist, but a repeated scope is rejected by the unique index — the table
+/// holds exactly one rule per (household, retailer, category, sub-category),
+/// with NULL sub-category treated as its own scope (issue #99).
+#[tokio::test]
+async fn migration_014_allows_one_rule_per_scope() {
+    const ALDI: &str = "aldi";
+    const PANTRY: &str = "c1000000-0000-0000-0000-000000000005";
+    const PASTA_RICE: &str = "d1000000-0000-0000-0000-000000000001";
+
+    let pool = migrated_pool().await;
+    let insert = |subcategory_id: Option<&str>| {
+        let pool = pool.clone();
+        let subcategory_id = subcategory_id.map(str::to_string);
+        async move {
+            sqlx::query(
+                "INSERT INTO household_store_category_rules \
+                     (household_id, retailer, category_id, subcategory_id, allowed, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1, 't')",
+            )
+            .bind(HOUSEHOLD)
+            .bind(ALDI)
+            .bind(PANTRY)
+            .bind(subcategory_id.as_deref())
+            .execute(&pool)
+            .await
+        }
+    };
+
+    // Whole-category and sub-category rules coexist.
+    insert(None).await.unwrap();
+    insert(Some(PASTA_RICE)).await.unwrap();
+
+    // Repeating either scope is rejected.
+    assert!(insert(None).await.is_err(), "duplicate whole-category rule");
+    assert!(
+        insert(Some(PASTA_RICE)).await.is_err(),
+        "duplicate sub-category rule"
+    );
+}

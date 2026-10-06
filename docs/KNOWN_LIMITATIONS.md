@@ -304,3 +304,44 @@ nothing is added to the list without confirmation.
 
 **Follow-up.** Add a "don't suggest this again" (permanent opt-out) option and a way to review or
 undo dismissals.
+
+## Per-store category rules
+
+Rules that keep a store out of plan generation for chosen categories (issue #99, the Aldi
+packaged-food case). Storage: `household_store_category_rules` (migration 014); enforcement in
+`crates/core/src/optimiser.rs`; settings surface at `frontend/src/routes/(app)/settings/+page.svelte`.
+
+### 1. Category rules apply only to plan generation
+
+**What happens.** The optimiser will not assign an item to a retailer whose rules exclude its
+category, but nothing else in the product consults the rules. Product-candidate matching
+(`crates/core/src/matching/`) still proposes candidates from an excluded category at that store, and
+shopping mode still groups an item under its normal aisle/category section regardless of the rule.
+So a household can accept a match for a fresh item at Aldi and still never see it priced there.
+
+**Why accepted.** Issue #99 scopes the rule to the optimiser ("the optimiser never assigns an item
+to a store whose rules exclude its category"); candidate generation and shopping mode were not in
+scope. Every rule the household sets is still enforced where it matters — the plan.
+
+**Workaround.** Read the plan's reasons: a store skipped by a rule reports "skipped for N items by
+your store category rules" on the recommended card. Reject an excluded store's candidate on the item
+preferences screen if its proposal is unwanted (it does not recur).
+
+**Follow-up.** Filter product-candidate proposals by the same per-store category rules, and (if the
+workflow needs it) reflect the rules in shopping-mode grouping.
+
+### 2. An item the optimiser cannot classify is never excluded
+
+**What happens.** An item whose category row has gone missing is allowed at every store, so a
+category rule cannot exclude it. The optimiser only receives an item's category when the API lookup
+finds its canonical item; an unresolved entry is already excluded from pricing for other reasons.
+
+**Why accepted.** Dropping an unclassifiable item would silently remove it from every plan, which is
+worse than pricing it where we can. The catalogue maps every seeded item (migration 010 backfills
+sub-categories; 002 gives every item a category), so this only affects hand-inserted or future rows.
+
+**Workaround.** None needed for the seeded catalogue; check `canonical_items.category_id` if a
+custom item is not being excluded as expected.
+
+**Follow-up.** Surface an unclassified resolved item as a data warning rather than only defaulting it
+to allowed.

@@ -185,12 +185,14 @@ describe('optimise page', () => {
 		const fetchMock = stubOptimise(fullResponse(), 200, {
 			convenience_threshold_2_cents: 1000,
 			convenience_threshold_3_cents: 2500,
+			categories: [],
+			subcategories: [],
 			stores: [
-				{ retailer: 'tesco', status: 'active', nearby: false },
-				{ retailer: 'dunnes', status: 'occasional', nearby: false },
-				{ retailer: 'supervalu', status: 'active', nearby: true },
-				{ retailer: 'aldi', status: 'active', nearby: false },
-				{ retailer: 'lidl', status: 'off', nearby: false }
+				{ retailer: 'tesco', status: 'active', nearby: false, category_rules: [] },
+				{ retailer: 'dunnes', status: 'occasional', nearby: false, category_rules: [] },
+				{ retailer: 'supervalu', status: 'active', nearby: true, category_rules: [] },
+				{ retailer: 'aldi', status: 'active', nearby: false, category_rules: [] },
+				{ retailer: 'lidl', status: 'off', nearby: false, category_rules: [] }
 			]
 		});
 		render(Page);
@@ -335,6 +337,13 @@ describe('optimise page', () => {
 				display_text: 'San Pellegrino',
 				canonical_item_id: 'ci-5',
 				reason: 'strict_no_exact_offer'
+			},
+			{
+				item_index: 6,
+				entry_id: 'e-6',
+				display_text: 'Apples',
+				canonical_item_id: 'ci-6',
+				reason: 'store_category_rules_excluded_all'
 			}
 		];
 		stubOptimise(response);
@@ -356,6 +365,7 @@ describe('optimise page', () => {
 
 		// strict_no_exact_offer maps to human copy, never the raw wire value.
 		expect(screen.getByText(/San Pellegrino — the exact product has no current offer/)).toBeTruthy();
+		expect(screen.getByText(/Apples — store category rules excluded every option/)).toBeTruthy();
 		expect(screen.queryByText(/strict_no_exact_offer/)).toBeNull();
 	});
 

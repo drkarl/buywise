@@ -86,6 +86,7 @@ export interface UnresolvedItem {
 export type NoValidOfferReason =
 	| 'no_matches'
 	| 'constraints_eliminated_all'
+	| 'store_category_rules_excluded_all'
 	| 'brand_policy_missing_brand'
 	// Backlog-T1: substitution_policy=strict and the exact matched product has no
 	// qualifying offer, so the item is shown as missing rather than substituted.

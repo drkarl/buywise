@@ -150,7 +150,7 @@ Useful screens once logged in:
 | `/list/<id>/optimise` | The four optimisation plans |
 | `/items/<canonical-item-id>/preferences?list=<id>` | Per-item product and substitution preferences, with known matches |
 | `/list/<id>/trip` | Per-store lists for the chosen plan (plus unallocated items) |
-| `/settings` | Household store preferences and convenience thresholds |
+| `/settings` | Store status, nearby settings, category rules, and convenience thresholds |
 | `/savings` | Savings ledger |
 
 To verify the API directly from the shell instead of the browser:

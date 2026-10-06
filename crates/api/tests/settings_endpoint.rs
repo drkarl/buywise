@@ -835,3 +835,273 @@ async fn nearby_store_lowers_second_store_threshold_end_to_end() {
     assert_eq!(body["recommended"]["clears_convenience_threshold"], true);
     assert_eq!(body["recommended"]["two_store_saving_cents"], 700);
 }
+
+// ---------------------------------------------------------------------------
+// Per-store category rules (issue #99)
+// ---------------------------------------------------------------------------
+
+const DAIRY_SUBCATEGORY: &str = "sub-dairy-chilled";
+
+/// `PATCH /api/settings` replaces a store's category rules and a fresh `GET`
+/// returns them; an empty list clears them again.
+#[tokio::test]
+async fn patch_settings_replaces_store_category_rules() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    let body = json_body(
+        patch_settings(
+            &pool,
+            &session,
+            serde_json::json!({
+                "stores": [{
+                    "retailer": "aldi",
+                    "category_rules": [
+                        { "category_id": DAIRY_CATEGORY, "allowed": false },
+                        { "category_id": BAKERY_CATEGORY, "allowed": true }
+                    ]
+                }]
+            }),
+        )
+        .await,
+    )
+    .await;
+    let aldi = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "aldi")
+        .unwrap();
+    assert_eq!(
+        aldi["category_rules"],
+        serde_json::json!([
+            { "category_id": DAIRY_CATEGORY, "subcategory_id": null, "allowed": false },
+            { "category_id": BAKERY_CATEGORY, "subcategory_id": null, "allowed": true }
+        ])
+    );
+    // The response carries the shared catalogue for the settings screen.
+    assert!(body["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == DAIRY_CATEGORY));
+    assert!(body["subcategories"].is_array());
+
+    // Persisted across a fresh GET.
+    let body = json_body(get_settings(&pool, &session).await).await;
+    let aldi = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "aldi")
+        .unwrap();
+    assert_eq!(aldi["category_rules"].as_array().unwrap().len(), 2);
+    // Untouched stores carry no rules (all categories allowed).
+    let tesco = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "tesco")
+        .unwrap();
+    assert_eq!(tesco["category_rules"], serde_json::json!([]));
+
+    // A replacement empty list clears every rule.
+    let body = json_body(
+        patch_settings(
+            &pool,
+            &session,
+            serde_json::json!({ "stores": [{ "retailer": "aldi", "category_rules": [] }] }),
+        )
+        .await,
+    )
+    .await;
+    let aldi = body["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["retailer"] == "aldi")
+        .unwrap();
+    assert_eq!(aldi["category_rules"], serde_json::json!([]));
+}
+
+/// A rule naming an unknown category is 422 and writes nothing.
+#[tokio::test]
+async fn patch_settings_unknown_rule_category_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({
+            "stores": [{ "retailer": "aldi", "category_rules": [
+                { "category_id": "cat-does-not-exist", "allowed": false }
+            ]}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let rules: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM household_store_category_rules WHERE household_id = ?1",
+    )
+    .bind(HOUSEHOLD)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rules, 0, "a rejected patch writes no rules");
+}
+
+/// A rule whose sub-category does not belong to its category is 422.
+#[tokio::test]
+async fn patch_settings_mismatched_rule_subcategory_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+    sqlx::query(
+        "INSERT INTO subcategories (id, category_id, name_en, name_es, default_order) \
+         VALUES (?1, ?2, 'Chilled', 'Refrigerado', 1)",
+    )
+    .bind(DAIRY_SUBCATEGORY)
+    .bind(DAIRY_CATEGORY)
+    .execute(&pool)
+    .await
+    .expect("insert subcategory");
+
+    // The sub-category belongs to Dairy, but the rule names Bakery.
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({
+            "stores": [{ "retailer": "aldi", "category_rules": [
+                { "category_id": BAKERY_CATEGORY, "subcategory_id": DAIRY_SUBCATEGORY, "allowed": false }
+            ]}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// A repeated scope within one store's rules is 422 (it would be ambiguous).
+#[tokio::test]
+async fn patch_settings_duplicate_rule_scope_is_422() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({
+            "stores": [{ "retailer": "aldi", "category_rules": [
+                { "category_id": DAIRY_CATEGORY, "allowed": false },
+                { "category_id": DAIRY_CATEGORY, "allowed": true }
+            ]}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Acceptance (issue #99): with Aldi's fresh (Dairy) category excluded, no plan
+/// ever places the fresh item at Aldi, while the packaged item can be when Aldi
+/// is cheapest, and the plan explanation says why the store was skipped.
+#[tokio::test]
+async fn category_rules_keep_fresh_items_off_aldi_end_to_end() {
+    const PANTRY_CATEGORY: &str = "cat-pantry";
+    const PASTA_ID: &str = "ci-pasta";
+
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    // A packaged (Pantry) category + item beside the fresh Dairy/Bakery pair.
+    sqlx::query(
+        "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+         VALUES (?1, 'Pantry', 'Despensa', 'package', 99)",
+    )
+    .bind(PANTRY_CATEGORY)
+    .execute(&pool)
+    .await
+    .expect("insert pantry category");
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES (?1, ?2, 'Pasta', 'Pasta', ?3, 'any', ?4)",
+    )
+    .bind(PASTA_ID)
+    .bind(HOUSEHOLD)
+    .bind(PANTRY_CATEGORY)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .expect("insert pasta item");
+
+    // Aldi is cheapest for both the fresh milk and the packaged pasta; Tesco
+    // prices both.
+    seed_priced_match(&pool, "p-milk-aldi", "aldi", MILK_ID, 100).await;
+    seed_priced_match(&pool, "p-milk-tesco", "tesco", MILK_ID, 200).await;
+    seed_priced_match(&pool, "p-pasta-aldi", "aldi", PASTA_ID, 100).await;
+    seed_priced_match(&pool, "p-pasta-tesco", "tesco", PASTA_ID, 200).await;
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "milk", "user-a").await;
+    seed_resolved_entry(&pool, "e-pasta", "list-1", PASTA_ID, "pasta", "user-a").await;
+
+    // The household excludes the fresh Dairy category at Aldi.
+    let resp = patch_settings(
+        &pool,
+        &session,
+        serde_json::json!({
+            "stores": [{ "retailer": "aldi", "category_rules": [
+                { "category_id": DAIRY_CATEGORY, "allowed": false }
+            ]}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body =
+        json_body(post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await)
+            .await;
+
+    // No plan ever places the fresh item at Aldi.
+    for key in ["best_single", "best_two_store", "theoretical_minimum"] {
+        let Some(plan) = body.get(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        for line in plan["lines"].as_array().unwrap() {
+            assert!(
+                !(line["canonical_item_id"] == MILK_ID && line["retailer"] == "aldi"),
+                "{key} placed the fresh item at Aldi: {body:#}"
+            );
+        }
+    }
+
+    // The packaged item CAN be at Aldi: the benchmark prices it there.
+    let benchmark = &body["theoretical_minimum"];
+    assert!(
+        benchmark["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["canonical_item_id"] == PASTA_ID && l["retailer"] == "aldi"),
+        "packaged item should be priced at the cheapest store: {body:#}"
+    );
+
+    // The recommendation explains the excluded store.
+    let recommended = body["plan_explanations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["plan"] == "recommended")
+        .expect("recommended explanation");
+    assert!(
+        recommended["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str().unwrap().contains("category rules")),
+        "explanation must surface the excluded-by-rule store: {body:#}"
+    );
+}

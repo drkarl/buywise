@@ -7,17 +7,35 @@ import Page from './+page.svelte';
 /** A stubbed `fetch` (as installed by {@link stubSettings}). */
 type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>;
 
-/** A settings payload exercising all three statuses and the nearby flag. */
+/** A settings payload exercising all three statuses, the nearby flag, and rules. */
 function baseSettings(): Settings {
 	return {
 		convenience_threshold_2_cents: 1000,
 		convenience_threshold_3_cents: 2500,
+		categories: [
+			{ id: 'cat-dairy', name_en: 'Dairy', name_es: 'Lácteos', icon: 'milk', default_order: 1 },
+			{ id: 'cat-pantry', name_en: 'Pantry', name_es: 'Despensa', icon: 'package', default_order: 2 }
+		],
+		subcategories: [
+			{
+				id: 'sub-breakfast',
+				category_id: 'cat-pantry',
+				name_en: 'Breakfast',
+				name_es: 'Desayuno',
+				default_order: 1
+			}
+		],
 		stores: [
-			{ retailer: 'tesco', status: 'active', nearby: false },
-			{ retailer: 'dunnes', status: 'occasional', nearby: false },
-			{ retailer: 'supervalu', status: 'active', nearby: true },
-			{ retailer: 'aldi', status: 'active', nearby: false },
-			{ retailer: 'lidl', status: 'off', nearby: false }
+			{ retailer: 'tesco', status: 'active', nearby: false, category_rules: [] },
+			{ retailer: 'dunnes', status: 'occasional', nearby: false, category_rules: [] },
+			{ retailer: 'supervalu', status: 'active', nearby: true, category_rules: [] },
+			{
+				retailer: 'aldi',
+				status: 'active',
+				nearby: false,
+				category_rules: [{ category_id: 'cat-dairy', subcategory_id: null, allowed: false }]
+			},
+			{ retailer: 'lidl', status: 'off', nearby: false, category_rules: [] }
 		]
 	};
 }
@@ -82,12 +100,14 @@ describe('store settings', () => {
 		expect(body.stores.find((s: { retailer: string }) => s.retailer === 'dunnes')).toEqual({
 			retailer: 'dunnes',
 			status: 'occasional',
-			nearby: false
+			nearby: false,
+			category_rules: []
 		});
 		expect(body.stores.find((s: { retailer: string }) => s.retailer === 'supervalu')).toEqual({
 			retailer: 'supervalu',
 			status: 'active',
-			nearby: true
+			nearby: true,
+			category_rules: []
 		});
 	});
 
@@ -104,5 +124,54 @@ describe('store settings', () => {
 		expect(
 			body.stores.find((s: { retailer: string }) => s.retailer === 'dunnes').status
 		).toBe('off');
+	});
+
+	it('reflects stored category rules as unchecked checkboxes', async () => {
+		stubSettings(baseSettings());
+		render(Page);
+		await screen.findByLabelText('Aldi status');
+
+		// Aldi's stored rule excludes Dairy; every other category stays allowed.
+		expect((screen.getByLabelText('Aldi allows Dairy') as HTMLInputElement).checked).toBe(false);
+		expect((screen.getByLabelText('Aldi allows Pantry') as HTMLInputElement).checked).toBe(true);
+		expect((screen.getByLabelText('Tesco allows Dairy') as HTMLInputElement).checked).toBe(true);
+	});
+
+	it('saves a category exclusion when a category is unticked', async () => {
+		const fetchMock = stubSettings(baseSettings());
+		render(Page);
+		await screen.findByLabelText('Tesco status');
+
+		await fireEvent.click(screen.getByLabelText('Tesco allows Dairy'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+
+		await waitFor(() => expect(fetchMock.mock.calls.some(([, i]) => i?.method === 'PATCH')).toBe(true));
+		const body = patchBody(fetchMock);
+		expect(body.stores.find((s: { retailer: string }) => s.retailer === 'tesco')).toEqual({
+			retailer: 'tesco',
+			status: 'active',
+			nearby: false,
+			category_rules: [{ category_id: 'cat-dairy', subcategory_id: null, allowed: false }]
+		});
+	});
+
+	it('saves a sub-category override when a sub-category is re-ticked', async () => {
+		const fetchMock = stubSettings(baseSettings());
+		render(Page);
+		await screen.findByLabelText('Tesco status');
+
+		// Exclude the whole Pantry category, then re-allow its Breakfast split.
+		await fireEvent.click(screen.getByLabelText('Tesco allows Pantry'));
+		await fireEvent.click(screen.getByLabelText('Tesco allows Breakfast'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+
+		await waitFor(() => expect(fetchMock.mock.calls.some(([, i]) => i?.method === 'PATCH')).toBe(true));
+		const body = patchBody(fetchMock);
+		expect(
+			body.stores.find((s: { retailer: string }) => s.retailer === 'tesco').category_rules
+		).toEqual([
+			{ category_id: 'cat-pantry', subcategory_id: null, allowed: false },
+			{ category_id: 'cat-pantry', subcategory_id: 'sub-breakfast', allowed: true }
+		]);
 	});
 });

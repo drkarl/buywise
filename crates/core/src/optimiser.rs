@@ -126,6 +126,17 @@ pub struct BasketItem {
     /// The merged constraints object (brand, preferred size, …) or `None` when
     /// the item has no `item_constraints` row.
     pub constraints: Option<ItemConstraints>,
+    /// The resolved canonical item's category id (issue #99), used to apply the
+    /// household's per-store category rules. `None` when the item is unresolved
+    /// or its category is unknown, in which case no category rule can exclude it
+    /// (an item we cannot classify is never silently dropped).
+    #[serde(default)]
+    pub category_id: Option<String>,
+    /// The resolved canonical item's sub-category id (issue #101), when the
+    /// category is split. A sub-category rule refines the category rule
+    /// (issue #99). `None` when the item is unresolved or not split.
+    #[serde(default)]
+    pub subcategory_id: Option<String>,
 }
 
 /// Identity and input order for one basket item, echoed in [`OptimiserOutput`]
@@ -140,6 +151,26 @@ pub struct BasketItemIdentity {
     pub display_text: String,
 }
 
+/// One per-store category rule (issue #99): whether `retailer` may fulfil items
+/// in `category_id` — or, when `subcategory_id` is set, only that sub-category
+/// of it (a refinement over the whole-category rule).
+///
+/// Rules are matched most-specific-first against an item's category and
+/// sub-category; an item with no matching rule is allowed. The list on a
+/// [`StoreSetting`] is the household's explicit rules for that store (empty ⇒
+/// every category allowed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryRule {
+    /// The category this rule targets (a `categories.id`).
+    pub category_id: String,
+    /// When `Some`, the rule applies only to this sub-category of `category_id`
+    /// (a `subcategories.id`); when `None`, to the whole category.
+    #[serde(default)]
+    pub subcategory_id: Option<String>,
+    /// Whether the store may fulfil items in this scope.
+    pub allowed: bool,
+}
+
 /// One household's stored disposition of a retailer (issue #98): whether it takes
 /// part in plan generation and whether its trip is cheap enough to lower the
 /// second-store convenience threshold. Carried on [`OptimiserInput`].
@@ -152,6 +183,10 @@ pub struct StoreSetting {
     /// True when the store is close by, so a two-store split including it clears
     /// the lower [`NEARBY_THRESHOLD_2_CENTS`] bar.
     pub nearby: bool,
+    /// Per-category / sub-category rules (issue #99). Empty ⇒ every category is
+    /// allowed (the pre-#99 behaviour). See [`CategoryRule`].
+    #[serde(default)]
+    pub category_rules: Vec<CategoryRule>,
 }
 
 /// Everything the optimiser needs for one run.
@@ -221,6 +256,49 @@ impl OptimiserInput {
         self.store_settings
             .iter()
             .any(|s| s.retailer == retailer && s.nearby)
+    }
+
+    /// Whether `retailer` may fulfil the basket item at `item_index` under the
+    /// household's per-store category rules (issue #99).
+    ///
+    /// Default-allow: an item with no category, a store with no rules, or an item
+    /// with no matching rule is allowed. A rule for the item's sub-category beats
+    /// one for its category (the refinement), and that rule's `allowed` decides.
+    fn store_allows_item(&self, retailer: Retailer, item_index: usize) -> bool {
+        let Some(item) = self.items.get(item_index) else {
+            return true;
+        };
+        let Some(category_id) = item.category_id.as_deref() else {
+            return true;
+        };
+        let Some(setting) = self.store_settings.iter().find(|s| s.retailer == retailer) else {
+            return true;
+        };
+
+        // Sub-category rule first: an explicit refinement always wins.
+        if let Some(subcategory_id) = item.subcategory_id.as_deref() {
+            if let Some(rule) = setting.category_rules.iter().find(|r| {
+                r.category_id == category_id && r.subcategory_id.as_deref() == Some(subcategory_id)
+            }) {
+                return rule.allowed;
+            }
+        }
+        // Otherwise the whole-category rule, if any.
+        if let Some(rule) = setting
+            .category_rules
+            .iter()
+            .find(|r| r.category_id == category_id && r.subcategory_id.is_none())
+        {
+            return rule.allowed;
+        }
+        true
+    }
+
+    /// Whether `retailer` is both eligible for this run and may fulfil the item
+    /// at `item_index` under its category rules (issue #99). The single gate the
+    /// plan builders apply.
+    fn retailer_can_price_item(&self, retailer: Retailer, item_index: usize) -> bool {
+        self.is_eligible(retailer) && self.store_allows_item(retailer, item_index)
     }
 }
 
@@ -386,6 +464,8 @@ pub enum NoOfferReason {
     NoMatches,
     /// Every candidate was filtered out by the item's constraints.
     ConstraintsEliminatedAll,
+    /// Every candidate was at a store excluded by the item's category rules.
+    StoreCategoryRulesExcludedAll,
     /// `policy = 'brand'` but no brand is configured. A configuration error: we
     /// never silently fall back to `any`, so the item is rejected with a warning.
     BrandPolicyMissingBrand,
@@ -566,6 +646,9 @@ pub enum ReasonCode {
     /// `retailers[0]` is an occasional store not marked for today's trip, so it is
     /// left out of this run.
     StoreNotOnTrip,
+    /// `retailers[0]`'s per-store category rules exclude `item_indices`, so it may
+    /// not fulfil them even though it stocks them (issue #99).
+    CategoryExcluded,
 }
 
 /// One deterministic, plan-specific reason explaining a plan (issue #103).
@@ -997,6 +1080,9 @@ fn build_single_store_plan(
 ) -> StorePlan {
     let mut lines = Vec::new();
     for &item_index in priced_items {
+        if !input.retailer_can_price_item(retailer, item_index) {
+            continue;
+        }
         if let Some(cand) = best.get(&item_index).and_then(|m| m.get(&retailer)) {
             lines.push(plan_line(input, cand));
         }
@@ -1026,8 +1112,12 @@ fn build_two_store_plan(
             Some(m) => m,
             None => continue,
         };
-        let ca = by_retailer.get(&a);
-        let cb = by_retailer.get(&b);
+        let ca = by_retailer
+            .get(&a)
+            .filter(|_| input.retailer_can_price_item(a, item_index));
+        let cb = by_retailer
+            .get(&b)
+            .filter(|_| input.retailer_can_price_item(b, item_index));
         let chosen = match (ca, cb) {
             (Some(ca), Some(cb)) => {
                 if is_cheaper(cb, ca) {
@@ -1073,16 +1163,18 @@ fn build_theoretical_minimum(
             Some(m) => m,
             None => continue,
         };
-        // The globally cheapest candidate for this item among eligible stores.
-        // An ineligible store (off, or occasional without a trip today) is never
-        // routed, so it cannot appear in the benchmark either (issue #98).
+        // The globally cheapest candidate for this item among eligible stores
+        // that its category rules allow. An ineligible store (off, or occasional
+        // without a trip today) or one the household's category rules exclude is
+        // never routed, so it cannot appear in the benchmark either (issues #98,
+        // #99).
         //
         // The final retailer tie-break keeps the choice independent of HashMap
         // iteration order: the benchmark names one store per item, and the reasons
         // derived from it must be reproducible run to run (issue #103).
         let cheapest = by_retailer
             .values()
-            .filter(|c| input.is_eligible(c.retailer))
+            .filter(|c| input.retailer_can_price_item(c.retailer, item_index))
             .min_by(|a, b| {
                 a.effective_unit_price()
                     .cmp(&b.effective_unit_price())
@@ -1425,8 +1517,9 @@ fn reason(
     }
 }
 
-/// The eligible stores that price `item`, in `as_db_str` order. Empty when the
-/// item has no candidate at all.
+/// The eligible stores that may price `item` (store eligibility plus its
+/// per-store category rules, issue #99), in `as_db_str` order. Empty when the
+/// item has no candidate at all or no store is allowed to take it.
 fn eligible_stores_for(
     input: &OptimiserInput,
     best_per_item: &BTreeMap<usize, HashMap<Retailer, Candidate>>,
@@ -1438,7 +1531,7 @@ fn eligible_stores_for(
             by_retailer
                 .keys()
                 .copied()
-                .filter(|r| input.is_eligible(*r))
+                .filter(|r| input.retailer_can_price_item(*r, item))
                 .collect()
         })
         .unwrap_or_default();
@@ -1872,7 +1965,30 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
                         None,
                         None,
                     )),
-                _ => {}
+                _ => {
+                    // The store takes part in this run, but its category rules
+                    // exclude some items it stocks (issue #99): name them so the
+                    // household sees why a cheaper store was skipped.
+                    let excluded: Vec<usize> = ctx
+                        .classification
+                        .category_excluded
+                        .iter()
+                        .filter_map(|&(item, excluded_retailer)| {
+                            (excluded_retailer == retailer).then_some(item)
+                        })
+                        .collect();
+                    if !excluded.is_empty() {
+                        out.push(reason(
+                            kind,
+                            ReasonCode::CategoryExcluded,
+                            excluded,
+                            vec![retailer],
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1889,7 +2005,7 @@ fn reasons_for_plan(kind: PlanKind, plan: &StorePlan, ctx: &ReasonContext) -> Ve
         | ReasonCode::UnresolvedItems => 3,
         ReasonCode::PriceAsOf | ReasonCode::StalePrices => 4,
         ReasonCode::BrandRule => 4,
-        ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip => 5,
+        ReasonCode::StoreOff | ReasonCode::StoreNotOnTrip | ReasonCode::CategoryExcluded => 5,
         ReasonCode::CheapestAtStore | ReasonCode::OnlyStoreStocking => 6,
     });
     out
@@ -1909,6 +2025,8 @@ pub struct Classification {
     pub no_valid_offer: Vec<NoValidOfferItem>,
     /// Resolved, priceable items held back under `substitution_policy = 'ask'`.
     pub needs_confirmation: Vec<NeedsConfirmationItem>,
+    /// Item/store pairs removed by per-store category rules.
+    pub category_excluded: Vec<(usize, Retailer)>,
 }
 
 /// Human-readable pack/size text for a candidate product. Prefers the retailer's
@@ -1993,6 +2111,7 @@ fn classify_items(
     let mut unresolved = Vec::new();
     let mut no_valid_offer = Vec::new();
     let mut needs_confirmation = Vec::new();
+    let mut category_excluded = Vec::new();
 
     for (item_index, item) in input.items.iter().enumerate() {
         // 1a. Unresolved: no canonical item id.
@@ -2028,7 +2147,16 @@ fn classify_items(
         // 1c. Constraint filter. A config error rejects the whole item.
         let mut item_candidates = Vec::new();
         let mut config_error = false;
+        let mut has_category_allowed_offer = false;
         for (m, product, offer) in rows {
+            if !input.store_allows_item(product.retailer, item_index) {
+                let excluded = (item_index, product.retailer);
+                if !category_excluded.contains(&excluded) {
+                    category_excluded.push(excluded);
+                }
+                continue;
+            }
+            has_category_allowed_offer = true;
             match check_constraints(item.constraint_policy, item.constraints.as_ref(), product) {
                 ConstraintCheck::ConfigError => {
                     config_error = true;
@@ -2064,7 +2192,11 @@ fn classify_items(
                 entry_id: item.entry_id.clone(),
                 display_text: item.display_text.clone(),
                 canonical_item_id: canonical_item_id.clone(),
-                reason: NoOfferReason::ConstraintsEliminatedAll,
+                reason: if has_category_allowed_offer {
+                    NoOfferReason::ConstraintsEliminatedAll
+                } else {
+                    NoOfferReason::StoreCategoryRulesExcludedAll
+                },
             });
             continue;
         }
@@ -2142,6 +2274,7 @@ fn classify_items(
             unresolved,
             no_valid_offer,
             needs_confirmation,
+            category_excluded,
         },
     )
 }

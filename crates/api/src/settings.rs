@@ -43,8 +43,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use buywise_core::db;
-use buywise_core::domain::{Cents, Retailer, StoreStatus};
-use buywise_core::optimiser::{StoreSetting, DEFAULT_THRESHOLDS};
+use buywise_core::domain::{Category, Cents, Retailer, StoreStatus, Subcategory};
+use buywise_core::optimiser::{CategoryRule, StoreSetting, DEFAULT_THRESHOLDS};
 
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
@@ -71,9 +71,16 @@ pub struct SettingsResponse {
     /// Third-store convenience threshold (cents). Default €25.00 (2500).
     pub convenience_threshold_3_cents: Cents,
     /// One entry per retailer ([`Retailer::ALL`], always all five), each carrying
-    /// its status (`active` / `occasional` / `off`) and `nearby` flag. A retailer
-    /// with no stored row is returned as `active`, not nearby.
+    /// its status (`active` / `occasional` / `off`), `nearby` flag, and per-store
+    /// category rules (issue #99). A retailer with no stored row is returned as
+    /// `active`, not nearby, with no category rules (all categories allowed).
     pub stores: Vec<StoreSetting>,
+    /// The shared category catalogue, so the settings screen can render the
+    /// per-store category rules without a second request (issue #99).
+    pub categories: Vec<Category>,
+    /// The shared sub-category catalogue (id, parent category, display order) for
+    /// rendering sub-category refinements (issues #99, #101).
+    pub subcategories: Vec<Subcategory>,
 }
 
 /// Body for `PATCH /api/settings`.
@@ -108,6 +115,10 @@ pub struct StoreSettingsPatch {
     pub status: Option<StoreStatus>,
     /// New nearby flag when present.
     pub nearby: Option<bool>,
+    /// Replacement per-store category rules (issue #99). When present the store's
+    /// whole rule set is replaced (an empty list clears every rule). `None` leaves
+    /// the stored rules unchanged.
+    pub category_rules: Option<Vec<CategoryRule>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,8 +145,9 @@ pub async fn stored_thresholds(
 }
 
 /// A household's stored per-retailer settings (issue #98), in `retailer`
-/// canonical order. Retailers with no stored row are simply absent; callers
-/// treat them as [`StoreStatus::Active`] and not nearby (see
+/// canonical order, each carrying its per-store category rules (issue #99).
+/// Retailers with no stored row are simply absent; callers treat them as
+/// [`StoreStatus::Active`], not nearby, with no category rules (see
 /// [`full_store_settings`]).
 ///
 /// Public so [`crate::optimise`] can build the optimiser input's store settings
@@ -152,14 +164,46 @@ pub async fn stored_store_settings(
     .fetch_all(pool)
     .await?;
 
+    let mut rules_by_retailer = stored_category_rules(pool, household_id).await?;
+
     Ok(rows
         .into_iter()
         .map(|(retailer, status, nearby)| StoreSetting {
             retailer,
             status,
             nearby: nearby != 0,
+            category_rules: rules_by_retailer.remove(&retailer).unwrap_or_default(),
         })
         .collect())
+}
+
+/// A household's stored per-store category rules (issue #99), grouped by
+/// retailer. Retailers with no rules are absent from the map (all categories
+/// allowed).
+async fn stored_category_rules(
+    pool: &sqlx::SqlitePool,
+    household_id: &str,
+) -> Result<std::collections::HashMap<Retailer, Vec<CategoryRule>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (Retailer, String, Option<String>, i64)>(
+        "SELECT retailer, category_id, subcategory_id, allowed \
+         FROM household_store_category_rules \
+         WHERE household_id = ?1 \
+         ORDER BY retailer, category_id, subcategory_id",
+    )
+    .bind(household_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_retailer: std::collections::HashMap<Retailer, Vec<CategoryRule>> =
+        std::collections::HashMap::new();
+    for (retailer, category_id, subcategory_id, allowed) in rows {
+        by_retailer.entry(retailer).or_default().push(CategoryRule {
+            category_id,
+            subcategory_id,
+            allowed: allowed != 0,
+        });
+    }
+    Ok(by_retailer)
 }
 
 /// Expand stored settings to the full [`Retailer::ALL`] list, filling any absent
@@ -177,9 +221,76 @@ fn full_store_settings(stored: &[StoreSetting]) -> Vec<StoreSetting> {
                     retailer,
                     status: StoreStatus::Active,
                     nearby: false,
+                    category_rules: Vec::new(),
                 })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Shared catalogue + category-rule validation (issue #99)
+// ---------------------------------------------------------------------------
+
+/// Load the shared category catalogue, in display order, for the settings screen.
+async fn load_categories(pool: &sqlx::SqlitePool) -> Result<Vec<Category>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, name_en, name_es, icon, default_order FROM categories \
+         ORDER BY default_order, id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Load the shared sub-category catalogue, ordered within each parent category.
+async fn load_subcategories(pool: &sqlx::SqlitePool) -> Result<Vec<Subcategory>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, category_id, name_en, name_es, default_order FROM subcategories \
+         ORDER BY category_id, default_order, id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Validate one store's replacement category rules against the shared catalogues:
+/// each category must exist, each named sub-category must belong to its category,
+/// and no scope may repeat (which would make the rule ambiguous). Returns 422 on
+/// any violation, or a logged 500 on a database error.
+async fn validate_category_rules(
+    pool: &sqlx::SqlitePool,
+    rules: &[CategoryRule],
+) -> Result<(), StatusCode> {
+    let mut seen: std::collections::HashSet<(&str, Option<&str>)> =
+        std::collections::HashSet::new();
+    for rule in rules {
+        if !seen.insert((rule.category_id.as_str(), rule.subcategory_id.as_deref())) {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        match rule.subcategory_id.as_deref() {
+            Some(subcategory_id) => {
+                let parent: Option<String> =
+                    sqlx::query_scalar("SELECT category_id FROM subcategories WHERE id = ?1")
+                        .bind(subcategory_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_error("patch_settings.rules_validate"))?;
+                if parent.as_deref() != Some(rule.category_id.as_str()) {
+                    return Err(StatusCode::UNPROCESSABLE_ENTITY);
+                }
+            }
+            None => {
+                let exists: Option<i64> =
+                    sqlx::query_scalar("SELECT 1 FROM categories WHERE id = ?1")
+                        .bind(&rule.category_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_error("patch_settings.rules_validate"))?;
+                if exists.is_none() {
+                    return Err(StatusCode::UNPROCESSABLE_ENTITY);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +356,19 @@ async fn get_settings(
             .map_err(db_error("get_settings.stores"))?,
     );
 
+    let categories = load_categories(pool)
+        .await
+        .map_err(db_error("get_settings.categories"))?;
+    let subcategories = load_subcategories(pool)
+        .await
+        .map_err(db_error("get_settings.subcategories"))?;
+
     Ok(Json(SettingsResponse {
         convenience_threshold_2_cents: threshold_2,
         convenience_threshold_3_cents: threshold_3,
         stores,
+        categories,
+        subcategories,
     }))
 }
 
@@ -278,9 +398,17 @@ async fn patch_settings(
         || body
             .stores
             .iter()
-            .any(|s| s.status.is_none() && s.nearby.is_none())
+            .any(|s| s.status.is_none() && s.nearby.is_none() && s.category_rules.is_none())
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // Validate every replacement rule set against the shared catalogues before
+    // any write, so a bad rule is a clean 422 with no partial state.
+    for patch in &body.stores {
+        if let Some(rules) = &patch.category_rules {
+            validate_category_rules(pool, rules).await?;
+        }
     }
 
     let household_id = caller_household(pool, &user.user_id)
@@ -326,6 +454,10 @@ async fn patch_settings(
         }
         if let Some(nearby) = patch.nearby {
             entry.nearby = nearby;
+        }
+        if let Some(rules) = &patch.category_rules {
+            // Replacement semantics: the whole rule set is what the client sent.
+            entry.category_rules = rules.clone();
         }
     }
 
@@ -376,15 +508,56 @@ async fn patch_settings(
             .execute(&mut *tx)
             .await
             .map_err(db_error("patch_settings.stores_upsert"))?;
+
+            // Replace the store's category rules when the patch supplied them:
+            // delete the old set, insert the new (issue #99). An empty list
+            // therefore clears every rule.
+            if patch.category_rules.is_some() {
+                sqlx::query(
+                    "DELETE FROM household_store_category_rules \
+                     WHERE household_id = ?1 AND retailer = ?2",
+                )
+                .bind(&household_id)
+                .bind(entry.retailer)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error("patch_settings.rules_delete"))?;
+
+                for rule in &entry.category_rules {
+                    sqlx::query(
+                        "INSERT INTO household_store_category_rules \
+                             (household_id, retailer, category_id, subcategory_id, allowed, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .bind(&household_id)
+                    .bind(entry.retailer)
+                    .bind(&rule.category_id)
+                    .bind(rule.subcategory_id.as_deref())
+                    .bind(if rule.allowed { 1_i64 } else { 0_i64 })
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_error("patch_settings.rules_insert"))?;
+                }
+            }
         }
         tx.commit()
             .await
             .map_err(db_error("patch_settings.stores_commit"))?;
     }
 
+    let categories = load_categories(pool)
+        .await
+        .map_err(db_error("patch_settings.categories"))?;
+    let subcategories = load_subcategories(pool)
+        .await
+        .map_err(db_error("patch_settings.subcategories"))?;
+
     Ok(Json(SettingsResponse {
         convenience_threshold_2_cents: threshold_2,
         convenience_threshold_3_cents: threshold_3,
         stores: merged,
+        categories,
+        subcategories,
     }))
 }

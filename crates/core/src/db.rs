@@ -819,6 +819,8 @@ mod tests {
             // Purchase suggestions (013, issue #106)
             "purchase_events",
             "purchase_dismissals",
+            // Per-store category rules (014, issue #99)
+            "household_store_category_rules",
         ];
 
         for name in expected {
@@ -826,7 +828,8 @@ mod tests {
             assert!(sql.is_some(), "table `{name}` should exist after migration");
         }
 
-        // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category
+        // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category + 1
+        // store-settings + 2 purchase-suggestion + 1 store-category-rules
         // application tables (excluding sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
@@ -1071,8 +1074,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 26,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category and household store settings tables + purchase suggestion tables in the file-backed database"
+            count, 27,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules and purchase suggestion tables in the file-backed database"
         );
 
         pool.close().await;

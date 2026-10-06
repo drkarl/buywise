@@ -120,6 +120,8 @@ fn item(display: &str, canonical_id: &str, count: u32) -> BasketItem {
         count,
         constraint_policy: ConstraintPolicy::Any,
         constraints: None,
+        category_id: None,
+        subcategory_id: None,
     }
 }
 
@@ -582,6 +584,7 @@ fn store_setting(retailer: Retailer, status: StoreStatus, nearby: bool) -> Store
         retailer,
         status,
         nearby,
+        category_rules: Vec::new(),
     }
 }
 
@@ -1415,6 +1418,8 @@ fn unresolved_items_excluded_from_total() {
         count: 1,
         constraint_policy: ConstraintPolicy::Any,
         constraints: None,
+        category_id: None,
+        subcategory_id: None,
     };
     let input = OptimiserInput::new(
         "hh-1",
@@ -2106,6 +2111,387 @@ fn nearby_threshold_never_raises_a_smaller_household_threshold() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-store category rules (issue #99)
+// ---------------------------------------------------------------------------
+
+const PRODUCE: &str = "cat-produce";
+const PANTRY: &str = "cat-pantry";
+const BREAKFAST: &str = "sub-breakfast";
+const PASTA_RICE: &str = "sub-pasta-rice";
+
+/// A resolved item in the given category (and optional sub-category).
+fn item_in(
+    display: &str,
+    canonical_id: &str,
+    category_id: &str,
+    subcategory_id: Option<&str>,
+) -> BasketItem {
+    let mut it = item(display, canonical_id, 1);
+    it.category_id = Some(category_id.into());
+    it.subcategory_id = subcategory_id.map(Into::into);
+    it
+}
+
+/// One category rule.
+fn category_rule(category_id: &str, subcategory_id: Option<&str>, allowed: bool) -> CategoryRule {
+    CategoryRule {
+        category_id: category_id.into(),
+        subcategory_id: subcategory_id.map(Into::into),
+        allowed,
+    }
+}
+
+/// An active Aldi store carrying the given category rules.
+fn aldi_with_rules(rules: Vec<CategoryRule>) -> StoreSetting {
+    let mut setting = store_setting(Retailer::Aldi, StoreStatus::Active, false);
+    setting.category_rules = rules;
+    setting
+}
+
+/// Acceptance (issue #99): with Aldi's Produce excluded, no plan ever places the
+/// fresh item at Aldi, while the packaged item still can be when Aldi is cheapest.
+#[test]
+fn fresh_item_never_placed_at_a_store_that_excludes_its_category() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            item_in("apple", "ci-apple", PRODUCE, None),
+            item_in("pasta", "ci-pasta", PANTRY, None),
+        ],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    // apple: Aldi 50 (cheapest), Tesco 200.
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-aa", "ci-apple", "p-aa", MatchStatus::Accepted),
+                product("p-aa", Retailer::Aldi),
+                offer("o-aa", "p-aa", 50, Some(5)),
+            ),
+            (
+                product_match("m-at", "ci-apple", "p-at", MatchStatus::Accepted),
+                product("p-at", Retailer::Tesco),
+                offer("o-at", "p-at", 200, Some(5)),
+            ),
+        ],
+    );
+    // pasta: Aldi 100 (cheapest), Tesco 200.
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 100, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+
+    // The fresh item is never routed to Aldi in ANY published plan.
+    for plan in [
+        out.best_single.as_ref(),
+        out.best_two_store.as_ref(),
+        out.theoretical_minimum.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            !plan
+                .lines
+                .iter()
+                .any(|l| l.item_index == 0 && l.retailer == Retailer::Aldi),
+            "fresh item must never be placed at Aldi: {plan:?}"
+        );
+    }
+    // The packaged item CAN be at Aldi when cheapest: the benchmark picks it there.
+    let bench = out.theoretical_minimum.as_ref().expect("benchmark");
+    assert!(
+        bench
+            .lines
+            .iter()
+            .any(|l| l.item_index == 1 && l.retailer == Retailer::Aldi),
+        "packaged item should be priced at the cheapest store: {bench:?}"
+    );
+    // Completeness: Tesco is the only complete single store (Aldi misses the apple).
+    assert_eq!(
+        out.best_single.as_ref().expect("single").stores,
+        vec![Retailer::Tesco]
+    );
+    // The recommendation explains why the cheaper store was skipped.
+    let excluded = reason_with(&out, PlanKind::Recommended, ReasonCode::CategoryExcluded)
+        .expect("category-excluded reason");
+    assert_eq!(excluded.retailers, vec![Retailer::Aldi]);
+    assert_eq!(excluded.item_indices, vec![0]);
+}
+
+/// A store with rules is still used for the categories it does allow, even when
+/// it is the cheapest option overall.
+#[test]
+fn packaged_item_can_be_placed_at_a_store_with_category_rules() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item_in("pasta", "ci-pasta", PANTRY, None)],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 100, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let single = out.best_single.as_ref().expect("single");
+    assert_eq!(single.stores, vec![Retailer::Aldi]);
+    assert_eq!(single.total_cents, 100);
+    assert!(
+        reason_with(&out, PlanKind::Recommended, ReasonCode::CategoryExcluded).is_none(),
+        "no rule excludes this category, so no exclusion reason"
+    );
+}
+
+/// A sub-category rule refines its category rule: excluding Pantry but allowing
+/// Breakfast lets the breakfast item stay at Aldi while the rest of Pantry moves.
+#[test]
+fn subcategory_allow_rule_overrides_a_category_exclusion() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            item_in("cereal", "ci-cereal", PANTRY, Some(BREAKFAST)),
+            item_in("pasta", "ci-pasta", PANTRY, Some(PASTA_RICE)),
+        ],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![
+        category_rule(PANTRY, None, false),
+        category_rule(PANTRY, Some(BREAKFAST), true),
+    ])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    // cereal: Aldi 100 (cheapest), Tesco 300.
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-ca", "ci-cereal", "p-ca", MatchStatus::Accepted),
+                product("p-ca", Retailer::Aldi),
+                offer("o-ca", "p-ca", 100, Some(5)),
+            ),
+            (
+                product_match("m-ct", "ci-cereal", "p-ct", MatchStatus::Accepted),
+                product("p-ct", Retailer::Tesco),
+                offer("o-ct", "p-ct", 300, Some(5)),
+            ),
+        ],
+    );
+    // pasta: Aldi 100 (cheapest), Tesco 200.
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 100, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let bench = out.theoretical_minimum.as_ref().expect("benchmark");
+    // Breakfast is re-allowed at Aldi; the rest of Pantry is not.
+    assert!(bench
+        .lines
+        .iter()
+        .any(|l| l.item_index == 0 && l.retailer == Retailer::Aldi));
+    assert!(!bench
+        .lines
+        .iter()
+        .any(|l| l.item_index == 1 && l.retailer == Retailer::Aldi));
+}
+
+/// A sub-category exclusion under an otherwise allowed category keeps the rest
+/// of that category at the store.
+#[test]
+fn subcategory_exclusion_applies_within_an_allowed_category() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            item_in("cereal", "ci-cereal", PANTRY, Some(BREAKFAST)),
+            item_in("pasta", "ci-pasta", PANTRY, Some(PASTA_RICE)),
+        ],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(
+        PANTRY,
+        Some(BREAKFAST),
+        false,
+    )])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-ca", "ci-cereal", "p-ca", MatchStatus::Accepted),
+                product("p-ca", Retailer::Aldi),
+                offer("o-ca", "p-ca", 100, Some(5)),
+            ),
+            (
+                product_match("m-ct", "ci-cereal", "p-ct", MatchStatus::Accepted),
+                product("p-ct", Retailer::Tesco),
+                offer("o-ct", "p-ct", 300, Some(5)),
+            ),
+        ],
+    );
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 100, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let out = run(&input, priced);
+    let bench = out.theoretical_minimum.as_ref().expect("benchmark");
+    assert!(!bench
+        .lines
+        .iter()
+        .any(|l| l.item_index == 0 && l.retailer == Retailer::Aldi));
+    assert!(bench
+        .lines
+        .iter()
+        .any(|l| l.item_index == 1 && l.retailer == Retailer::Aldi));
+}
+
+#[test]
+fn ask_policy_filters_category_exclusions_before_confirmation_or_preference() {
+    let mut basket_item = item_in("chicken", "ci-chicken", PRODUCE, None);
+    let mut c = empty_constraints();
+    c.substitution_policy = SubstitutionPolicy::Ask;
+    basket_item.constraints = Some(c);
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![basket_item]);
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-aldi", "ci-chicken", "p-aldi", MatchStatus::Accepted),
+                product("p-aldi", Retailer::Aldi),
+                offer("o-aldi", "p-aldi", 100, Some(5)),
+            ),
+            (
+                product_match("m-tesco", "ci-chicken", "p-tesco", MatchStatus::Accepted),
+                product("p-tesco", Retailer::Tesco),
+                offer("o-tesco", "p-tesco", 200, Some(5)),
+            ),
+        ],
+    );
+
+    let awaiting_choice = run(&input, priced.clone());
+    let confirmation = &awaiting_choice.needs_confirmation_items[0];
+    assert_eq!(confirmation.candidate_count, 1);
+    assert_eq!(confirmation.candidates[0].retailer, Retailer::Tesco);
+
+    let mut preferred = BTreeMap::new();
+    preferred.insert(0, "p-aldi".to_string());
+    let excluded_preference = run_with_preferred(&input, priced, preferred);
+    assert!(excluded_preference.best_single.is_none());
+    let confirmation = &excluded_preference.needs_confirmation_items[0];
+    assert_eq!(confirmation.candidate_count, 1);
+    assert_eq!(confirmation.candidates[0].retailer, Retailer::Tesco);
+}
+
+/// An item we cannot classify (no category) is never excluded by a category
+/// rule — we drop unpriceable unknowns, never silently lose a resolved item.
+#[test]
+fn unclassified_item_is_not_excluded_by_category_rules() {
+    let mut input = OptimiserInput::new("hh-1", Some(5), vec![item("mystery", "ci-x", 1)]);
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m", "ci-x", "p", MatchStatus::Accepted),
+            product("p", Retailer::Aldi),
+            offer("o", "p", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    assert_eq!(
+        out.best_single.expect("single").stores,
+        vec![Retailer::Aldi]
+    );
+}
+
+#[test]
+fn all_offers_excluded_by_category_rules_have_a_distinct_reason() {
+    let mut input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item_in("apple", "ci-apple", PRODUCE, None)],
+    );
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-apple", "ci-apple", "p-apple", MatchStatus::Accepted),
+            product("p-apple", Retailer::Aldi),
+            offer("o-apple", "p-apple", 100, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    assert_eq!(out.no_valid_offer_items.len(), 1);
+    assert_eq!(
+        out.no_valid_offer_items[0].reason,
+        NoOfferReason::StoreCategoryRulesExcludedAll
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Plan reasons (issue #103)
 // ---------------------------------------------------------------------------
 
@@ -2286,6 +2672,8 @@ fn reason_distinguishes_unpriced_and_unresolved_items() {
         count: 1,
         constraint_policy: ConstraintPolicy::Any,
         constraints: None,
+        category_id: None,
+        subcategory_id: None,
     };
     let input = OptimiserInput::new(
         "hh-1",
