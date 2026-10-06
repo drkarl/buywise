@@ -35,9 +35,10 @@
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use buywise_core::purchase_ledger::{self, ImportError, TransactionDetail, TransactionSummary};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::middleware::AuthenticatedUser;
@@ -60,12 +61,26 @@ pub fn router() -> Router<AppState> {
             "/api/household/{household_id}/purchases",
             post(import_purchases).get(list_purchases),
         )
+        // A purchase typed by hand lives under the same collection but on its own
+        // path: `POST /purchases` is the import document, so the manual create
+        // needs a distinct route rather than a second meaning for the same one.
+        .route(
+            "/api/household/{household_id}/purchases/manual",
+            post(create_manual_purchase),
+        )
         .route(
             "/api/household/{household_id}/purchases/{transaction_id}",
-            get(get_purchase).delete(delete_purchase),
+            get(get_purchase)
+                .put(update_manual_purchase)
+                .delete(delete_purchase),
         )
-        // The import is the only route that reads a request body; cap it here so
-        // the limit travels with the route rather than the whole app.
+        .route(
+            "/api/household/{household_id}/purchases/{transaction_id}/receipt",
+            put(set_receipt_link),
+        )
+        // Every route here may read a request body (the import and manual
+        // documents, and the link body); cap them here so the limit travels with
+        // the routes rather than the whole app.
         .layer(DefaultBodyLimit::max(MAX_IMPORT_BODY_BYTES))
 }
 
@@ -102,6 +117,12 @@ async fn import_purchases(
         )
             .into_response()),
         Err(ImportError::NoSuchHousehold(_)) => Err(StatusCode::NOT_FOUND),
+        Err(err @ (ImportError::NoSuchTransaction(_) | ImportError::NotManual(_))) => {
+            // Neither can arise from an import document; if one ever does, it is
+            // a server fault, not a client outcome.
+            tracing::error!(error = %err, "purchases.import");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
         Err(ImportError::Sqlx(err)) => {
             tracing::error!(error = %err, "purchases.import");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -164,9 +185,152 @@ async fn delete_purchase(
     }
 }
 
+/// Body of `PUT .../purchases/{id}/receipt`: the photo to link, or `null` to
+/// clear the link. An absent field is treated as `null`, so a body can clear a
+/// link with `{}`.
+#[derive(Debug, Deserialize)]
+struct SetReceiptLink {
+    receipt_image_id: Option<String>,
+}
+
+/// `POST /api/household/{household_id}/purchases/manual` — add one purchase by
+/// hand.
+///
+/// 403 unless the caller is a member of `household_id`; 404 if the household
+/// does not exist; 422 with `{ "errors": [...] }` when the body is malformed or
+/// names a receipt photo that is not the household's (or is expired). On success
+/// returns 201 with the stored transaction, its lines and its revisions.
+async fn create_manual_purchase(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(household_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(status) = require_member(&state, &user.user_id, &household_id).await {
+        return status.into_response();
+    }
+    match purchase_ledger::create_manual_purchase(
+        &state.pool,
+        &household_id,
+        &body,
+        (state.clock)(),
+    )
+    .await
+    {
+        Ok(detail) => (StatusCode::CREATED, Json(detail)).into_response(),
+        Err(err) => ledger_error("purchases.create_manual", err),
+    }
+}
+
+/// `PUT /api/household/{household_id}/purchases/{transaction_id}` — correct one
+/// hand-entered purchase.
+///
+/// 403 unless the caller is a member; 404 when the household has no such
+/// purchase. An imported purchase cannot be edited here (422): it is corrected
+/// by re-importing, so the manual endpoint never turns an import into a manual
+/// purchase. The edit keeps the transaction's identity, so it corrects the same
+/// row — a revision, never a second purchase. Returns the updated transaction
+/// with its lines and revisions.
+async fn update_manual_purchase(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((household_id, transaction_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(status) = require_member(&state, &user.user_id, &household_id).await {
+        return status.into_response();
+    }
+    match purchase_ledger::update_manual_purchase(
+        &state.pool,
+        &household_id,
+        &transaction_id,
+        &body,
+        (state.clock)(),
+    )
+    .await
+    {
+        Ok(detail) => Json(detail).into_response(),
+        Err(err) => ledger_error("purchases.update_manual", err),
+    }
+}
+
+/// `PUT /api/household/{household_id}/purchases/{transaction_id}/receipt` — set
+/// or clear the purchase's linked receipt photo.
+///
+/// 403 unless the caller is a member; 404 when the household has no such
+/// purchase; 422 when the named photo is not the household's own unexpired
+/// receipt. Linking a photo changes neither the purchase's content nor its
+/// revision. Returns the updated transaction.
+async fn set_receipt_link(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((household_id, transaction_id)): Path<(String, String)>,
+    Json(body): Json<SetReceiptLink>,
+) -> Response {
+    if let Err(status) = require_member(&state, &user.user_id, &household_id).await {
+        return status.into_response();
+    }
+    let now = (state.clock)();
+    match purchase_ledger::set_receipt_link(
+        &state.pool,
+        &household_id,
+        &transaction_id,
+        body.receipt_image_id.as_deref(),
+        now,
+    )
+    .await
+    {
+        Ok(()) => {
+            match purchase_ledger::get_transaction(&state.pool, &household_id, &transaction_id)
+                .await
+            {
+                Ok(Some(detail)) => Json(detail).into_response(),
+                Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                Err(err) => ledger_error("purchases.set_receipt_link.read", err),
+            }
+        }
+        Err(err) => ledger_error("purchases.set_receipt_link", err),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Map a manual-purchase ledger error to its status and body.
+///
+/// Expected client outcomes carry their reason in the same `{ "errors": [...] }`
+/// shape the import route uses: malformed input and an invalid receipt-photo
+/// link are 422, as is an edit of an imported purchase; a missing household or
+/// purchase is 404. A database error is a logged 500.
+fn ledger_error(context: &'static str, err: ImportError) -> Response {
+    match err {
+        ImportError::Malformed(errors) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "errors": errors })),
+        )
+            .into_response(),
+        ImportError::NotManual(id) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "errors": [format!(
+                "purchase {id} was not entered by hand; imported purchases are corrected by re-importing"
+            )] })),
+        )
+            .into_response(),
+        ImportError::NoSuchTransaction(_) | ImportError::NoSuchHousehold(_) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        ImportError::UnsupportedFormatVersion(version) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "errors": [format!("unsupported format_version {version}")] })),
+        )
+            .into_response(),
+        ImportError::Sqlx(err) => {
+            tracing::error!(error = %err, "{context}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
 
 /// Refuse with 403 unless `user_id` is a member of `household_id`.
 ///

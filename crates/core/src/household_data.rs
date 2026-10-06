@@ -219,7 +219,7 @@ pub async fn export_household(
         pool,
         "SELECT id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
                 transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
-                source_payload, created_at, updated_at \
+                source_payload, created_at, updated_at, receipt_image_id \
          FROM purchase_transactions WHERE household_id = ?1 ORDER BY purchase_date, id",
         household_id,
     )

@@ -14,18 +14,21 @@ _Last reviewed: 2026-10-06._
 Purchase-ledger format, identity, and limits are owned by
 [`docs/purchase-ledger.md`](purchase-ledger.md).
 
-### 1. Structured imports are the only source; nothing matches a line to a product or a saving
+### 1. Manual entry and structured imports are the only sources; nothing matches a line to a product or a saving
 
-**What happens.** The ledger is populated by structured imports; receipt reading,
-retailer-specific importers, and a UI are not implemented. Lines are not linked
-to savings or recommendations, and no price statistics are computed. See the
-format document for line-link and match-status behavior.
+**What happens.** The ledger is populated by structured imports and, since
+issue #156, by purchases typed by hand at the Purchases screen (`source_kind =
+manual`). Receipt reading, retailer-specific importers, and any product matching
+are not implemented: every hand-entered or imported line is stored
+`unmatched`, lines are not linked to savings or recommendations, and no price
+statistics are computed. See the format document for line-link and
+match-status behavior.
 
 **Why accepted.** The pilot validates purchase history before adding a paid price
 source; matching, statistics, and savings links remain out of scope.
 
-**Workaround.** Imported lines remain readable in the ledger and household
-export whether or not they are matched.
+**Workaround.** Imported and hand-entered lines remain readable in the ledger and
+household export whether or not they are matched.
 
 **Follow-up.** Receipt reading (#116), retailer-specific importers, a review UI
 for unmatched lines, and linking the ledger to savings events (#117 / #118) are
@@ -59,6 +62,42 @@ job is to keep source amounts faithfully rather than become an FX ledger.
 
 **Follow-up.** If a household needs combined multi-currency reporting, define an
 explicit conversion policy with a dated rate source.
+
+### 4. Purchase entry is online-only; there is no offline queue
+
+**What happens.** The Purchases form saves with one request per create or edit and
+holds nothing locally, so a purchase typed on a phone without a connection (or a
+tab closed mid-save) is lost and must be retyped. The offline machinery is the
+list-mutation queue, which this form does not use.
+
+**Why accepted.** Offline queueing of purchase entry was explicitly out of scope
+for issue #156; the pilot records purchases from receipts at a desk or on a
+connection, and the form reports a failed save rather than pretending it stayed.
+
+**Workaround.** Enter the purchase where the connection is reasonable; the server
+is the only place the draft ever exists, so a failed save loses only what was not
+yet stored.
+
+**Follow-up.** Add purchase entry to the existing offline queue (or park a draft
+in IndexedDB) if members report failures on shop wifi.
+
+### 5. A hand edit corrects only hand-entered purchases
+
+**What happens.** The Purchases screen's edit form applies to `source_kind =
+manual` purchases; the API refuses to hand-edit an imported purchase (422), and
+the screen shows no edit control for one. An import is corrected by re-importing
+its source document, which the ledger's identity and revision rules handle.
+
+**Why accepted.** Allowing a hand edit of an import would overwrite content whose
+identity belongs to the retailer's own document, and the correction would be lost
+on the next import; keeping hand edits and imports separate keeps one authority
+per transaction.
+
+**Workaround.** Re-import a corrected document to change an imported purchase; a
+receipt photo can still be linked to any purchase from its detail view.
+
+**Follow-up.** Decide whether an imported purchase should gain a first-class
+hand-correction path that survives re-import.
 
 ## Per-store trip view
 
@@ -568,7 +607,9 @@ household's own server for 30 days. Storage layout, limits, the per-upload proce
 expiry sweep and how deletion and export treat the images are described in
 [`docs/data-flows.md`](data-flows.md) §4; the export key is in
 [`docs/household-export.md`](household-export.md). Reading the image is **not** implemented: there is
-no OCR, the images are not linked to purchase records, and no external service is called.
+no OCR, nothing extracts lines from the picture, and no external service is called. A member can link
+one image to one purchase by hand at the Purchases screen (issue #156), but that link is metadata the
+member chose, not something the app read.
 
 ### 1. The image bytes are stored verbatim, so EXIF (including a location tag) survives
 
@@ -627,22 +668,26 @@ the scheduled run. Rely on full-disk encryption for an at-rest guarantee.
 **Follow-up.** None until backup encryption and key custody are decided (issue #142); revisit if the
 household owner asks for encrypted storage of receipt images.
 
-### 4. Nothing reads the image, and an image is not linked to the purchases it documents
+### 4. Nothing reads the image, and a purchase link is member-chosen metadata
 
 **What happens.** The photo is stored and shown, but no code reads it: there is no OCR, so no line
 items are extracted, and `purchase_events.source = 'receipt'` (which the schema allows) is never
-written from an image. An image is also not attached to any purchase or list line, so a receipt sits
-beside the household's purchase records rather than proving them.
+written from an image. Since issue #156 a purchase may carry a `receipt_image_id` linking it to one
+photo, but the member picks that link by hand at the Purchases screen; nothing verifies that the
+purchase's lines match the picture, and the link clears (leaving the purchase and its lines) when the
+image is deleted or expires after 30 days.
 
 **Why accepted.** Reading an image well is a much larger slice (text detection, layout, product
-matching, correction UI) and the owner asked for storage with retention and deletion first. Linking
-images to lines without reading them would be guesswork.
+matching, correction UI) and the owner asked for storage with retention and deletion first, then for
+hand entry beside the photo. Inferring a link from an unread image would be guesswork.
 
-**Workaround.** None: purchases are recorded by checking items off the list, which is the existing
-purchase record.
+**Workaround.** None needed for the pilot: purchases are recorded by checking items off the list, by
+hand entry at the Purchases screen, or by an operator import, and a linked photo is a convenience
+beside them. Enter the purchase by hand while the photo is open.
 
-**Follow-up.** Add reading (local first, per the owner's recorded decisions) and then an explicit
-image↔purchase link. An offline upload queue and image editing are also out of this slice.
+**Follow-up.** Add reading (local first, per the owner's recorded decisions), then replace the
+member-chosen link with a verified image↔line reconciliation. An offline upload queue and image
+editing are also out of this slice.
 
 ### 5. An upload is one request, with no resume and no offline queue
 

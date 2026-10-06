@@ -101,6 +101,7 @@ describe('home page (auth gate + list index)', () => {
 		expect(await screen.findByText('Your lists')).toBeTruthy();
 		expect(screen.getByText('Weekly Shop')).toBeTruthy();
 		expect(screen.getByText(/Signed in as/)).toBeTruthy();
+		expect(screen.getByRole('link', { name: 'Purchases →' })).toBeTruthy();
 	});
 
 	it('shows an empty state when the household has no lists', async () => {

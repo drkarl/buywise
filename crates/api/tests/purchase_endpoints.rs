@@ -452,3 +452,402 @@ async fn export_includes_imported_purchases() {
     assert_eq!(transactions[0]["id"], transaction_id.as_str());
     assert_eq!(transactions[0]["lines"].as_array().unwrap().len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Manual purchases (issue #156)
+// ---------------------------------------------------------------------------
+
+/// Send a JSON body with a mutating method (POST/PUT) and the session's CSRF
+/// token, on the same router the other helpers drive.
+async fn send_json(
+    pool: &SqlitePool,
+    session: &Session,
+    method: &str,
+    uri: String,
+    body: &Value,
+) -> axum::response::Response {
+    app(AppState::new(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("session={}", session.session))
+                .header("X-CSRF-Token", &session.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A manual-purchase body with two lines: milk at 258 and bread at 199 with a
+/// 20-cent discount (line sum 437). `total` and `image` override the printed
+/// total and the linked photo when supplied.
+fn manual_body(retailer: &str, total: Option<i64>, image: Option<&str>) -> Value {
+    let mut body = json!({
+        "retailer": retailer,
+        "purchase_date": "2026-10-01",
+        "lines": [
+            { "original_text": "Milk 1L", "quantity": 2, "line_total_cents": 258 },
+            { "original_text": "Bread", "line_total_cents": 199, "line_discount_cents": 20 }
+        ]
+    });
+    if let Some(total) = total {
+        body["total_cents"] = json!(total);
+    }
+    if let Some(image) = image {
+        body["receipt_image_id"] = json!(image);
+    }
+    body
+}
+
+/// A 32-hex-char storage key derived from `seed`, so the name passes the receipt
+/// key shape check the delete path applies. No file is written: the delete
+/// tolerates a missing file, which is exactly the outcome here.
+fn fake_storage_key(seed: &str) -> String {
+    let mut key: String = seed
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(32)
+        .collect();
+    while key.len() < 32 {
+        key.push('0');
+    }
+    format!("{key}.jpg")
+}
+
+/// Insert one `receipt_images` row for a household. No bytes are written: the
+/// tests that use it only need the record, and a delete tolerates a missing file.
+async fn seed_receipt_image(pool: &SqlitePool, household_id: &str, id: &str, seed: &str) {
+    sqlx::query(
+        "INSERT INTO receipt_images \
+         (id, household_id, uploaded_by, uploaded_at, expires_at, content_type, byte_size, \
+          sha256_hex, storage_key, processing) \
+         VALUES (?1, ?2, NULL, '2026-09-01T00:00:00.000Z', '2999-01-01T00:00:00.000Z', \
+                 'image/jpeg', 4, 'aa', ?3, 'local')",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(fake_storage_key(seed))
+    .execute(pool)
+    .await
+    .expect("insert receipt image");
+}
+
+#[tokio::test]
+async fn a_manual_purchase_is_created_listed_and_edited_as_one_revision() {
+    let pool = setup_pool().await;
+    let (a, _b) = seed_two(&pool).await;
+
+    let resp = send_json(
+        &pool,
+        &a,
+        "POST",
+        format!("/api/household/{HH_A}/purchases/manual"),
+        &manual_body("Tesco", None, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = json_body(resp).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["source_kind"], "manual");
+    assert_eq!(created["retailer"], "tesco", "the retailer is normalised");
+    assert_eq!(
+        created["total_cents"], 437,
+        "with no printed total the lines are the total"
+    );
+    assert_eq!(created["revision"], 1);
+    assert_eq!(created["line_count"], 2);
+    assert_eq!(created["lines"][0]["match_status"], "unmatched");
+    assert_eq!(created["lines"][0]["quantity"], 2.0);
+    assert!(created["lines"][0]["canonical_item_id"].is_null());
+    assert!(created["receipt_image_id"].is_null());
+    assert_eq!(created["identity_kind"], "source_id");
+    let identity = created["source_transaction_id"]
+        .as_str()
+        .expect("a manual purchase has a generated identity");
+    assert!(!identity.is_empty());
+
+    let list = json_body(get(&pool, &a, &format!("/api/household/{HH_A}/purchases")).await).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], id.as_str());
+    assert_eq!(list[0]["line_count"], 2);
+
+    // Edit the retailer, the date and the second line.
+    let edit = json!({
+        "retailer": "Lidl",
+        "purchase_date": "2026-10-02",
+        "total_cents": 500,
+        "lines": [
+            { "original_text": "Milk 1L", "quantity": 2, "line_total_cents": 258 },
+            { "original_text": "Sourdough", "line_total_cents": 242 }
+        ]
+    });
+    let edited = json_body(
+        send_json(
+            &pool,
+            &a,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{id}"),
+            &edit,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(edited["id"], id.as_str());
+    assert_eq!(edited["revision"], 2);
+    assert_eq!(edited["retailer"], "lidl");
+    assert_eq!(edited["total_cents"], 500);
+    assert_eq!(edited["line_count"], 2);
+    assert_eq!(edited["lines"][1]["original_text"], "Sourdough");
+    assert_eq!(
+        edited["source_transaction_id"], created["source_transaction_id"],
+        "an edit keeps the purchase's identity"
+    );
+    assert_eq!(edited["revisions"].as_array().unwrap().len(), 1);
+    assert_eq!(edited["revisions"][0]["revision"], 1);
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM purchase_transactions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "an edit must not create a second purchase");
+
+    // An edit with identical content is a no-op, not a third revision.
+    let unchanged = json_body(
+        send_json(
+            &pool,
+            &a,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{id}"),
+            &edit,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unchanged["revision"], 2);
+}
+
+#[tokio::test]
+async fn a_receipt_link_is_validated_and_clears_when_the_image_is_deleted() {
+    let pool = setup_pool().await;
+    let (a, _b) = seed_two(&pool).await;
+    seed_receipt_image(&pool, HH_A, "ri-a", "aa").await;
+    seed_receipt_image(&pool, HH_B, "ri-b", "bb").await;
+
+    // Another household's photo is refused.
+    let refused = send_json(
+        &pool,
+        &a,
+        "POST",
+        format!("/api/household/{HH_A}/purchases/manual"),
+        &manual_body("tesco", Some(437), Some("ri-b")),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json_body(refused).await["errors"]
+        .to_string()
+        .contains("receipt_image_id"));
+
+    // The household's own photo links at create time.
+    let created = json_body(
+        send_json(
+            &pool,
+            &a,
+            "POST",
+            format!("/api/household/{HH_A}/purchases/manual"),
+            &manual_body("tesco", Some(437), Some("ri-a")),
+        )
+        .await,
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["receipt_image_id"], "ri-a");
+
+    let export = json_body(get(&pool, &a, &format!("/api/household/{HH_A}/export")).await).await;
+    assert_eq!(export["purchase_transactions"][0]["source_kind"], "manual");
+    assert_eq!(
+        export["purchase_transactions"][0]["receipt_image_id"],
+        "ri-a"
+    );
+    assert_eq!(
+        export["purchase_transactions"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Deleting the image (the app's own delete, and what the expiry sweep does)
+    // clears the link through the foreign key; the purchase and lines stay.
+    let resp = delete(&pool, &a, &format!("/api/household/{HH_A}/receipts/ri-a")).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after =
+        json_body(get(&pool, &a, &format!("/api/household/{HH_A}/purchases/{id}")).await).await;
+    assert!(
+        after["receipt_image_id"].is_null(),
+        "the link must clear with the image"
+    );
+    assert_eq!(after["id"], id.as_str());
+    assert_eq!(after["line_count"], 2, "the purchase and its lines stay");
+}
+
+#[tokio::test]
+async fn manual_purchases_are_private_and_imported_ones_cannot_be_edited_by_hand() {
+    let pool = setup_pool().await;
+    let (a, b) = seed_two(&pool).await;
+    let created = json_body(
+        send_json(
+            &pool,
+            &a,
+            "POST",
+            format!("/api/household/{HH_A}/purchases/manual"),
+            &manual_body("tesco", None, None),
+        )
+        .await,
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // A member of another household cannot edit it through A's path...
+    assert_eq!(
+        send_json(
+            &pool,
+            &b,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{id}"),
+            &manual_body("lidl", None, None),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_json(
+            &pool,
+            &b,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{id}/receipt"),
+            &json!({ "receipt_image_id": null }),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    // ...and through their own path the id reads as missing.
+    assert_eq!(
+        send_json(
+            &pool,
+            &b,
+            "PUT",
+            format!("/api/household/{HH_B}/purchases/{id}"),
+            &manual_body("lidl", None, None),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // An imported purchase is corrected by re-importing, not by hand.
+    let imported =
+        json_body(post_import(&pool, &a, HH_A, &document(Some("SRC-9"), 500)).await).await;
+    let imported_id = imported["results"][0]["transaction_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        send_json(
+            &pool,
+            &a,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{imported_id}"),
+            &manual_body("tesco", None, None),
+        )
+        .await
+        .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // Its receipt link can still be set and cleared, without a revision.
+    seed_receipt_image(&pool, HH_A, "ri-c", "cc").await;
+    let linked = json_body(
+        send_json(
+            &pool,
+            &a,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{imported_id}/receipt"),
+            &json!({ "receipt_image_id": "ri-c" }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(linked["receipt_image_id"], "ri-c");
+    assert_eq!(linked["revision"], 1, "linking a photo is not a revision");
+
+    let cleared = json_body(
+        send_json(
+            &pool,
+            &a,
+            "PUT",
+            format!("/api/household/{HH_A}/purchases/{imported_id}/receipt"),
+            &json!({ "receipt_image_id": null }),
+        )
+        .await,
+    )
+    .await;
+    assert!(cleared["receipt_image_id"].is_null());
+}
+
+#[tokio::test]
+async fn manual_money_is_validated_and_a_negative_discount_is_allowed() {
+    let pool = setup_pool().await;
+    let (a, _b) = seed_two(&pool).await;
+    let uri = format!("/api/household/{HH_A}/purchases/manual");
+
+    // A negative printed total, a negative line total and an unknown field are
+    // each refused with the offending field named.
+    let bad = json!({
+        "retailer": "tesco",
+        "purchase_date": "2026-10-01",
+        "total_cents": -1,
+        "surprise": true,
+        "lines": [{ "original_text": "Milk", "line_total_cents": -5 }]
+    });
+    let resp = send_json(&pool, &a, "POST", uri.clone(), &bad).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let errors = json_body(resp).await["errors"].to_string();
+    assert!(
+        errors.contains("$.total_cents: must not be negative"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("lines[0].line_total_cents: must not be negative"),
+        "{errors}"
+    );
+    assert!(errors.contains("$.surprise: unknown field"), "{errors}");
+
+    // A negative discount (a surcharge) is the one place a negative amount is
+    // accepted, and it raises the line sum.
+    let created = json_body(
+        send_json(
+            &pool,
+            &a,
+            "POST",
+            uri,
+            &json!({
+                "retailer": "spar",
+                "purchase_date": "2026-10-01",
+                "lines": [
+                    { "original_text": "Milk", "line_total_cents": 258 },
+                    { "original_text": "Bag charge", "line_total_cents": 199, "line_discount_cents": -50 }
+                ]
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(created["total_cents"], 507);
+    assert_eq!(created["lines"][1]["line_discount_cents"], -50);
+}

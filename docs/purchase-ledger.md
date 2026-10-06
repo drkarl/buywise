@@ -3,7 +3,9 @@
 The purchase ledger is BuyWise's record of **what the household actually
 bought**: one row per purchase transaction and one per line, household-scoped,
 with quantities and amounts. It is fed today by structured imports (a retailer's
-own export) and, later, by reading receipts; both feed the same model
+own export) and by purchases a member types by hand beside the photo of the
+receipt (issue [#156](https://github.com/drkarl/buywise/issues/156)); a later
+slice adds reading receipts. All feed the same model
 (issue [#148](https://github.com/drkarl/buywise/issues/148), roadmap #114).
 
 It is deliberately separate from `purchase_events`: that table records only the
@@ -27,7 +29,8 @@ parses.
 7. [Limits](#limits)
 8. [Worked example](#worked-example)
 9. [Reading and deleting a ledger](#reading-and-deleting-a-ledger)
-10. [Export and household deletion](#export-and-household-deletion)
+10. [Manual purchases and the receipt-photo link](#manual-purchases-and-the-receipt-photo-link)
+11. [Export and household deletion](#export-and-household-deletion)
 
 ## Importing
 
@@ -137,13 +140,18 @@ Every transaction has an **identity**, which is decisive for idempotency:
 - Otherwise the identity is a **stable fingerprint** computed by this build
   (`identity_kind = "fingerprint"`).
 
-The stored unique key is `(household_id, retailer, "import", identity)`.
+The stored unique key is `(household_id, retailer, source_kind, identity)`.
 Retailer names are trimmed and lowercased before they are used in this key, so
 `Tesco` and `tesco` identify the same retailer. Source transaction IDs are
 scoped to their retailer: two retailers may use the same ID without replacing
 each other's purchase. Re-importing a document is therefore idempotent: the
 same transaction yields **one transaction row and one set of lines**, and totals
 are never summed over duplicate links.
+
+Imports write `source_kind = import`. A purchase typed by hand (see
+[Manual purchases](#manual-purchases-and-the-receipt-photo-link)) writes
+`source_kind = manual` and always has a generated UUID as its
+`source_transaction_id`, so its identity never depends on a fingerprint.
 
 ### Fingerprint algorithm
 
@@ -266,17 +274,80 @@ ledger; a later matching pass may link it.
 ## Reading and deleting a ledger
 
 The API returns transaction summaries from `GET .../purchases` (id, retailer,
-purchase date, source id and identity kind, fingerprint, currency, total,
-revision, line count and timestamps) and a full transaction from
-`GET .../purchases/{id}`: the summary plus its current `lines` and its
-`revisions` (each with the superseded header, source payload, `lines` as JSON and
-`superseded_at`). `DELETE .../purchases/{id}` removes one transaction; its lines
-and revision history are removed with it.
+purchase date, source kind, source id and identity kind, fingerprint, currency,
+total, revision, line count, linked receipt photo and timestamps) and a full
+transaction from `GET .../purchases/{id}`: the summary plus its current `lines`
+and its `revisions` (each with the superseded header, source payload, `lines` as
+JSON and `superseded_at`). `DELETE .../purchases/{id}` removes one transaction;
+its lines and revision history are removed with it.
+
+## Manual purchases and the receipt-photo link
+
+A household member can add a purchase by hand at the Purchases screen (issue
+[#156](https://github.com/drkarl/buywise/issues/156)) instead of importing one:
+any retailer, no reading accuracy, and the same ledger model. A hand-entered
+purchase writes `source_kind = manual` and a **generated UUID** as its
+`source_transaction_id`, so it has a stable identity from the first write and
+every later edit is a correction of that row — a revision, never a second
+purchase — through the correction rule above. Deleting uses the ledger's delete.
+Its lines are stored `unmatched`; nothing links them to a product, and no price
+statistics are computed from them.
+
+`POST .../purchases/manual` adds one, `PUT .../purchases/{id}` corrects one, and
+`PUT .../purchases/{id}/receipt` sets or clears its linked receipt photo. Every
+route requires membership of the household in the path (403 otherwise), and a
+transaction of another household reads as missing (404). Only a `manual`
+transaction can be corrected by hand: an imported purchase is refused (422) and
+is corrected by re-importing its document, so a hand edit can never take
+ownership of an import's identity.
+
+### Manual purchase body
+
+One JSON object; unknown fields are rejected and every problem is reported with
+its field path, exactly as an import document is.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `retailer` | string | yes | Free text; stored trimmed and lowercased. |
+| `purchase_date` | string | yes | Calendar date `YYYY-MM-DD`. |
+| `total_cents` | integer | optional | The total as printed, non-negative. Omitted or `null` means the lines are the total. |
+| `receipt_image_id` | string | optional | A `receipt_images.id` of the same household, unexpired. Omitted or `null` means no link. |
+| `lines` | array | yes | The purchase's lines (may be empty), at most 1000. |
+
+Each line carries `original_text` (required, as printed), `quantity` (optional,
+greater than zero), `line_total_cents` (required, non-negative) and
+`line_discount_cents` (optional). Everything the ledger can hold that the form
+cannot ask for — name, brand, size, unit price, deposit, product links — is left
+`NULL`, and `match_status` is `unmatched`.
+
+Money is integer cents, exactly as in the import format; the screen converts the
+euro amounts a member types (a comma or a dot as the decimal separator, rounded to
+the nearest cent) and never stores a floating-point amount. **A negative total is
+refused, and the line discount is the one place a negative amount is accepted** (a
+surcharge, or the only way to express a reduction on a line whose printed total
+already excludes it); the import path still refuses negative discounts. A line's
+effective amount is `line_total_cents - line_discount_cents`, and when no printed
+total is supplied the transaction's `total_cents` is the sum of those amounts.
+
+Editing the same content is a no-op; changing it snapshots the previous revision
+and bumps `revision`, so a purchase edited twice reports `revision = 3` and keeps
+two superseded revisions.
+
+### The receipt-photo link
+
+`receipt_image_id` points at one of the household's own unexpired receipt photos
+(a cross-household or expired id is a 422). The link is not part of the
+transaction's content, so setting or clearing it does not change the revision or
+the lines. The column is a foreign key with `ON DELETE SET NULL` (migration 021),
+so when the image is deleted — from the Receipts page, by the household delete, or
+by the daily `expire-receipts` sweep once its 30 days pass — the link clears and
+**the purchase and its lines remain**. Linking a photo is metadata a member chose:
+nothing reads the image, so nothing verifies that the purchase's lines match it.
 
 ## Export and household deletion
 
-A household's ledger — every `purchase_transactions` row with its `lines` and
-`revisions` nested — is part of the documented household export
-([`docs/household-export.md`](household-export.md)) and is removed by the
-household delete, so the household's own data controls cover it like every other
-household-scoped record.
+A household's ledger — every `purchase_transactions` row (including its
+`receipt_image_id`) with its `lines` and `revisions` nested — is part of the
+documented household export ([`docs/household-export.md`](household-export.md))
+and is removed by the household delete, so the household's own data controls
+cover it like every other household-scoped record.
