@@ -1,4 +1,4 @@
-// Client types + helper for the savings dashboard (P5-T4).
+// Client types + helper for the savings dashboard (P5-T4, relabelled in #117).
 //
 // These mirror the wire shape of `GET /api/savings/summary` exactly — the serde
 // serialisation of `crates/api/src/savings.rs::SavingsSummaryResponse`. Field
@@ -7,12 +7,10 @@
 // `formatEuros` from `$lib/api/optimise`.
 
 /**
- * One calendar month's aggregate savings. `month` is `"YYYY-MM"` (UTC).
- * `accepted_cents`/`net_cents` treat un-reconciled (null) rows as 0 on the
- * server, so a month with no actual-spend entered yet reads as €0 net rather
- * than a skewed figure. `lists` is the count of archived lists in the month.
+ * One calendar month's figures, grouped by the list's archive (shop) date — not
+ * the row creation timestamp. Only the events of one status feed a bucket.
  */
-export interface MonthlySummary {
+export interface MonthlyBucket {
 	month: string;
 	gross_cents: number;
 	accepted_cents: number;
@@ -21,28 +19,49 @@ export interface MonthlySummary {
 }
 
 /**
- * One archived list's outcome, for the per-list table. `chosen_basket_cost_cents`
- * and `net_saving_cents` are null until the household posts their actual spend;
- * a null `chosen_basket_cost_cents` is what drives the "Enter actual spend"
- * prompt in the UI.
+ * One aggregate of events sharing a status, with the short copy that names its
+ * baseline and included costs. `saved` counts only `verified` events; `legacy`
+ * presents total-only basket variances separately.
+ */
+export interface SavingsAggregate {
+	label: string;
+	note: string;
+	baseline_label: string;
+	costs_note: string;
+	cumulative_cents: number;
+	monthly: MonthlyBucket[];
+}
+
+/**
+ * One savings event's outcome. `status` is the honest label of what the row
+ * proves: `estimated` (like-for-like opportunity, not a saving), `unreconciled`
+ * (plans price different lines, so no saving is claimed), or
+ * `legacy_total_only` (a manual whole-basket total). `verified` is reserved and
+ * never produced yet. A null `chosen_basket_cost_cents` drives the "Enter actual
+ * spend" prompt in the UI.
  */
 export interface ListOutcome {
 	id: string;
 	list_id: string;
 	list_name: string;
-	created_at: string;
+	archived_at: string;
+	status: 'estimated' | 'unreconciled' | 'legacy_total_only' | 'verified';
+	status_label: string;
+	baseline_label: string;
+	coverage_label: string;
+	costs_note: string;
 	gross_saving_cents: number;
 	chosen_basket_cost_cents: number | null;
-	net_saving_cents: number | null;
+	basket_variance_cents: number | null;
 }
 
 /** The full `GET /api/savings/summary` 200 response body. */
 export interface SavingsSummary {
-	/** Per-month aggregates, ordered chronologically (oldest first). */
-	monthly: MonthlySummary[];
-	/** Sum of `net_saving_cents` across all non-null rows. */
-	cumulative_net_cents: number;
-	/** Per-archived-list outcomes, newest first. */
+	/** The verified-only "saved" aggregate (empty until reconciliation exists). */
+	saved: SavingsAggregate;
+	/** The legacy total-only basket variance, shown separately. */
+	legacy: SavingsAggregate;
+	/** Per-event outcomes, newest archive date first. */
 	lists: ListOutcome[];
 }
 

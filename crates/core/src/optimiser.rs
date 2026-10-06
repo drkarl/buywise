@@ -421,6 +421,28 @@ pub struct StorePlan {
     pub dunnes_voucher_offer_text: Option<String>,
 }
 
+/// True when two priced-line sets cover exactly the same basket item indices, so
+/// their totals are like-for-like and a saving may be claimed between them.
+///
+/// This is the one comparison the product uses to *refuse* a cross-plan cost
+/// comparison: the optimise explanation suppresses its saving sentence when the
+/// recommended plan prices a different set of items than the best single store
+/// ([`crate::optimiser`] consumers in the API), and the savings ledger refuses to
+/// record a gross estimate as a saving on the same rule. A set that is missing a
+/// line, has an extra one, or substitutes a different line is not comparable —
+/// its total difference is not a saving.
+///
+/// Quantities are not part of a [`PlanLine`], so this compares lines only; pack
+/// sizes beyond the planned amount are out of scope for this comparison.
+pub fn prices_same_lines<'a>(
+    a: impl IntoIterator<Item = &'a usize>,
+    b: impl IntoIterator<Item = &'a usize>,
+) -> bool {
+    let a: BTreeSet<usize> = a.into_iter().copied().collect();
+    let b: BTreeSet<usize> = b.into_iter().copied().collect();
+    a == b
+}
+
 /// Which plan the recommendation chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

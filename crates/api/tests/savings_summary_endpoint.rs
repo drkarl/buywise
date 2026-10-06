@@ -1,18 +1,21 @@
-//! Integration tests for the savings dashboard endpoint (P5-T4, issue #35).
+//! Integration tests for the savings dashboard endpoint (P5-T4, #35; relabelled
+//! and made verified-only in #117).
 //!
 //! Drives the real axum router (`buywise_api::app`) against a private in-memory
 //! SQLite database with the full migrations applied. Seeds `savings_events` rows
-//! directly (one row per list) with known figures and asserts that
+//! directly (one row per list) with known figures and statuses and asserts that
 //! `GET /api/savings/summary`:
-//!   * groups gross/accepted/net per `"YYYY-MM"` month, ordered chronologically,
-//!     with a per-month list count. `accepted_cents` is DERIVED as
-//!     `baseline − chosen_basket` over reconciled rows (un-reconciled → 0), so
-//!     these tests seed `baseline`/`chosen` rather than the unused
-//!     `accepted_savings_cents` column; `net_saving_cents` NULL → 0;
-//!   * reports `cumulative_net_cents` as the SUM of `net_saving_cents` over the
-//!     NON-NULL rows only (the un-reconciled list contributes nothing);
-//!   * lists each archived list's outcome newest-first, exposing a null
-//!     `chosen_basket_cost_cents` for lists awaiting actual-spend entry (AC3);
+//!   * counts ONLY `verified` events in the aggregate it calls saved
+//!     (`saved.cumulative_cents` / `saved.monthly`), which today is empty;
+//!   * presents `legacy_total_only` (manual whole-basket) events separately
+//!     under `legacy`, with their original figures — never as saved money;
+//!   * excludes `estimated` and `unreconciled` events from both aggregates'
+//!     saved totals (an estimate or a refused comparison is not saved money);
+//!   * groups both aggregates by the list's ARCHIVE date (`shopping_lists.
+//!     archived_at`), not the row's creation timestamp;
+//!   * lists each event's outcome newest-archive-date-first, carrying the status
+//!     and its short baseline/coverage/costs labels, and a null chosen cost for
+//!     a list awaiting actual-spend entry;
 //!   * scopes everything to the caller's household (no cross-household leakage);
 //!   * requires a session (401 without one).
 
@@ -28,8 +31,6 @@ use tower::ServiceExt; // for `oneshot`
 const PASSWORD: &str = "correct horse battery staple";
 const HOUSEHOLD: &str = "11111111-1111-1111-1111-111111111111";
 
-/// An authenticated session. `GET /api/savings/summary` is a read, so no CSRF
-/// token is needed here — only the session cookie is carried on requests.
 struct Session {
     session: String,
 }
@@ -82,25 +83,32 @@ async fn seed_household_and_user(
     login(pool, email).await
 }
 
-/// Seed an ARCHIVED list owned by `household_id`.
-async fn seed_list(pool: &SqlitePool, household_id: &str, list_id: &str, name: &str) {
+/// Seed an ARCHIVED list owned by `household_id`, with an explicit archive date
+/// (the date the summary groups realised figures by).
+async fn seed_list(
+    pool: &SqlitePool,
+    household_id: &str,
+    list_id: &str,
+    name: &str,
+    archived_at: &str,
+) {
     sqlx::query(
-        "INSERT INTO shopping_lists (id, household_id, name, status, current_revision, created_at) \
-         VALUES (?1, ?2, ?3, 'archived', 0, ?4)",
+        "INSERT INTO shopping_lists \
+             (id, household_id, name, status, current_revision, created_at, archived_at) \
+         VALUES (?1, ?2, ?3, 'archived', 0, ?4, ?4)",
     )
     .bind(list_id)
     .bind(household_id)
     .bind(name)
-    .bind(db::now_iso())
+    .bind(archived_at)
     .execute(pool)
     .await
     .expect("insert list");
 }
 
-/// Seed one `savings_events` row with explicit figures. `chosen`/`net` are
-/// nullable so a test can model a list still awaiting actual-spend entry.
+/// Seed one `savings_events` row with explicit figures and status.
 ///
-/// `baseline` is parametrised because the summary derives `accepted_cents` as
+/// `baseline` is parametrised because `accepted_cents` is derived as
 /// `baseline − chosen_basket` over reconciled rows; the unused
 /// `accepted_savings_cents` column is deliberately left NULL (no production path
 /// writes it this phase).
@@ -110,6 +118,7 @@ async fn seed_event(
     id: &str,
     list_id: &str,
     created_at: &str,
+    status: &str,
     baseline: i64,
     gross: i64,
     chosen: Option<i64>,
@@ -119,8 +128,8 @@ async fn seed_event(
         "INSERT INTO savings_events \
              (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
               theoretical_minimum_cost_cents, chosen_basket_cost_cents, gross_saving_cents, \
-              net_saving_cents, created_at) \
-         VALUES (?1, ?2, NULL, ?3, 4200, 3900, ?4, ?5, ?6, ?7)",
+              net_saving_cents, created_at, status) \
+         VALUES (?1, ?2, NULL, ?3, 4200, 3900, ?4, ?5, ?6, ?7, ?8)",
     )
     .bind(id)
     .bind(list_id)
@@ -129,6 +138,7 @@ async fn seed_event(
     .bind(gross)
     .bind(net)
     .bind(created_at)
+    .bind(status)
     .execute(pool)
     .await
     .expect("insert savings event");
@@ -190,31 +200,45 @@ async fn json_body(resp: axum::response::Response) -> Value {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Testing expectation: seed 3 savings events with known values, call the
-/// summary endpoint, and assert the monthly aggregates + cumulative figure.
-///
-/// Fixtures (same household, all baseline 5000):
-///   * list-1, 2026-05: gross 3000, chosen 4500, net 2500 → accepted 5000−4500=500
-///   * list-2, 2026-05: gross 1000, chosen 4800, net  800 → accepted 5000−4800=200
-///   * list-3, 2026-06: gross 2000, chosen NULL, net NULL (no actual-spend yet) →
-///     accepted 0
-/// Expected:
-///   * monthly[2026-05] = gross 4000, accepted 700, net 3300, lists 2
-///   * monthly[2026-06] = gross 2000, accepted   0, net    0, lists 1
-///   * cumulative_net   = 2500 + 800 = 3300 (the NULL-net June row is excluded)
+/// A verified-only aggregate: the saved headline and its monthly buckets count
+/// ONLY `verified` rows. An `estimated` opportunity, an `unreconciled` refusal
+/// and a `legacy_total_only` total are all excluded.
 #[tokio::test]
-async fn summary_aggregates_three_events() {
+async fn saved_aggregate_counts_only_verified_rows() {
     let pool = setup_pool().await;
     let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
-    seed_list(&pool, HOUSEHOLD, "list-1", "May A").await;
-    seed_list(&pool, HOUSEHOLD, "list-2", "May B").await;
-    seed_list(&pool, HOUSEHOLD, "list-3", "June A").await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-v",
+        "Verified",
+        "2026-05-03T10:00:00Z",
+    )
+    .await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-e",
+        "Estimated",
+        "2026-05-04T10:00:00Z",
+    )
+    .await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-u",
+        "Unreconciled",
+        "2026-05-05T10:00:00Z",
+    )
+    .await;
+    seed_list(&pool, HOUSEHOLD, "list-l", "Legacy", "2026-05-06T10:00:00Z").await;
 
     seed_event(
         &pool,
-        "ev-1",
-        "list-1",
+        "ev-v",
+        "list-v",
         "2026-05-03T10:00:00Z",
+        "verified",
         5000,
         3000,
         Some(4500),
@@ -223,24 +247,38 @@ async fn summary_aggregates_three_events() {
     .await;
     seed_event(
         &pool,
-        "ev-2",
-        "list-2",
-        "2026-05-20T10:00:00Z",
+        "ev-e",
+        "list-e",
+        "2026-05-04T10:00:00Z",
+        "estimated",
         5000,
-        1000,
-        Some(4800),
-        Some(800),
+        3000,
+        None,
+        None,
     )
     .await;
     seed_event(
         &pool,
-        "ev-3",
-        "list-3",
-        "2026-06-01T10:00:00Z",
+        "ev-u",
+        "list-u",
+        "2026-05-05T10:00:00Z",
+        "unreconciled",
         5000,
-        2000,
+        4000,
         None,
         None,
+    )
+    .await;
+    seed_event(
+        &pool,
+        "ev-l",
+        "list-l",
+        "2026-05-06T10:00:00Z",
+        "legacy_total_only",
+        5000,
+        3000,
+        Some(4800),
+        Some(700),
     )
     .await;
 
@@ -248,56 +286,156 @@ async fn summary_aggregates_three_events() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
 
-    // Cumulative net: only the two non-null rows count (AC2).
-    assert_eq!(body["cumulative_net_cents"], 3300);
+    // Saved: only the verified row, all in one month.
+    assert_eq!(body["saved"]["cumulative_cents"], 2500);
+    let saved_monthly = body["saved"]["monthly"].as_array().expect("saved monthly");
+    assert_eq!(saved_monthly.len(), 1);
+    assert_eq!(saved_monthly[0]["month"], "2026-05");
+    assert_eq!(saved_monthly[0]["gross_cents"], 3000);
+    assert_eq!(saved_monthly[0]["accepted_cents"], 500);
+    assert_eq!(saved_monthly[0]["net_cents"], 2500);
+    assert_eq!(saved_monthly[0]["lists"], 1, "only the verified row");
 
-    // Monthly aggregates, ordered chronologically.
-    let monthly = body["monthly"].as_array().expect("monthly array");
-    assert_eq!(monthly.len(), 2, "two distinct months");
-
-    assert_eq!(monthly[0]["month"], "2026-05");
-    assert_eq!(monthly[0]["gross_cents"], 4000);
-    // Derived accepted = (5000−4500) + (5000−4800) = 500 + 200 = 700.
-    assert_eq!(monthly[0]["accepted_cents"], 700);
-    assert_eq!(monthly[0]["net_cents"], 3300);
-    assert_eq!(monthly[0]["lists"], 2);
-
-    assert_eq!(monthly[1]["month"], "2026-06");
-    assert_eq!(monthly[1]["gross_cents"], 2000);
-    // The un-reconciled June row (chosen NULL) contributes 0 to accepted and net.
-    assert_eq!(monthly[1]["accepted_cents"], 0);
-    assert_eq!(monthly[1]["net_cents"], 0);
-    assert_eq!(monthly[1]["lists"], 1);
+    // Legacy: only the total-only row, with its original figures.
+    assert_eq!(body["legacy"]["cumulative_cents"], 700);
+    let legacy_monthly = body["legacy"]["monthly"]
+        .as_array()
+        .expect("legacy monthly");
+    assert_eq!(legacy_monthly.len(), 1);
+    assert_eq!(legacy_monthly[0]["month"], "2026-05");
+    assert_eq!(legacy_monthly[0]["gross_cents"], 3000);
+    assert_eq!(legacy_monthly[0]["accepted_cents"], 200); // 5000 − 4800
+    assert_eq!(legacy_monthly[0]["net_cents"], 700);
+    assert_eq!(legacy_monthly[0]["lists"], 1, "only the total-only row");
 }
 
-/// AC3: a list with `chosen_basket_cost_cents IS NULL` is surfaced in the
-/// per-list outcomes with a null chosen cost (the UI's "Enter actual spend"
-/// prompt). Lists are ordered newest-first.
+/// A skipped-item manual-total fixture: an event whose whole-basket actual spend
+/// makes the stored difference large and positive is NEVER saved money. It shows
+/// up only under the legacy label, and the saved aggregate stays empty.
 #[tokio::test]
-async fn summary_lists_outcomes_newest_first_with_null_chosen() {
+async fn manual_total_never_appears_as_saved_money() {
     let pool = setup_pool().await;
     let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
-    seed_list(&pool, HOUSEHOLD, "list-1", "Older").await;
-    seed_list(&pool, HOUSEHOLD, "list-2", "Newer").await;
-
-    // Older list: reconciled (chosen + net present).
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-1",
+        "Skipped items",
+        "2026-06-01T10:00:00Z",
+    )
+    .await;
+    // Household bought a small basket: €10.00 actual against a €50.00 estimate,
+    // so the stored difference is €40.00. It proves nothing about lines skipped.
     seed_event(
         &pool,
         "ev-1",
         "list-1",
+        "2026-06-01T11:00:00Z",
+        "legacy_total_only",
+        5000,
+        3000,
+        Some(1000),
+        Some(1000),
+    )
+    .await;
+
+    let resp = get_summary(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["saved"]["cumulative_cents"], 0);
+    assert!(
+        body["saved"]["monthly"].as_array().unwrap().is_empty(),
+        "a manual total is never counted as saved money"
+    );
+    // It is shown, honestly, as a legacy basket variance.
+    assert_eq!(body["legacy"]["cumulative_cents"], 1000);
+    assert_eq!(body["legacy"]["monthly"][0]["net_cents"], 1000);
+}
+
+/// Realised figures group by the list's archive date, not the row's creation
+/// timestamp: an event created much later still lands in the shop's month.
+#[tokio::test]
+async fn realised_figures_group_by_archive_date() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-1",
+        "May shop",
         "2026-05-03T10:00:00Z",
+    )
+    .await;
+    seed_event(
+        &pool,
+        "ev-1",
+        "list-1",
+        "2026-07-19T10:00:00Z", // created long after the shop
+        "legacy_total_only",
+        5000,
+        3000,
+        Some(4500),
+        Some(500),
+    )
+    .await;
+
+    let resp = get_summary(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    let monthly = body["legacy"]["monthly"].as_array().unwrap();
+    assert_eq!(monthly.len(), 1);
+    assert_eq!(
+        monthly[0]["month"], "2026-05",
+        "grouped by the archive/shop date, not row creation"
+    );
+    // The per-event outcome carries the archive date too.
+    assert_eq!(body["lists"][0]["archived_at"], "2026-05-03T10:00:00Z");
+}
+
+/// Per-event outcomes are newest-archive-date-first, carry the honest status and
+/// its short baseline/coverage/costs copy, and expose a null chosen cost for a
+/// list awaiting actual-spend.
+#[tokio::test]
+async fn outcomes_carry_status_labels_and_are_archive_ordered() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-old",
+        "Older",
+        "2026-05-03T10:00:00Z",
+    )
+    .await;
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-new",
+        "Newer",
+        "2026-06-01T10:00:00Z",
+    )
+    .await;
+
+    seed_event(
+        &pool,
+        "ev-old",
+        "list-old",
+        "2026-05-03T10:00:00Z",
+        "legacy_total_only",
         5000,
         3000,
         Some(4500),
         Some(2500),
     )
     .await;
-    // Newer list: awaiting actual-spend (chosen + net NULL).
     seed_event(
         &pool,
-        "ev-2",
-        "list-2",
+        "ev-new",
+        "list-new",
         "2026-06-01T10:00:00Z",
+        "estimated",
         5000,
         2000,
         None,
@@ -311,20 +449,44 @@ async fn summary_lists_outcomes_newest_first_with_null_chosen() {
 
     let lists = body["lists"].as_array().expect("lists array");
     assert_eq!(lists.len(), 2);
-
-    // Newest first.
-    assert_eq!(lists[0]["list_id"], "list-2");
-    assert_eq!(lists[0]["list_name"], "Newer");
-    assert_eq!(lists[0]["gross_saving_cents"], 2000);
-    assert!(
-        lists[0]["chosen_basket_cost_cents"].is_null(),
-        "unreconciled list keeps a null chosen cost (drives the prompt)"
+    // Newest archive date first.
+    assert_eq!(lists[0]["list_id"], "list-new");
+    assert_eq!(lists[0]["status"], "estimated");
+    assert_eq!(
+        lists[0]["status_label"],
+        "Estimated opportunity (not verified)"
     );
-    assert!(lists[0]["net_saving_cents"].is_null());
+    assert_eq!(
+        lists[0]["coverage_label"],
+        "Both plans price the same lines; quantities not reconciled"
+    );
+    assert!(lists[0]["chosen_basket_cost_cents"].is_null());
+    assert!(lists[0]["basket_variance_cents"].is_null());
 
-    assert_eq!(lists[1]["list_id"], "list-1");
+    assert_eq!(lists[1]["list_id"], "list-old");
+    assert_eq!(lists[1]["status"], "legacy_total_only");
+    assert_eq!(
+        lists[1]["status_label"],
+        "Legacy total-only basket variance"
+    );
+    assert_eq!(
+        lists[1]["coverage_label"],
+        "Whole-basket total only; quantities and purchases unverified"
+    );
     assert_eq!(lists[1]["chosen_basket_cost_cents"], 4500);
-    assert_eq!(lists[1]["net_saving_cents"], 2500);
+    assert_eq!(lists[1]["basket_variance_cents"], 2500);
+
+    // Every outcome names its baseline and included costs.
+    for outcome in lists {
+        assert_eq!(
+            outcome["baseline_label"],
+            "Baseline: best single store estimate"
+        );
+        assert_eq!(
+            outcome["costs_note"],
+            "Travel included where entered; service and data costs excluded."
+        );
+    }
 }
 
 /// Scoping: another household's savings events never appear in the caller's
@@ -333,12 +495,13 @@ async fn summary_lists_outcomes_newest_first_with_null_chosen() {
 async fn summary_is_scoped_to_caller_household() {
     let pool = setup_pool().await;
     let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
-    seed_list(&pool, HOUSEHOLD, "list-1", "Mine").await;
+    seed_list(&pool, HOUSEHOLD, "list-1", "Mine", "2026-05-03T10:00:00Z").await;
     seed_event(
         &pool,
         "ev-1",
         "list-1",
         "2026-05-03T10:00:00Z",
+        "legacy_total_only",
         5000,
         3000,
         Some(4500),
@@ -348,12 +511,20 @@ async fn summary_is_scoped_to_caller_household() {
 
     // A different household with its own (much larger) savings event.
     seed_household_and_user(&pool, "hh-other", "user-b", "b@example.test").await;
-    seed_list(&pool, "hh-other", "list-other", "Theirs").await;
+    seed_list(
+        &pool,
+        "hh-other",
+        "list-other",
+        "Theirs",
+        "2026-05-04T10:00:00Z",
+    )
+    .await;
     seed_event(
         &pool,
         "ev-other",
         "list-other",
         "2026-05-04T10:00:00Z",
+        "legacy_total_only",
         100000,
         99999,
         Some(1),
@@ -365,9 +536,8 @@ async fn summary_is_scoped_to_caller_household() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
 
-    // Only the caller's single event is reflected.
-    assert_eq!(body["cumulative_net_cents"], 2500);
-    let monthly = body["monthly"].as_array().unwrap();
+    assert_eq!(body["legacy"]["cumulative_cents"], 2500);
+    let monthly = body["legacy"]["monthly"].as_array().unwrap();
     assert_eq!(monthly.len(), 1);
     assert_eq!(monthly[0]["gross_cents"], 3000);
     assert_eq!(monthly[0]["lists"], 1);
@@ -406,26 +576,42 @@ async fn summary_picks_single_household_for_multi_household_user() {
     .await
     .expect("insert second membership");
 
-    // A modest saving in the selected (lower-id) household.
-    seed_list(&pool, lower, "list-lower", "Selected").await;
+    // A modest total-only variance in the selected (lower-id) household.
+    seed_list(
+        &pool,
+        lower,
+        "list-lower",
+        "Selected",
+        "2026-05-03T10:00:00Z",
+    )
+    .await;
     seed_event(
         &pool,
         "ev-lower",
         "list-lower",
         "2026-05-03T10:00:00Z",
+        "legacy_total_only",
         5000,
         3000,
         Some(4500),
         Some(2500),
     )
     .await;
-    // A much larger saving in the OTHER (higher-id) household that must be excluded.
-    seed_list(&pool, higher, "list-higher", "Excluded").await;
+    // A much larger one in the OTHER (higher-id) household that must be excluded.
+    seed_list(
+        &pool,
+        higher,
+        "list-higher",
+        "Excluded",
+        "2026-05-04T10:00:00Z",
+    )
+    .await;
     seed_event(
         &pool,
         "ev-higher",
         "list-higher",
         "2026-05-04T10:00:00Z",
+        "legacy_total_only",
         100000,
         99999,
         Some(1),
@@ -438,8 +624,8 @@ async fn summary_picks_single_household_for_multi_household_user() {
     let body = json_body(resp).await;
 
     // Only the lower-id household's single event is reflected — not the blend.
-    assert_eq!(body["cumulative_net_cents"], 2500);
-    let monthly = body["monthly"].as_array().unwrap();
+    assert_eq!(body["legacy"]["cumulative_cents"], 2500);
+    let monthly = body["legacy"]["monthly"].as_array().unwrap();
     assert_eq!(monthly.len(), 1);
     assert_eq!(monthly[0]["gross_cents"], 3000);
     assert_eq!(monthly[0]["lists"], 1);
@@ -448,7 +634,8 @@ async fn summary_picks_single_household_for_multi_household_user() {
     assert_eq!(lists[0]["list_id"], "list-lower");
 }
 
-/// An empty household (no savings events) gets an empty summary, not an error.
+/// An empty household (no savings events) gets an empty, honestly labelled
+/// summary, not an error.
 #[tokio::test]
 async fn summary_empty_household_is_zeroes() {
     let pool = setup_pool().await;
@@ -457,8 +644,11 @@ async fn summary_empty_household_is_zeroes() {
     let resp = get_summary(&pool, &session).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
-    assert_eq!(body["cumulative_net_cents"], 0);
-    assert!(body["monthly"].as_array().unwrap().is_empty());
+    assert_eq!(body["saved"]["cumulative_cents"], 0);
+    assert_eq!(body["saved"]["label"], "Verified savings");
+    assert!(body["saved"]["monthly"].as_array().unwrap().is_empty());
+    assert_eq!(body["legacy"]["cumulative_cents"], 0);
+    assert!(body["legacy"]["monthly"].as_array().unwrap().is_empty());
     assert!(body["lists"].as_array().unwrap().is_empty());
 }
 
@@ -480,17 +670,13 @@ async fn summary_without_session_is_401() {
 }
 
 // ---------------------------------------------------------------------------
-// Real-flow test: archive → actual-spend → summary
+// Real-flow tests: archive → actual-spend → summary
 // ---------------------------------------------------------------------------
 //
-// The reviewer (P5-T4) asked for a test that exercises the real production path
-// rather than seeding figures directly, to prove `accepted_cents` is non-zero
-// through that path (it would always read 0 if it summed the never-written
-// `accepted_savings_cents` column). Integration test files are separate binaries
-// so we can't import the helpers in `savings_endpoints.rs`; the small ones we
-// need (seed an ACTIVE list, seed a recommendation run, login carrying CSRF,
-// archive via PATCH, POST actual-spend) are replicated below, mirroring the seed
-// shapes in that file.
+// Integration test files are separate binaries so we can't import the helpers in
+// `savings_endpoints.rs`; the small ones we need (seed an ACTIVE list, seed a
+// recommendation run, login carrying CSRF, archive via PATCH, POST actual-spend)
+// are replicated below.
 
 /// Known plan totals baked into the seeded run's plans_json (mirror
 /// `savings_endpoints.rs`).
@@ -532,8 +718,9 @@ async fn seed_active_list(pool: &SqlitePool, household_id: &str, list_id: &str, 
     .expect("insert active list");
 }
 
-/// Seed one `recommendation_runs` row whose `plans_json` carries the three plan
-/// totals the ledger reads (mirrors `savings_endpoints.rs::seed_run`).
+/// Seed one `recommendation_runs` row whose plans_json carries the three plan
+/// totals the ledger reads, with the same priced lines on both plans (so the
+/// event is `estimated`). Mirrors `savings_endpoints.rs::seed_run`.
 async fn seed_recommendation_run(
     pool: &SqlitePool,
     household_id: &str,
@@ -542,7 +729,7 @@ async fn seed_recommendation_run(
     run_at: &str,
 ) {
     let plan = |total: i64| {
-        serde_json::json!({ "stores": [], "lines": [], "total_cents": total,
+        serde_json::json!({ "stores": [], "lines": [{ "item_index": 0 }], "total_cents": total,
             "missing_count": 0, "dunnes_voucher_offer_text": null })
     };
     let plans_json = serde_json::json!({
@@ -620,17 +807,13 @@ async fn post_actual_spend(
         .unwrap()
 }
 
-/// End-to-end: seed a run, archive the list (creating the savings_events row),
-/// POST actual-spend, then GET the summary — and assert `accepted_cents` and
-/// `net_cents` are BOTH non-zero and equal the derived `baseline − chosen` and
-/// `baseline − chosen − travel`. This proves accepted no longer reads as 0
-/// through the real path (it would, if the query summed the never-written
-/// `accepted_savings_cents` column).
+/// End-to-end: seed a run, archive the list, POST a whole-basket actual spend,
+/// then GET the summary. The event starts as an `estimated` opportunity and, once
+/// a total is entered, becomes a `legacy_total_only` basket variance shown under
+/// the legacy label — never saved money.
 #[tokio::test]
-async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
+async fn actual_spend_becomes_legacy_variance_through_summary() {
     let pool = setup_pool().await;
-    // Reuse the read-only helper to seed the household, member, and a session;
-    // log in again to also capture the CSRF cookie the mutations need.
     seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
     let (session, csrf) = login_with_csrf(&pool, "a@example.test").await;
 
@@ -661,7 +844,6 @@ async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
     .await;
     assert_eq!(spend.status(), StatusCode::OK);
 
-    // GET the summary and assert the DERIVED accepted + stored net are both > 0.
     let resp = get_summary(
         &pool,
         &Session {
@@ -672,24 +854,99 @@ async fn summary_accepted_is_nonzero_through_archive_then_actual_spend() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
 
-    let expected_accepted = FLOW_BASELINE - chosen; // 500
-    let expected_net = FLOW_BASELINE - chosen - travel; // 200
-    assert!(
-        expected_accepted > 0 && expected_net > 0,
-        "fixture must be positive"
-    );
+    // Nothing is claimed as saved.
+    assert_eq!(body["saved"]["cumulative_cents"], 0);
+    assert!(body["saved"]["monthly"].as_array().unwrap().is_empty());
 
-    let monthly = body["monthly"].as_array().expect("monthly array");
+    // The total-only variance is shown under the legacy label, grouped by the
+    // archive/shop date (set to now during the PATCH).
+    let expected_variance = FLOW_BASELINE - chosen - travel; // 200
+    assert_eq!(body["legacy"]["cumulative_cents"], expected_variance);
+    let monthly = body["legacy"]["monthly"]
+        .as_array()
+        .expect("legacy monthly");
     assert_eq!(monthly.len(), 1, "one month");
-    // The savings_events row this flow creates is stamped with the server's
-    // `now()` at archive time, so the aggregate month is the CURRENT UTC month —
-    // never a fixed literal (this assertion hardcoded "2026-06" and rotted once
-    // the wall clock moved past it).
     let expected_month = chrono::Utc::now().format("%Y-%m").to_string();
     assert_eq!(monthly[0]["month"], expected_month);
-    // The regression this guards: accepted is non-zero (would be 0 if the query
-    // summed the never-written accepted_savings_cents column).
-    assert_eq!(monthly[0]["accepted_cents"], expected_accepted);
-    assert_eq!(monthly[0]["net_cents"], expected_net);
-    assert_eq!(body["cumulative_net_cents"], expected_net);
+    assert_eq!(monthly[0]["accepted_cents"], FLOW_BASELINE - chosen); // 500
+    assert_eq!(monthly[0]["net_cents"], expected_variance);
+
+    // The outcome is labelled as a legacy total-only variance.
+    let lists = body["lists"].as_array().unwrap();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0]["status"], "legacy_total_only");
+    assert_eq!(lists[0]["basket_variance_cents"], expected_variance);
+}
+
+/// Real-flow coverage guard: a run whose plans price different lines produces an
+/// `unreconciled` event through the archive path, so it never enters the saved
+/// aggregate even before any actual spend is entered.
+#[tokio::test]
+async fn mismatched_coverage_archive_stays_out_of_saved() {
+    let pool = setup_pool().await;
+    seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+    let (session, csrf) = login_with_csrf(&pool, "a@example.test").await;
+
+    seed_active_list(&pool, HOUSEHOLD, "list-1", "Weekly").await;
+    // Best single prices two lines; the recommended plan prices one.
+    let plan = |total: i64, lines: Value| {
+        serde_json::json!({ "stores": [], "lines": lines, "total_cents": total,
+            "missing_count": 0, "dunnes_voucher_offer_text": null })
+    };
+    let plans_json = serde_json::json!({
+        "best_single": plan(FLOW_BASELINE, serde_json::json!([{ "item_index": 0 }, { "item_index": 1 }])),
+        "best_two_store": Value::Null,
+        "theoretical_minimum": plan(FLOW_THEORETICAL, serde_json::json!([{ "item_index": 0 }, { "item_index": 1 }])),
+        "recommended": {
+            "kind": "single_store",
+            "plan": plan(FLOW_RECOMMENDED, serde_json::json!([{ "item_index": 0 }])),
+            "clears_convenience_threshold": false,
+            "two_store_saving_cents": 0,
+        },
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO recommendation_runs \
+             (id, list_id, household_id, run_at, offer_snapshot_date, plans_json, \
+              recommended_plan, convenience_threshold_2, convenience_threshold_3) \
+         VALUES ('run-1', 'list-1', ?1, '2026-06-01T10:00:00Z', NULL, ?2, 'single_store', 1000, 2500)",
+    )
+    .bind(HOUSEHOLD)
+    .bind(&plans_json)
+    .execute(&pool)
+    .await
+    .expect("insert mismatched run");
+
+    let archived = patch_list(
+        &pool,
+        &session,
+        &csrf,
+        "list-1",
+        serde_json::json!({ "status": "archived" }),
+    )
+    .await;
+    assert_eq!(archived.status(), StatusCode::OK);
+
+    let resp = get_summary(
+        &pool,
+        &Session {
+            session: session.clone(),
+        },
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["saved"]["cumulative_cents"], 0);
+    assert!(body["saved"]["monthly"].as_array().unwrap().is_empty());
+    // Not a total-only variance either — it is an unreconciled refusal.
+    assert_eq!(body["legacy"]["cumulative_cents"], 0);
+    assert!(body["legacy"]["monthly"].as_array().unwrap().is_empty());
+    let lists = body["lists"].as_array().unwrap();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0]["status"], "unreconciled");
+    assert_eq!(
+        lists[0]["status_label"],
+        "Not comparable — plans price different lines"
+    );
 }

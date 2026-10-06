@@ -263,6 +263,62 @@ async fn savings_rows(pool: &SqlitePool, list_id: &str) -> Vec<SavingsRow> {
     .expect("query savings_events")
 }
 
+/// The stored `status` of the list's savings event.
+async fn event_status(pool: &SqlitePool, list_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM savings_events WHERE list_id = ?1")
+        .bind(list_id)
+        .fetch_one(pool)
+        .await
+        .expect("savings event status")
+}
+
+/// Seed a run whose best single store and recommended plan price DIFFERENT
+/// lines, so the ledger must refuse to present the difference as a saving
+/// (issue #117). Totals match `seed_run`, so the test exercises the coverage
+/// guard, not the arithmetic.
+async fn seed_mismatched_coverage_run(
+    pool: &SqlitePool,
+    run_id: &str,
+    list_id: &str,
+    run_at: &str,
+) {
+    let plan = |total: i64, lines: Value| {
+        serde_json::json!({ "stores": [], "lines": lines, "total_cents": total,
+            "missing_count": 0, "dunnes_voucher_offer_text": null })
+    };
+    let plans_json = serde_json::json!({
+        "best_single": plan(BASELINE, serde_json::json!([
+            { "item_index": 0 }, { "item_index": 1 }
+        ])),
+        "best_two_store": Value::Null,
+        "theoretical_minimum": plan(THEORETICAL, serde_json::json!([
+            { "item_index": 0 }, { "item_index": 1 }
+        ])),
+        "recommended": {
+            "kind": "single_store",
+            "plan": plan(RECOMMENDED, serde_json::json!([{ "item_index": 0 }])),
+            "clears_convenience_threshold": false,
+            "two_store_saving_cents": 0,
+        },
+    })
+    .to_string();
+
+    sqlx::query(
+        "INSERT INTO recommendation_runs \
+             (id, list_id, household_id, run_at, offer_snapshot_date, plans_json, \
+              recommended_plan, convenience_threshold_2, convenience_threshold_3) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'single_store', 1000, 2500)",
+    )
+    .bind(run_id)
+    .bind(list_id)
+    .bind(HOUSEHOLD)
+    .bind(run_at)
+    .bind(&plans_json)
+    .execute(pool)
+    .await
+    .expect("insert mismatched-coverage run");
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -314,6 +370,42 @@ async fn archive_with_run_creates_savings_event() {
             .await
             .expect("recommendation_run_id");
     assert_eq!(run_id, "run-1");
+
+    // Both plans price the same lines (empty line sets), so this is an
+    // `estimated` opportunity — never `verified`.
+    assert_eq!(event_status(&pool, "list-1").await, "estimated");
+}
+
+/// Issue #117: when the best single store and the recommended plan price
+/// DIFFERENT lines, the gross difference is not a saving. The row is still
+/// written (the plan totals are known and the cost columns are NOT NULL) but it
+/// is marked `unreconciled`, so no aggregate or label presents it as saved.
+#[tokio::test]
+async fn archive_with_mismatched_coverage_is_unreconciled() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_list(&pool, "list-1").await;
+    seed_mismatched_coverage_run(&pool, "run-1", "list-1", "2026-06-01T10:00:00Z").await;
+
+    let resp = patch_list(
+        &pool,
+        &session,
+        "list-1",
+        serde_json::json!({ "status": "archived" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rows = savings_rows(&pool, "list-1").await;
+    assert_eq!(rows.len(), 1, "the row is still written for audit");
+    // The stored figures are kept (known plan totals), not zeroed.
+    assert_eq!(rows[0].1, BASELINE);
+    assert_eq!(rows[0].4, GROSS);
+    assert_eq!(
+        event_status(&pool, "list-1").await,
+        "unreconciled",
+        "a coverage mismatch is never presented as a saving"
+    );
 }
 
 /// The LATEST run drives the figures when several runs exist for the list.
@@ -454,7 +546,7 @@ async fn actual_spend_updates_event() {
     let expected_net = BASELINE - actual - travel;
     assert_eq!(body["chosen_basket_cost_cents"], actual);
     assert_eq!(body["travel_cost_cents"], travel);
-    assert_eq!(body["net_saving_cents"], expected_net);
+    assert_eq!(body["basket_variance_cents"], expected_net);
     assert_eq!(body["baseline_cost_cents"], BASELINE);
 
     // Persisted values match.
@@ -463,6 +555,11 @@ async fn actual_spend_updates_event() {
     assert_eq!(rows[0].5, Some(actual));
     assert_eq!(rows[0].6, Some(travel));
     assert_eq!(rows[0].7, Some(expected_net));
+
+    // A manual whole-basket total is a legacy total-only variance, never a
+    // verified saving, and the response no longer calls it a net saving.
+    assert_eq!(event_status(&pool, "list-1").await, "legacy_total_only");
+    assert_eq!(body["status"], "legacy_total_only");
 }
 
 /// travel_cost_cents defaults to 0 when omitted.
@@ -499,7 +596,7 @@ async fn actual_spend_defaults_travel_to_zero() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["travel_cost_cents"], 0);
-    assert_eq!(body["net_saving_cents"], BASELINE - 4800);
+    assert_eq!(body["basket_variance_cents"], BASELINE - 4800);
 }
 
 /// Overspend: when actual + travel exceeds the baseline, net_saving_cents is
@@ -541,7 +638,7 @@ async fn actual_spend_overspend_stores_negative_net() {
     let expected_net = BASELINE - actual - travel;
     assert!(expected_net < 0, "this fixture must model an overspend");
     let body = json_body(resp).await;
-    assert_eq!(body["net_saving_cents"], expected_net);
+    assert_eq!(body["basket_variance_cents"], expected_net);
 
     // The negative net is persisted, not clamped.
     let rows = savings_rows(&pool, "list-1").await;
@@ -605,7 +702,7 @@ async fn actual_spend_double_post_updates_same_row() {
     let expected_net = BASELINE - second_actual - second_travel;
     assert_eq!(second_body["chosen_basket_cost_cents"], second_actual);
     assert_eq!(second_body["travel_cost_cents"], second_travel);
-    assert_eq!(second_body["net_saving_cents"], expected_net);
+    assert_eq!(second_body["basket_variance_cents"], expected_net);
 
     // Still exactly one row, carrying the latest figures.
     let rows = savings_rows(&pool, "list-1").await;
