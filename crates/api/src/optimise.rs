@@ -58,9 +58,9 @@ use serde::{Deserialize, Serialize};
 use buywise_core::db::{self, DbError};
 use buywise_core::domain::{Cents, ConstraintPolicy, Retailer};
 use buywise_core::optimiser::{
-    optimise, BasketItem, BasketItemIdentity, NeedsConfirmationItem, NoValidOfferItem,
-    OptimiserInput, OptimiserOutput, PlanKind, PlanReason, ReasonCode, Recommendation,
-    RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
+    optimise, AldiComparison, BasketItem, BasketItemIdentity, NeedsConfirmationItem,
+    NoValidOfferItem, OptimiserInput, OptimiserOutput, PlanKind, PlanReason, ReasonCode,
+    Recommendation, RecommendedKind, StorePlan, StoreSetting, UnresolvedItem, DEFAULT_THRESHOLDS,
 };
 
 use crate::middleware::AuthenticatedUser;
@@ -148,6 +148,12 @@ pub struct OptimiseResponse {
     /// Latest `source_snapshot_date` among the offers backing the recommended
     /// plan (nullable: offers may not carry a snapshot date).
     pub offer_snapshot_date: Option<String>,
+    /// What Aldi would have cost the basket versus the recommended plan, split
+    /// packaged versus fresh (issue #100). `null` when there is no recommended
+    /// plan; a split with `item_count == 0` means Aldi has no qualifying price.
+    /// Computed independently of the store-off and category-exclusion rules, so it
+    /// is present even when Aldi takes no part in the plan.
+    pub aldi_comparison: Option<AldiComparison>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +273,7 @@ async fn optimise_list(
         plain_language_explanation: explanation.summary,
         plan_explanations: explanation.plans,
         offer_snapshot_date,
+        aldi_comparison: output.aldi_comparison,
     }))
 }
 
@@ -389,10 +396,14 @@ async fn build_input_from_list(
             None => (ConstraintPolicy::Any, None),
         };
         // The resolved item's category / sub-category drive the household's
-        // per-store category rules (issue #99). Absent for an unresolved item.
-        let (category_id, subcategory_id) = match canonical_item_id.as_deref() {
-            Some(id) => taxonomy_by_id.get(id).cloned().unwrap_or((None, None)),
-            None => (None, None),
+        // per-store category rules (issue #99) and the fresh/packaged split of the
+        // Aldi comparison (issue #100). Absent for an unresolved item.
+        let (category_id, subcategory_id, is_fresh) = match canonical_item_id.as_deref() {
+            Some(id) => taxonomy_by_id
+                .get(id)
+                .cloned()
+                .unwrap_or((None, None, false)),
+            None => (None, None, false),
         };
 
         items.push(BasketItem {
@@ -410,6 +421,7 @@ async fn build_input_from_list(
             constraints,
             category_id,
             subcategory_id,
+            is_fresh,
         });
     }
 
@@ -558,29 +570,35 @@ async fn item_constraints_by_canonical_ids(
     Ok(by_id)
 }
 
-/// Bulk-load `(category_id, subcategory_id)` for every given canonical item id,
-/// keyed by id, in chunked `IN (...)` queries (issue #99). Unknown ids are
-/// absent; callers fall back to `(None, None)` so an unclassifiable item is
-/// never excluded by a category rule.
+/// Bulk-load `(category_id, subcategory_id, is_fresh)` for every given canonical
+/// item id, keyed by id, in chunked `IN (...)` queries (issues #99, #100).
+/// Unknown ids are absent; callers fall back to `(None, None, false)` so an
+/// unclassifiable item is never excluded by a category rule and counts as
+/// packaged in the Aldi comparison.
 async fn canonical_item_taxonomy(
     pool: &sqlx::SqlitePool,
     ids: &[&str],
-) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>)>, DbError> {
+) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>, bool)>, DbError> {
     let mut by_id = std::collections::HashMap::new();
     if ids.is_empty() {
         return Ok(by_id);
     }
     for chunk in ids.chunks(IN_CHUNK_SIZE) {
         let placeholders = sql_placeholders(chunk.len());
+        // LEFT JOIN so an item whose category row is missing still yields a row
+        // (category_id is NOT NULL on canonical_items, but a dangling FK would
+        // otherwise silently drop the item); COALESCE gives it `false`.
         let sql = format!(
-            "SELECT id, category_id, subcategory_id FROM canonical_items WHERE id IN ({placeholders})"
+            "SELECT ci.id, ci.category_id, ci.subcategory_id, COALESCE(c.is_fresh, 0) \
+             FROM canonical_items ci LEFT JOIN categories c ON c.id = ci.category_id \
+             WHERE ci.id IN ({placeholders})"
         );
-        let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, String, Option<String>, bool)>(&sql);
         for id in chunk {
             query = query.bind(*id);
         }
-        for (id, category_id, subcategory_id) in query.fetch_all(pool).await? {
-            by_id.insert(id, (Some(category_id), subcategory_id));
+        for (id, category_id, subcategory_id, is_fresh) in query.fetch_all(pool).await? {
+            by_id.insert(id, (Some(category_id), subcategory_id, is_fresh));
         }
     }
     Ok(by_id)
@@ -1193,6 +1211,11 @@ struct PlansJson<'a> {
     best_two_store: Option<&'a StorePlan>,
     theoretical_minimum: Option<&'a StorePlan>,
     recommended: Option<&'a Recommendation>,
+    /// The Aldi counterfactual (issue #100), recorded per optimisation so the
+    /// figure survives for later evidence work. It lives in this open JSON column
+    /// rather than a dedicated column, so no schema change is needed; the savings
+    /// dashboard does not aggregate it yet (see docs/KNOWN_LIMITATIONS.md).
+    aldi_comparison: Option<&'a AldiComparison>,
 }
 
 /// Insert one `recommendation_runs` row and return its id.
@@ -1219,6 +1242,7 @@ async fn persist_run(
         best_two_store: output.best_two_store.as_ref(),
         theoretical_minimum: output.theoretical_minimum.as_ref(),
         recommended: output.recommended.as_ref(),
+        aldi_comparison: output.aldi_comparison.as_ref(),
     };
     // serde_json on owned, already-validated data cannot fail in practice; treat
     // a failure as a 500 via DbError rather than panicking.
@@ -1288,6 +1312,7 @@ mod tests {
             constraints: None,
             category_id: None,
             subcategory_id: None,
+            is_fresh: false,
         }
     }
 

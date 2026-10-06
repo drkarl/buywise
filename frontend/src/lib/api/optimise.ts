@@ -153,6 +153,31 @@ export interface PlanExplanation {
 	reasons: string[];
 }
 
+/**
+ * One half of the Aldi comparison (issue #100): Aldi's cost versus the
+ * recommended plan's cost for the same items. Both totals cover exactly the
+ * items Aldi prices *and* the recommended plan prices, so the figures are
+ * like-for-like; `item_count` is how many items they cover, and `saving_cents`
+ * is positive when Aldi would have been cheaper.
+ */
+export interface AldiComparisonSplit {
+	item_count: number;
+	aldi_total_cents: number;
+	recommended_total_cents: number;
+	saving_cents: number;
+}
+
+/**
+ * What the basket would have cost at Aldi, split packaged versus fresh, compared
+ * with the recommended plan (issue #100). Computed independently of the store-off
+ * and category-exclusion rules, so it is present even when Aldi takes no part in
+ * the plan. `null` when there is no recommended plan.
+ */
+export interface AldiComparison {
+	packaged: AldiComparisonSplit;
+	fresh: AldiComparisonSplit;
+}
+
 /** The full `POST /api/optimise` 200 response body. */
 export interface OptimiseResponse {
 	basket_items: BasketItemIdentity[];
@@ -176,6 +201,9 @@ export interface OptimiseResponse {
 	// is most important first; the UI renders at most four per card, and a plan
 	// with no (or no entry's) reasons renders nothing extra. May be empty.
 	plan_explanations: PlanExplanation[];
+	// Issue #100: Aldi's counterfactual cost versus the recommended plan, split
+	// packaged versus fresh. `null` without a recommendation.
+	aldi_comparison: AldiComparison | null;
 }
 
 /** Lowercase retailer id → display label (reuses the shopping store's table). */

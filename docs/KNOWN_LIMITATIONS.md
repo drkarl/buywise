@@ -7,7 +7,7 @@ what happens, why it was accepted, a workaround or none, and the follow-up that 
 issue, a backlog id, or an explicit open question). A limitation that must hold a release is marked
 **RELEASE BLOCKER** at the top of its section.
 
-_Last reviewed: 2026-10-05._
+_Last reviewed: 2026-10-06._
 
 ## Per-store trip view
 
@@ -345,3 +345,47 @@ custom item is not being excluded as expected.
 
 **Follow-up.** Surface an unclassified resolved item as a data warning rather than only defaulting it
 to allowed.
+
+## Aldi comparison
+
+The side comparison of what the recommended basket would have cost at Aldi, split packaged versus
+fresh (issue #100). Computed in `crates/core/src/optimiser.rs` (`aldi_comparison`) from Aldi's
+constraint-passing offers and the recommended plan's lines, independently of the store-off and
+per-store category rules; surfaced by `POST /api/optimise` and rendered on the optimisation screen.
+Freshness comes from `categories.is_fresh` (migration 015).
+
+### 1. The savings page does not aggregate the Aldi figure into a running total yet
+
+**What happens.** Each optimisation records the comparison inside `recommendation_runs.plans_json`,
+so the per-run figure survives, but `GET /api/savings/summary` only aggregates `savings_events` and
+does not read `plans_json`. The savings page therefore shows no running Aldi total over weeks.
+
+**Why accepted.** Folding the figure into the savings dashboard would mean either adding Aldi
+columns to `savings_events` and populating them at archive time, or parsing every
+`recommendation_runs.plans_json` for the household's lists — a broader change than the issue's
+optional recording, which the intent scoped to "a small migration or leave it out". The figure is
+still persisted per optimisation for a later pass.
+
+**Workaround.** Read the comparison on each optimisation run; the per-run figure is in the
+optimise response and in the stored `plans_json`.
+
+**Follow-up.** Issue #100 follow-up: add `aldi_saving_packaged_cents` / `aldi_saving_fresh_cents`
+to `savings_events` (populated when a plan is chosen or the list is archived) and show the running
+total on `/savings`.
+
+### 2. An item with no category, or a category not marked fresh, counts as packaged
+
+**What happens.** The fresh/packaged split reads `categories.is_fresh` (Produce, Meat & Fish, Dairy
+and Bakery are fresh). A canonical item whose category row is missing, a category a household adds
+later, and every item the CLI costs in fixture mode (no taxonomy) default to packaged. A genuinely
+fresh item in such a category is reported under "packaged food" instead of "fresh food".
+
+**Why accepted.** Defaulting an unclassifiable item to fresh would overstate the figure the quality
+concern is about; treating it as packaged keeps the fresh number a lower bound. The seeded catalogue
+maps every item to a category (002), so only hand-inserted, future or CLI items are affected.
+
+**Workaround.** Mark the category fresh (`UPDATE categories SET is_fresh = 1 WHERE id = ...`) if a
+new category genuinely holds fresh food.
+
+**Follow-up.** Expose `is_fresh` on the settings catalogue so a household can set it without SQL,
+and make the CLI's fixture mode load the category taxonomy.

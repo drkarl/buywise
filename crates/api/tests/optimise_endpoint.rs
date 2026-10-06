@@ -719,3 +719,218 @@ async fn optimise_unresolved_status_entry_is_unresolved_item() {
     assert_eq!(unresolved.len(), 1, "exactly one unresolved item");
     assert_eq!(unresolved[0]["display_text"], "mystery item");
 }
+
+// ---------------------------------------------------------------------------
+// Aldi comparison (issue #100)
+// ---------------------------------------------------------------------------
+
+/// Mark `category_id` as fresh food (migration 015 seeds the shared catalogue;
+/// these tests build their own categories, so they set the flag explicitly).
+async fn mark_category_fresh(pool: &SqlitePool, category_id: &str) {
+    sqlx::query("UPDATE categories SET is_fresh = 1 WHERE id = ?1")
+        .bind(category_id)
+        .execute(pool)
+        .await
+        .expect("mark category fresh");
+}
+
+/// Store a household disposition of `retailer` (`active`/`occasional`/`off`).
+async fn set_store_status(pool: &SqlitePool, retailer: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO household_store_settings (household_id, retailer, status, nearby, updated_at) \
+         VALUES (?1, ?2, ?3, 0, ?4)",
+    )
+    .bind(HOUSEHOLD)
+    .bind(retailer)
+    .bind(status)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert store setting");
+}
+
+/// Exclude a whole category at `retailer` for the household (issue #99).
+async fn exclude_category_at(pool: &SqlitePool, retailer: &str, category_id: &str) {
+    sqlx::query(
+        "INSERT INTO household_store_category_rules \
+             (household_id, retailer, category_id, subcategory_id, allowed, updated_at) \
+         VALUES (?1, ?2, ?3, NULL, 0, ?4)",
+    )
+    .bind(HOUSEHOLD)
+    .bind(retailer)
+    .bind(category_id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert category rule");
+}
+
+/// Seed the two-item basket (fresh dairy milk + packaged bakery bread) priced at
+/// both Tesco and Aldi. Aldi is cheaper for both.
+async fn seed_aldi_split_catalogue(pool: &SqlitePool) {
+    seed_catalogue(pool).await;
+    mark_category_fresh(pool, DAIRY_CATEGORY).await;
+    seed_priced_match(
+        pool,
+        "p-milk-aldi",
+        "aldi",
+        MILK_ID,
+        100,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_priced_match(
+        pool,
+        "p-milk-tesco",
+        "tesco",
+        MILK_ID,
+        300,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_priced_match(
+        pool,
+        "p-bread-aldi",
+        "aldi",
+        BREAD_ID,
+        150,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_priced_match(
+        pool,
+        "p-bread-tesco",
+        "tesco",
+        BREAD_ID,
+        200,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_list(pool, "list-1").await;
+    seed_resolved_entry(pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
+    seed_resolved_entry(pool, "e-bread", "list-1", BREAD_ID, "pan", "user-a").await;
+}
+
+/// Acceptance (issue #100): with Aldi switched off, the recommended plan still
+/// carries the Aldi comparison, split fresh versus packaged, and no plan routes
+/// through Aldi.
+#[tokio::test]
+async fn aldi_comparison_shown_when_aldi_is_off() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_aldi_split_catalogue(&pool).await;
+    set_store_status(&pool, "aldi", "off").await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    // Aldi takes no part in the recommendation.
+    assert_eq!(
+        body["recommended"]["plan"]["stores"][0], "tesco",
+        "{body:#}"
+    );
+    for key in ["best_single", "best_two_store", "theoretical_minimum"] {
+        let Some(plan) = body.get(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        for line in plan["lines"].as_array().expect("lines array") {
+            assert_ne!(
+                line["retailer"], "aldi",
+                "{key} routed an off store: {body:#}"
+            );
+        }
+    }
+
+    // The comparison is present and split by freshness.
+    let comparison = &body["aldi_comparison"];
+    assert_eq!(comparison["fresh"]["item_count"], 1);
+    assert_eq!(comparison["fresh"]["aldi_total_cents"], 100);
+    assert_eq!(comparison["fresh"]["recommended_total_cents"], 300);
+    assert_eq!(comparison["fresh"]["saving_cents"], 200);
+    assert_eq!(comparison["packaged"]["item_count"], 1);
+    assert_eq!(comparison["packaged"]["aldi_total_cents"], 150);
+    assert_eq!(comparison["packaged"]["recommended_total_cents"], 200);
+    assert_eq!(comparison["packaged"]["saving_cents"], 50);
+
+    // And it is recorded per optimisation inside plans_json.
+    let run_id = body["run_id"].as_str().expect("run_id string");
+    let plans_json: String =
+        sqlx::query_scalar("SELECT plans_json FROM recommendation_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("plans_json persisted");
+    let plans: Value = serde_json::from_str(&plans_json).expect("plans_json is valid JSON");
+    assert_eq!(plans["aldi_comparison"]["fresh"]["saving_cents"], 200);
+    assert_eq!(plans["aldi_comparison"]["packaged"]["saving_cents"], 50);
+}
+
+/// Acceptance (issue #100): with the fresh category excluded at Aldi, no plan
+/// routes the fresh item there, yet the comparison still prices it at Aldi.
+#[tokio::test]
+async fn aldi_comparison_survives_a_category_exclusion() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_aldi_split_catalogue(&pool).await;
+    // The rules are only surfaced for a retailer that also has a settings row
+    // (the settings surface always writes both), so make Aldi active first.
+    set_store_status(&pool, "aldi", "active").await;
+    exclude_category_at(&pool, "aldi", DAIRY_CATEGORY).await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    // No plan places the fresh milk at Aldi.
+    for key in ["best_single", "best_two_store", "theoretical_minimum"] {
+        let Some(plan) = body.get(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        for line in plan["lines"].as_array().expect("lines array") {
+            assert!(
+                !(line["canonical_item_id"] == MILK_ID && line["retailer"] == "aldi"),
+                "{key} placed the fresh item at Aldi: {body:#}"
+            );
+        }
+    }
+
+    // The fresh comparison still uses Aldi's cheaper price.
+    let fresh = &body["aldi_comparison"]["fresh"];
+    assert_eq!(fresh["item_count"], 1);
+    assert_eq!(fresh["aldi_total_cents"], 100);
+    assert_eq!(fresh["saving_cents"], 200);
+}
+
+/// With no Aldi offers on record the comparison is still returned, but reports
+/// zero coverage so the UI can say there is nothing to compare.
+#[tokio::test]
+async fn aldi_comparison_reports_zero_coverage_without_aldi_prices() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+    seed_priced_match(
+        &pool,
+        "p-milk-tesco",
+        "tesco",
+        MILK_ID,
+        300,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert!(
+        body["recommended"].is_object(),
+        "plan exists to compare against"
+    );
+    assert_eq!(body["aldi_comparison"]["fresh"]["item_count"], 0);
+    assert_eq!(body["aldi_comparison"]["fresh"]["saving_cents"], 0);
+    assert_eq!(body["aldi_comparison"]["packaged"]["item_count"], 0);
+    assert_eq!(body["aldi_comparison"]["packaged"]["saving_cents"], 0);
+}

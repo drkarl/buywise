@@ -116,10 +116,13 @@ pub async fn build_optimiser_input(
             constraint_policy: policy,
             constraints,
             // Fixture mode builds its pool from the Phase-0 schema, which has no
-            // sub-category column, and the CLI never loads per-store category
-            // rules (issue #99), so the taxonomy is left unset here.
+            // sub-category or category-freshness columns, and the CLI never loads
+            // per-store category rules (issue #99), so the taxonomy is left unset
+            // here; the Aldi comparison (issue #100) therefore counts every CLI
+            // item as packaged.
             category_id: None,
             subcategory_id: None,
+            is_fresh: false,
         });
     }
 

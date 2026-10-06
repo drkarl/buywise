@@ -114,7 +114,21 @@ function fullResponse(): OptimiseResponse {
 				reasons: ['One trip covers your whole list.', 'No split between stores needed.']
 			}
 		],
-		offer_snapshot_date: '2026-06-07'
+		offer_snapshot_date: '2026-06-07',
+		aldi_comparison: {
+			fresh: {
+				item_count: 1,
+				aldi_total_cents: 250,
+				recommended_total_cents: 400,
+				saving_cents: 150
+			},
+			packaged: {
+				item_count: 2,
+				aldi_total_cents: 300,
+				recommended_total_cents: 320,
+				saving_cents: 20
+			}
+		}
 	};
 }
 
@@ -507,7 +521,8 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
-			offer_snapshot_date: null
+			offer_snapshot_date: null,
+			aldi_comparison: null
 		};
 
 		// A's re-optimise (older, seq 2): butter still ask. Tagged so we can detect
@@ -635,7 +650,8 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
-			offer_snapshot_date: null
+			offer_snapshot_date: null,
+			aldi_comparison: null
 		};
 
 		let feedbackCalls = 0;
@@ -695,7 +711,8 @@ describe('optimise page', () => {
 			needs_confirmation_items: [],
 			plain_language_explanation: '',
 			plan_explanations: [],
-			offer_snapshot_date: null
+			offer_snapshot_date: null,
+			aldi_comparison: null
 		};
 		stubOptimise(empty);
 		render(Page);
@@ -743,7 +760,8 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
-			offer_snapshot_date: null
+			offer_snapshot_date: null,
+			aldi_comparison: null
 		};
 		stubOptimise(allHeld);
 		render(Page);
@@ -863,5 +881,43 @@ describe('optimise page', () => {
 			(typeof input === 'string' ? input : input.toString()).includes('/api/optimise')
 		);
 		expect(optimiseCalls).toHaveLength(0);
+	});
+
+	it('shows the Aldi comparison split fresh versus packaged', async () => {
+		stubOptimise(fullResponse());
+		render(Page);
+
+		const section = await screen.findByRole('region', { name: 'Aldi comparison' });
+		// Total saving is the sum of both splits: €1.50 + €0.20 = €1.70.
+		expect(
+			within(section).getByText(/Aldi would have saved €1\.70 on this list/)
+		).toBeTruthy();
+		expect(within(section).getByText(/Fresh food: €1\.50 cheaper/)).toBeTruthy();
+		expect(within(section).getByText(/Packaged food: €0\.20 cheaper/)).toBeTruthy();
+		// The section states it never affects the recommendation.
+		expect(within(section).getByText(/never changes which plan is recommended/)).toBeTruthy();
+	});
+
+	it('says there is nothing to compare when Aldi prices none of the plan', async () => {
+		const response = fullResponse();
+		response.aldi_comparison = {
+			fresh: { item_count: 0, aldi_total_cents: 0, recommended_total_cents: 0, saving_cents: 0 },
+			packaged: { item_count: 0, aldi_total_cents: 0, recommended_total_cents: 0, saving_cents: 0 }
+		};
+		stubOptimise(response);
+		render(Page);
+
+		const section = await screen.findByRole('region', { name: 'Aldi comparison' });
+		expect(within(section).getByText(/nothing to compare/i)).toBeTruthy();
+	});
+
+	it('renders no comparison section without a recommended plan', async () => {
+		const response = fullResponse();
+		response.aldi_comparison = null;
+		stubOptimise(response);
+		render(Page);
+
+		await screen.findByRole('region', { name: 'Plans' });
+		expect(screen.queryByRole('region', { name: 'Aldi comparison' })).toBeNull();
 	});
 });
