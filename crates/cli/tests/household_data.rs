@@ -433,7 +433,10 @@ async fn scalar(pool: &SqlitePool, sql: &str) -> i64 {
 /// Export through a JSON round trip, so assertions run against the serialised
 /// document a consumer would actually read.
 async fn export_document(pool: &SqlitePool, household_id: &str) -> Value {
-    let document = household::export_household(pool, household_id)
+    let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let document = household::export_household(pool, household_id, now)
         .await
         .expect("export household");
     let text = serde_json::to_string(&document).expect("serialise export");
@@ -611,9 +614,15 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
 async fn export_rejects_an_unknown_household() {
     let pool = setup_pool().await;
     seed_fixture(&pool).await;
-    let err = household::export_household(&pool, "hh-missing")
-        .await
-        .expect_err("unknown household must fail");
+    let err = household::export_household(
+        &pool,
+        "hh-missing",
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    )
+    .await
+    .expect_err("unknown household must fail");
     assert!(err.to_string().contains("no household"), "got {err}");
 }
 
@@ -771,7 +780,15 @@ async fn delete_removes_only_the_target_household() {
     );
 
     assert!(
-        household::export_household(&pool, HH_A).await.is_err(),
+        household::export_household(
+            &pool,
+            HH_A,
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .await
+        .is_err(),
         "the exported household is gone"
     );
 }

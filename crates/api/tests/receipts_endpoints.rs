@@ -680,6 +680,47 @@ async fn the_household_image_count_quota_is_enforced() {
     assert_eq!(count_receipts(&harness.pool, HH_A).await, 1);
 }
 
+#[tokio::test]
+async fn expired_receipts_do_not_count_toward_upload_quotas_before_the_sweep() {
+    let harness = Harness::with_config(|dir| {
+        ReceiptConfig::with_dir(dir).with_limits(10 * 1024 * 1024, 1, 72)
+    })
+    .await;
+    let (a, _b) = seed_two_households(&harness.pool).await;
+    let expired_id = upload_png(&harness, &a, HH_A).await;
+    let expired_path = stored_file(&harness, &expired_id).await;
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    sqlx::query("UPDATE receipt_images SET expires_at = '2026-10-01T10:00:00.000Z' WHERE id = ?1")
+        .bind(&expired_id)
+        .execute(&harness.pool)
+        .await
+        .expect("expire first receipt");
+
+    let uploaded = harness
+        .router_at(now)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/household/{HH_A}/receipts"))
+                .header(header::CONTENT_TYPE, "image/png")
+                .header(header::COOKIE, format!("session={}", a.session))
+                .header("X-CSRF-Token", &a.csrf)
+                .body(Body::from(image_bytes("png", 64)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(count_receipts(&harness.pool, HH_A).await, 2);
+    assert!(
+        expired_path.exists(),
+        "quota filtering does not run the sweep"
+    );
+}
+
 /// The per-household total-size quota is enforced with a clear 409.
 #[tokio::test]
 async fn the_household_total_size_quota_is_enforced() {
@@ -869,6 +910,40 @@ async fn export_lists_receipt_image_metadata() {
     // The other household's own (empty) export has no receipts of ours.
     let other = json_body(export(&harness, &b, HH_B).await).await;
     assert!(other["receipt_images"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn household_export_omits_expired_unswept_receipts() {
+    let harness = Harness::new().await;
+    let (a, _b) = seed_two_households(&harness.pool).await;
+    let expired_id = upload_png(&harness, &a, HH_A).await;
+    let path = stored_file(&harness, &expired_id).await;
+    sqlx::query("UPDATE receipt_images SET expires_at = '2026-10-01T10:00:00.000Z' WHERE id = ?1")
+        .bind(&expired_id)
+        .execute(&harness.pool)
+        .await
+        .expect("expire receipt");
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let document = harness
+        .router_at(now)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/household/{HH_A}/export"))
+                .header(header::COOKIE, format!("session={}", a.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(document.status(), StatusCode::OK);
+    let document = json_body(document).await;
+    assert!(document["receipt_images"].as_array().unwrap().is_empty());
+    assert_eq!(count_receipts(&harness.pool, HH_A).await, 1);
+    assert!(path.exists(), "export filtering does not run the sweep");
 }
 
 /// Household delete removes every receipt file and record of that household,
