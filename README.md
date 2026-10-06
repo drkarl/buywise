@@ -62,7 +62,6 @@ once, then run the server, which serves both on one port.
 
 - Rust toolchain (`cargo`)
 - Node.js ≥ 20 (`npm`)
-- `sqlite3` CLI (used to seed the first user — see below)
 
 ### 1. Build the frontend
 
@@ -92,53 +91,30 @@ On startup the server:
 | `PORT` | `3000` | TCP port |
 | `RUST_LOG` | `info` | Log filter (`tracing` `EnvFilter`) |
 
-The app is now at **http://localhost:3000**. The migrations seed the default
-household, the product catalogue, categories, and per-store aisle ordering — but
-**no users and no shopping lists** (those are created at runtime). Do the one-time
-seed below before you can log in.
+The app is now at **http://localhost:3000**. Migrations seed the default
+catalogue household, product catalogue, categories, and per-store aisle ordering,
+but no users. Bootstrap creates a household with its first owner before you can
+log in.
 
-### 3. Seed the first user, membership, and a list
+### 3. Create the first household and owner
 
-Users are deliberately **not** seeded by migrations (password hashes are never
-committed). The `set-password` CLI only *updates* an existing user row, so you
-first insert a user (+ household membership + a list) directly, then set its
-password.
-
-Start the server once first (step 2) so `buywise.db` exists and is migrated, then:
+Run the one-time bootstrap command from the repository root. It creates and
+migrates the database if needed, then prompts for a password without echoing it:
 
 ```bash
-NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-USER_ID="11111111-1111-1111-1111-111111111111"
-HOUSEHOLD="00000000-0000-0000-0000-000000000001"   # the seeded default household
-LIST_ID="22222222-2222-2222-2222-222222222222"
-
-sqlite3 buywise.db <<SQL
-INSERT OR IGNORE INTO users (id, email, password_hash, display_name, created_at)
-  VALUES ('$USER_ID', 'me@buywise.local', 'placeholder', 'Me', '$NOW');
-INSERT OR IGNORE INTO household_members (household_id, user_id, role, joined_at)
-  VALUES ('$HOUSEHOLD', '$USER_ID', 'owner', '$NOW');
-INSERT OR IGNORE INTO shopping_lists (id, household_id, name, status, current_revision, created_at)
-  VALUES ('$LIST_ID', '$HOUSEHOLD', 'Weekly Shop', 'active', 0, '$NOW');
-SQL
-
-# Hash and store a real password for that user (argon2id):
-printf 'buywise123\n' | cargo run -p buywise-cli -- set-password me@buywise.local --db buywise.db
+cargo run -p buywise-cli -- bootstrap-household --db buywise.db \
+  --name "Our Household" --email owner@example.com
 ```
 
-> The household id **must** be `00000000-0000-0000-0000-000000000001` — that is the
-> default household the catalogue is seeded against (see `migrations/004_seed_phase1.sql`).
-> A user only sees data for households they belong to via `household_members`.
-
-> `set-password` reads the password from stdin when it is not a TTY (shown above),
-> or prompts twice (hidden) when run interactively. It errors if the email matches
-> no existing user row.
+The first account is the household owner. The owner adds other members in
+**Settings → Household members** and can share each member's initial password
+out of band. See [`deploy/README.md`](deploy/README.md) for deployed setup.
 
 ### 4. Log in and open the app
 
 Open **http://localhost:3000**. The home page is the auth gate and list index:
-sign in with the email/password you set above (`me@buywise.local` / `buywise123`),
-and your active lists appear as links. Pick one to open the shopping list; you can
-also create further lists and reach the savings ledger from here.
+sign in with the email and password you chose during bootstrap. Create a list or
+open an existing one; you can also reach the savings ledger from here.
 
 The session cookie is `Secure`, which browsers accept over `http://localhost`
 (treated as a secure context), so the cookie-based login works without HTTPS in
@@ -196,8 +172,9 @@ What leaves the device and the server, who can read it and how long it is kept i
 deletion and raw-receipt retention policy. The JSON layout produced by export is documented in
 [`docs/household-export.md`](docs/household-export.md).
 
-Household members can also download the export or delete household data from
-Settings → **Your data**; the CLI commands below remain available to operators.
+Household members can download the export from Settings → **Your data**. Only
+owners can delete household data or manage members there; the CLI commands below
+remain available to operators.
 
 ```bash
 # Export a household's records as one JSON document (read-only; omit --out for stdout).

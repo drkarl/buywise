@@ -392,9 +392,7 @@ fn core_error(context: &'static str) -> impl Fn(HouseholdDataError) -> StatusCod
 /// 500.
 fn membership_error(context: &'static str) -> impl Fn(MembershipError) -> StatusCode {
     move |err| match &err {
-        MembershipError::DuplicateEmail(_) | MembershipError::LastOwner(_) => {
-            StatusCode::CONFLICT
-        }
+        MembershipError::DuplicateEmail(_) | MembershipError::LastOwner(_) => StatusCode::CONFLICT,
         MembershipError::Password(_) | MembershipError::BlankUserField(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }

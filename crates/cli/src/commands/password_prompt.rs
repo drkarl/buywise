@@ -89,7 +89,10 @@ mod tests {
             "hunter2"
         );
         // Scripting path: no confirmation required.
-        assert_eq!(validate_password("hunter2".into(), None).unwrap(), "hunter2");
+        assert_eq!(
+            validate_password("hunter2".into(), None).unwrap(),
+            "hunter2"
+        );
     }
 
     #[test]

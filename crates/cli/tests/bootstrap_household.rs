@@ -45,9 +45,12 @@ fn bootstrap_creates_the_household_owner_and_a_signable_password() {
     let pool: SqlitePool = block_on(db::connect(&format!("sqlite://{db_path}"))).expect("reopen");
 
     // The household row carries the requested name.
-    let name: String =
-        block_on(sqlx::query_scalar("SELECT name FROM households WHERE id = ?1").bind(&created.household_id).fetch_one(&pool))
-            .expect("household row");
+    let name: String = block_on(
+        sqlx::query_scalar("SELECT name FROM households WHERE id = ?1")
+            .bind(&created.household_id)
+            .fetch_one(&pool),
+    )
+    .expect("household row");
     assert_eq!(name, "Our Home");
 
     // The owner is the household's single, `owner`-role member.
@@ -61,10 +64,16 @@ fn bootstrap_creates_the_household_owner_and_a_signable_password() {
     assert_eq!(user_id, created.owner.user_id);
 
     // ...and their stored hash verifies against the password the operator typed.
-    let hash: String =
-        block_on(sqlx::query_scalar("SELECT password_hash FROM users WHERE email = ?1").bind("owner@example.test").fetch_one(&pool))
-            .expect("user row");
-    assert!(buywise_core::password::verify_password("owner-password", &hash));
+    let hash: String = block_on(
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = ?1")
+            .bind("owner@example.test")
+            .fetch_one(&pool),
+    )
+    .expect("user row");
+    assert!(buywise_core::password::verify_password(
+        "owner-password",
+        &hash
+    ));
     assert!(!buywise_core::password::verify_password("wrong", &hash));
 }
 
@@ -112,10 +121,7 @@ fn bootstrap_refuses_a_database_that_already_has_an_account() {
 
 #[test]
 fn bootstrap_refuses_blank_owner_email_or_display_name() {
-    for (email, display_name) in [
-        (" \t ", "Owner"),
-        ("owner@example.test", " \n "),
-    ] {
+    for (email, display_name) in [(" \t ", "Owner"), ("owner@example.test", " \n ")] {
         let dir = TempDir::new().expect("temp dir");
         let db_path = dir.path().join("buywise.db");
         let db_path = db_path.to_str().unwrap();
@@ -132,8 +138,9 @@ fn bootstrap_refuses_blank_owner_email_or_display_name() {
 
         let pool: SqlitePool = block_on(db::connect(&format!("sqlite://{db_path}")))
             .expect("reopen migrated database");
-        let users: i64 = block_on(sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool))
-            .expect("count users");
+        let users: i64 =
+            block_on(sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool))
+                .expect("count users");
         assert_eq!(users, 0, "no owner account is created");
         let household_count: i64 =
             block_on(sqlx::query_scalar("SELECT COUNT(*) FROM households").fetch_one(&pool))

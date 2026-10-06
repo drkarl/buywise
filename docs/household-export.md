@@ -25,12 +25,9 @@ authenticated and requires the caller to be a member of that household; it
 returns **the same document** as the CLI, as
 `Content-Disposition: attachment; filename="buywise-household-<id>.json"`, so a
 browser saves the file instead of rendering it. `GET /api/household` returns the
-caller's `{ id, name, role }` and the app uses that id. Export is available to
-every member; the sibling **Delete household data** action (issue #136) and the
-member administration below it are restricted to the household `owner`
-(issue #139) — see
-[`docs/data-flows.md`](data-flows.md) §5.1a and
-[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md).
+caller's `{ id, name, role }` and the app uses that id. For export, delete and
+member administration access rules, see
+[`docs/data-flows.md`](data-flows.md) §5.1a.
 
 The document is built by `buywise_core::household_data::export_household`;
 `crates/cli/src/commands/household.rs` and `crates/api/src/household.rs` are thin

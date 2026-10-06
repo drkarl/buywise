@@ -68,7 +68,9 @@ pub enum MembershipError {
     LastOwner(String),
 
     /// A user already exists, so the database is not fresh.
-    #[error("a user already exists in this database; bootstrap-household is only for a fresh database")]
+    #[error(
+        "a user already exists in this database; bootstrap-household is only for a fresh database"
+    )]
     AlreadyBootstrapped,
 
     /// Argon2id hashing failed.
@@ -180,7 +182,8 @@ pub async fn create_user(
         return Err(MembershipError::BlankUserField("display name"));
     }
     validate_new_password(password)?;
-    let hash = hash_password_for_storage(password).map_err(|e| MembershipError::Hash(e.to_string()))?;
+    let hash =
+        hash_password_for_storage(password).map_err(|e| MembershipError::Hash(e.to_string()))?;
 
     let result = sqlx::query(
         "INSERT INTO users (id, email, password_hash, display_name, created_at) \
@@ -288,11 +291,10 @@ pub async fn add_member(
 
     let mut tx = pool.begin().await?;
 
-    let household: Option<String> =
-        sqlx::query_scalar("SELECT id FROM households WHERE id = ?1")
-            .bind(household_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let household: Option<String> = sqlx::query_scalar("SELECT id FROM households WHERE id = ?1")
+        .bind(household_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     if household.is_none() {
         return Err(MembershipError::NoSuchHousehold(household_id.to_string()));
     }
@@ -502,13 +504,12 @@ mod tests {
         assert!(removal.account_deleted);
         assert_eq!(removal.sessions_ended, 1);
 
-        let members: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM household_members WHERE user_id = ?1",
-        )
-        .bind(&member.user_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM household_members WHERE user_id = ?1")
+                .bind(&member.user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(members, 0);
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?1")
             .bind(&member.user_id)
