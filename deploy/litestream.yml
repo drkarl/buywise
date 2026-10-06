@@ -20,3 +20,16 @@ dbs:
         region: auto
         access-key-id: $LITESTREAM_ACCESS_KEY_ID
         secret-access-key: $LITESTREAM_SECRET_ACCESS_KEY
+        # Keep 7 days of snapshots and WAL frames (replica-level setting; default
+        # is 24h). Litestream checks retention hourly (retention-check-interval,
+        # default 1h), prunes anything older than this, and writes a fresh
+        # snapshot each time it runs.
+        #
+        # Recovery window: the replica holds the last 7 days of database history,
+        # so a row deleted on the server can still exist in R2 for up to about
+        # 7 days, and a restore can target any point inside that window. This is
+        # the owner's choice (issue #136) — long enough to notice and recover a
+        # silent corruption or a late-noticed deletion, short enough to bound how
+        # long deleted household data survives in the bucket. Documented in
+        # docs/data-flows.md §2.4; keep the two in step.
+        retention: 168h

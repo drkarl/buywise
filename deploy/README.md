@@ -7,16 +7,18 @@ replicates the SQLite database to Cloudflare R2.
 
 ## Architecture
 
-Two long-running systemd services run side by side, plus a weekly ingest timer
-(and, once you serve the app to phones, the optional Caddy reverse proxy from
-section 7):
+Two long-running systemd services run side by side, plus an optional weekly
+ingest timer (disabled by default) and, once you serve the app to phones, the
+optional Caddy reverse proxy from section 7:
 
 - `buywise.service` — runs `/usr/local/bin/buywise-api` as the `buywise` user.
 - `litestream.service` — runs `/usr/local/bin/litestream replicate` against the
   same SQLite database, replicating to Cloudflare R2.
-- `buywise-ingest.timer` → `buywise-ingest.service` — a weekly oneshot that runs
-  the price-ingest adapters (`buywise-cli ingest-basketwatch` + `ingest-lidl`)
-  to refresh offer data. See "Weekly price ingest" below.
+- `buywise-ingest.timer` → `buywise-ingest.service` — **optional** weekly oneshot
+  that runs the price-ingest adapters (`buywise-cli ingest-basketwatch` +
+  `ingest-lidl`) to refresh offer data. `setup.sh` installs it **without enabling
+  it**; the first deploy runs without price ingest. See "Weekly price ingest"
+  below for when and how to turn it on.
 
 | Item | Value |
 | --- | --- |
@@ -50,13 +52,16 @@ All variables live in `/etc/buywise/buywise.env`, loaded by both services.
 The variable names are referenced by `deploy/litestream.yml`. The default values
 above are the in-code defaults read by `crates/api/src/main.rs`.
 
-**Weekly ingest (`buywise-ingest.service`):**
+**Weekly ingest (`buywise-ingest.service`; optional — installed but not enabled):**
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `BASKETWATCH_API_KEY` | **yes** | — | BasketWatch API key. The `ingest-basketwatch` run is the primary, non-best-effort source: without this key it fails (`MissingApiKey`) and reds the whole weekly unit. Set it before the first weekly fire. |
+| `BASKETWATCH_API_KEY` | **yes, to run it** | — | BasketWatch API key. The `ingest-basketwatch` run is the primary, non-best-effort source: without this key it fails (`MissingApiKey`) and reds the whole weekly unit. Set it before you enable the timer, not before the first deploy. |
 | `BASKETWATCH_API_HOST` | no | `basketwatch.p.rapidapi.com` | BasketWatch API host. Only set to override the default RapidAPI host. |
-| `LIDL_FEED_URL` | no | — | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. |
+| `LIDL_FEED_URL` | no | — | Source URL for the Lidl direct ingest adapter. If unset, the Lidl half of the weekly ingest is best-effort and is skipped without failing the timer; BasketWatch always runs. There is no default and no verified Lidl feed yet. |
+
+Leave all three unset while the ingest stays disabled; see "Weekly price ingest"
+below for when to enable it.
 
 **LLM resolution fallback (`buywise-api`; optional, default off):**
 
@@ -66,6 +71,12 @@ without any of these set — an unresolved term simply stays `unresolved`. When
 `LLM_FALLBACK_ENABLED=true`, both `LLM_API_KEY` and `LLM_MODEL` are required for
 a request to be made; if either is missing the fallback silently stays disabled
 (no startup error). Every provider is assumed OpenAI-chat-completions-compatible.
+If it is ever turned on, the raw list term and the household's canonical item
+names (and, for candidate ranking, the item description and candidate product
+labels) leave the server for the configured endpoint — the full inventory of
+what does and does not leave is in
+[`docs/data-flows.md`](../docs/data-flows.md) §2.6. Keep it off unless you have
+chosen to accept that flow.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
@@ -114,11 +125,20 @@ The binary lands at `target/aarch64-unknown-linux-gnu/release/buywise-api`.
 ### Frontend (SvelteKit PWA)
 
 The API serves the SvelteKit static build from `frontend/build/` via
-`tower-http`'s `ServeDir`. Until Phase 2 scaffolds the frontend, `GET /` returns
-404 and only the `/api/*` routes are live — that is expected and the API still
-deploys and runs. Once the frontend exists, build it (`npm run build` in
-`frontend/`) and ship `frontend/build/` to the server's working directory
-(`/var/lib/buywise/frontend/build`).
+`tower-http`'s `ServeDir`. Build it on your build machine and ship it to the
+server's working directory (`/var/lib/buywise/frontend/build`) **before** the
+`buywise` service starts: without it, `GET /` and every non-`/api` path returns
+404 (only the `/api/*` routes are live) and the PWA cannot be installed.
+
+```bash
+cd frontend
+npm ci
+npm run build        # emits the static SPA (PWA manifest + service worker) into frontend/build
+```
+
+Build output must include `200.html` (the SPA shell), `manifest.webmanifest` and
+`sw.js`; `deploy/smoke.sh` checks the manifest and service worker are served (see
+section 6). Copy the whole directory to the server in section 2.
 
 ## 2. Copy binaries to the server
 
@@ -133,6 +153,20 @@ scp target/aarch64-unknown-linux-gnu/release/buywise-cli root@<server>:/usr/loca
 > `cargo build --release --target aarch64-unknown-linux-gnu -p buywise-cli`
 > (native on the CAX11: `cargo build --release -p buywise-cli`). The binary
 > lands at `target/aarch64-unknown-linux-gnu/release/buywise-cli`.
+
+Copy the built frontend (section 1) to the server's working directory. It must
+land at `/var/lib/buywise/frontend/build`, and the `buywise` service user must be
+able to read it:
+
+```bash
+tar -C frontend -czf - build \
+  | ssh root@<server> 'mkdir -p /var/lib/buywise/frontend && \
+      tar -C /var/lib/buywise/frontend -xzf - && \
+      chown -R buywise:buywise /var/lib/buywise/frontend'
+```
+
+Re-run this copy after every frontend rebuild; the API serves whatever is on disk
+at the moment of the request, so a new build needs no restart.
 
 Install Litestream on the server (ARM64 release). On the server:
 
@@ -166,46 +200,93 @@ sudo ./setup.sh
 - creates the `buywise` no-login system user (if missing);
 - creates `/var/lib/buywise/` owned by `buywise`;
 - creates `/etc/buywise/` and a `buywise.env` template (mode 600) if absent;
-- installs the systemd units to `/etc/systemd/system/` (including
-  `buywise-ingest.service` and `buywise-ingest.timer`);
+- installs the systemd units to `/etc/systemd/system/`, **including** the
+  optional `buywise-ingest.service` and `buywise-ingest.timer` — installed but
+  deliberately **not** enabled (see "Weekly price ingest");
 - installs `litestream.yml` to `/etc/litestream.yml`;
 - runs `systemctl daemon-reload`;
-- *enables* (but does not start) `buywise-ingest.timer` — the weekly ingest
-  timer only; it is started in step 5 after the env file is set, because its
-  `Persistent=true` would otherwise fire a catch-up run immediately (the Monday
-  03:00 point has already elapsed) and red the ingest with `MissingApiKey`
-  before you configure `BASKETWATCH_API_KEY`. The long-running `buywise`/
-  `litestream` units are likewise left for you to enable once the binaries are
-  in place;
+- enables **nothing**: `buywise`, `litestream` and the weekly ingest timer are all
+  left for you to enable once the binaries and the env file are in place. The
+  ingest timer in particular stays disabled until you turn it on on purpose — it
+  is `Persistent=true`, so an enabled timer left unconfigured fires a catch-up
+  run at the next boot and reds the ingest with `MissingApiKey`;
 - installs the Caddy HTTPS reverse proxy, enables `caddy.service`, and restarts
   it to load the config **only** once you have set the hostname in
   `deploy/Caddyfile` and installed Caddy — an opt-in step that never enables the
   proxy with the placeholder still in place (see section 7);
 - prints the next-step commands.
 
-## 4. Set environment variables and the R2 endpoint
+## 4. Set environment variables, and create the R2 bucket and token
 
-Edit `/etc/buywise/buywise.env` and fill in the values (see the table above).
-Then edit `/etc/litestream.yml` and replace `<ACCOUNT_ID>` in the endpoint with
-your Cloudflare account id (Cloudflare dashboard → R2). The bucket
-(`buywise-backup`) must already exist in R2.
+### 4.1 BuyWise environment
+
+Edit `/etc/buywise/buywise.env` and fill in the values (see the table above):
+
+- `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` — the R2 token from
+  §4.2. Backups cannot start without them.
+- `DATABASE_URL` — set it to
+  `sqlite:///var/lib/buywise/buywise.db` to make the Litestream-replicated path
+  explicit.
+- Leave the ingest variables (`BASKETWATCH_API_KEY`, `LIDL_FEED_URL`) unset for
+  now: the first deploy runs without the price ingest (see "Weekly price
+  ingest").
+- Leave the LLM variables unset: the external AI fallback is off by default and
+  stays off for the first deploy.
+
+### 4.2 Cloudflare R2 bucket and scoped token
+
+Backups replicate to a single R2 bucket reached with a token scoped to **only**
+that bucket (the owner's decision, issue #136 — not an account-wide token).
+
+1. **Create the bucket.** Cloudflare dashboard → **R2 object storage** →
+   **Create bucket**, named `buywise-backup`. Leave the default location
+   unless you need a jurisdiction (a jurisdictional bucket needs the matching
+   endpoint, e.g. `https://<ACCOUNT_ID>.eu.r2.cloudflarestorage.com`).
+2. **Create a scoped token.** R2 object storage → **Account Details** →
+   **Manage** next to **API Tokens** → **Create Account API token** (a User API
+   token works too; it is tied to your user). Then:
+   - **Permissions:** `Object Read & Write` — the only thing Litestream needs
+     (it reads, writes and lists objects; it never manages buckets). Do **not**
+     pick `Admin Read & Write`: that would also let the token create and delete
+     buckets.
+   - **Scope:** with `Object Read & Write` selected, apply the token to
+     **specific buckets only** and select `buywise-backup`. This is the only way
+     to keep it off your other buckets.
+3. **Copy the credentials** into `/etc/buywise/buywise.env`
+   (`LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY`). The Secret
+   Access Key is shown once — the dashboard will not show it again.
+4. **Confirm the scope in the dashboard** before trusting it: open the token
+   under **Manage API Tokens** and check it lists `buywise-backup` (not
+   "All buckets") and shows a read-and-write object permission only. If it says
+   all buckets, delete it and create a scoped one.
+5. **Point Litestream at your account.** Edit `/etc/litestream.yml` and replace
+   `<ACCOUNT_ID>` in the `endpoint` with your Cloudflare account id
+   (dashboard → **R2**; the id is also in the endpoint URL Cloudflare shows for
+   the bucket). The bucket must exist before `litestream` starts.
+
+> R2 scopes a token to whole buckets, not prefixes, so this token can read and
+> write every object under `buywise-backup`. That is the narrowest R2 offers and
+> is what the owner chose; the runbook's restore rehearsal below checks it.
 
 ## 5. Enable and start the services
 
-Do this only **after** the env file (step 4) is set — the weekly ingest needs
-`BASKETWATCH_API_KEY` before it first runs.
+Do this only **after** the env file and R2 token (§4) are set.
 
 ```bash
 sudo systemctl enable --now buywise litestream
-
-# `setup.sh` already *enabled* buywise-ingest.timer (persisted for the next
-# boot) but deliberately did not start it. Start it now that the env file holds
-# BASKETWATCH_API_KEY, so a Persistent=true catch-up run can't red the ingest
-# with MissingApiKey before configuration:
-sudo systemctl start buywise-ingest.timer
 ```
 
-## 6. Create the first household and owner (one-time)
+Leave the weekly ingest timer **disabled** for now: the first deploy runs
+without the price ingest, so do not enable or start `buywise-ingest.timer`.
+"Weekly price ingest" below documents when and how to turn it on (after the
+live-savings validation, issue #109), what it needs, and how to check it
+produced offers.
+
+Then run the first-deploy steps in section 6.
+
+## 6. First deploy: create the household and verify the deploy
+
+### 6.1 Create the first household and owner (one-time)
 
 The app has no self-registration, so the first household and its owner are
 created with a one-time command. Run it once, before anyone signs in:
@@ -225,11 +306,52 @@ owner shares out of band). The command refuses to run once the database has any
 account, so it cannot be used to add a second household. See
 [`docs/data-flows.md`](../docs/data-flows.md) §5.1.
 
-## 7. Smoke test (matches acceptance criteria)
+> **First-deploy order.** Start the services (§5) → bootstrap the household and
+> owner here → verify (§6.2) → optionally serve over HTTPS (§7). The weekly price
+> ingest comes **later**: leave `buywise-ingest.timer` disabled until the
+> live-savings validation (issue #109) has confirmed supplier access, terms and
+> cost (see "Weekly price ingest"). The external AI fallback also stays off — its
+> default — for the first deploy; if it is ever turned on, the raw list term and
+> the household's canonical item names leave the server (see
+> `docs/data-flows.md` §2.6).
+
+### 6.2 Smoke test (matches acceptance criteria)
 
 > These checks exercise the loopback HTTP listener directly. To serve the app to
 > phones over `https://<hostname>`, complete section 7 (HTTPS reverse proxy) and
 > run its verification block.
+
+**One-command check:** `deploy/smoke.sh` runs everything below that can be
+automated and exits non-zero with a clear message on the first failure. It checks
+the health endpoint, the PWA manifest and service worker, and — when the
+credentials below are set — an authenticated list read and a short SSE
+connection. It never prints credentials.
+
+```bash
+# Anonymous checks only (health, manifest, service worker):
+deploy/smoke.sh http://127.0.0.1:3000
+
+# Or with an account, to also exercise auth and the live-sync stream:
+BUYWISE_SMOKE_EMAIL=owner@example.com \
+BUYWISE_SMOKE_PASSWORD='<the owner password>' \
+  deploy/smoke.sh http://127.0.0.1:3000
+```
+
+Expected ending:
+
+```
+ok: API health reports ok
+ok: PWA manifest served
+ok: service worker served
+ok: logged in
+ok: authenticated list read succeeded
+ok: SSE stream delivered a frame
+SMOKE TEST PASSED
+```
+
+With no credentials it stops after the asset checks and prints `SMOKE TEST
+PASSED` too. `deploy/smoke.sh --help` lists the environment variables (including
+`BUYWISE_SMOKE_LIST_ID` to target a list and `BUYWISE_SMOKE_SSE_TIMEOUT`).
 
 **Service is active:**
 
@@ -280,6 +402,10 @@ sqlite3 /tmp/verify.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_mast
 sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
 sudo rm -f /tmp/verify.db  # written by root
 ```
+
+> This proves replication on the spot. The formal, required restore rehearsal —
+> with a place to record the timestamp, Litestream version, token scope check,
+> retention and outcome — is in "Disaster recovery → Restore rehearsal".
 
 ## 7. HTTPS reverse proxy (Caddy)
 
@@ -477,16 +603,79 @@ Once this passes, open `https://<hostname>/` on each phone and install the PWA.
 Serving the app over HTTPS satisfies the PWA's secure-context requirement, so
 offline mode and live sync work on both phones.
 
-## Weekly price ingest
+**5. Run the smoke script against the proxy.** `deploy/smoke.sh` re-checks all of
+the above through Caddy, including that it does not buffer the SSE stream:
 
-Price data is refreshed weekly by a oneshot systemd unit driven by a timer:
+```bash
+BUYWISE_SMOKE_EMAIL=owner@example.com \
+BUYWISE_SMOKE_PASSWORD='<the owner password>' \
+  deploy/smoke.sh https://<hostname>
+```
+
+It exits non-zero with a clear message on the first failure; the expected ending
+is in section 6.2.
+
+## Weekly price ingest (optional; the timer is disabled by default)
+
+Price comparison needs retailer offers, refreshed weekly by a oneshot systemd
+unit driven by a timer — but **the first deploy runs without it**. `setup.sh`
+installs the units and deliberately leaves the timer disabled (section 3), and
+the first-deploy order (section 6) keeps it that way. Enable it only after the
+live-savings validation (issue #109) has confirmed supplier access, terms and
+cost.
+
+**What it needs before you enable it:**
+
+- **An account and an API key.** `BASKETWATCH_API_KEY` is required: the
+  BasketWatch run is the primary source and fails with `MissingApiKey` without
+  it, which reds the whole unit. Set it in `/etc/buywise/buywise.env` (set
+  `BASKETWATCH_API_HOST` only to use a different RapidAPI host).
+- **Supplier terms checked against issue #109** — current access, coverage,
+  refresh cadence, permitted private use and actual cost. The old $9.99/month
+  RapidAPI figure is not current fact.
+- **Which retailers it supplies.** The BasketWatch adapter requests Tesco,
+  Dunnes, SuperValu and Aldi; it is not full coverage.
+- **A Lidl feed, if you have one.** `LIDL_FEED_URL` has no default and there is
+  no verified Lidl feed, so there is nothing to set until you have one whose
+  terms you can rely on. The Lidl step is best-effort (its `ExecStart` is
+  prefixed with `-`), so leaving it unset just skips Lidl and never fails the
+  unit.
+- **Household `product_matches`.** Ingested offers alone do not produce a price
+  comparison: the optimiser prices only items that have `product_matches` rows
+  (see the note under the environment tables). Seed them with
+  `buywise-cli seed-matches` or accept proposals in the app.
+
+**Enable it** (only once `BASKETWATCH_API_KEY` is set):
+
+```bash
+sudo systemctl enable --now buywise-ingest.timer
+```
+
+The `--now` after the scheduled Monday 03:00 point has elapsed fires a
+`Persistent=true` catch-up run straight away — which is exactly why the key must
+be in place first.
+
+**Check the ingest produced offers** — a green unit only says the run exited 0:
+
+```bash
+sqlite3 /var/lib/buywise/buywise.db \
+  "SELECT rp.source, count(*) FROM product_offers po \
+     JOIN retailer_products rp ON rp.id = po.retailer_product_id GROUP BY rp.source;"
+sqlite3 /var/lib/buywise/buywise.db \
+  "SELECT source, status, finished_at FROM source_runs ORDER BY started_at DESC LIMIT 5;"
+```
+
+The first query must gain rows and the latest `source_runs` row must be `success`.
+Empty offers or a `failed` run means it ran but is not delivering prices.
+
+**How it runs:**
 
 - `buywise-ingest.service` (`Type=oneshot`) runs the ingest adapters as the
   `buywise` user with `/etc/buywise/buywise.env` loaded (so it picks up
   `BASKETWATCH_API_KEY` and `LIDL_FEED_URL`). It runs, in order:
   - `buywise-cli ingest-basketwatch --db /var/lib/buywise/buywise.db` — the
     **primary** source. It **requires `BASKETWATCH_API_KEY`** (see the env
-    table above); without it the run fails. If it fails, the unit fails (visible
+    table above); without it the run fails, and the unit fails with it (visible
     in `systemctl status` / the journal).
   - `buywise-cli ingest-lidl --db /var/lib/buywise/buywise.db` — **best-effort**
     (its `ExecStart` is prefixed with `-`). If `LIDL_FEED_URL` is unset or the
@@ -573,10 +762,11 @@ sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; litestream restore -co
 # 4. The restore ran as root, so hand the DB back to the buywise user.
 sudo chown buywise:buywise /var/lib/buywise/buywise.db
 
-# 5. Re-enable and start the services, in order, only AFTER the restore is done.
-#    Re-enable the ingest *timer* (not the oneshot service); it resumes its
-#    weekly schedule.
-sudo systemctl enable --now buywise litestream buywise-ingest.timer
+# 5. Re-enable and start the units that were enabled before, only AFTER the
+#    restore is done: `buywise` and `litestream` always; the weekly ingest timer
+#    only if you had deliberately enabled it (it is disabled by default).
+sudo systemctl enable --now buywise litestream
+# sudo systemctl enable --now buywise-ingest.timer   # only if it was enabled before
 ```
 
 > Do not run `litestream restore` while `buywise` or the ingest timer is enabled
@@ -585,3 +775,50 @@ sudo systemctl enable --now buywise litestream buywise-ingest.timer
 > restore from an already-running app, and nothing orders the weekly ingest
 > against a restore. Disabling buywise and `buywise-ingest.timer` (step 1) is
 > what guards the restore.
+
+### Restore rehearsal (required)
+
+A documented disaster-recovery procedure that has never been rehearsed is not a
+recovery plan. Run this **non-destructive** drill once before the deploy is
+considered done, and again after any credential rotation or retention change. It
+restores the replica into a scratch file and never touches the live database, so
+it is safe while the services run.
+
+```bash
+# 1. Record what you are rehearsing with.
+litestream version
+grep -E 'retention|bucket|endpoint' /etc/litestream.yml
+
+# 2. Restore the latest R2 replica into a scratch path (does NOT touch the live
+#    DB). Run as root with the env file loaded so litestream sees the R2
+#    credentials (see the note in section 6.2).
+sudo bash -c 'set -a; . /etc/buywise/buywise.env; set +a; \
+  litestream restore -o /tmp/rehearsal.db -config /etc/litestream.yml /var/lib/buywise/buywise.db'
+
+# 3. The restored copy must open, pass integrity_check, and hold the live rows.
+sqlite3 /tmp/rehearsal.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;'
+sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
+
+# 4. Clean up (the file was written by root).
+sudo rm -f /tmp/rehearsal.db
+```
+
+Step 1's `retention` output must be `168h` and the endpoint must be the R2
+account endpoint. In the Cloudflare dashboard, confirm the token under **Manage
+API Tokens** is scoped to `buywise-backup` only (see §4.2). If the token is
+account-wide, stop and recreate it before recording the result.
+
+Record the outcome (a copy of this table belongs in the deploy log/issue):
+
+| Field | Value |
+| --- | --- |
+| Rehearsal timestamp (UTC) | |
+| Litestream version | |
+| Token scope check (bucket-scoped? dashboard confirmed) | |
+| Retention in `/etc/litestream.yml` | |
+| Outcome (integrity_check, row-count match, restore time) | |
+| Operator | |
+
+Tracking: this rehearsal, the scoped token and the explicit retention are the
+backup-hardening items of [issue #136](https://github.com/drkarl/buywise/issues/136);
+record the result there (or in the deploy issue) so it is not only on the server.

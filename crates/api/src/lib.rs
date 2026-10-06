@@ -5,7 +5,9 @@
 //! `/api/items`, the offline-sync mutation endpoint (P1-T4) at `/api/mutations`,
 //! the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`, the basket
 //! optimiser (P4-T1) at `/api/optimise`, and the household product-preference
-//! screen (issue #102) at `/api/items/{id}/preferences`. The shared
+//! screen (issue #102) at `/api/items/{id}/preferences`. The unauthenticated
+//! readiness probe (issue #141) is `GET /api/health`, registered outside
+//! authentication and CSRF. The shared
 //! [`AppState`] carries the SQLite pool that handlers and the
 //! [`middleware::AuthenticatedUser`] extractor read from, plus the per-list SSE
 //! broadcast registry.
@@ -33,6 +35,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub const FRONTEND_BUILD_DIR: &str = "frontend/build";
 
 pub mod auth;
+pub mod health;
 pub mod household;
 pub mod lists;
 pub mod llm;
@@ -117,6 +120,10 @@ pub fn api_router(state: AppState) -> Router {
     auth::warm_dummy_hash();
     Router::new()
         .nest("/api/auth", auth::router())
+        // `health::router` carries the absolute `/api/health` path: the
+        // unauthenticated readiness probe (issue #141), deliberately outside the
+        // auth/CSRF extractor.
+        .merge(health::router())
         // `lists::router` already carries absolute `/api/...` paths (the list
         // endpoints span two path shapes — `/api/lists` and `/api/list/:id` —
         // so they are merged rather than nested under one prefix).
