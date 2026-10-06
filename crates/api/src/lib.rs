@@ -33,6 +33,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub const FRONTEND_BUILD_DIR: &str = "frontend/build";
 
 pub mod auth;
+pub mod household;
 pub mod lists;
 pub mod llm;
 pub mod match_feedback;
@@ -142,6 +143,9 @@ pub fn api_router(state: AppState) -> Router {
         // `suggestions::router` carries `/api/list/{id}/suggestions`: the
         // purchase-history "Suggested" section (issue #106).
         .merge(suggestions::router())
+        // `household::router` carries `/api/household[...]`: the member-facing
+        // export download and guarded delete (issue #136).
+        .merge(household::router())
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,
