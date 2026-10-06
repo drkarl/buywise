@@ -397,14 +397,10 @@ Issue #117, roadmap #114. The status model, accepted rules and the three decisio
 
 ### 1. Nothing is verified yet — there is no line-level reconciliation
 
-**What happens.** `GET /api/savings/summary` has a `saved` aggregate that counts only `verified`
-events, and no production path writes `verified` (it needs the purchase ledger of #116). So the
-dashboard's verified headline reads €0.00 with an empty state, and each event is labelled
-`estimated` (a like-for-like opportunity estimate) or `unreconciled` (the plans price different
-lines, so no saving is claimed), or `unchecked` (historical comparability was never checked).
-A manual whole-basket actual spend is labelled
-`legacy_total_only` and shown separately as a basket variance. Buying fewer items therefore never
-appears as saved money.
+**What happens.** `GET /api/savings/summary` counts only `verified` events as saved, and no
+production path writes `verified` yet (it needs the purchase ledger of #116). The dashboard's
+verified headline therefore reads €0.00 with an empty state. See [`docs/design.md`](design.md) §10
+for the authoritative status meanings and display rules.
 
 **Coverage history.** Posting an actual spend replaces the row's earlier status, so an
 `unreconciled` or `unchecked` row becomes `legacy_total_only`. Migration 016 also labels every
@@ -415,9 +411,8 @@ coverage. Retaining revisions of the earlier status belongs to the later event-s
 automatic line reconciliation is explicitly deferred until the purchase-ledger experiment
 supports it.
 
-**Workaround.** Read each event's status and coverage label: an `estimated` row is a theoretical
-opportunity, an `unchecked` row has unknown comparability, and a `legacy_total_only` row is a
-total-only basket difference — none is a realised saving.
+**Workaround.** Use each event's status and coverage label as described in [`docs/design.md`](design.md)
+§10; only `verified` events represent saved money.
 
 **Follow-up.** #116/#117: reconcile planned versus purchased quantities/products (extra, skipped,
 substituted, unmatched lines) to produce `verified` events.

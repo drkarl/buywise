@@ -14,7 +14,7 @@ Built for two adults and two children. Not a public product.
 - Per-item product rules, preferred sizes, substitutions, and suggested retailer product matches
 - Purchase suggestions based on check-off history; each must be confirmed before it is added to a list
 - Offline-first PWA: the shopping list works without connectivity in-store, with sync status and pending items shown until the server confirms them
-- Savings ledger: tracks what was actually saved over time
+- Savings ledger: separates opportunity estimates and total-only basket variances from verified savings
 
 ## Stack
 
