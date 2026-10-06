@@ -274,40 +274,63 @@ encrypted-at-rest in §6 matters) or only held transiently during processing.
 ### 5.1 The commands
 
 ```
+buywise-cli bootstrap-household --db /var/lib/buywise/buywise.db --name "<household>" --email <owner@example.com>
 buywise-cli export-household --db /var/lib/buywise/buywise.db --household-id <uuid> [--out household.json]
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --dry-run
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --confirm
 ```
 
+`bootstrap-household` (issue #139) creates the very first household and its owner
+on a fresh database: it creates and migrates the database file, prompts for the
+owner's password without echoing it, and writes the household, the owner's
+account and an `owner` membership in one transaction. It refuses once any account
+exists, so it is a one-time command; the owner adds everyone else from the app
+(§5.1a). See `deploy/README.md` for the deployment step.
+
 `export-household` is read-only and writes the documented JSON layout in
 [`docs/household-export.md`](household-export.md). `delete-household` refuses to
 run without `--confirm`, and `--dry-run` executes the real statements inside a
 transaction and rolls it back, printing exactly what a run would remove. Neither
-command runs migrations or creates a missing database file.
+export nor delete runs migrations or creates a missing database file.
 
 ### 5.1a The member-facing controls
 
 A household member does not need an operator (issue #136): the settings screen
-(**Your data**) offers a **Download export** button and a **Delete household
-data** action, backed by the API and the same shared implementation
-(`buywise_core::household_data`) the CLI calls, so the two cannot drift.
+(**Your data**) offers a **Download export** button and, to owners, a **Delete
+household data** action, backed by the API and the same shared implementations
+(`buywise_core::household_data` and `buywise_core::members`) the CLI calls, so
+the two cannot drift. Owners also get **Settings → Household members** to add and
+remove members (issue #139).
 
-| Request | Purpose |
-| --- | --- |
-| `GET /api/household` | the caller's household `{ id, name }` |
-| `GET /api/household/{household_id}/export` | download the document above as an attachment |
-| `POST /api/household/{household_id}/delete` | guarded delete, then end the session |
+| Request | Who | Purpose |
+| --- | --- | --- |
+| `GET /api/household` | any member | the caller's household `{ id, name, role }` |
+| `GET /api/household/{household_id}/export` | any member | download the document above as an attachment |
+| `POST /api/household/{household_id}/delete` | owner | guarded delete, then end the session |
+| `GET /api/household/{household_id}/members` | owner | list the members with their roles |
+| `POST /api/household/{household_id}/members` | owner | add a member (email, display name, initial password) |
+| `DELETE /api/household/{household_id}/members/{user_id}` | owner | remove a member |
 
 Every endpoint requires a live session and membership of the named household
 (`household_members`): a member of another household is refused with `403`, so
-one household can never read or delete another's data. The delete additionally
-requires the household name typed exactly and the member's own password
-re-entered; either mismatch is `422` and changes nothing. On success the
+one household can never read or delete another's data. `household_members.role`
+(migration 003) is enforced: **export is available to every member**, while the
+member endpoints and the household delete require the `owner` role. The delete
+additionally requires the household name typed exactly and the owner's own
+password re-entered; either mismatch is `422` and changes nothing. On success the
 household's rows are removed by the same dependency-ordered transaction as the
 CLI, the caller's session row is deleted and the `session` / `csrf` cookies are
-cleared, so the client returns to the sign-in page. There is no owner/admin
-concept in the code, so any member may export and delete — see
-[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) ("Household data controls").
+cleared, so the client returns to the sign-in page.
+
+Adding a member takes an email, a display name and an initial password the owner
+shares out of band — it is never emailed and the server never returns it; a
+duplicate email is `409`. Removing a member ends their sessions immediately (their
+next request is `401`), removes their membership, and deletes their account only
+if they belong to no other household; removing the household's last owner is
+`409`. The very first household and owner are created on a fresh database by
+`bootstrap-household` (§5.1). See
+[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) ("Household member
+management").
 
 ### 5.2 What deletion removes
 
@@ -418,6 +441,7 @@ share of them) should also be purged on deletion.
 ## 8. Known gaps and follow-ups
 
 Recorded in [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) under "Household
-data controls": deletion not being restricted to a household owner, receipt
-ingestion and its external-processing gate being policy-only, deletion not
-reaching backups immediately, and no receipt-image path to delete yet.
+data controls" and "Household member management": receipt ingestion and its
+external-processing gate being policy-only, deletion not reaching backups
+immediately, no receipt-image path to delete yet, member roles not being
+changeable (no promote/demote), and no self-registration or invite flow.

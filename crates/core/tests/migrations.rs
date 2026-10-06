@@ -741,3 +741,109 @@ async fn migration_015_marks_fresh_categories_only() {
         .unwrap();
     assert_eq!(custom, 0, "a new category is packaged by default");
 }
+
+/// Migration 017 promotes the earliest-joined member of every existing household
+/// that has no owner (issue #139). Households created before the change stored
+/// only `member` roles, so without this they would have no one able to add or
+/// remove members, or delete the household.
+///
+/// The migration is pure SQL, so the test inserts ownerless households into an
+/// already-migrated database and re-runs the migration file's statement against
+/// them: that exercises the real selection logic, including the `joined_at`
+/// tie-break, without needing a partially-migrated database.
+#[tokio::test]
+async fn migration_017_promotes_the_earliest_member_of_ownerless_households() {
+    let pool = migrated_pool().await;
+    let migration_sql = include_str!("../../../migrations/017_household_owner_role.sql");
+
+    // A well-defined "earliest" (distinct join times).
+    seed_household_member(&pool, "hh-ownerless", "u-late", "late@example.test", "2025-02-01T00:00:00Z").await;
+    seed_household_member(&pool, "hh-ownerless", "u-early", "early@example.test", "2025-01-01T00:00:00Z").await;
+    // A same-timestamp tie, resolved deterministically by user_id.
+    seed_household_member(&pool, "hh-tie", "u-z", "z@example.test", "2025-01-01T00:00:00Z").await;
+    seed_household_member(&pool, "hh-tie", "u-a", "a@example.test", "2025-01-01T00:00:00Z").await;
+    // A single member (a household with one person).
+    seed_household_member(&pool, "hh-single", "u-solo", "solo@example.test", "2025-03-01T00:00:00Z").await;
+    // A household that already has an owner must be left alone.
+    seed_household_member_with_role(&pool, "hh-has-owner", "u-owner", "owner@example.test", "owner", "2025-01-01T00:00:00Z").await;
+    seed_household_member_with_role(&pool, "hh-has-owner", "u-plain", "plain@example.test", "member", "2025-02-01T00:00:00Z").await;
+
+    sqlx::query(migration_sql).execute(&pool).await.expect("run 017");
+
+    assert_role(&pool, "hh-ownerless", "u-early", "owner").await;
+    assert_role(&pool, "hh-ownerless", "u-late", "member").await;
+    assert_role(&pool, "hh-tie", "u-a", "owner").await;
+    assert_role(&pool, "hh-tie", "u-z", "member").await;
+    assert_role(&pool, "hh-single", "u-solo", "owner").await;
+    assert_role(&pool, "hh-has-owner", "u-owner", "owner").await;
+    assert_role(&pool, "hh-has-owner", "u-plain", "member").await;
+
+    // Exactly one owner per household that needed one.
+    let owners: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM household_members WHERE role = 'owner' AND household_id IN ('hh-ownerless', 'hh-tie', 'hh-single')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, 3, "one owner per ownerless household");
+}
+
+/// Insert one household member with the given role and join time.
+async fn seed_household_member_with_role(
+    pool: &SqlitePool,
+    household_id: &str,
+    user_id: &str,
+    email: &str,
+    role: &str,
+    joined_at: &str,
+) {
+    sqlx::query("INSERT OR IGNORE INTO households (id, name, created_at) VALUES (?1, ?1, 't')")
+        .bind(household_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, display_name, created_at) \
+         VALUES (?1, ?2, 'argon2id$dummy', ?1, 't')",
+    )
+    .bind(user_id)
+    .bind(email)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO household_members (household_id, user_id, role, joined_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(household_id)
+    .bind(user_id)
+    .bind(role)
+    .bind(joined_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Insert one plain `member` with the given join time.
+async fn seed_household_member(
+    pool: &SqlitePool,
+    household_id: &str,
+    user_id: &str,
+    email: &str,
+    joined_at: &str,
+) {
+    seed_household_member_with_role(pool, household_id, user_id, email, "member", joined_at).await;
+}
+
+/// Assert a membership's stored role.
+async fn assert_role(pool: &SqlitePool, household_id: &str, user_id: &str, expected: &str) {
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM household_members WHERE household_id = ?1 AND user_id = ?2",
+    )
+    .bind(household_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(role, expected, "{household_id}/{user_id}");
+}

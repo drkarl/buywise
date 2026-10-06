@@ -205,7 +205,27 @@ sudo systemctl enable --now buywise litestream
 sudo systemctl start buywise-ingest.timer
 ```
 
-## 6. Smoke test (matches acceptance criteria)
+## 6. Create the first household and owner (one-time)
+
+The app has no self-registration, so the first household and its owner are
+created with a one-time command. Run it once, before anyone signs in:
+
+```bash
+sudo -u buywise buywise-cli bootstrap-household \
+  --db /var/lib/buywise/buywise.db \
+  --name "Our Household" \
+  --email owner@example.com
+```
+
+It creates and migrates the database file if it is missing, and prompts for the
+owner's password (hidden; entered twice on a terminal). Keep that password and
+sign in as that email; the owner then adds the rest of the household from
+**Settings → Household members** (each new member gets an initial password the
+owner shares out of band). The command refuses to run once the database has any
+account, so it cannot be used to add a second household. See
+[`docs/data-flows.md`](../docs/data-flows.md) §5.1.
+
+## 7. Smoke test (matches acceptance criteria)
 
 > These checks exercise the loopback HTTP listener directly. To serve the app to
 > phones over `https://<hostname>`, complete section 7 (HTTPS reverse proxy) and

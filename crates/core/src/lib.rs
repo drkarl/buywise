@@ -3,6 +3,7 @@ pub mod db;
 pub mod domain;
 pub mod household_data;
 pub mod matching;
+pub mod members;
 pub mod normalise;
 pub mod optimiser;
 pub mod password;

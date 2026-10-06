@@ -6,10 +6,36 @@
 //! `api ↔ cli` dependency. `buywise_api::auth` re-exports
 //! [`hash_password_for_storage`] so the API's call sites keep their existing
 //! path.
+//!
+//! [`validate_new_password`] holds the one password policy (the `set-password`
+//! rule: a non-empty password) so the CLI tools and the member-creation API
+//! cannot drift.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use rand::rngs::OsRng;
+
+/// Why a proposed password was refused by [`validate_new_password`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PasswordPolicyError {
+    /// The password was empty. Mirrors the `set-password` rule (issue #51):
+    /// there is no other minimum, deliberately, so a household can pick any
+    /// password it can share out of band.
+    #[error("password must not be empty")]
+    Empty,
+}
+
+/// The one password policy for a *new* password, shared by `set-password`,
+/// `bootstrap-household` and the API's add-member path.
+///
+/// This is exactly the `set-password` rule — a non-empty password — extracted so
+/// the three call sites cannot drift rather than a new, stricter policy.
+pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> {
+    if password.is_empty() {
+        return Err(PasswordPolicyError::Empty);
+    }
+    Ok(())
+}
 
 /// Hash a plaintext password with argon2id, producing a PHC string suitable for
 /// storage in `users.password_hash`.

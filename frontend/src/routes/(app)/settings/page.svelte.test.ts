@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import type { Household, Member } from '$lib/api/household';
 import type { Settings } from '$lib/api/settings';
 
 // Keep the real household API helpers, but replace the browser redirect with a
@@ -13,7 +14,27 @@ import { redirectToSignIn } from '$lib/api/household';
 import Page from './+page.svelte';
 
 /** The household `GET /api/household` reports for these tests. */
-const HOUSEHOLD = { id: 'hh-settings', name: 'Our Household' };
+const HOUSEHOLD: Household = { id: 'hh-settings', name: 'Our Household', role: 'owner' };
+
+/** Two members: an owner and a plain member, as `GET …/members` returns them. */
+function baseMembers(): Member[] {
+	return [
+		{
+			user_id: 'user-owner',
+			email: 'owner@example.test',
+			display_name: 'Olive',
+			role: 'owner',
+			joined_at: '2026-01-01T00:00:00Z'
+		},
+		{
+			user_id: 'user-2',
+			email: 'member@example.test',
+			display_name: 'Robin',
+			role: 'member',
+			joined_at: '2026-02-01T00:00:00Z'
+		}
+	];
+}
 
 /** A stubbed `fetch` (as installed by {@link stubSettings}). */
 type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>;
@@ -55,13 +76,23 @@ function baseSettings(): Settings {
  * Stub global fetch: GET `/api/settings` answers with `settings`; a PATCH echoes
  * its own request body back (the endpoint returns the merged settings, and the
  * patch here carries every field, so echoing is equivalent for these tests).
- * `GET /api/household` answers with {@link HOUSEHOLD}; the household export and
- * delete endpoints answer with `options`, defaulting to success.
+ * `GET /api/household` answers with {@link HOUSEHOLD} (role overridable); the
+ * member endpoints answer from `options`; the household export and delete
+ * endpoints answer with `options`, defaulting to success.
  */
 function stubSettings(
 	settings: Settings,
-	options: { deleteStatus?: number; exportStatus?: number } = {}
+	options: {
+		deleteStatus?: number;
+		exportStatus?: number;
+		role?: Household['role'];
+		members?: Member[];
+		addStatus?: number;
+		removeStatus?: number;
+	} = {}
 ): FetchMock {
+	const role = options.role ?? 'owner';
+	const members = options.members ?? [];
 	const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input.toString();
 		if (url.includes('/api/household')) {
@@ -77,7 +108,40 @@ function stubSettings(
 					status
 				});
 			}
-			return new Response(JSON.stringify(HOUSEHOLD), { status: 200 });
+			if (url.includes('/members/')) {
+				const status = options.removeStatus ?? 200;
+				return new Response(
+					status === 200
+						? JSON.stringify({
+								removed_user_id: 'user-2',
+								sessions_ended: 1,
+								account_deleted: true
+							})
+						: 'refused',
+					{ status }
+				);
+			}
+			if (url.endsWith('/members')) {
+				if (init?.method === 'POST') {
+					const status = options.addStatus ?? 201;
+					if (status !== 201) return new Response('refused', { status });
+					const body = JSON.parse(init.body as string);
+					return new Response(
+						JSON.stringify({
+							user_id: 'user-new',
+							email: body.email,
+							display_name: body.display_name,
+							role: 'member',
+							joined_at: '2026-03-01T00:00:00Z'
+						}),
+						{ status }
+					);
+				}
+				return new Response(JSON.stringify(members), { status: 200 });
+			}
+			return new Response(JSON.stringify({ id: HOUSEHOLD.id, name: HOUSEHOLD.name, role }), {
+				status: 200
+			});
 		}
 		if (!url.includes('/api/settings')) {
 			return new Response('not found', { status: 404 });
@@ -283,5 +347,115 @@ describe('household data controls', () => {
 		render(Page);
 		await fireEvent.click(await screen.findByRole('button', { name: 'Download export' }));
 		expect(await screen.findByText(/Couldn’t download your export/)).toBeTruthy();
+	});
+});
+
+describe('household members', () => {
+	/** Fill the add-member form. */
+	async function fillAddForm(name: string, email: string, password: string) {
+		await fireEvent.input(screen.getByLabelText('Display name'), { target: { value: name } });
+		await fireEvent.input(screen.getByLabelText('Email'), { target: { value: email } });
+		await fireEvent.input(screen.getByLabelText('Initial password'), {
+			target: { value: password }
+		});
+	}
+
+	it('lists the members with their roles for an owner', async () => {
+		stubSettings(baseSettings(), { members: baseMembers() });
+		render(Page);
+
+		expect(await screen.findByRole('heading', { name: 'Household members' })).toBeTruthy();
+		expect(await screen.findByText('Olive')).toBeTruthy();
+		expect(screen.getByText('owner@example.test')).toBeTruthy();
+		expect(screen.getByText('Robin')).toBeTruthy();
+		expect(screen.getByText('Owner')).toBeTruthy();
+		expect(screen.getByText('Member')).toBeTruthy();
+	});
+
+	it('adds a member with the initial password supplied to the server', async () => {
+		const fetchMock = stubSettings(baseSettings(), { members: baseMembers() });
+		render(Page);
+		await screen.findByLabelText('Display name');
+
+		await fillAddForm('Sam', 'sam@example.test', 'temp-password');
+		await fireEvent.click(screen.getByRole('button', { name: 'Add member' }));
+
+		await waitFor(() =>
+			expect(
+				fetchMock.mock.calls.some(
+					([url, init]) => String(url).endsWith('/members') && init?.method === 'POST'
+				)
+			).toBe(true)
+		);
+		const call = fetchMock.mock.calls.find(
+			([url, init]) => String(url).endsWith('/members') && init?.method === 'POST'
+		);
+		expect(JSON.parse(call![1]!.body as string)).toEqual({
+			email: 'sam@example.test',
+			display_name: 'Sam',
+			password: 'temp-password'
+		});
+		expect(new Headers(call![1]!.headers).get('X-CSRF-Token')).toBe('tok-123');
+
+		// The new member appears, the password field is cleared, and the message
+		// tells the owner the password is not shown again.
+		expect(await screen.findByText('Sam')).toBeTruthy();
+		expect((screen.getByLabelText('Initial password') as HTMLInputElement).value).toBe('');
+		expect(await screen.findByText(/Share the password with them directly/)).toBeTruthy();
+	});
+
+	it('shows a clear message when the email is already taken', async () => {
+		stubSettings(baseSettings(), { members: baseMembers(), addStatus: 409 });
+		render(Page);
+		await screen.findByLabelText('Display name');
+
+		await fillAddForm('Sam', 'member@example.test', 'temp-password');
+		await fireEvent.click(screen.getByRole('button', { name: 'Add member' }));
+
+		expect(await screen.findByText(/already exists/)).toBeTruthy();
+	});
+
+	it('confirms before removing a member, stating what happens, and sends no delete until confirmed', async () => {
+		const fetchMock = stubSettings(baseSettings(), { members: baseMembers() });
+		render(Page);
+		await screen.findByText('Robin');
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+
+		expect(await screen.findByText(/signed out immediately/)).toBeTruthy();
+		expect(screen.getByText(/deleted too if they belong to no other household/)).toBeTruthy();
+		expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Confirm remove' }));
+
+		await waitFor(() =>
+			expect(
+				fetchMock.mock.calls.some(
+					([url, init]) => String(url).includes('/members/user-2') && init?.method === 'DELETE'
+				)
+			).toBe(true)
+		);
+		await waitFor(() => expect(screen.queryByText('Robin')).toBeNull());
+	});
+
+	it('withholds the remove control from the last owner', async () => {
+		stubSettings(baseSettings(), { members: [baseMembers()[0]] });
+		render(Page);
+		await screen.findByText('Olive');
+
+		expect(screen.getByText('Last owner')).toBeTruthy();
+		expect(screen.queryByRole('button', { name: 'Remove' })).toBeNull();
+	});
+
+	it('hides the members section and the delete action from a plain member', async () => {
+		stubSettings(baseSettings(), { role: 'member', members: baseMembers() });
+		render(Page);
+		await screen.findByText(/Download everything BuyWise holds/);
+
+		expect(screen.queryByRole('heading', { name: 'Household members' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Delete household data' })).toBeNull();
+		expect(screen.queryByText(/or delete it/)).toBeNull();
+		// Export stays available to every member.
+		expect(screen.getByRole('button', { name: 'Download export' })).toBeTruthy();
 	});
 });

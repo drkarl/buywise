@@ -106,6 +106,31 @@ async fn add_membership(pool: &SqlitePool, household_id: &str, user_id: &str) {
     .expect("insert membership");
 }
 
+/// Insert a user with the test password and a plain `member` membership of
+/// `household_id`, then log them in.
+async fn seed_plain_member(
+    pool: &SqlitePool,
+    household_id: &str,
+    user_id: &str,
+    email: &str,
+) -> Session {
+    let hash = buywise_api::auth::hash_password_for_storage(PASSWORD).expect("hash");
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, display_name, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind(&hash)
+    .bind(user_id)
+    .bind(db::now_iso())
+    .execute(pool)
+    .await
+    .expect("insert user");
+    add_membership(pool, household_id, user_id).await;
+    login(pool, email).await
+}
+
 async fn login(pool: &SqlitePool, email: &str) -> Session {
     let body = json!({ "email": email, "password": PASSWORD }).to_string();
     let resp = app(AppState::new(pool.clone()))
@@ -392,6 +417,35 @@ async fn delete_refuses_a_member_of_another_household() {
     assert_eq!(
         scalar(&pool, "SELECT COUNT(*) FROM households WHERE id = 'hh-a'").await,
         1
+    );
+}
+
+/// A plain (non-owner) member cannot delete the household, even with the exact
+/// name and their correct password: the delete action is owners-only.
+#[tokio::test]
+async fn delete_refuses_a_non_owner_member() {
+    let pool = setup_pool().await;
+    let _a = seed_household(&pool, HH_A, HH_A_NAME, "user-a", "a@example.test").await;
+    let plain = seed_plain_member(&pool, HH_A, "user-plain", "plain@example.test").await;
+
+    let resp = delete(
+        &pool,
+        &plain,
+        HH_A,
+        json!({ "household_name": HH_A_NAME, "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Nothing was removed and the member's own session still works.
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM households WHERE id = 'hh-a'").await,
+        1
+    );
+    assert_eq!(
+        get_household(&pool, &plain).await.status(),
+        StatusCode::OK,
+        "a refused delete must not end the member's session"
     );
 }
 

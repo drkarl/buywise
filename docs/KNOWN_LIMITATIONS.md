@@ -484,10 +484,6 @@ Issue #119, roadmap #114. The authoritative policy, behaviour, procedures and ex
 
 Open follow-ups:
 
-- Deletion is not restricted to a household owner: `household_members.role` (`owner` / `member`) is
-  stored but not enforced anywhere, so any member may export, and any member may delete after typing
-  the household name and re-entering their own password. Enforce the owner role if a household ever
-  needs a single member to hold the delete right.
 - When receipt ingestion is implemented, enforce a per-upload processing choice, provider
   disclosure, no-publication/no-training terms, image expiry and deletion.
 - Decide explicit backup retention, encryption and key custody; verify the deployed R2 token scope
@@ -526,3 +522,25 @@ section 7.2 and confirm `sudo ufw status verbose` lists only SSH, 80 and 443.
 defaulting to `0.0.0.0`) to `crates/api/src/main.rs` and set it to `127.0.0.1`
 in `deploy/systemd/buywise.service`, so the port is loopback-only without
 depending on the firewall.
+
+## Household member management
+
+Issue #139, roadmap #114. An owner adds and removes members from **Settings → Household members**
+(or the API), and `bootstrap-household` creates the very first household and owner on a fresh
+database. The roles (`owner` / `member`) are enforced: export stays available to every member, while
+member administration and the household delete require the owner role. The endpoints and rules are
+in [`docs/data-flows.md`](data-flows.md) (§5.1a).
+
+Open follow-ups:
+
+- **Roles cannot be changed.** There is no promote/demote action, so an owner cannot hand ownership
+  to another member or demote a co-owner; the last-owner guard only prevents *removing* the final
+  owner. A household that needs to move ownership must edit `household_members.role` in the
+  database. Add promote/demote when ownership hand-over is required.
+- **Bootstrap is one-time and single-household.** `bootstrap-household` refuses once any account
+  exists, so creating a second household — and re-running it after a partial setup — is out of
+  scope. There is still no self-registration or email invite flow (both deliberate non-goals).
+- **Removing a member notifies nobody.** Their sessions end immediately and their account is
+  deleted only if they belong to no other household, but no email is sent and list data already
+  cached in their browser (IndexedDB/localStorage) is not reachable from the server — the same
+  limitation that applies to a deleted household.

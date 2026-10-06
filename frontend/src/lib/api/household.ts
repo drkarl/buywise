@@ -16,6 +16,38 @@ export interface Household {
 	id: string;
 	/** `households.name` — the exact string the delete confirmation must repeat. */
 	name: string;
+	/** The caller's role in this household. Owners alone may administer members. */
+	role: MemberRole;
+}
+
+/** A household member's role (mirrors `household_members.role`). */
+export type MemberRole = 'owner' | 'member';
+
+/**
+ * One household member as `GET /api/household/{id}/members` returns it. Never
+ * carries a password hash or a session token.
+ */
+export interface Member {
+	/** `users.id`. */
+	user_id: string;
+	/** `users.email`. */
+	email: string;
+	/** `users.display_name`. */
+	display_name: string;
+	/** `household_members.role`. */
+	role: MemberRole;
+	/** `household_members.joined_at` (RFC 3339 UTC). */
+	joined_at: string;
+}
+
+/** The outcome of removing a member (mirrors `members::MemberRemoval`). */
+export interface MemberRemoval {
+	/** The removed user's id. */
+	removed_user_id: string;
+	/** How many of their session rows were deleted. */
+	sessions_ended: number;
+	/** Whether their account was deleted (only when they had no other household). */
+	account_deleted: boolean;
 }
 
 /** An error carrying the HTTP status, so callers can react to a specific one. */
@@ -85,6 +117,61 @@ export async function deleteHousehold(
 	if (!res.ok) {
 		throw new HttpResponseError(res.status, `delete failed (${res.status})`);
 	}
+}
+
+/**
+ * List the household's members from `GET /api/household/{id}/members`
+ * (owner-only; a plain member gets a 403). Throws on a non-OK response.
+ */
+export async function listMembers(householdId: string): Promise<Member[]> {
+	const res = await fetch(`/api/household/${encodeURIComponent(householdId)}/members`);
+	if (!res.ok) {
+		throw new HttpResponseError(res.status, `members failed (${res.status})`);
+	}
+	return (await res.json()) as Member[];
+}
+
+/**
+ * Add a member via `POST /api/household/{id}/members` (CSRF-protected,
+ * owner-only). Takes the new member's email, display name and an initial
+ * password the owner shares out of band; the password is not stored client-side
+ * and the server never returns it. A duplicate email is a 409.
+ */
+export async function addMember(
+	householdId: string,
+	email: string,
+	displayName: string,
+	password: string
+): Promise<Member> {
+	const res = await fetch(`/api/household/${encodeURIComponent(householdId)}/members`, {
+		method: 'POST',
+		headers: jsonMutationHeaders(),
+		body: JSON.stringify({ email, display_name: displayName, password })
+	});
+	if (!res.ok) {
+		throw new HttpResponseError(res.status, `add member failed (${res.status})`);
+	}
+	return (await res.json()) as Member;
+}
+
+/**
+ * Remove a member via `DELETE /api/household/{id}/members/{user_id}`
+ * (CSRF-protected, owner-only). The server ends their sessions immediately,
+ * removes their membership, and deletes their account only if they belong to no
+ * other household; removing the last owner is a 409.
+ */
+export async function removeMember(
+	householdId: string,
+	userId: string
+): Promise<MemberRemoval> {
+	const res = await fetch(
+		`/api/household/${encodeURIComponent(householdId)}/members/${encodeURIComponent(userId)}`,
+		{ method: 'DELETE', headers: jsonMutationHeaders() }
+	);
+	if (!res.ok) {
+		throw new HttpResponseError(res.status, `remove member failed (${res.status})`);
+	}
+	return (await res.json()) as MemberRemoval;
 }
 
 /**
