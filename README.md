@@ -196,6 +196,9 @@ What leaves the device and the server, who can read it and how long it is kept i
 deletion and raw-receipt retention policy. The JSON layout produced by export is documented in
 [`docs/household-export.md`](docs/household-export.md).
 
+Household members can also download the export or delete household data from
+Settings → **Your data**; the CLI commands below remain available to operators.
+
 ```bash
 # Export a household's records as one JSON document (read-only; omit --out for stdout).
 cargo run -p buywise-cli -- export-household --db buywise.db --household-id <uuid> --out household.json
