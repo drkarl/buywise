@@ -35,7 +35,8 @@ export interface SavingsAggregate {
 /**
  * One savings event's outcome. `status` is the honest label of what the row
  * proves: `estimated` (like-for-like opportunity, not a saving), `unreconciled`
- * (plans price different lines, so no saving is claimed), or
+ * (plans price different lines, so no saving is claimed), `unchecked`
+ * (comparability was not checked), or
  * `legacy_total_only` (a manual whole-basket total). `verified` is reserved and
  * never produced yet. A null `chosen_basket_cost_cents` drives the "Enter actual
  * spend" prompt in the UI.
@@ -45,7 +46,7 @@ export interface ListOutcome {
 	list_id: string;
 	list_name: string;
 	archived_at: string;
-	status: 'estimated' | 'unreconciled' | 'legacy_total_only' | 'verified';
+	status: 'estimated' | 'unreconciled' | 'unchecked' | 'legacy_total_only' | 'verified';
 	status_label: string;
 	baseline_label: string;
 	coverage_label: string;

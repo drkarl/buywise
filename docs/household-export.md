@@ -127,7 +127,7 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
                               "gross_saving_cents", "accepted_savings_cents",
                               "rejected_savings_cents", "travel_cost_cents",
                               "subscription_cost_alloc_cents", "net_saving_cents",
-                              "created_at" } ]
+                              "status", "created_at" } ]
   } ],
 
   "purchase_events": [ { "id", "canonical_item_id", "list_id", "entry_id", "source",

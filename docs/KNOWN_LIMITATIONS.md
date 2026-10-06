@@ -401,7 +401,8 @@ Issue #117, roadmap #114. The status model, accepted rules and the three decisio
 events, and no production path writes `verified` (it needs the purchase ledger of #116). So the
 dashboard's verified headline reads €0.00 with an empty state, and each event is labelled
 `estimated` (a like-for-like opportunity estimate) or `unreconciled` (the plans price different
-lines, so no saving is claimed). A manual whole-basket actual spend is labelled
+lines, so no saving is claimed), or `unchecked` (historical comparability was never checked).
+A manual whole-basket actual spend is labelled
 `legacy_total_only` and shown separately as a basket variance. Buying fewer items therefore never
 appears as saved money.
 
@@ -410,8 +411,8 @@ automatic line reconciliation is explicitly deferred until the purchase-ledger e
 supports it.
 
 **Workaround.** Read each event's status and coverage label: an `estimated` row is a theoretical
-opportunity, a `legacy_total_only` row a total-only basket difference — neither is a realised
-saving.
+opportunity, an `unchecked` row has unknown comparability, and a `legacy_total_only` row is a
+total-only basket difference — none is a realised saving.
 
 **Follow-up.** #116/#117: reconcile planned versus purchased quantities/products (extra, skipped,
 substituted, unmatched lines) to produce `verified` events.

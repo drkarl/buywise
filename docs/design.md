@@ -594,6 +594,8 @@ baseline, evidence coverage, date, and included costs:
   the coverage guard at archive time, reusing the same line-set comparison the
   optimise explanation uses to refuse a cross-plan cost comparison
   (`optimiser::prices_same_lines`).
+* **`unchecked`** — a pre-guard row whose comparability was never checked. No
+  saving is claimed and it is excluded from both aggregates.
 * **`legacy_total_only`** — a manual whole-basket actual-spend total compared
   against the best single store estimate. Quantities and purchases are
   unverified; travel is included where entered; service and data costs are
