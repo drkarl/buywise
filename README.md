@@ -10,6 +10,7 @@ Built for two adults and two children. Not a public product.
 - Bilingual entry (English and Spanish resolve to the same item)
 - Weekly price data via BasketWatch (RapidAPI) and Lidl direct
 - Four optimisation plans with plain-language reasons for each recommendation
+- Aldi side comparison of potential savings, split between packaged and fresh items
 - Per-item product rules, preferred sizes, substitutions, and suggested retailer product matches
 - Purchase suggestions based on check-off history; each must be confirmed before it is added to a list
 - Offline-first PWA: the shopping list works without connectivity in-store, with sync status and pending items shown until the server confirms them

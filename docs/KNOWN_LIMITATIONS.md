@@ -348,11 +348,8 @@ to allowed.
 
 ## Aldi comparison
 
-The side comparison of what the recommended basket would have cost at Aldi, split packaged versus
-fresh (issue #100). Computed in `crates/core/src/optimiser.rs` (`aldi_comparison`) from Aldi's
-constraint-passing offers and the recommended plan's lines, independently of the store-off and
-per-store category rules; surfaced by `POST /api/optimise` and rendered on the optimisation screen.
-Freshness comes from `categories.is_fresh` (migration 015).
+See [the design document](design.md#aldi-comparison-issue-100) for comparison behavior and data
+semantics. The remaining limitations are:
 
 ### 1. The savings page does not aggregate the Aldi figure into a running total yet
 
