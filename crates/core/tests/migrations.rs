@@ -757,18 +757,72 @@ async fn migration_017_promotes_the_earliest_member_of_ownerless_households() {
     let migration_sql = include_str!("../../../migrations/017_household_owner_role.sql");
 
     // A well-defined "earliest" (distinct join times).
-    seed_household_member(&pool, "hh-ownerless", "u-late", "late@example.test", "2025-02-01T00:00:00Z").await;
-    seed_household_member(&pool, "hh-ownerless", "u-early", "early@example.test", "2025-01-01T00:00:00Z").await;
+    seed_household_member(
+        &pool,
+        "hh-ownerless",
+        "u-late",
+        "late@example.test",
+        "2025-02-01T00:00:00Z",
+    )
+    .await;
+    seed_household_member(
+        &pool,
+        "hh-ownerless",
+        "u-early",
+        "early@example.test",
+        "2025-01-01T00:00:00Z",
+    )
+    .await;
     // A same-timestamp tie, resolved deterministically by user_id.
-    seed_household_member(&pool, "hh-tie", "u-z", "z@example.test", "2025-01-01T00:00:00Z").await;
-    seed_household_member(&pool, "hh-tie", "u-a", "a@example.test", "2025-01-01T00:00:00Z").await;
+    seed_household_member(
+        &pool,
+        "hh-tie",
+        "u-z",
+        "z@example.test",
+        "2025-01-01T00:00:00Z",
+    )
+    .await;
+    seed_household_member(
+        &pool,
+        "hh-tie",
+        "u-a",
+        "a@example.test",
+        "2025-01-01T00:00:00Z",
+    )
+    .await;
     // A single member (a household with one person).
-    seed_household_member(&pool, "hh-single", "u-solo", "solo@example.test", "2025-03-01T00:00:00Z").await;
+    seed_household_member(
+        &pool,
+        "hh-single",
+        "u-solo",
+        "solo@example.test",
+        "2025-03-01T00:00:00Z",
+    )
+    .await;
     // A household that already has an owner must be left alone.
-    seed_household_member_with_role(&pool, "hh-has-owner", "u-owner", "owner@example.test", "owner", "2025-01-01T00:00:00Z").await;
-    seed_household_member_with_role(&pool, "hh-has-owner", "u-plain", "plain@example.test", "member", "2025-02-01T00:00:00Z").await;
+    seed_household_member_with_role(
+        &pool,
+        "hh-has-owner",
+        "u-owner",
+        "owner@example.test",
+        "owner",
+        "2025-01-01T00:00:00Z",
+    )
+    .await;
+    seed_household_member_with_role(
+        &pool,
+        "hh-has-owner",
+        "u-plain",
+        "plain@example.test",
+        "member",
+        "2025-02-01T00:00:00Z",
+    )
+    .await;
 
-    sqlx::query(migration_sql).execute(&pool).await.expect("run 017");
+    sqlx::query(migration_sql)
+        .execute(&pool)
+        .await
+        .expect("run 017");
 
     assert_role(&pool, "hh-ownerless", "u-early", "owner").await;
     assert_role(&pool, "hh-ownerless", "u-late", "member").await;

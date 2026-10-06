@@ -285,7 +285,8 @@ async fn bootstrapped_owner_adds_a_member_who_can_sign_in() {
 #[tokio::test]
 async fn a_non_owner_cannot_use_the_member_endpoints() {
     let pool = setup_pool().await;
-    let owner = seed_household_owner(&pool, HH_A, HH_A_NAME, "user-owner", "owner@example.test").await;
+    let owner =
+        seed_household_owner(&pool, HH_A, HH_A_NAME, "user-owner", "owner@example.test").await;
     // A second member promoted to nothing: plain `member` role, with a session.
     let plain = add_member(
         &pool,
@@ -332,11 +333,17 @@ async fn a_non_owner_cannot_use_the_member_endpoints() {
 
     // Nor remove the owner (or anyone else).
     assert_eq!(
-        remove_member(&pool, &plain, HH_A, "user-owner").await.status(),
+        remove_member(&pool, &plain, HH_A, "user-owner")
+            .await
+            .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'").await,
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'"
+        )
+        .await,
         2,
         "a refused remove must change nothing"
     );
@@ -467,7 +474,10 @@ async fn removing_a_member_requires_csrf() {
         }),
     )
     .await;
-    let member_id = json_body(added).await["user_id"].as_str().unwrap().to_string();
+    let member_id = json_body(added).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let resp = request(
         &pool,
@@ -534,7 +544,11 @@ async fn a_duplicate_email_is_refused() {
         "the duplicate must not create a second user"
     );
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'").await,
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'"
+        )
+        .await,
         2
     );
 }
@@ -592,8 +606,11 @@ async fn blank_email_and_display_name_are_refused() {
 
     assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM users").await, 1);
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'")
-            .await,
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'"
+        )
+        .await,
         1
     );
 }
@@ -619,7 +636,10 @@ async fn removing_a_member_ends_their_session_on_the_next_request() {
         }),
     )
     .await;
-    let member_id = json_body(added).await["user_id"].as_str().unwrap().to_string();
+    let member_id = json_body(added).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // The member signs in; this session must stop working when they are removed.
     let member = login(&pool, "member@example.test", MEMBER_PASSWORD).await;
