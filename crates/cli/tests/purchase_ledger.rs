@@ -38,6 +38,22 @@ async fn scalar(pool: &SqlitePool, sql: &str) -> i64 {
         .expect("scalar")
 }
 
+async fn seed_canonical_item(pool: &SqlitePool, id: &str, household_id: &str) {
+    sqlx::query(
+        "INSERT INTO canonical_items
+            (id, household_id, name_en, name_es, category_id,
+             default_constraint_policy, created_at)
+         SELECT ?1, ?2, 'Milk', 'Leche', c.id, 'any', ?3
+         FROM categories c LIMIT 1",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(T)
+    .execute(pool)
+    .await
+    .expect("seed canonical item");
+}
+
 /// A one-transaction document. Two lines: a described one whose total is
 /// `line_total`, and a bare one that must stay `unmatched`.
 fn document(source_transaction_id: Option<&str>, line_total: i64) -> Value {
@@ -285,6 +301,133 @@ async fn a_malformed_document_reports_each_field() {
         purchase_ledger::parse_import_document(&unsupported),
         Err(ImportError::UnsupportedFormatVersion(2))
     ));
+}
+
+#[tokio::test]
+async fn imports_reject_unknown_line_links_before_writing_anything() {
+    let pool = setup_pool().await;
+    for (field, id, message) in [
+        (
+            "canonical_item_id",
+            "missing-item",
+            "no such canonical item in this household",
+        ),
+        (
+            "retailer_product_id",
+            "missing-product",
+            "no such retailer product",
+        ),
+    ] {
+        let mut doc = document(Some("SRC-1"), 500);
+        doc["transactions"][0]["lines"][0][field] = json!(id);
+        if field == "canonical_item_id" {
+            doc["transactions"][0]["lines"][0]["match_status"] = json!("matched");
+        }
+        let err = purchase_ledger::import_transactions(&pool, HH_A, &doc)
+            .await
+            .expect_err("unknown linked row");
+        let ImportError::Malformed(errors) = err else {
+            panic!("expected Malformed, got {err}");
+        };
+        assert!(errors.iter().any(|error| {
+            error.contains(&format!("transactions[0].lines[0].{field}")) && error.contains(message)
+        }));
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions").await,
+            0
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM purchase_lines").await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn imports_reject_canonical_items_owned_by_another_household() {
+    let pool = setup_pool().await;
+    seed_canonical_item(&pool, "foreign-item", HH_B).await;
+    let mut doc = document(Some("SRC-1"), 500);
+    doc["transactions"][0]["lines"][0]["canonical_item_id"] = json!("foreign-item");
+    doc["transactions"][0]["lines"][0]["match_status"] = json!("matched");
+
+    let err = purchase_ledger::import_transactions(&pool, HH_A, &doc)
+        .await
+        .expect_err("foreign canonical item");
+    let ImportError::Malformed(errors) = err else {
+        panic!("expected Malformed, got {err}");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("transactions[0].lines[0].canonical_item_id")
+            && error.contains("no such canonical item in this household")
+    }));
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_imports_share_one_transaction_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("concurrent.db");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let pool = db::connect(&db_url).await.expect("connect");
+    db::run_migrations(&pool).await.expect("migrate");
+    sqlx::query("INSERT INTO households (id, name, created_at) VALUES (?1, 'Home A', ?2)")
+        .bind(HH_A)
+        .bind(T)
+        .execute(&pool)
+        .await
+        .expect("insert household");
+    let doc = document(Some("SRC-RACE"), 500);
+
+    let (first, second) = tokio::join!(
+        purchase_ledger::import_transactions(&pool, HH_A, &doc),
+        purchase_ledger::import_transactions(&pool, HH_A, &doc),
+    );
+    let first = first.expect("first concurrent import");
+    let second = second.expect("second concurrent import");
+    assert_eq!(
+        first.results[0].transaction_id,
+        second.results[0].transaction_id
+    );
+    assert_eq!(
+        [first.results[0].status, second.results[0].status]
+            .iter()
+            .filter(|status| **status == ImportStatus::Inserted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first.results[0].status, second.results[0].status]
+            .iter()
+            .filter(|status| **status == ImportStatus::Unchanged)
+            .count(),
+        1
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions").await,
+        1
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM purchase_lines").await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn match_status_must_agree_with_canonical_item_link() {
+    let mut doc = document(Some("SRC-1"), 500);
+    doc["transactions"][0]["lines"][0]["match_status"] = json!("matched");
+    let err = purchase_ledger::parse_import_document(&doc).expect_err("inconsistent match");
+    let ImportError::Malformed(errors) = err else {
+        panic!("expected Malformed, got {err}");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("transactions[0].lines[0].match_status")
+            && error.contains("canonical_item_id is set")
+    }));
 }
 
 #[tokio::test]

@@ -564,6 +564,10 @@ fn parse_line(value: &Value, path: &str, errors: &mut Vec<String>) -> Option<Par
         errors.push(format!(
             "{path}.match_status: expected {MATCH_UNMATCHED:?} or {MATCH_MATCHED:?}"
         ));
+    } else if (match_status == MATCH_MATCHED) != canonical_item_id.is_some() {
+        errors.push(format!(
+            "{path}.match_status: must be {MATCH_MATCHED:?} exactly when canonical_item_id is set"
+        ));
     }
 
     Some(ParsedLine {
@@ -785,6 +789,7 @@ pub async fn import_transactions(
         return Err(ImportError::NoSuchHousehold(household_id.to_string()));
     }
 
+    validate_line_links(pool, household_id, &transactions).await?;
     let mut conn = pool.begin().await?;
     let mut results = Vec::with_capacity(transactions.len());
     for transaction in &transactions {
@@ -806,6 +811,51 @@ pub async fn import_transactions(
         }
     }
     Ok(outcome)
+}
+
+async fn validate_line_links(
+    pool: &SqlitePool,
+    household_id: &str,
+    transactions: &[ParsedTransaction],
+) -> Result<(), ImportError> {
+    let mut errors = Vec::new();
+    for (transaction_index, transaction) in transactions.iter().enumerate() {
+        for (line_index, line) in transaction.lines.iter().enumerate() {
+            let path = format!("transactions[{transaction_index}].lines[{line_index}]");
+            if let Some(id) = &line.retailer_product_id {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM retailer_products WHERE id = ?1)",
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+                if !exists {
+                    errors.push(format!(
+                        "{path}.retailer_product_id: no such retailer product"
+                    ));
+                }
+            }
+            if let Some(id) = &line.canonical_item_id {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM canonical_items WHERE id = ?1 AND household_id = ?2)",
+                )
+                .bind(id)
+                .bind(household_id)
+                .fetch_one(pool)
+                .await?;
+                if !exists {
+                    errors.push(format!(
+                        "{path}.canonical_item_id: no such canonical item in this household"
+                    ));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ImportError::Malformed(errors))
+    }
 }
 
 /// A stored transaction header, read back for comparison and revision snapshots.
@@ -851,39 +901,38 @@ async fn import_one(
         source_id
     };
 
-    let existing_id: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM purchase_transactions \
-         WHERE household_id = ?1 AND source_kind = ?2 AND transaction_identity = ?3",
-    )
-    .bind(household_id)
-    .bind(SOURCE_KIND_IMPORT)
-    .bind(identity)
-    .fetch_optional(&mut *conn)
-    .await?;
-
     let now = db::now_iso();
-
-    let Some(target_id) = existing_id else {
-        let id = uuid::Uuid::new_v4().to_string();
-        insert_transaction(
-            conn,
-            &id,
-            household_id,
-            transaction,
-            identity,
-            identity_kind,
-            &fingerprint,
-            1,
-            &now,
-        )
-        .await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let inserted = insert_transaction(
+        conn,
+        &id,
+        household_id,
+        transaction,
+        identity,
+        identity_kind,
+        &fingerprint,
+        1,
+        &now,
+    )
+    .await?;
+    if inserted {
         insert_lines(conn, &id, &transaction.lines, 1, &now).await?;
         return Ok(TransactionResult {
             transaction_id: id,
             revision: 1,
             status: ImportStatus::Inserted,
         });
-    };
+    }
+
+    let target_id: String = sqlx::query_scalar(
+        "SELECT id FROM purchase_transactions \
+         WHERE household_id = ?1 AND source_kind = ?2 AND transaction_identity = ?3",
+    )
+    .bind(household_id)
+    .bind(SOURCE_KIND_IMPORT)
+    .bind(identity)
+    .fetch_one(&mut *conn)
+    .await?;
 
     let stored: StoredTransaction = sqlx::query_as(
         "SELECT retailer, purchase_date, currency, total_cents, revision, source_payload \
@@ -968,13 +1017,14 @@ async fn insert_transaction(
     fingerprint: &str,
     revision: i64,
     now: &str,
-) -> Result<(), ImportError> {
-    sqlx::query(
+) -> Result<bool, ImportError> {
+    let result = sqlx::query(
         "INSERT INTO purchase_transactions \
          (id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
           transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
           source_payload, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
+         ON CONFLICT(household_id, source_kind, transaction_identity) DO NOTHING",
     )
     .bind(id)
     .bind(household_id)
@@ -992,7 +1042,7 @@ async fn insert_transaction(
     .bind(now)
     .execute(&mut *conn)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 async fn insert_lines(
