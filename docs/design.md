@@ -645,13 +645,15 @@ written once at run creation from the same in-memory input the optimiser used:
 * `basket_snapshot_json` — every ACTIVE line as submitted: the `list_entries.id`,
   canonical item id, display text, requested pack count, constraint policy, the
   item's product rules (`item_constraints`) and the constrained base-unit size
-  where known.
+  where known; the effective settings for every retailer (including defaults)
+  and the trip retailers admitted for this run.
 * `price_evidence_json` — one row per offer the run used: offer id, retailer,
-  product, **observed `source_snapshot_date`**, shelf and loyalty price, loyalty
-  scheme, unit price, pack size, and the discount assumptions
-  (`previous_price_cents`, `offer_text`, `offer_valid_until`). "Offers used" is
-  the union of the offers backing the best-single and recommended plans — the two
-  plans the savings figure compares.
+  product and its source, **observed `source_snapshot_date`**, shelf and loyalty
+  price, loyalty scheme, unit price, pack size and usable base units where the
+  offer data supplies a recognized size, unit and pack count, and the discount
+  assumptions (`previous_price_cents`, `offer_text`, `offer_valid_until`).
+  "Offers used" is the union of the offers backing the best-single and
+  recommended plans — the two plans the savings figure compares.
 * `coverage_json` — which lines each plan priced, the common-scope set priced by
   both, the lines exclusive to each side, and the missing / unresolved /
   confirmation-needed sets, plus the bounded `covered_subtotal_cents`,
@@ -678,8 +680,11 @@ bounded common-scope estimate is shown, labelled
 `Covered subtotal: N of M lines, prices as of DATE`, where N is the number of
 lines both plans price and M is the number of active lines submitted. Missing
 prices, unresolved identities and failed eligibility stay **unknown** and are
-never imputed as zero; they are reported in the coverage sets. A covered subtotal
-is never presented as a verified saving. `POST /api/optimise` exposes the result
+never imputed as zero; they are reported in the coverage sets. If any used offer
+has no observed date, the label also reports the undated-offer count; when no
+used offer has a date it says `prices as of unknown`. The count is stored in
+coverage JSON and old snapshots default it to zero. A covered subtotal is never
+presented as a verified saving. `POST /api/optimise` exposes the result
 as `coverage`, and `GET /api/savings/summary` reads it from the event's run
 (`recommendation_run_id`) so the dashboard shows the same bounded figure for an
 `unreconciled` event.

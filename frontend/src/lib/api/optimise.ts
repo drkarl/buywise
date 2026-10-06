@@ -198,6 +198,7 @@ export interface CoverageSummary {
 	covered_saving_cents: number | null;
 	full_basket_saving_cents: number | null;
 	price_date: string | null;
+	undated_offer_count: number;
 }
 
 /** The full `POST /api/optimise` 200 response body. */

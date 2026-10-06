@@ -1056,7 +1056,8 @@ async fn outcome_exposes_frozen_covered_subtotal_and_suppresses_full_basket() {
         "best_single_only": [], "recommended_only": [1],
         "missing": [], "unresolved": [], "confirmation_needed": [],
         "covered_subtotal_cents": 3000, "covered_saving_cents": 2000,
-        "full_basket_saving_cents": null, "price_date": "2026-06-01"
+        "full_basket_saving_cents": null, "price_date": "2026-06-01",
+        "undated_offer_count": 1
     })
     .to_string();
     sqlx::query(
@@ -1135,7 +1136,7 @@ async fn outcome_exposes_frozen_covered_subtotal_and_suppresses_full_basket() {
     assert_eq!(unreconciled["price_date"], "2026-06-01");
     assert_eq!(
         unreconciled["covered_label"],
-        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01"
+        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01, 1 offer undated"
     );
     // The audit gross figure is still stored on the row.
     assert_eq!(unreconciled["gross_saving_cents"], 800);

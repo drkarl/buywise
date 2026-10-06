@@ -268,9 +268,14 @@ async fn optimise_list(
     // the latest: a basket compiled from a mixture of evidence is only as fresh
     // as its stalest line.
     let offer_snapshot_date = run_snapshot::oldest_observed_date(&price_evidence.offers);
+    let undated_offer_count = run_snapshot::undated_offer_count(&price_evidence.offers);
     let basket_snapshot = run_snapshot::build_basket_snapshot(&body.list_id, &household_id, &input);
-    let coverage =
-        run_snapshot::build_coverage(&output, input.items.len(), offer_snapshot_date.clone());
+    let coverage = run_snapshot::build_coverage(
+        &output,
+        input.items.len(),
+        offer_snapshot_date.clone(),
+        undated_offer_count,
+    );
     let coverage_summary = CoverageSummary::from_snapshot(&coverage);
 
     let explanation = build_explanation(pool, &input, &output)
@@ -647,6 +652,7 @@ struct OfferEvidenceRow {
     id: String,
     retailer: Retailer,
     retailer_product_id: String,
+    source: Option<String>,
     name: String,
     source_snapshot_date: Option<String>,
     price_cents: Cents,
@@ -685,6 +691,7 @@ async fn load_price_evidence(
         let sql = format!(
             "SELECT o.id AS id, p.retailer AS retailer, \
                     o.retailer_product_id AS retailer_product_id, p.name AS name, \
+                    p.source AS source, \
                     o.source_snapshot_date AS source_snapshot_date, \
                     o.price_cents AS price_cents, o.loyalty_price_cents AS loyalty_price_cents, \
                     o.loyalty_scheme AS loyalty_scheme, \
@@ -704,10 +711,13 @@ async fn load_price_evidence(
             query = query.bind(id);
         }
         for row in query.fetch_all(pool).await? {
+            let usable_base_units =
+                usable_base_units(row.size_value, row.size_unit.as_deref(), row.pack_count);
             offers.push(OfferEvidence {
                 offer_id: row.id,
                 retailer: row.retailer,
                 retailer_product_id: row.retailer_product_id,
+                source: row.source,
                 product_name: row.name,
                 observed_date: row.source_snapshot_date,
                 shelf_price_cents: row.price_cents,
@@ -719,6 +729,7 @@ async fn load_price_evidence(
                 size_value: row.size_value,
                 size_unit: row.size_unit,
                 pack_count: row.pack_count,
+                usable_base_units,
                 previous_price_cents: row.previous_price_cents,
                 offer_text: row.offer_text,
                 offer_valid_until: row.offer_valid_until,
@@ -729,6 +740,24 @@ async fn load_price_evidence(
     Ok(PriceEvidence {
         version: SNAPSHOT_VERSION,
         offers,
+    })
+}
+
+fn usable_base_units(
+    size_value: Option<f64>,
+    size_unit: Option<&str>,
+    pack_count: Option<i32>,
+) -> Option<run_snapshot::BaseUnit> {
+    let value = size_value?;
+    let unit = size_unit?;
+    let count = pack_count?;
+    if count < 1 || !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let basis = buywise_core::domain::SizeBasis::from_db_str(unit).ok()?;
+    Some(run_snapshot::BaseUnit {
+        value: value * f64::from(count),
+        basis,
     })
 }
 
