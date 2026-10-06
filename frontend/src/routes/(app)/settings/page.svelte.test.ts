@@ -115,7 +115,8 @@ function stubSettings(
 						? JSON.stringify({
 								removed_user_id: 'user-2',
 								sessions_ended: 1,
-								account_deleted: true
+								account_deleted: true,
+								account_deactivated: false
 							})
 						: 'refused',
 					{ status }
@@ -313,7 +314,9 @@ describe('household data controls', () => {
 		render(Page);
 		await screen.findByText(/Download everything BuyWise holds/);
 		expect(
-			screen.getByText(/Any member account with no other household is also deleted and signed out\./)
+			screen.getByText(
+				/Member accounts left with no other household are signed out and deleted, or deactivated/
+			)
 		).toBeTruthy();
 
 		await fillDeleteForm(HOUSEHOLD.name, 'secret');
@@ -423,7 +426,9 @@ describe('household members', () => {
 		await fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
 
 		expect(await screen.findByText(/signed out immediately/)).toBeTruthy();
-		expect(screen.getByText(/deleted too if they belong to no other household/)).toBeTruthy();
+		expect(
+			screen.getByText(/deactivated and shown as a former member when/)
+		).toBeTruthy();
 		expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
 
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm remove' }));

@@ -538,9 +538,10 @@ async function confirmRemove() {
 								{:else if confirmingRemoval?.user_id === member.user_id}
 									<div class="remove-confirm">
 										<p class="hint">
-											Remove {member.display_name}? They are signed out immediately, their
-											membership is deleted, and their account is deleted too if they belong
-											to no other household.
+											Remove {member.display_name}? They are signed out immediately and their
+											membership is deleted. If they belong to no other household, their
+											account is deleted, or deactivated and shown as a former member when
+											the household still keeps items, receipts or other history they added.
 										</p>
 										<button
 											type="button"
@@ -637,8 +638,9 @@ async function confirmRemove() {
 							household’s records from the live server: lists, catalogue, matches, preferences
 							and purchase history. Backups expire on their own schedule (up to about a day),
 							aggregate usage counters with no household id remain, and clearing any copies
-							left on disk is an operator step. Any member account with no other household is
-							also deleted and signed out.
+							left on disk is an operator step. Member accounts left with no other household
+							are signed out and deleted, or deactivated when other records still reference
+							them.
 						</p>
 						<form class="delete-form" onsubmit={removeHousehold}>
 							<label for="confirm-name">

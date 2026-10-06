@@ -10,11 +10,12 @@
 //! * [`create_user`] is the one user-creation path (argon2id hash via
 //!   [`crate::password`], duplicate email refused); [`add_member`] and
 //!   [`bootstrap_household`] both call it.
-//! * [`remove_member`] deletes a member's sessions and membership, and their
-//!   account only if they belong to no other household — the same account rule,
-//!   and the same code
-//!   ([`crate::household_data::delete_orphaned_accounts`]), as the household
-//!   delete, so a member shared with another household keeps their login.
+//! * [`remove_member`] deletes a member's sessions and membership, and then
+//!   hands their account to the same cleanup the household delete uses
+//!   ([`crate::household_data::delete_orphaned_accounts`]): a member shared with
+//!   another household keeps their login, an account with no history is deleted,
+//!   and an account history still references is deactivated in place so the
+//!   household keeps its contributions attributed to a former member.
 //! * The last owner of a household can never be removed.
 //!
 //! These functions expect a database the caller has already migrated (the API
@@ -118,8 +119,13 @@ pub struct MemberRemoval {
     /// on their next request).
     pub sessions_ended: u64,
     /// Whether their `users` row was deleted (true only when they belonged to no
-    /// other household).
+    /// other household and nothing referenced the account).
     pub account_deleted: bool,
+    /// Whether their account was deactivated instead of deleted (true when they
+    /// belonged to no other household but history rows still reference it): the
+    /// row stays with an unusable password, a tombstone email and the
+    /// [`crate::household_data::FORMER_MEMBER_DISPLAY_NAME`] name.
+    pub account_deactivated: bool,
 }
 
 /// List a household's members, owners first, then in join order.
@@ -326,9 +332,11 @@ pub async fn add_member(
 /// Remove `user_id` from `household_id`.
 ///
 /// Deletes their membership and every session row (so their open sessions stop
-/// working on the next request), and deletes the account only when they belong
-/// to no other household — the same rule as the household delete, reusing
-/// [`crate::household_data::delete_accounts_without_membership`].
+/// working on the next request), then hands the account to the shared cleanup
+/// ([`crate::household_data::delete_orphaned_accounts`]): deleted when they
+/// belong to no other household and nothing references it, deactivated in place
+/// when history rows still do, and left untouched when they belong to another
+/// household.
 ///
 /// Refuses with [`MembershipError::LastOwner`] when the target is the household's
 /// only owner, and with [`MembershipError::NotAMember`] when they are not a
@@ -373,21 +381,22 @@ pub async fn remove_member(
         .execute(&mut *tx)
         .await?;
 
-    // A removed member's open sessions stop immediately, and their account is
-    // removed only when no other household remains — the same account rule as the
-    // household delete, reused from core.
+    // A removed member's open sessions stop immediately. Their account is
+    // removed only when no other household remains; if history rows still
+    // reference it, it is deactivated in place instead of deleted — the same
+    // account rule as the household delete, reused from core.
     let candidate = [user_id.to_string()];
     let sessions_ended =
         crate::household_data::delete_sessions_for_users(&mut tx, &candidate).await?;
-    let users_removed =
-        crate::household_data::delete_orphaned_accounts(&mut tx, &candidate).await?;
+    let cleanup = crate::household_data::delete_orphaned_accounts(&mut tx, &candidate).await?;
 
     tx.commit().await?;
 
     Ok(MemberRemoval {
         removed_user_id: user_id.to_string(),
         sessions_ended,
-        account_deleted: users_removed > 0,
+        account_deleted: cleanup.deleted > 0,
+        account_deactivated: cleanup.deactivated > 0,
     })
 }
 
@@ -399,6 +408,144 @@ mod tests {
         let pool = db::connect("sqlite::memory:").await.expect("connect");
         db::run_migrations(&pool).await.expect("migrate");
         pool
+    }
+
+    /// Insert a live session row for `user_id`.
+    async fn insert_session(pool: &SqlitePool, user_id: &str, id: &str) {
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, token_hash, csrf_token, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, 'csrf-1', ?4, '2999-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(format!("hash-{id}"))
+        .bind(db::now_iso())
+        .execute(pool)
+        .await
+        .expect("insert session");
+    }
+
+    /// Seed one row in every table that references `user_id`, so a removal has
+    /// history to preserve. `household_members` and `sessions` are not seeded
+    /// here: the membership is created by [`add_member`] and the session by
+    /// [`insert_session`], and the removal path itself deletes both.
+    async fn seed_member_history(pool: &SqlitePool, household_id: &str, user_id: &str) {
+        let now = db::now_iso();
+        sqlx::query(
+            "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+             VALUES ('cat-history', 'Test', 'Prueba', 'x', 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert category");
+        sqlx::query(
+            "INSERT INTO canonical_items \
+                 (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+             VALUES ('ci-1', ?1, 'Apples', 'Manzanas', 'cat-history', 'any', ?2)",
+        )
+        .bind(household_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert canonical item");
+        sqlx::query(
+            "INSERT INTO retailer_products (id, source, retailer, name, first_seen_at, last_seen_at) \
+             VALUES ('rp-1', 'manual', 'tesco', 'Apples 1kg', ?1, ?1)",
+        )
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert retailer product");
+        sqlx::query(
+            "INSERT INTO product_matches (id, household_id, canonical_item_id, retailer_product_id, \
+                 status, matched_by, created_at, updated_at) \
+             VALUES ('pm-1', ?1, 'ci-1', 'rp-1', 'accepted', 'user', ?2, ?2)",
+        )
+        .bind(household_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert product match");
+        sqlx::query(
+            "INSERT INTO shopping_lists (id, household_id, name, status, current_revision, created_at) \
+             VALUES ('list-1', ?1, 'Groceries', 'active', 1, ?2)",
+        )
+        .bind(household_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert list");
+        sqlx::query(
+            "INSERT INTO list_entries (id, list_id, resolution_status, raw_text, display_name, \
+                 added_by, status, effective_constraint_hash, created_at, updated_at) \
+             VALUES ('e-added', 'list-1', 'unresolved', 'milk', 'Milk', ?1, 'active', 'default', ?2, ?2)",
+        )
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert added entry");
+        sqlx::query(
+            "INSERT INTO list_entries (id, list_id, resolution_status, raw_text, display_name, \
+                 added_by, status, bought_by, bought_at, effective_constraint_hash, created_at, updated_at) \
+             VALUES ('e-bought', 'list-1', 'unresolved', 'bread', 'Bread', ?1, 'bought', ?1, ?2, 'default', ?2, ?2)",
+        )
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert bought entry");
+        sqlx::query(
+            "INSERT INTO list_entry_events (id, entry_id, user_id, event_type, payload, created_at) \
+             VALUES ('ev-1', 'e-bought', ?1, 'marked_bought', '{}', ?2)",
+        )
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert entry event");
+        sqlx::query(
+            "INSERT INTO mutations (id, client_mutation_id, device_id, user_id, list_id, \
+                 entity_type, entity_id, operation_type, payload, base_revision, \
+                 created_at_client, received_at_server) \
+             VALUES ('mut-1', 'cm-1', 'dev-1', ?1, 'list-1', 'list_entry', 'e-added', \
+                     'add_item', '{}', 0, ?2, ?2)",
+        )
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert mutation");
+        sqlx::query(
+            "INSERT INTO match_feedback (id, product_match_id, user_id, action, created_at) \
+             VALUES ('mf-1', 'pm-1', ?1, 'accept', ?2)",
+        )
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert match feedback");
+        sqlx::query(
+            "INSERT INTO purchase_dismissals (id, household_id, canonical_item_id, dismissed_by, dismissed_at) \
+             VALUES ('pd-1', ?1, 'ci-1', ?2, ?3)",
+        )
+        .bind(household_id)
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert dismissal");
+        sqlx::query(
+            "INSERT INTO receipt_images (id, household_id, uploaded_by, uploaded_at, expires_at, \
+                 content_type, byte_size, sha256_hex, storage_key) \
+             VALUES ('ri-1', ?1, ?2, ?3, '2999-01-01T00:00:00Z', 'image/png', 4, 'aa', 'ri-1.png')",
+        )
+        .bind(household_id)
+        .bind(user_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert receipt image");
     }
 
     #[tokio::test]
@@ -502,6 +649,10 @@ mod tests {
             .await
             .expect("remove");
         assert!(removal.account_deleted);
+        assert!(
+            !removal.account_deactivated,
+            "a deleted account is not deactivated"
+        );
         assert_eq!(removal.sessions_ended, 1);
 
         let members: i64 =
@@ -577,6 +728,10 @@ mod tests {
             .await
             .expect("remove shared member");
         assert!(!removal.account_deleted, "a shared account survives");
+        assert!(
+            !removal.account_deactivated,
+            "a shared account still belongs to another household, so it is untouched"
+        );
         assert_eq!(removal.sessions_ended, 1);
 
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?1")
@@ -600,6 +755,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions, 0, "the removed member's sessions must end");
+    }
+
+    /// Issue #152 acceptance: a member who has added list entries, ticked one
+    /// off and uploaded a receipt can be removed. Their history stays with the
+    /// household, attributed to a former member, and their account can never
+    /// sign in again. Before the fix this failed with `FOREIGN KEY constraint
+    /// failed` (code 787) and the transaction rolled back.
+    #[tokio::test]
+    async fn remove_member_deactivates_an_account_with_history() {
+        let pool = pool().await;
+        let created = bootstrap_household(&pool, "Home", "owner@example.test", "Owner", "pw")
+            .await
+            .unwrap();
+        let member = add_member(
+            &pool,
+            &created.household_id,
+            "member@example.test",
+            "Member",
+            "pw",
+        )
+        .await
+        .unwrap();
+
+        seed_member_history(&pool, &created.household_id, &member.user_id).await;
+        insert_session(&pool, &member.user_id, "sess-1").await;
+
+        let removal = remove_member(&pool, &created.household_id, &member.user_id)
+            .await
+            .expect("removing a member with history must succeed");
+
+        assert!(
+            !removal.account_deleted,
+            "a referenced account cannot be deleted"
+        );
+        assert!(removal.account_deactivated);
+        assert_eq!(removal.sessions_ended, 1);
+
+        // The row stays (the foreign keys still point at it) but can no longer
+        // sign in and no longer holds the real email.
+        let (email, hash, display_name): (String, String, String) =
+            sqlx::query_as("SELECT email, password_hash, display_name FROM users WHERE id = ?1")
+                .bind(&member.user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            display_name,
+            crate::household_data::FORMER_MEMBER_DISPLAY_NAME
+        );
+        assert_eq!(
+            email,
+            crate::household_data::deactivated_email(&member.user_id)
+        );
+        assert!(
+            !crate::password::verify_password("pw", &hash),
+            "no password may verify against a deactivated account"
+        );
+
+        // The household keeps every row, still attributed to that user id.
+        for (table, id) in [
+            ("list_entries", "e-added"),
+            ("list_entries", "e-bought"),
+            ("list_entry_events", "ev-1"),
+            ("mutations", "mut-1"),
+            ("match_feedback", "mf-1"),
+            ("purchase_dismissals", "pd-1"),
+            ("receipt_images", "ri-1"),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE id = '{id}'"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1, "{table}.{id} must survive the removal");
+        }
+        let added_by: String =
+            sqlx::query_scalar("SELECT added_by FROM list_entries WHERE id = 'e-added'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(added_by, member.user_id);
+        let bought_by: String =
+            sqlx::query_scalar("SELECT bought_by FROM list_entries WHERE id = 'e-bought'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bought_by, member.user_id);
+
+        // No longer a member, and the real email is free to register again.
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM household_members WHERE user_id = ?1")
+                .bind(&member.user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, 0, "a deactivated account holds no membership");
+        add_member(
+            &pool,
+            &created.household_id,
+            "member@example.test",
+            "Replacement",
+            "pw",
+        )
+        .await
+        .expect("the removed member's email is free again");
+    }
+
+    /// The referencing-table check is generic, so removal succeeds whatever
+    /// table points at the account. This seeds a row in every table the schema
+    /// reports as referencing `users(id)` and pins that set: adding a referencing
+    /// table without extending [`seed_member_history`] fails the assertion, so
+    /// the coverage cannot silently rot behind a hand-kept list.
+    #[tokio::test]
+    async fn remove_member_succeeds_with_a_row_in_every_referencing_table() {
+        let pool = pool().await;
+        let created = bootstrap_household(&pool, "Home", "owner@example.test", "Owner", "pw")
+            .await
+            .unwrap();
+        let member = add_member(
+            &pool,
+            &created.household_id,
+            "member@example.test",
+            "Member",
+            "pw",
+        )
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut referencing: Vec<String> =
+            crate::household_data::user_referencing_columns(&mut conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(table, column)| format!("{table}.{column}"))
+                .collect();
+        referencing.sort();
+        drop(conn);
+        assert_eq!(
+            referencing,
+            [
+                "household_members.user_id",
+                "list_entries.added_by",
+                "list_entries.bought_by",
+                "list_entry_events.user_id",
+                "match_feedback.user_id",
+                "mutations.user_id",
+                "purchase_dismissals.dismissed_by",
+                "receipt_images.uploaded_by",
+                "sessions.user_id",
+            ],
+            "the schema now references users(id) from a new place: seed it in \
+             seed_member_history so removal stays covered"
+        );
+
+        seed_member_history(&pool, &created.household_id, &member.user_id).await;
+        insert_session(&pool, &member.user_id, "sess-1").await;
+
+        let removal = remove_member(&pool, &created.household_id, &member.user_id)
+            .await
+            .expect("removal must succeed with a row in every referencing table");
+        assert!(removal.account_deactivated);
+        assert_eq!(removal.sessions_ended, 1);
     }
 
     #[tokio::test]

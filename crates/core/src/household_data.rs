@@ -659,29 +659,153 @@ pub async fn delete_orphaned_sessions(
     Ok(removed)
 }
 
-/// Delete the account of each user in `user_ids` who belongs to no household;
-/// returns the rows removed.
+/// The display name a deactivated account carries.
 ///
-/// The one account-deletion rule, shared by [`delete_household`] and by member
+/// Views that join `users` to attribute a contribution read this in place of the
+/// person's name: the household keeps the history, attributed to a former
+/// member.
+pub(crate) const FORMER_MEMBER_DISPLAY_NAME: &str = "Former member";
+
+/// The reserved domain for a deactivated account's tombstone email.
+///
+/// `.invalid` is reserved by RFC 2606 and can never resolve, and the address
+/// embeds the (unique) user id, so the tombstone is unique while the real
+/// address becomes free to register again.
+const DEACTIVATED_EMAIL_DOMAIN: &str = "deactivated.invalid";
+
+/// The `password_hash` stored on a deactivated account.
+///
+/// Deliberately not a PHC string, so [`crate::password::verify_password`]
+/// refuses every plaintext against it — no password can ever sign the account in
+/// again.
+const DEACTIVATED_PASSWORD_HASH: &str = "!deactivated";
+
+/// The tombstone email written to a deactivated account's `users` row.
+///
+/// Derived only from the user id, so re-running a deactivation is idempotent and
+/// two deactivations can never collide (`users.email` is UNIQUE).
+pub(crate) fn deactivated_email(user_id: &str) -> String {
+    format!("deactivated+{user_id}@{DEACTIVATED_EMAIL_DOMAIN}")
+}
+
+/// What [`delete_orphaned_accounts`] did with the accounts it was given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanedAccountCleanup {
+    /// Accounts whose `users` row was deleted, because nothing referenced it.
+    pub deleted: u64,
+    /// Accounts deactivated in place instead, because history rows still
+    /// reference them.
+    pub deactivated: u64,
+}
+
+/// Every `(table, column)` in the schema whose FOREIGN KEY targets `users(id)`.
+///
+/// Read from the database itself (`sqlite_master` joined with the table-valued
+/// `pragma_foreign_key_list`), never a hand-kept table list, so a table a later
+/// migration adds is found without a code change here.
+pub(crate) async fn user_referencing_columns(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.name, fk.\"from\" \
+         FROM sqlite_master m, pragma_foreign_key_list(m.name) fk \
+         WHERE m.type = 'table' AND fk.\"table\" = 'users' \
+         ORDER BY m.name, fk.\"from\"",
+    )
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Whether any row in a table that references `users(id)` still points at
+/// `user_id`.
+async fn account_is_referenced(
+    conn: &mut SqliteConnection,
+    user_id: &str,
+    referencing: &[(String, String)],
+) -> Result<bool, sqlx::Error> {
+    for (table, column) in referencing {
+        // Table and column names come from `sqlite_master` and cannot be bound
+        // as parameters, so they are quoted (doubling any embedded quote).
+        let sql = format!(
+            "SELECT 1 FROM \"{}\" WHERE \"{}\" = ?1 LIMIT 1",
+            table.replace('"', "\"\""),
+            column.replace('"', "\"\""),
+        );
+        let found: Option<i64> = sqlx::query_scalar(&sql)
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if found.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Anonymise a `users` row in place: unusable password, tombstone email, former
+/// member display name. The row stays, so every foreign key that points at it —
+/// and the attribution of the history it keeps — still holds.
+async fn deactivate_account(conn: &mut SqliteConnection, user_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET email = ?2, password_hash = ?3, display_name = ?4 WHERE id = ?1")
+        .bind(user_id)
+        .bind(deactivated_email(user_id))
+        .bind(DEACTIVATED_PASSWORD_HASH)
+        .bind(FORMER_MEMBER_DISPLAY_NAME)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Clean up the account of each user in `user_ids` who belongs to no household.
+///
+/// The one account-cleanup rule, shared by [`delete_household`] and by member
 /// removal ([`crate::members::remove_member`]): a user who also belongs to
-/// another household keeps their account. Callers delete the relevant
+/// another household keeps their account untouched. Among the users left with no
+/// household:
+///
+/// * an account that nothing references is DELETED — the behaviour for a member
+///   who never contributed;
+/// * an account that rows still reference (an item they added, a receipt they
+///   uploaded, an audit event) is DEACTIVATED in place instead
+///   ([`deactivate_account`]): the `users` row stays so the foreign keys hold and
+///   the household keeps its history attributed to a former member, while the
+///   password becomes unusable and the email becomes a unique tombstone.
+///
+/// Deleting such an account would violate the `NO ACTION` foreign keys several
+/// tables declare against `users(id)` (issue #152). Which tables count is
+/// discovered from the schema ([`user_referencing_columns`]), so a table added
+/// later is handled automatically. Callers delete the relevant
 /// `household_members` rows first.
 pub async fn delete_orphaned_accounts(
     conn: &mut SqliteConnection,
     user_ids: &[String],
-) -> Result<u64, sqlx::Error> {
-    let mut removed = 0u64;
+) -> Result<OrphanedAccountCleanup, sqlx::Error> {
+    let referencing = user_referencing_columns(&mut *conn).await?;
+    let mut cleanup = OrphanedAccountCleanup::default();
     for user_id in user_ids {
-        let result = sqlx::query(
-            "DELETE FROM users WHERE id = ?1 AND NOT EXISTS \
+        let orphan: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE id = ?1 AND NOT EXISTS \
              (SELECT 1 FROM household_members m WHERE m.user_id = ?1)",
         )
         .bind(user_id)
-        .execute(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
-        removed += result.rows_affected();
+        if orphan.is_none() {
+            // Belongs to another household, or the row is already gone.
+            continue;
+        }
+        if account_is_referenced(&mut *conn, user_id, &referencing).await? {
+            deactivate_account(&mut *conn, user_id).await?;
+            cleanup.deactivated += 1;
+        } else {
+            let result = sqlx::query("DELETE FROM users WHERE id = ?1")
+                .bind(user_id)
+                .execute(&mut *conn)
+                .await?;
+            cleanup.deleted += result.rows_affected();
+        }
     }
-    Ok(removed)
+    Ok(cleanup)
 }
 
 /// Delete every household-scoped row for `household_id` in one transaction,
@@ -740,12 +864,12 @@ pub async fn delete_household(
         counts.push((step.table, result.rows_affected()));
     }
 
-    let (sessions, users) = (
-        delete_orphaned_sessions(&mut tx, &candidate_user_ids).await?,
-        delete_orphaned_accounts(&mut tx, &candidate_user_ids).await?,
-    );
+    let sessions = delete_orphaned_sessions(&mut tx, &candidate_user_ids).await?;
+    // `deleted` only: a deactivated account's row stays (see
+    // [`delete_orphaned_accounts`]), so it is not a removed row.
+    let accounts = delete_orphaned_accounts(&mut tx, &candidate_user_ids).await?;
     counts.push(("sessions", sessions));
-    counts.push(("users", users));
+    counts.push(("users", accounts.deleted));
 
     if dry_run {
         tx.rollback().await?;
@@ -813,4 +937,117 @@ fn column_value(row: &SqliteRow, index: usize) -> Value {
         return Value::from(value);
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = db::connect("sqlite::memory:").await.expect("connect");
+        db::run_migrations(&pool).await.expect("migrate");
+        pool
+    }
+
+    /// The enumeration really is schema-driven: a table created after the
+    /// migrations is reported, which is what lets a later migration's table be
+    /// handled without a code change (issue #152).
+    #[tokio::test]
+    async fn user_referencing_columns_sees_a_table_added_after_migrations() {
+        let pool = migrated_pool().await;
+        sqlx::query(
+            "CREATE TABLE later_table (id TEXT PRIMARY KEY, added_by TEXT REFERENCES users(id))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create later table");
+
+        let mut conn = pool.acquire().await.expect("acquire");
+        let referencing = user_referencing_columns(&mut conn)
+            .await
+            .expect("enumerate");
+        assert!(
+            referencing.contains(&("later_table".to_string(), "added_by".to_string())),
+            "{referencing:?}"
+        );
+    }
+
+    /// Regression for issue #152: the household delete path is unchanged — it
+    /// removes the household's rows first, so a member's account whose only
+    /// references were those rows is still deleted, not deactivated.
+    #[tokio::test]
+    async fn delete_household_deletes_an_account_whose_history_goes_with_it() {
+        let pool = migrated_pool().await;
+        let dir =
+            std::env::temp_dir().join(format!("buywise-delete-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create receipt dir");
+        let now = db::now_iso();
+
+        sqlx::query("INSERT INTO households (id, name, created_at) VALUES ('hh-1', 'Home', ?1)")
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .expect("insert household");
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, display_name, created_at) \
+             VALUES ('u-1', 'one@example.test', 'hash', 'One', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert user");
+        sqlx::query(
+            "INSERT INTO household_members (household_id, user_id, role, joined_at) \
+             VALUES ('hh-1', 'u-1', 'owner', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert membership");
+        sqlx::query(
+            "INSERT INTO shopping_lists (id, household_id, name, status, current_revision, created_at) \
+             VALUES ('list-1', 'hh-1', 'Groceries', 'active', 1, ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert list");
+        sqlx::query(
+            "INSERT INTO list_entries (id, list_id, resolution_status, raw_text, display_name, \
+                 added_by, status, effective_constraint_hash, created_at, updated_at) \
+             VALUES ('e-1', 'list-1', 'unresolved', 'milk', 'Milk', 'u-1', 'active', 'default', ?1, ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert entry");
+        sqlx::query(
+            "INSERT INTO receipt_images (id, household_id, uploaded_by, uploaded_at, expires_at, \
+                 content_type, byte_size, sha256_hex, storage_key) \
+             VALUES ('ri-1', 'hh-1', 'u-1', ?1, '2999-01-01T00:00:00Z', 'image/png', 4, 'aa', '00112233445566778899aabbccddeeff.png')",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert receipt image");
+        receipts::write_file(&dir, "00112233445566778899aabbccddeeff.png", b"img!")
+            .expect("write receipt file");
+
+        let counts = delete_household(&pool, "hh-1", false, &dir)
+            .await
+            .expect("delete household");
+        let reported: std::collections::BTreeMap<&str, u64> = counts.into_iter().collect();
+        assert_eq!(
+            reported["users"], 1,
+            "the orphaned account is still deleted"
+        );
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'u-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

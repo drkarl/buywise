@@ -620,7 +620,7 @@ async fn blank_email_and_display_name_are_refused() {
 // ---------------------------------------------------------------------------
 
 /// Removing a member ends their session immediately and deletes the account when
-/// they belong to no other household.
+/// they belong to no other household (see the history case in the test below).
 #[tokio::test]
 async fn removing_a_member_ends_their_session_on_the_next_request() {
     let pool = setup_pool().await;
@@ -726,4 +726,129 @@ async fn removing_a_non_member_is_not_found() {
 
     let resp = remove_member(&pool, &owner, HH_A, "nobody").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Issue #152: a member who has added list entries and uploaded a receipt can be
+/// removed. Their account is deactivated rather than deleted — the household's
+/// history keeps its attribution — and they can no longer sign in, by session or
+/// by password.
+#[tokio::test]
+async fn removing_a_member_with_history_deactivates_them_and_blocks_sign_in() {
+    let pool = setup_pool().await;
+    let owner = seed_household_owner(&pool, HH_A, HH_A_NAME, "user-a", "a@example.test").await;
+    let added = add_member(
+        &pool,
+        &owner,
+        HH_A,
+        json!({
+            "email": "member@example.test",
+            "display_name": "Member",
+            "password": MEMBER_PASSWORD,
+        }),
+    )
+    .await;
+    let member_id = json_body(added).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The member signs in, then leaves history behind that references their
+    // account.
+    let member = login(&pool, "member@example.test", MEMBER_PASSWORD).await;
+    sqlx::query(
+        "INSERT INTO shopping_lists (id, household_id, name, status, current_revision, created_at) \
+         VALUES ('list-1', 'hh-a', 'Groceries', 'active', 1, ?1)",
+    )
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO list_entries (id, list_id, resolution_status, raw_text, display_name, \
+             added_by, status, effective_constraint_hash, created_at, updated_at) \
+         VALUES ('e-1', 'list-1', 'unresolved', 'milk', 'Milk', ?1, 'active', 'default', ?2, ?2)",
+    )
+    .bind(&member_id)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO receipt_images (id, household_id, uploaded_by, uploaded_at, expires_at, \
+             content_type, byte_size, sha256_hex, storage_key) \
+         VALUES ('ri-1', 'hh-a', ?1, ?2, '2999-01-01T00:00:00Z', 'image/png', 4, 'aa', \
+                 '00112233445566778899aabbccddeeff.png')",
+    )
+    .bind(&member_id)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let removed = remove_member(&pool, &owner, HH_A, &member_id).await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let removed = json_body(removed).await;
+    assert_eq!(removed["removed_user_id"], member_id);
+    assert_eq!(removed["account_deleted"], false);
+    assert_eq!(removed["account_deactivated"], true);
+    assert_eq!(removed["sessions_ended"], 1);
+
+    // The open session and the password both stop working.
+    assert_eq!(
+        request(&pool, "GET", "/api/auth/me", Some(&member), false, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "a removed member's session must be rejected on the next request"
+    );
+    let relogin = request(
+        &pool,
+        "POST",
+        "/api/auth/login",
+        None,
+        false,
+        Some(json!({ "email": "member@example.test", "password": MEMBER_PASSWORD })),
+    )
+    .await;
+    assert_eq!(
+        relogin.status(),
+        StatusCode::UNAUTHORIZED,
+        "the removed member must not be able to sign in again"
+    );
+
+    // The history stays with the household, still attributed to the account —
+    // now a former member.
+    let added_by: String = sqlx::query_scalar("SELECT added_by FROM list_entries WHERE id = 'e-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(added_by, member_id);
+    let uploaded_by: Option<String> =
+        sqlx::query_scalar("SELECT uploaded_by FROM receipt_images WHERE id = 'ri-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(uploaded_by.as_deref(), Some(member_id.as_str()));
+    let (email, display_name): (String, String) =
+        sqlx::query_as("SELECT email, display_name FROM users WHERE id = ?1")
+            .bind(&member_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(display_name, "Former member");
+    assert!(
+        email.ends_with("@deactivated.invalid"),
+        "email becomes a tombstone, freeing the real address: {email}"
+    );
+
+    // The removed member is no longer listed as a member.
+    let members = json_body(list_members(&pool, &owner, HH_A).await).await;
+    assert!(
+        members
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["user_id"] != member_id),
+        "{members}"
+    );
 }
