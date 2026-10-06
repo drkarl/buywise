@@ -17,26 +17,22 @@ transaction row per purchase identity, one line row per bought line, and a
 snapshot of each superseded revision. Import format and identity rules:
 `docs/purchase-ledger.md`.
 
-### 1. Structured imports are the only source; nothing links a line to a product or a saving
+### 1. Structured imports are the only source; nothing matches a line to a product or a saving
 
 **What happens.** A ledger is written only by the import path (`buywise-cli
 import-purchases` and `POST /api/household/{id}/purchases`). Reading receipts is
 not implemented, there is no retailer-specific importer, and there is no UI.
-Imported lines arrive `match_status = 'unmatched'` unless the importer itself
-supplies `retailer_product_id` / `canonical_item_id`, and nothing connects a line
-to `product_matches`, `savings_events` or the recommendation flow, and no price
-statistics are computed. Optional ids are trusted as given: the schema does not
-check that a supplied `canonical_item_id` belongs to the importing household, so
-a malformed import could point a line at another household's canonical item.
+Imported lines default to `match_status = 'unmatched'`; callers may supply
+`retailer_product_id` / `canonical_item_id`, but nothing connects a line to
+`product_matches`, `savings_events` or the recommendation flow, and no price
+statistics are computed. Supplied ids must exist, and canonical items must
+belong to the importing household.
 
 **Why accepted.** The captain's decision was to validate savings through a
 purchase-history pilot first (receipts and the household's own retailer exports)
 and defer any paid price source until the history shows which products matter.
 Matching, statistics and savings links are explicitly out of scope for this
 slice, so adding them now would guess at a shape the pilot has not settled.
-Optional ids are trusted because the importer is the household's own tool and the
-reads and writes are household-scoped; the reference is a link, not a copy of
-another household's data.
 
 **Workaround.** An operator writing an importer can supply canonical-item ids
 from the household's own export; every line stays readable in the ledger and in
@@ -44,10 +40,22 @@ the household export whether or not it is matched.
 
 **Follow-up.** Receipt reading (#116), retailer-specific importers, a review UI
 for unmatched lines, and linking the ledger to savings events (#117 / #118) are
-later slices. Decide whether an import must reject ids it cannot verify as the
-household's own once a matcher writes them.
+later slices.
 
-### 2. Fingerprint identity can only correct fields that are not part of the fingerprint
+### 2. `match_status` is informational
+
+**What happens.** `match_status` accepts `unmatched` or `matched` and defaults to
+`unmatched`, but the ledger does not interpret the value or use it to create or
+validate product links.
+
+**Why accepted.** Matching behavior is left for later work; the pilot records
+the source's status without imposing semantics on it.
+
+**Workaround.** Treat the value as source-provided metadata.
+
+**Follow-up.** Define matching semantics when the later matching work is scoped.
+
+### 3. Fingerprint identity can only correct fields that are not part of the fingerprint
 
 **What happens.** When an import supplies no `source_transaction_id`, the
 identity is the computed fingerprint of retailer + purchase date + total + the
@@ -69,7 +77,7 @@ author would read it.
 **Follow-up.** None planned; the rule is a documented part of the format, and
 `pl1:` versions it should it ever need to widen.
 
-### 3. No currency conversion and a request-size cap
+### 4. No currency conversion and a request-size cap
 
 **What happens.** Each transaction stores its own ISO-4217 `currency` (default
 `EUR`), but nothing converts between currencies: `household_total_cents` sums the

@@ -113,18 +113,17 @@ An incompatible layout change bumps `format_version`.
 | `deposit_cents` | integer | optional | Deposit/recycling charge in integer cents; non-negative. Defaults to `0`. |
 | `retailer_product_id` | string | optional | Link to an existing `retailer_products` row, when the source knows one. |
 | `canonical_item_id` | string | optional | Link to an existing `canonical_items` row owned by the importing household. |
-| `match_status` | string | optional | `unmatched` (default) when `canonical_item_id` is absent; `matched` when it is present. |
+| `match_status` | string | optional | `unmatched` (default) or `matched`; informational and independent of the optional product ids. |
 
 Optional fields that are absent, `null` or an empty/whitespace-only string are
 stored as `NULL` rather than as a guessed value. A line with no product link is
-**kept** with `match_status = "unmatched"` — unmatched lines are never dropped
-and never guessed. A supplied `retailer_product_id` must resolve to a row in
-`retailer_products`; a supplied `canonical_item_id` must resolve to a row in
-`canonical_items` belonging to the importing household. A failed or
-cross-household link is a `422` validation error at that field path, and no
-transaction in the import document is written. `match_status` must be
-`"matched"` exactly when `canonical_item_id` is supplied; inconsistent pairs
-are rejected at `match_status`.
+**kept** and defaults to `match_status = "unmatched"` — lines are never dropped
+or assigned a status from their product links. A supplied `retailer_product_id`
+must resolve to a row in `retailer_products`; a supplied `canonical_item_id`
+must resolve to a row in `canonical_items` belonging to the importing household.
+A failed or cross-household link is a `422` validation error at that field
+path, and no transaction in the import document is written. `match_status` is accepted
+independently of either optional product id.
 
 Money is always integer cents, never a float. `quantity` and `size_value` are the
 only numbers that may be fractional.
@@ -194,10 +193,10 @@ The CLI prints the same messages and exits non-zero. Problems reported per field
 unknown field, missing required field, wrong type, empty required string,
 non-`YYYY-MM-DD` date, non-integer money, negative size/discount/deposit,
 non-positive quantity, an unsupported `match_status` or `format_version`, an
-unknown retailer product, a missing or other-household canonical item, and a
-`match_status` inconsistent with `canonical_item_id`. Link validation happens
-before any transaction is written. All input and link problems in a document are
-reported with field paths, so a whole file can be fixed at once.
+unknown retailer product, and a missing or other-household canonical item. Link
+validation happens before any transaction is written. All input and link
+problems in a document are reported with field paths, so a whole file can be
+fixed at once.
 
 ## Limits
 
