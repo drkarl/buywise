@@ -278,7 +278,7 @@ describe('purchases', () => {
 			makeStore([
 				detail({ id: 'tx-old', purchase_date: '2026-09-01', receipt_image_id: null }),
 				detail({ id: 'tx-new', purchase_date: '2026-10-05', receipt_image_id: 'rc-1' })
-			])
+			], [receipt()])
 		);
 		render(Page);
 
@@ -411,7 +411,7 @@ describe('purchases', () => {
 		expect(open.closest('li')?.textContent).toContain('No photo');
 		await fireEvent.click(open);
 		expect(screen.queryByRole('img', { name: 'Linked receipt' })).toBeNull();
-		expect(screen.getByText(/No photo linked/)).toBeTruthy();
+		expect(await screen.findByText(/No photo linked/)).toBeTruthy();
 		await fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Save purchase' }));
 
@@ -456,7 +456,7 @@ describe('purchases', () => {
 		stubApi(store, true);
 		render(Page);
 		await fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
-		await fireEvent.click(screen.getByRole('button', { name: 'Remove photo' }));
+		await fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }));
 
 		expect(await screen.findByText('Photo link cleared, but the list could not be refreshed. It may be out of date.')).toBeTruthy();
 		expect(await screen.findByText(/No photo linked/)).toBeTruthy();

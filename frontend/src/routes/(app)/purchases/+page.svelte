@@ -513,9 +513,11 @@
 								<span class="lines">
 									{purchase.line_count} {purchase.line_count === 1 ? 'line' : 'lines'}
 								</span>
-								{@const rowReceipt = findReceipt(purchase.receipt_image_id)}
-								<span class="photo-flag" class:linked={rowReceipt !== null}>
-									{rowReceipt ? 'Photo linked' : 'No photo'}
+								<span
+									class="photo-flag"
+									class:linked={findReceipt(purchase.receipt_image_id) !== null}
+								>
+									{findReceipt(purchase.receipt_image_id) ? 'Photo linked' : 'No photo'}
 								</span>
 							</div>
 							<button type="button" class="secondary" onclick={() => openDetail(purchase.id)}>
