@@ -37,7 +37,7 @@ All variables live in `/etc/buywise/buywise.env`, loaded by both services.
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | recommended (to make the path explicit) | `sqlite://buywise.db` | SQLite connection URL. The default resolves under `WorkingDirectory=/var/lib/buywise` to the same file, but set it to `sqlite:///var/lib/buywise/buywise.db` to make the Litestream-replicated path explicit. |
-| `PORT` | no | `3000` | TCP port the API binds on (`0.0.0.0:PORT`). |
+| `PORT` | no | `3000` | TCP port the API binds on (`0.0.0.0:PORT`). If you change it, update the upstream port in `deploy/Caddyfile` to match. |
 | `RUST_LOG` | no | `info` | `tracing-subscriber` `EnvFilter` log directive. |
 
 **`litestream` (Cloudflare R2 credentials):**
