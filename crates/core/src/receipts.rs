@@ -312,7 +312,7 @@ pub fn detect_image(bytes: &[u8]) -> Option<ImageKind> {
         let brand = &bytes[8..12];
         match brand {
             b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm" | b"hevs" => {
-                return Some(ImageKind::Heic)
+                return Some(ImageKind::Heic);
             }
             b"mif1" | b"msf1" => return Some(ImageKind::Heif),
             _ => {}
@@ -443,8 +443,8 @@ pub struct ReceiptImage {
     pub id: String,
     /// Owning household.
     pub household_id: String,
-    /// Uploading member (`users.id`).
-    pub uploaded_by: String,
+    /// Uploading member (`users.id`), or `None` after their account is deleted.
+    pub uploaded_by: Option<String>,
     /// Upload time (RFC 3339 UTC, millisecond precision).
     pub uploaded_at: String,
     /// `uploaded_at` + [`RECEIPT_TTL_DAYS`].
@@ -613,7 +613,7 @@ pub async fn store_receipt(
     let receipt = ReceiptImage {
         id: Uuid::new_v4().to_string(),
         household_id: household_id.to_string(),
-        uploaded_by: uploaded_by.to_string(),
+        uploaded_by: Some(uploaded_by.to_string()),
         uploaded_at: iso(now),
         expires_at: iso(now + Duration::days(RECEIPT_TTL_DAYS)),
         content_type: kind.content_type().to_string(),
@@ -668,14 +668,17 @@ async fn usage(conn: &mut SqliteConnection, household_id: &str) -> Result<(i64, 
 pub async fn list_receipts(
     pool: &SqlitePool,
     household_id: &str,
+    now: DateTime<Utc>,
 ) -> Result<Vec<ReceiptImage>, ReceiptError> {
+    let cutoff = iso(now);
     let rows = sqlx::query_as::<_, ReceiptImage>(
         "SELECT id, household_id, uploaded_by, uploaded_at, expires_at, content_type, \
                 byte_size, sha256_hex, storage_key, processing \
-         FROM receipt_images WHERE household_id = ?1 \
+         FROM receipt_images WHERE household_id = ?1 AND expires_at > ?2 \
          ORDER BY uploaded_at DESC, id DESC",
     )
     .bind(household_id)
+    .bind(cutoff)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -686,6 +689,18 @@ pub async fn list_receipts(
 /// Scoped by household in the query itself: a receipt id from another household
 /// is indistinguishable from a missing one, which is what the API needs.
 pub async fn get_receipt(
+    pool: &SqlitePool,
+    household_id: &str,
+    id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ReceiptImage>, ReceiptError> {
+    let Some(row) = lookup_receipt(pool, household_id, id).await? else {
+        return Ok(None);
+    };
+    Ok((row.expires_at > iso(now)).then_some(row))
+}
+
+async fn lookup_receipt(
     pool: &SqlitePool,
     household_id: &str,
     id: &str,
@@ -710,7 +725,7 @@ pub async fn delete_receipt(
     household_id: &str,
     id: &str,
 ) -> Result<bool, ReceiptError> {
-    let Some(receipt) = get_receipt(pool, household_id, id).await? else {
+    let Some(receipt) = lookup_receipt(pool, household_id, id).await? else {
         return Ok(false);
     };
     remove_file(&config.dir, &receipt.storage_key)?;

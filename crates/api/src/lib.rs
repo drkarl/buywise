@@ -24,9 +24,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::any;
-use axum::Router;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
@@ -63,6 +64,7 @@ pub mod suggestions;
 /// for a list (see [`sse::sender_for`]) and the mutation commit path looks one up
 /// to fan a committed mutation out to every connected client.
 pub type SseChannels = Arc<DashMap<String, broadcast::Sender<sse::SseEvent>>>;
+pub type ApiClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// Application state shared across handlers and extractors.
 ///
@@ -92,6 +94,8 @@ pub struct AppState {
     /// with [`AppState::with_receipt_config`] so no test writes into the
     /// repository.
     pub receipt_config: buywise_core::receipts::ReceiptConfig,
+    /// Clock shared by receipt uploads and expiry-aware reads.
+    pub clock: ApiClock,
 }
 
 impl AppState {
@@ -105,6 +109,7 @@ impl AppState {
             sse_config: sse::SseConfig::default(),
             llm_client: llm::client_from_env(),
             receipt_config: buywise_core::receipts::ReceiptConfig::from_env(),
+            clock: Arc::new(Utc::now),
         }
     }
 
@@ -126,6 +131,11 @@ impl AppState {
     /// uploads at a temporary directory and to exercise the quota limits).
     pub fn with_receipt_config(mut self, config: buywise_core::receipts::ReceiptConfig) -> Self {
         self.receipt_config = config;
+        self
+    }
+
+    pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
         self
     }
 }

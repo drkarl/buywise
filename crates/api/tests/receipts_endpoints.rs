@@ -13,14 +13,14 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use buywise_api::{app, AppState};
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use buywise_api::{AppState, app};
 use buywise_core::db;
 use buywise_core::receipts::ReceiptConfig;
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -103,6 +103,10 @@ impl Harness {
 
     fn router(&self) -> Router {
         app(self.state())
+    }
+
+    fn router_at(&self, now: chrono::DateTime<chrono::Utc>) -> Router {
+        app(self.state().with_clock(move || now))
     }
 
     /// The file names currently in the receipt directory (empty if it was never
@@ -497,6 +501,90 @@ async fn member_uploads_lists_views_and_deletes_a_receipt() {
         delete_receipt(&harness, &a, HH_A, &id).await.status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn expired_receipt_is_hidden_and_unavailable_before_the_sweep() {
+    let harness = Harness::new().await;
+    let (a, _b) = seed_two_households(&harness.pool).await;
+    let id = upload_png(&harness, &a, HH_A).await;
+    let path = stored_file(&harness, &id).await;
+    let expired_at = "2026-10-01T10:00:00.000Z";
+    sqlx::query("UPDATE receipt_images SET expires_at = ?1 WHERE id = ?2")
+        .bind(expired_at)
+        .bind(&id)
+        .execute(&harness.pool)
+        .await
+        .expect("set expiry");
+    let router = harness.router_at(
+        chrono::DateTime::parse_from_rfc3339("2026-10-01T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/household/{HH_A}/receipts"))
+                .header(header::COOKIE, format!("session={}", a.session))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert!(json_body(listed).await.as_array().unwrap().is_empty());
+    assert_eq!(
+        router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/household/{HH_A}/receipts/{id}"))
+                    .header(header::COOKIE, format!("session={}", a.session))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        path.exists(),
+        "read-time expiry does not run the storage sweep"
+    );
+    assert_eq!(count_receipts(&harness.pool, HH_A).await, 1);
+}
+
+#[tokio::test]
+async fn deleting_uploader_account_preserves_receipt_with_null_uploader() {
+    let harness = Harness::new().await;
+    let (a, _b) = seed_two_households(&harness.pool).await;
+    let id = upload_png(&harness, &a, HH_A).await;
+
+    sqlx::query("DELETE FROM sessions WHERE user_id = 'user-a'")
+        .execute(&harness.pool)
+        .await
+        .expect("delete sessions");
+    sqlx::query("DELETE FROM household_members WHERE user_id = 'user-a'")
+        .execute(&harness.pool)
+        .await
+        .expect("delete membership");
+    sqlx::query("DELETE FROM users WHERE id = 'user-a'")
+        .execute(&harness.pool)
+        .await
+        .expect("delete uploader");
+
+    let uploader: Option<String> =
+        sqlx::query_scalar("SELECT uploaded_by FROM receipt_images WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("receipt uploader");
+    assert_eq!(uploader, None);
+    assert_eq!(count_receipts(&harness.pool, HH_A).await, 1);
 }
 
 /// Every accepted format is stored with its detected content type, regardless

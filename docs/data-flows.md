@@ -313,7 +313,7 @@ the count and total-size limits are checked against the household's stored rows
 (`409`). An unparsable override falls back to the default rather than removing the
 guardrail.
 
-### 4.4 Retention: 30 days, swept daily
+### 4.4 Retention: exactly 30 days, swept daily
 
 `expires_at` is `uploaded_at + 30 days`. The sweep is
 `buywise-cli expire-receipts --db <db> [--receipt-dir <dir>]`, run daily by
@@ -321,8 +321,10 @@ guardrail.
 see `deploy/README.md`). For each expired record it deletes the **file first**,
 then the row, so the sweep can be run repeatedly and safely on a database restored
 without its images: a file that is already gone is counted, not treated as an
-error. Nothing else about the household changes — derived purchase records are
-ordinary records and are not touched by expiry.
+error. Expired images stop appearing in lists and cannot be viewed once
+`expires_at` is reached; the daily sweep only reclaims their files and rows.
+Nothing else about the household changes — derived purchase records are ordinary
+records and are not touched by expiry.
 
 ### 4.5 Deletion and export
 
@@ -489,10 +491,10 @@ immediate nor complete in the backup (§2.4):
     the expiry sweep unlink files; the blocks are freed but the bytes may remain
     readable on the disk until overwritten. A household that needs that stronger
     guarantee needs full-disk encryption or a wiped volume, not a delete command.
-  - *The sweep runs daily*, so an image can outlive its exact 30-day expiry by less
-    than a day, and a host that is off at 03:30 sweeps on the next boot (the timer
-    is `Persistent`). Running `buywise-cli expire-receipts` by hand enforces it
-    immediately.
+  - *The sweep runs daily*, so expired files and rows can remain until the next
+    run. List and view routes hide an image as soon as its exact 30-day expiry
+    passes; a host that is off at 03:30 sweeps on the next boot (the timer is
+    `Persistent`).
 
 ### 5.4 Recommended operator sequence for a household leaving
 
@@ -538,7 +540,7 @@ The R2 token scope and the explicit backup `retention` are decided and shipped
 | # | Decision | Options | Recommendation |
 | --- | --- | --- | --- |
 | 1 | Receipt OCR: local or external? | (a) server-local OCR, external never used; (b) external opt-in per upload; (c) external by default | **Decided (owner) and reflected in code:** reading is local, and external processing is only ever a deliberate per-upload choice. Reading itself is not implemented yet; the upload path stores `processing = 'local'` and refuses `external` with `501` until an external path exists (§4.2). |
-| 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | **Decided (owner) and shipped (issue #149):** 30 days, enforced by the daily `expire-receipts` sweep (§4.4), with derived lines kept as ordinary purchase records. |
+| 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | **Decided (owner) and shipped (issue #149):** 30 days, enforced at read time and reclaimed by the daily `expire-receipts` sweep (§4.4), with derived lines kept as ordinary purchase records. |
 | 3 | Backup encryption and key custody | R2-managed keys; or Litestream `age` with a household-held key | **Decided for now:** use provider-managed R2 keys. Revisit client-side encryption only if key custody and restore procedures are agreed. |
 | 4 | R2 token scope and backup retention | account token vs bucket-scoped read/write token; default 24 h vs an explicit policy | **Decided and shipped (issues #136/#142):** bucket-scoped token; `retention: 168h` (7 days) set explicitly. |
 | 5 | Do aggregate usage counters count as household data? | leave `api_usage_events` (no household id) in place; or delete the household's share | Leaving unattributable totals is harmless; revisit if per-household attribution is added. |

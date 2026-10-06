@@ -27,7 +27,7 @@ export interface Receipt {
 	/** Lowercase hex SHA-256 of the stored bytes. */
 	sha256_hex: string;
 	/** The user who uploaded it. */
-	uploaded_by: string;
+	uploaded_by: string | null;
 	/** How the photo is processed; only `local` is supported today. */
 	processing: string;
 	/** Absolute path serving the stored image bytes. */

@@ -17,7 +17,7 @@
 --
 -- Columns:
 --   * `household_id`  — the owning tenant; every read and write is scoped by it.
---   * `uploaded_by`   — the member who uploaded the image.
+--   * `uploaded_by`   — the member who uploaded the image; null if their account is deleted.
 --   * `uploaded_at`   — when the upload was accepted (wall clock, RFC 3339 ms).
 --   * `expires_at`    — `uploaded_at` + 30 days. Indexed: the expiry sweep
 --     (`buywise-cli expire-receipts`, daily systemd timer) selects on it.
@@ -46,7 +46,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE receipt_images (
     id           TEXT PRIMARY KEY,
     household_id TEXT NOT NULL REFERENCES households(id),
-    uploaded_by  TEXT NOT NULL REFERENCES users(id),
+    uploaded_by  TEXT REFERENCES users(id) ON DELETE SET NULL,
     uploaded_at  TEXT NOT NULL,
     expires_at   TEXT NOT NULL,
     content_type TEXT NOT NULL,

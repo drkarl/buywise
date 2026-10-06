@@ -176,7 +176,9 @@ async fn the_sweep_uses_the_thirty_day_boundary() {
         .await
         .expect("sweep");
     assert_eq!(report.records_removed, 1);
-    let remaining = receipts::list_receipts(&pool, HH).await.expect("list");
+    let remaining = receipts::list_receipts(&pool, HH, sweep_now())
+        .await
+        .expect("list");
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, just_inside.id);
     assert!(!temp.path().join(&on_boundary.storage_key).exists());
