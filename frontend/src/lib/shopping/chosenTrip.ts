@@ -33,6 +33,8 @@ export interface ChosenTrip {
 	 * id-only check so an old cached trip still loads.
 	 */
 	quantities?: Record<string, number>;
+	/** The canonical item each planned entry referred to when the plan was chosen. */
+	canonicalItemIds?: Record<string, string | null>;
 	/** ISO timestamp the plan was chosen. */
 	savedAt: string;
 }
@@ -79,28 +81,37 @@ export function clearChosenTrip(listId: string): void {
 /**
  * Whether the chosen trip no longer covers the list as the plan computed it: an
  * entry still to buy (an `active` one) is not in the plan's allocation, or a
- * planned entry's quantity has changed since the plan was chosen. Adding a list
- * item after choosing, or editing a planned item's quantity through
- * `setQuantity`, makes the plan stale, so the view offers the review path back
- * to the optimiser.
+ * planned entry's quantity or canonical item has changed since the plan was
+ * chosen. Adding a list item after choosing, editing a planned item's quantity,
+ * or resolving an ambiguous item makes the plan stale.
  *
  * A check-off is NOT stale: the entry keeps its id and simply moves out of
  * `active` (it is done, so the plan no longer needs to cover it). A deletion is
  * not stale either — nothing is left unbought. A cache written before quantity
  * snapshots carried no `quantities` map; the check then stays id-only, so an old
- * cached trip still loads and never reports stale for a quantity it never saw.
+ * cached trip still loads and only checks the fields it has snapshots for.
  */
 export function isTripStale(
 	trip: ChosenTrip,
-	entries: ReadonlyArray<{ id: string; status: string; quantity?: number }>
+	entries: ReadonlyArray<{
+		id: string;
+		status: string;
+		quantity?: number;
+		canonical_item_id?: string;
+	}>
 ): boolean {
 	const planned = new Set(trip.allocation.entryIds);
-	const snapshot = trip.quantities;
+	const quantities = trip.quantities;
+	const canonicalItemIds = trip.canonicalItemIds;
 	return entries.some((e) => {
 		if (e.status !== 'active') return false;
 		if (!planned.has(e.id)) return true;
-		if (!snapshot) return false;
-		const plannedQuantity = snapshot[e.id];
-		return plannedQuantity !== undefined && e.quantity !== plannedQuantity;
+		const plannedQuantity = quantities?.[e.id];
+		if (plannedQuantity !== undefined && e.quantity !== plannedQuantity) return true;
+		const plannedCanonicalItemId = canonicalItemIds?.[e.id];
+		return (
+			plannedCanonicalItemId !== undefined &&
+			(e.canonical_item_id ?? null) !== plannedCanonicalItemId
+		);
 	});
 }
