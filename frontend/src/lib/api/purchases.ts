@@ -113,6 +113,8 @@ export interface PurchaseRevision {
 
 /** One purchase with its current lines and its superseded revisions. */
 export interface PurchaseDetail extends PurchaseSummary {
+	/** Original payload stored for the current revision. */
+	source_payload: string;
 	lines: PurchaseLine[];
 	revisions: PurchaseRevision[];
 }
