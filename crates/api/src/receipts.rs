@@ -64,6 +64,14 @@ use crate::household::require_member;
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
 
+struct ErrorResponse(Box<Response>);
+
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
 /// Query parameters of an upload. `processing` defaults to `local` when absent.
 #[derive(Debug, Default, Deserialize)]
 pub struct UploadParams {
@@ -170,10 +178,10 @@ async fn upload_receipt(
     Path(household_id): Path<String>,
     Query(params): Query<UploadParams>,
     body: Bytes,
-) -> Result<Response, Response> {
+) -> Result<Response, ErrorResponse> {
     require_member(&state, &user.user_id, &household_id)
         .await
-        .map_err(IntoResponse::into_response)?;
+        .map_err(|status| ErrorResponse(Box::new(status.into_response())))?;
 
     let processing = params
         .processing
@@ -209,17 +217,21 @@ async fn download_receipt(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((household_id, receipt_id)): Path<(String, String)>,
-) -> Result<Response, Response> {
+) -> Result<Response, ErrorResponse> {
     require_member(&state, &user.user_id, &household_id)
         .await
-        .map_err(IntoResponse::into_response)?;
+        .map_err(|status| ErrorResponse(Box::new(status.into_response())))?;
 
     let Some(record) =
         receipts::get_receipt(&state.pool, &household_id, &receipt_id, (state.clock)())
             .await
-            .map_err(|err| internal_error("receipts.download_lookup", err))?
+            .map_err(|err| {
+                ErrorResponse(Box::new(internal_error("receipts.download_lookup", err)))
+            })?
     else {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(ErrorResponse(Box::new(
+            StatusCode::NOT_FOUND.into_response(),
+        )));
     };
 
     let bytes = match receipts::read_file(&state.receipt_config.dir, &record.storage_key) {
@@ -229,9 +241,16 @@ async fn download_receipt(
         // available. The expiry sweep will eventually remove the record.
         Err(ReceiptError::FileMissing { .. }) => {
             tracing::error!(receipt = %record.id, "receipts.download: file missing");
-            return Err(StatusCode::NOT_FOUND.into_response());
+            return Err(ErrorResponse(Box::new(
+                StatusCode::NOT_FOUND.into_response(),
+            )));
         }
-        Err(err) => return Err(internal_error("receipts.download_read", err)),
+        Err(err) => {
+            return Err(ErrorResponse(Box::new(internal_error(
+                "receipts.download_read",
+                err,
+            ))))
+        }
     };
 
     let mut response = Response::new(axum::body::Body::from(bytes));
@@ -243,7 +262,9 @@ async fn download_receipt(
         }
         Err(err) => {
             tracing::error!(error = %err, receipt = %record.id, "receipts.download: bad content type");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(ErrorResponse(Box::new(
+                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            )));
         }
     }
     let extension = ImageKind::from_content_type(&record.content_type)
@@ -256,7 +277,9 @@ async fn download_receipt(
         }
         Err(err) => {
             tracing::error!(error = %err, receipt = %record.id, "receipts.download: bad disposition");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(ErrorResponse(Box::new(
+                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            )));
         }
     }
     headers.insert(
@@ -281,10 +304,10 @@ async fn delete_receipt(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((household_id, receipt_id)): Path<(String, String)>,
-) -> Result<StatusCode, Response> {
+) -> Result<StatusCode, ErrorResponse> {
     require_member(&state, &user.user_id, &household_id)
         .await
-        .map_err(IntoResponse::into_response)?;
+        .map_err(|status| ErrorResponse(Box::new(status.into_response())))?;
 
     let removed = receipts::delete_receipt(
         &state.pool,
@@ -293,12 +316,14 @@ async fn delete_receipt(
         &receipt_id,
     )
     .await
-    .map_err(|err| internal_error("receipts.delete", err))?;
+    .map_err(|err| ErrorResponse(Box::new(internal_error("receipts.delete", err))))?;
 
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(StatusCode::NOT_FOUND.into_response())
+        Err(ErrorResponse(Box::new(
+            StatusCode::NOT_FOUND.into_response(),
+        )))
     }
 }
 
@@ -312,7 +337,7 @@ async fn delete_receipt(
 /// oversized image (413), a signature that is not an accepted format (415), a
 /// quota the household has reached (409), an unknown processing value (422) and
 /// external processing that does not exist yet (501).
-fn upload_error(err: ReceiptError) -> Response {
+fn upload_error(err: ReceiptError) -> ErrorResponse {
     let (status, message) = match &err {
         ReceiptError::ImageTooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -348,7 +373,7 @@ fn upload_error(err: ReceiptError) -> Response {
             )
         }
     };
-    error_response(status, &message)
+    ErrorResponse(Box::new(error_response(status, &message)))
 }
 
 /// Map a storage error to a logged 500 with a plain message.
