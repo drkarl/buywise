@@ -1597,7 +1597,7 @@ Configure SQLite connection pool:
 
 **Acceptance Criteria:**
 - [ ] `cargo run -p buywise-api` starts without error with an existing SQLite file
-- [ ] `GET /` serves the SvelteKit app shell (once `frontend/build/` exists; 404 until Phase 2)
+- [ ] `GET /` serves the SvelteKit app shell when `frontend/build/` exists; production deploys install that build before starting the service (see `deploy/README.md`)
 - [ ] All API routes respond with correct HTTP status codes
 - [ ] SQLite connection pool has WAL mode, busy timeout, and foreign keys enabled
 
