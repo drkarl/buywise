@@ -187,6 +187,21 @@ function stubOptimise(response: OptimiseResponse, status = 200, settings?: Setti
 	return fetchMock;
 }
 
+/** A minimal cached list entry for seeding Dexie in the plan-choice tests. */
+function listEntry(id: string, quantity: number) {
+	return {
+		id,
+		list_id: 'list-42',
+		resolution_status: 'resolved' as const,
+		raw_text: id,
+		display_name: id,
+		quantity,
+		status: 'active' as const,
+		last_updated_revision: 0,
+		updated_at: '2026-01-01T00:00:00Z'
+	};
+}
+
 // The page now flushes the pending mutation queue before pricing, which reads
 // Dexie. Reset the fake-indexeddb between tests so a seeded `pending` mutation
 // from one test can't leak into another (mirrors SyncQueue.test.ts).
@@ -194,7 +209,6 @@ beforeEach(async () => {
 	await db.delete();
 	await db.open();
 });
-
 afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
@@ -295,6 +309,14 @@ describe('optimise page', () => {
 
 	it('persists plan-specific misses in the chosen trip coverage', async () => {
 		stubOptimise(fullResponse());
+		// Seed the entries the plan covers, with a non-default quantity on e-0, so
+		// the cache snapshots what the optimiser priced.
+		await db.list_entries.bulkPut([
+			listEntry('e-0', 2),
+			listEntry('e-1', 1),
+			listEntry('e-2', 1),
+			listEntry('e-3', 1)
+		]);
 		render(Page);
 
 		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
@@ -310,6 +332,9 @@ describe('optimise page', () => {
 			reason: 'not_in_plan'
 		});
 		expect(new Set(saved.allocation.entryIds)).toEqual(new Set(['e-0', 'e-1', 'e-2', 'e-3']));
+		// The chosen cache snapshots each planned entry's quantity, so a later
+		// `setQuantity` edit can be detected as staleness.
+		expect(saved.quantities).toEqual({ 'e-0': 2, 'e-1': 1, 'e-2': 1, 'e-3': 1 });
 	});
 
 	it('renders the plain-language explanation', async () => {

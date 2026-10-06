@@ -8,8 +8,9 @@
 	// queued), so nothing here is a separate copy that can drift.
 	//
 	// The chosen plan itself is a client-side cache (`chosenTrip.ts`), read on
-	// mount. When the list has changed since the plan was chosen (an entry added or
-	// removed) a banner offers the review path back to the optimiser.
+	// mount. When the list has changed since the plan was chosen (an entry added, or
+	// a planned entry's quantity edited) a banner offers the review path back to the
+	// optimiser.
 	//
 	// SSR/prerender are disabled globally in `src/routes/+layout.ts`, so this
 	// dynamic `[id]` route needs no per-route override.
@@ -17,6 +18,7 @@
 	import { page } from '$app/state';
 	import CategoryGroup from '$lib/components/CategoryGroup.svelte';
 	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
+	import StalePlanWarning from '$lib/components/StalePlanWarning.svelte';
 	import { markBought, pendingEntityIds } from '$lib/stores/list';
 	import {
 		shoppingEntries,
@@ -151,10 +153,7 @@
 		</p>
 	{:else}
 		{#if stale}
-			<p class="stale" role="alert">
-				Your list has changed since you chose this plan, so it may not cover everything below.
-				<a class="link" href="/list/{listId}/optimise">Review and choose a plan again</a>.
-			</p>
+			<StalePlanWarning {listId} />
 		{/if}
 
 		{#each storeViews as view (view.retailer)}
@@ -249,15 +248,6 @@
 	.link {
 		font-size: 0.9rem;
 		color: #0f766e;
-	}
-	.stale {
-		margin: 0;
-		padding: 0.75rem;
-		background: #fffbeb;
-		border: 1px solid #fde68a;
-		border-radius: 0.5rem;
-		color: #92400e;
-		font-size: 0.9rem;
 	}
 	.store-trip {
 		display: flex;

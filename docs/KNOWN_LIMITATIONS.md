@@ -15,48 +15,48 @@ Splits the chosen optimiser plan into one shopping list per store — the trip v
 shopping mode, and the allocation backing them (issue #104, merged in
 [PR #125](https://github.com/drkarl/buywise/pull/125)). Design: `docs/design.md` §10.
 
-### 1. Store-scoped shopping mode has no stale-plan warning, and the chosen trip is a per-device cache
+### 1. The chosen trip is a per-device cache, and an entry added after choosing has no per-item view
 
-**What happens.** Shopping mode scoped to one store
-(`frontend/src/routes/(app)/list/[id]/shopping/+page.svelte`) renders only that store's allocated
-entries (`storeEntryIds`, `:70-75`). It reads the chosen trip but never calls `isTripStale`, so it
-shows no stale-plan warning; an entry added after the plan was chosen, and an item the plan left
-unallocated, are neither rendered nor check-off-able there. The only affordance is the
-"N item(s) not in a store list — View whole trip" link (`:143-151`), whose count is the active
-entries that are unallocated or absent from `allocation.entryIds` (`:75-84`); the stale-plan banner
-lives only on the trip page (`frontend/src/routes/(app)/list/[id]/trip/+page.svelte:153-158`). An
-entry added after choosing is counted by that link but has no per-item view in either the trip or
-store-scoped shopping view — its "Not allocated to a store" section (`trip/+page.svelte:183-212`)
-carries only the items the plan itself left unallocated. The entry remains available on the plain
-list page (`frontend/src/routes/(app)/list/[id]/+page.svelte:223-249`), where it can be checked off.
+**What happens.** The chosen allocation is a client-side cache in `localStorage` under
+`buywise:trip:<listId>` (`frontend/src/lib/shopping/chosenTrip.ts:40`, `:62`), not server state. It is
+therefore per device: another household device does not see the choice until it picks a plan itself
+— its trip page shows "No plan selected yet" (`trip/+page.svelte:149-152`) and its shopping mode
+falls back to all five stores. The cache is never invalidated by app code (`clearChosenTrip`,
+`chosenTrip.ts:71`, is exported but only tests call it); it only changes by re-selecting a plan on
+the optimise page, which overwrites it (`optimise/+page.svelte:223-249`), and there is no per-line
+manual reassignment.
 
-The chosen allocation is a client-side cache in `localStorage` under `buywise:trip:<listId>`
-(`frontend/src/lib/shopping/chosenTrip.ts:33`, `:57`), not server state. It is therefore per device:
-another household device does not see the choice until it picks a plan itself — its trip page shows
-"No plan selected yet" (`trip/+page.svelte:148-151`) and its shopping mode falls back to all five
-stores (`shopping/+page.svelte:38-42`). The cache is never invalidated by app code
-(`clearChosenTrip`, `chosenTrip.ts:64`, is exported but only tests call it), and staleness is
-id-only (`chosenTrip.ts:82-86`): a quantity edit through `setQuantity`
-(`frontend/src/lib/stores/list.ts:304`) keeps the entry's id, so the trip still reports the chosen
-product and the frozen `Estimated` per-store totals (`trip/+page.svelte:164`) as current. The
-allocation only changes by re-selecting a plan on the optimise page, which overwrites the cache
-(`optimise/+page.svelte:182-201`); there is no per-line manual reassignment.
+Both the trip page (`trip/+page.svelte:155-157`) and store-scoped shopping mode
+(`shopping/+page.svelte:152-154`) now show the shared stale-plan warning
+(`frontend/src/lib/components/StalePlanWarning.svelte`) with the review path back to the optimiser.
+It is driven by `isTripStale` (`chosenTrip.ts:93-106`), which flags an `active` entry absent from the
+plan and a planned entry whose quantity differs from the snapshot taken when the plan was chosen
+(the `quantities` map on the cached trip, populated by `choosePlan` in `optimise/+page.svelte`).
+The store-scoped view still renders only the plan's allocated lines (`storeEntryIds`,
+`shopping/+page.svelte:80`), so an entry added after choosing is counted by the "N item(s) not in a
+store list — View whole trip" link (`shopping/+page.svelte:85-93`, `:156-166`) but has no per-item
+view in either the trip or store-scoped shopping view — the trip's "Not allocated to a store"
+section (`trip/+page.svelte:182-206`) carries only the items the plan itself left unallocated. The
+entry remains available on the plain list page (`frontend/src/routes/(app)/list/[id]/+page.svelte:223-249`),
+where it can be checked off. The per-store `Estimated` totals (`trip/+page.svelte:163`) remain the
+plan-time prices, not a live re-price.
 
 **Why accepted.** The per-store lists are views over the shared list entries and every check-off
 still flows through the normal offline queue, so devices converge on the entries even though each
 holds its own plan snapshot. `localStorage` avoids a Dexie schema migration for a small, per-device
 snapshot, and design §10 records the per-device cache, the replace-by-reselecting workflow, and the
-frozen-price snapshot as deliberate volume-one scope; a second stale banner inside shopping mode was
-out of scope.
+frozen-price snapshot as deliberate volume-one scope. The stale warning now covers both added
+entries and quantity edits without moving the plan to server state; giving a later-added entry its
+own per-item view inside the trip views, and sharing the chosen plan between devices, are larger
+changes left to follow-ups.
 
 **Workaround.** Open `/list/<id>` to view and check off an entry added after choosing a plan. Open
 `/list/<id>/trip` for the whole trip — its stale banner links back to the optimiser. Re-optimise and
 re-choose on each device; the shared entries and their statuses stay in sync.
 
-**Follow-up.** Issue #104 follow-up: show the stale-plan warning (or the not-in-a-store-list notice)
-inside store-scoped shopping mode, extend the stale check to quantity and other plan-affecting
-edits, and decide whether the chosen plan becomes shared server state. Add per-line reassignment if
-the workflow needs it.
+**Follow-up.** Decide whether the chosen plan becomes shared server state so every device sees the
+household's choice. Add a per-item view for entries added after choosing inside the trip views. Add
+per-line reassignment if the workflow needs it.
 
 ## Optimiser CLI and core
 

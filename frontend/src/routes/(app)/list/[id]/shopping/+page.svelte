@@ -12,10 +12,12 @@
 	import CategoryGroup from '$lib/components/CategoryGroup.svelte';
 	import ProgressBar from '$lib/components/ProgressBar.svelte';
 	import SyncIndicator from '$lib/components/SyncIndicator.svelte';
+	import StalePlanWarning from '$lib/components/StalePlanWarning.svelte';
 	import { markBought, pendingEntityIds } from '$lib/stores/list';
 	import {
 		RETAILERS,
 		shoppingEntries,
+		allEntries,
 		categories,
 		subcategories,
 		storeCategoryOrders,
@@ -24,7 +26,7 @@
 		type RetailerId
 	} from '$lib/stores/shopping';
 	import { sortByStoreOrder } from '$lib/shopping/sortByStoreOrder';
-	import { loadChosenTrip } from '$lib/shopping/chosenTrip';
+	import { loadChosenTrip, isTripStale } from '$lib/shopping/chosenTrip';
 	import { retailerLabel } from '$lib/api/optimise';
 	import { startSync, deriveSyncStatus, type SyncHandle, type SyncStatus } from '$lib/sync';
 
@@ -45,10 +47,18 @@
 	// store orders are list-independent (household-wide), but deriving them here
 	// keeps every subscription scoped to this page's lifecycle.
 	const entries = $derived(shoppingEntries(listId));
+	const all = $derived(allEntries(listId));
 	const pendingIds = $derived(pendingEntityIds(listId));
 	const cats = $derived(categories());
 	const subs = $derived(subcategories());
 	const orders = $derived(storeCategoryOrders());
+
+	/**
+	 * True when the list no longer matches the chosen plan (an entry added, or a
+	 * planned entry's quantity edited). Mirrors the trip page so shopping mode
+	 * scoped to one store surfaces the same review path.
+	 */
+	const stale = $derived(trip ? isTripStale(trip, $all) : false);
 
 	let selectedStore = $state<RetailerId>(loadSelectedStore());
 
@@ -138,6 +148,10 @@
 	</header>
 
 	<StoreSelector stores={storeOptions} selected={activeStore} onselect={selectStore} />
+
+	{#if stale}
+		<StalePlanWarning {listId} />
+	{/if}
 
 	{#if trip}
 	<p class="trip-note">

@@ -8,7 +8,7 @@ import {
 	type ChosenTrip
 } from './chosenTrip';
 
-function trip(entryIds: string[]): ChosenTrip {
+function trip(entryIds: string[], quantities?: Record<string, number>): ChosenTrip {
 	return {
 		listId: 'list-1',
 		runId: 'run-1',
@@ -23,7 +23,8 @@ function trip(entryIds: string[]): ChosenTrip {
 			],
 			unallocated: entryIds.map((entryId) => ({ entryId, reason: 'unresolved' as const })),
 			entryIds
-		}
+		},
+		quantities
 	};
 }
 
@@ -61,6 +62,36 @@ describe('chosenTrip', () => {
 			isTripStale(trip(['e-1', 'e-2']), [
 				{ id: 'e-1', status: 'active' },
 				{ id: 'e-2', status: 'deleted' }
+			])
+		).toBe(false);
+	});
+
+	it('treats an edited quantity on a planned entry as stale', () => {
+		// The plan was chosen when Milk (e-2) had quantity 2.
+		expect(
+			isTripStale(trip(['e-1', 'e-2'], { 'e-1': 1, 'e-2': 2 }), [
+				{ id: 'e-1', status: 'active', quantity: 1 },
+				{ id: 'e-2', status: 'active', quantity: 3 }
+			])
+		).toBe(true);
+	});
+
+	it('is not stale when a planned entry keeps its quantity', () => {
+		expect(
+			isTripStale(trip(['e-1', 'e-2'], { 'e-1': 1, 'e-2': 2 }), [
+				{ id: 'e-1', status: 'active', quantity: 1 },
+				{ id: 'e-2', status: 'active', quantity: 2 }
+			])
+		).toBe(false);
+	});
+
+	it('ignores quantity on a cache written before snapshots existed', () => {
+		// An old cache has no `quantities` map; it must still load and must not
+		// report stale just because the entries now carry quantities.
+		expect(
+			isTripStale(trip(['e-1', 'e-2']), [
+				{ id: 'e-1', status: 'active', quantity: 5 },
+				{ id: 'e-2', status: 'active', quantity: 9 }
 			])
 		).toBe(false);
 	});
