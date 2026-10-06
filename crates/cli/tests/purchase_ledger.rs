@@ -349,7 +349,6 @@ async fn imports_reject_canonical_items_owned_by_another_household() {
     seed_canonical_item(&pool, "foreign-item", HH_B).await;
     let mut doc = document(Some("SRC-1"), 500);
     doc["transactions"][0]["lines"][0]["canonical_item_id"] = json!("foreign-item");
-    doc["transactions"][0]["lines"][0]["match_status"] = json!("matched");
 
     let err = purchase_ledger::import_transactions(&pool, HH_A, &doc)
         .await
@@ -414,20 +413,6 @@ async fn concurrent_first_imports_share_one_transaction_identity() {
         scalar(&pool, "SELECT COUNT(*) FROM purchase_lines").await,
         2
     );
-}
-
-#[tokio::test]
-async fn match_status_must_agree_with_canonical_item_link() {
-    let mut doc = document(Some("SRC-1"), 500);
-    doc["transactions"][0]["lines"][0]["match_status"] = json!("matched");
-    let err = purchase_ledger::parse_import_document(&doc).expect_err("inconsistent match");
-    let ImportError::Malformed(errors) = err else {
-        panic!("expected Malformed, got {err}");
-    };
-    assert!(errors.iter().any(|error| {
-        error.contains("transactions[0].lines[0].match_status")
-            && error.contains("canonical_item_id is set")
-    }));
 }
 
 #[tokio::test]

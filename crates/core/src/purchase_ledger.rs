@@ -13,9 +13,9 @@
 //! its total, currency, source identity and the original source payload.
 //! Its `purchase_lines` rows carry the original text plus whatever the source
 //! knew (name, brand, quantity, size, unit price, line total, discount,
-//! deposit, optional retailer-product and canonical-item links). A line whose
-//! product is unknown is kept with `match_status = 'unmatched'` — never dropped
-//! and never guessed.
+//! deposit, optional retailer-product and canonical-item links). Every line is
+//! kept, and `match_status` defaults to `unmatched` without being inferred from
+//! the optional links.
 //!
 //! # Identity and idempotency
 //!
@@ -63,9 +63,9 @@ pub const DEFAULT_CURRENCY: &str = "EUR";
 /// The `source_kind` imports write (`receipt` is reserved for receipt reading).
 pub const SOURCE_KIND_IMPORT: &str = "import";
 
-/// Match status of a line the import did not link to a canonical item.
+/// Unmatched status value for a purchase line.
 pub const MATCH_UNMATCHED: &str = "unmatched";
-/// Match status of a line the import linked to a canonical item.
+/// Matched status value for a purchase line.
 pub const MATCH_MATCHED: &str = "matched";
 
 /// Maximum transactions accepted in one import document.
@@ -563,10 +563,6 @@ fn parse_line(value: &Value, path: &str, errors: &mut Vec<String>) -> Option<Par
     if match_status != MATCH_UNMATCHED && match_status != MATCH_MATCHED {
         errors.push(format!(
             "{path}.match_status: expected {MATCH_UNMATCHED:?} or {MATCH_MATCHED:?}"
-        ));
-    } else if (match_status == MATCH_MATCHED) != canonical_item_id.is_some() {
-        errors.push(format!(
-            "{path}.match_status: must be {MATCH_MATCHED:?} exactly when canonical_item_id is set"
         ));
     }
 
