@@ -543,6 +543,33 @@ plans price the same set of items. Otherwise the screen says the totals are not
 directly comparable. See the optimisation screen for the rendered explanation;
 the response carries ordered reasons per plan in `plan_explanations`.
 
+### Aldi comparison (issue #100)
+
+Aldi prices are collected even when Aldi is switched off or kept out of a
+category, so the household can see whether Aldi is worth shopping at — packaged
+food today, and fresh food only if the quality concern turns out not to be worth
+the price gap. Plans therefore show a side line, "Aldi would have saved €X on
+this list", computed against the recommended plan and split into **packaged** and
+**fresh** items because the quality concern is about fresh food.
+
+The comparison (`aldi_comparison` on `POST /api/optimise`) is computed *after* the
+plans are fixed and independently of them: for every item the recommended plan
+prices, the item's cheapest constraint-passing Aldi offer is looked up without
+applying the household's store settings or per-store category rules, then totalled
+per split. Both sides cover exactly the items Aldi prices *and* the recommended
+plan prices, so the figures are like-for-like; an item only one side prices is
+excluded from both, and `item_count` reports the covered set. A split with
+`item_count == 0` means Aldi has no qualifying price to compare, and the whole
+comparison is absent when no plan could be priced. The comparison never changes
+which plan is recommended.
+
+"Fresh" is the shared `categories.is_fresh` flag (migration 015): Produce,
+Meat & Fish, Dairy and Bakery are fresh; every other category, including ones a
+household adds later, is packaged. The split is stored on the basket item by the
+API's list → `OptimiserInput` pre-step. The figure is recorded per optimisation
+inside `recommendation_runs.plans_json`, but the savings dashboard does not
+aggregate it yet (see `docs/KNOWN_LIMITATIONS.md`).
+
 ---
 
 ## 11. Sync Protocol

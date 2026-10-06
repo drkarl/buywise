@@ -122,6 +122,7 @@ fn item(display: &str, canonical_id: &str, count: u32) -> BasketItem {
         constraints: None,
         category_id: None,
         subcategory_id: None,
+        is_fresh: false,
     }
 }
 
@@ -1420,6 +1421,7 @@ fn unresolved_items_excluded_from_total() {
         constraints: None,
         category_id: None,
         subcategory_id: None,
+        is_fresh: false,
     };
     let input = OptimiserInput::new(
         "hh-1",
@@ -2492,6 +2494,265 @@ fn all_offers_excluded_by_category_rules_have_a_distinct_reason() {
 }
 
 // ---------------------------------------------------------------------------
+// Aldi comparison (issue #100)
+// ---------------------------------------------------------------------------
+
+/// A resolved item in the given category, flagged as fresh food (issue #100).
+fn fresh_item(display: &str, canonical_id: &str, category_id: &str) -> BasketItem {
+    let mut it = item_in(display, canonical_id, category_id, None);
+    it.is_fresh = true;
+    it
+}
+
+/// A fresh apple + a packaged pasta, each priced at Tesco and at Aldi. Returns
+/// the input and priced rows; the caller decides Aldi's store settings.
+fn aldi_split_fixture() -> (OptimiserInput, BTreeMap<usize, Rows>) {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            fresh_item("apple", "ci-apple", PRODUCE),
+            item_in("pasta", "ci-pasta", PANTRY, None),
+        ],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    // apple: Aldi 100 (fresh food), Tesco 300.
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-aa", "ci-apple", "p-aa", MatchStatus::Accepted),
+                product("p-aa", Retailer::Aldi),
+                offer("o-aa", "p-aa", 100, Some(5)),
+            ),
+            (
+                product_match("m-at", "ci-apple", "p-at", MatchStatus::Accepted),
+                product("p-at", Retailer::Tesco),
+                offer("o-at", "p-at", 300, Some(5)),
+            ),
+        ],
+    );
+    // pasta: Aldi 150 (packaged), Tesco 200.
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 150, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+    (input, priced)
+}
+
+/// The recommended plan is Tesco (Aldi cannot price the fresh apple), and the
+/// comparison reports Aldi's cheaper total split fresh versus packaged.
+#[test]
+fn aldi_comparison_splits_fresh_and_packaged() {
+    let (mut input, priced) = aldi_split_fixture();
+    input.store_settings = vec![aldi_with_rules(vec![category_rule(PRODUCE, None, false)])];
+
+    let out = run(&input, priced);
+    let rec = out.recommended.as_ref().expect("recommended");
+    assert_eq!(rec.plan.stores, vec![Retailer::Tesco]);
+
+    let comparison = out.aldi_comparison.expect("comparison");
+    assert_eq!(
+        comparison.fresh,
+        AldiComparisonSplit {
+            item_count: 1,
+            aldi_total_cents: 100,
+            recommended_total_cents: 300,
+            saving_cents: 200,
+        }
+    );
+    assert_eq!(
+        comparison.packaged,
+        AldiComparisonSplit {
+            item_count: 1,
+            aldi_total_cents: 150,
+            recommended_total_cents: 200,
+            saving_cents: 50,
+        }
+    );
+}
+
+/// The comparison is computed even when the household turned Aldi off: Aldi
+/// prices are still collected, and no plan routes through Aldi.
+#[test]
+fn aldi_comparison_present_when_aldi_is_off() {
+    let (mut input, priced) = aldi_split_fixture();
+    input.store_settings = vec![store_setting(Retailer::Aldi, StoreStatus::Off, false)];
+
+    let out = run(&input, priced);
+    let rec = out.recommended.as_ref().expect("recommended");
+    assert!(
+        !rec.plan.stores.contains(&Retailer::Aldi),
+        "an off store can never be routed: {rec:?}"
+    );
+    for plan in [
+        out.best_single.as_ref(),
+        out.best_two_store.as_ref(),
+        out.theoretical_minimum.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            !plan.lines.iter().any(|l| l.retailer == Retailer::Aldi),
+            "an off store must not price a plan line: {plan:?}"
+        );
+    }
+
+    let comparison = out.aldi_comparison.expect("comparison");
+    assert_eq!(comparison.fresh.aldi_total_cents, 100);
+    assert_eq!(comparison.fresh.saving_cents, 200);
+    assert_eq!(comparison.packaged.aldi_total_cents, 150);
+    assert_eq!(comparison.packaged.saving_cents, 50);
+}
+
+/// An item the recommended plan does not price is excluded from both sides: the
+/// comparison stays like-for-like rather than crediting Aldi with items the
+/// household's plan never bought.
+#[test]
+fn aldi_comparison_excludes_items_the_recommended_plan_does_not_price() {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![
+            fresh_item("apple", "ci-apple", PRODUCE),
+            item_in("pasta", "ci-pasta", PANTRY, None),
+        ],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-aa", "ci-apple", "p-aa", MatchStatus::Accepted),
+            product("p-aa", Retailer::Aldi),
+            offer("o-aa", "p-aa", 100, Some(5)),
+        )],
+    );
+    priced.insert(
+        1,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 150, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+    let mut input = input;
+    input.store_settings = vec![store_setting(Retailer::Aldi, StoreStatus::Off, false)];
+
+    let out = run(&input, priced);
+    assert_eq!(
+        out.recommended.as_ref().expect("recommended").plan.stores,
+        vec![Retailer::Tesco]
+    );
+
+    let comparison = out.aldi_comparison.expect("comparison");
+    assert_eq!(comparison.fresh, AldiComparisonSplit::default());
+    assert_eq!(
+        comparison.packaged,
+        AldiComparisonSplit {
+            item_count: 1,
+            aldi_total_cents: 150,
+            recommended_total_cents: 200,
+            saving_cents: 50,
+        }
+    );
+}
+
+/// Without any Aldi offers the comparison is still present (there is a plan to
+/// compare against) but reports zero coverage on both splits.
+#[test]
+fn aldi_comparison_without_aldi_prices_reports_no_coverage() {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item_in("pasta", "ci-pasta", PANTRY, None)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![(
+            product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+            product("p-pt", Retailer::Tesco),
+            offer("o-pt", "p-pt", 200, Some(5)),
+        )],
+    );
+
+    let out = run(&input, priced);
+    let comparison = out.aldi_comparison.expect("comparison");
+    assert_eq!(comparison.packaged, AldiComparisonSplit::default());
+    assert_eq!(comparison.fresh, AldiComparisonSplit::default());
+}
+
+/// With no recommended plan there is nothing to compare against, so the
+/// comparison is absent rather than a misleading zero.
+#[test]
+fn aldi_comparison_absent_without_a_recommended_plan() {
+    let input = OptimiserInput::new("hh-1", Some(5), vec![item("milk", "ci-milk", 1)]);
+    let out = run(&input, BTreeMap::new());
+    assert!(out.recommended.is_none());
+    assert!(out.aldi_comparison.is_none());
+}
+
+/// The comparison counts `count` per item, like the plan lines it compares with.
+#[test]
+fn aldi_comparison_multiplies_by_item_count() {
+    let input = OptimiserInput::new(
+        "hh-1",
+        Some(5),
+        vec![item_in("pasta", "ci-pasta", PANTRY, None)],
+    );
+    let mut priced: BTreeMap<usize, Rows> = BTreeMap::new();
+    priced.insert(
+        0,
+        vec![
+            (
+                product_match("m-pa", "ci-pasta", "p-pa", MatchStatus::Accepted),
+                product("p-pa", Retailer::Aldi),
+                offer("o-pa", "p-pa", 150, Some(5)),
+            ),
+            (
+                product_match("m-pt", "ci-pasta", "p-pt", MatchStatus::Accepted),
+                product("p-pt", Retailer::Tesco),
+                offer("o-pt", "p-pt", 200, Some(5)),
+            ),
+        ],
+    );
+    let mut input = input;
+    input.items[0].count = 3;
+    // Aldi off, so the plan is Tesco and quantity 3 tests the multiplication.
+    input.store_settings = vec![store_setting(Retailer::Aldi, StoreStatus::Off, false)];
+
+    let out = run(&input, priced);
+    assert_eq!(
+        out.aldi_comparison.expect("comparison").packaged,
+        AldiComparisonSplit {
+            item_count: 1,
+            aldi_total_cents: 450,
+            recommended_total_cents: 600,
+            saving_cents: 150,
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Plan reasons (issue #103)
 // ---------------------------------------------------------------------------
 
@@ -2674,6 +2935,7 @@ fn reason_distinguishes_unpriced_and_unresolved_items() {
         constraints: None,
         category_id: None,
         subcategory_id: None,
+        is_fresh: false,
     };
     let input = OptimiserInput::new(
         "hh-1",

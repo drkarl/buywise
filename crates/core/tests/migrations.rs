@@ -703,3 +703,41 @@ async fn migration_014_allows_one_rule_per_scope() {
         "duplicate sub-category rule"
     );
 }
+
+/// Migration 015 marks the four fresh-food categories and leaves every other
+/// category packaged (issue #100). A category created after the migration keeps
+/// the `packaged` default, so the Aldi comparison never guesses freshness.
+#[tokio::test]
+async fn migration_015_marks_fresh_categories_only() {
+    let pool = migrated_pool().await;
+
+    let fresh: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM categories WHERE is_fresh = 1 ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fresh,
+        vec![
+            "c1000000-0000-0000-0000-000000000001",
+            "c1000000-0000-0000-0000-000000000002",
+            "c1000000-0000-0000-0000-000000000003",
+            "c1000000-0000-0000-0000-000000000004",
+        ],
+        "exactly Produce, Meat & Fish, Dairy and Bakery are fresh"
+    );
+
+    // A category inserted after the migration defaults to packaged.
+    sqlx::query(
+        "INSERT INTO categories (id, name_en, name_es, icon, default_order) \
+         VALUES ('cat-custom', 'Custom', 'Custom', 'icon', 99)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let custom: i64 = sqlx::query_scalar("SELECT is_fresh FROM categories WHERE id = 'cat-custom'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(custom, 0, "a new category is packaged by default");
+}

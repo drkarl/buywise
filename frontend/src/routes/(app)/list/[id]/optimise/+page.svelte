@@ -36,6 +36,8 @@
 		formatEuros,
 		retailerLabel,
 		sendMatchFeedback,
+		type AldiComparison,
+		type AldiComparisonSplit,
 		type CandidateOffer,
 		type NoValidOfferReason,
 		type OptimiseResponse,
@@ -146,6 +148,43 @@
 	const bestSingleItemIndices = $derived(
 		result?.best_single?.lines.map((line) => line.item_index) ?? []
 	);
+
+	/**
+	 * The Aldi side comparison (issue #100), or `null` when there is no
+	 * recommended plan. It never affects the plans; it exists so the household can
+	 * judge whether Aldi is worth shopping at. `aldiCovered` is false when Aldi has
+	 * no qualifying price for any item the plan prices — we show a "nothing to
+	 * compare" note rather than a misleading €0.00 saving.
+	 */
+	const aldiComparison = $derived(result?.aldi_comparison ?? null);
+	const aldiCovered = $derived(
+		!!aldiComparison &&
+			(aldiComparison.fresh.item_count > 0 || aldiComparison.packaged.item_count > 0)
+	);
+
+	/** Headline: Aldi's total saving across both splits, or the cost if it is pricier. */
+	function aldiSummary(comparison: AldiComparison): string {
+		const total = comparison.fresh.saving_cents + comparison.packaged.saving_cents;
+		if (total >= 0) {
+			return `Aldi would have saved ${formatEuros(total)} on this list.`;
+		}
+		return `Aldi would have cost ${formatEuros(Math.abs(total))} more than your plan.`;
+	}
+
+	/** One split's line: the saving (or extra cost) and the two totals it compares. */
+	function aldiSplitLine(label: string, split: AldiComparisonSplit): string {
+		const totals = `Aldi ${formatEuros(split.aldi_total_cents)} vs your plan ${formatEuros(
+			split.recommended_total_cents
+		)}`;
+		if (split.saving_cents >= 0) {
+			return `${label}: ${formatEuros(split.saving_cents)} cheaper. ${totals} for ${split.item_count} item${
+				split.item_count === 1 ? '' : 's'
+			}.`;
+		}
+		return `${label}: ${formatEuros(Math.abs(split.saving_cents))} more. ${totals} for ${
+			split.item_count
+		} item${split.item_count === 1 ? '' : 's'}.`;
+	}
 
 	/**
 	 * Plain-language reasons for the card of a given plan kind (issue #103). The
@@ -398,6 +437,31 @@
 			{/if}
 		</section>
 
+		{#if aldiComparison}
+			<section class="aldi" aria-label="Aldi comparison">
+				<h2>Aldi comparison</h2>
+				{#if aldiCovered}
+					<p class="aldi-summary">{aldiSummary(aldiComparison)}</p>
+					<ul class="aldi-splits">
+						{#if aldiComparison.fresh.item_count > 0}
+							<li>{aldiSplitLine('Fresh food', aldiComparison.fresh)}</li>
+						{/if}
+						{#if aldiComparison.packaged.item_count > 0}
+							<li>{aldiSplitLine('Packaged food', aldiComparison.packaged)}</li>
+						{/if}
+					</ul>
+				{:else}
+					<p class="aldi-empty">
+						No Aldi prices on record for the items in your plan, so there’s nothing to compare
+						yet.
+					</p>
+				{/if}
+				<p class="aldi-note">
+					For information only — Aldi never changes which plan is recommended.
+				</p>
+			</section>
+		{/if}
+
 		{#if result.plain_language_explanation}
 			<section class="explanation" aria-label="Explanation">
 				<h2>What this means</h2>
@@ -573,20 +637,22 @@
 	}
 	.explanation,
 	.unresolved,
-	.needs-confirmation {
+	.needs-confirmation,
+	.aldi {
 		border: 1px solid #e2e8f0;
 		border-radius: 0.5rem;
 		padding: 1rem;
 	}
-	/* Actionable, not an error state: a warm accent sets it apart from the
-	   "excluded from totals" block below it. */
-	.needs-confirmation {
-		border-color: #fcd34d;
-		background: #fffbeb;
+	/* The Aldi comparison (issue #100) is informational evidence, not a plan:
+	   a cool accent keeps it visually separate from the routable plan cards. */
+	.aldi {
+		border-color: #bae6fd;
+		background: #f0f9ff;
 	}
 	.explanation h2,
 	.unresolved h2,
-	.needs-confirmation h2 {
+	.needs-confirmation h2,
+	.aldi h2 {
 		margin: 0 0 0.5rem;
 		font-size: 1.05rem;
 	}
@@ -594,6 +660,30 @@
 		margin: 0;
 		color: #334155;
 		line-height: 1.5;
+	}
+	.aldi-summary {
+		margin: 0 0 0.5rem;
+		font-weight: 600;
+		color: #0c4a6e;
+	}
+	.aldi-splits {
+		list-style: none;
+		margin: 0 0 0.5rem;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-size: 0.92rem;
+		color: #334155;
+	}
+	.aldi-empty,
+	.aldi-note {
+		margin: 0;
+		font-size: 0.85rem;
+		color: #64748b;
+	}
+	.aldi-note {
+		margin-top: 0.5rem;
 	}
 	.unresolved-note,
 	.needs-confirmation-note {

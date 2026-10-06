@@ -137,6 +137,12 @@ pub struct BasketItem {
     /// (issue #99). `None` when the item is unresolved or not split.
     #[serde(default)]
     pub subcategory_id: Option<String>,
+    /// Whether the item's category is fresh food (issue #100, `categories.is_fresh`):
+    /// produce, meat/fish, dairy, bakery. Drives only the packaged/fresh split of
+    /// the Aldi comparison; it never affects plan ranking or routing. `false` for
+    /// an unresolved item or one whose category is unknown/not marked fresh.
+    #[serde(default)]
+    pub is_fresh: bool,
 }
 
 /// Identity and input order for one basket item, echoed in [`OptimiserOutput`]
@@ -442,6 +448,43 @@ pub struct Recommendation {
     pub two_store_saving_cents: Cents,
 }
 
+/// What the basket would have cost at Aldi, split fresh versus packaged, compared
+/// with the recommended plan (issue #100).
+///
+/// This is evidence, never a routed plan: it is computed from Aldi's own
+/// constraint-passing offers (ignoring the household's store settings and
+/// per-store category rules) and the recommended plan's lines, and it never
+/// affects which plan is recommended. The household collects it so it can judge
+/// whether Aldi is worth shopping at — for packaged food today, and fresh food
+/// only if the quality concern turns out not to be worth the price gap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AldiComparison {
+    /// The packaged (non-fresh) items.
+    pub packaged: AldiComparisonSplit,
+    /// The fresh-food items (produce, meat/fish, dairy, bakery).
+    pub fresh: AldiComparisonSplit,
+}
+
+/// One half of an [`AldiComparison`]: Aldi's cost versus the recommended plan's
+/// cost for the same items.
+///
+/// Both totals cover exactly the items that Aldi prices *and* the recommended
+/// plan prices, so the comparison is like-for-like. An item only one side prices
+/// is excluded from both totals rather than compared against nothing;
+/// [`Self::item_count`] carries how many items the figures cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AldiComparisonSplit {
+    /// How many items both Aldi and the recommended plan price (the covered set).
+    pub item_count: usize,
+    /// Aldi's total for those items (effective unit price × count).
+    pub aldi_total_cents: Cents,
+    /// The recommended plan's total for the same items.
+    pub recommended_total_cents: Cents,
+    /// `recommended_total_cents − aldi_total_cents`: positive means Aldi would
+    /// have been cheaper for these items, negative means it would have cost more.
+    pub saving_cents: Cents,
+}
+
 /// An item that could not be resolved to a canonical item (no `canonical_item_id`).
 /// Excluded from every total; surfaced so the household can clarify it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -705,6 +748,12 @@ pub struct OptimiserOutput {
     /// #103), ordered most-important-first within each [`PlanKind`]. Callers
     /// render up to four per plan card.
     pub reasons: Vec<PlanReason>,
+    /// What Aldi would have cost the basket versus the recommended plan, split
+    /// packaged versus fresh (issue #100). `None` when there is no recommended
+    /// plan to compare against. Computed independently of the store-off and
+    /// category-exclusion rules and never used to rank or route plans; a split
+    /// with `item_count == 0` means Aldi has no qualifying price to compare.
+    pub aldi_comparison: Option<AldiComparison>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2346,6 +2395,94 @@ pub async fn optimise(
     Ok(build_output(input, &priced_inputs, &preferred_products))
 }
 
+/// The cheapest Aldi price for one basket item from its raw match/offer rows,
+/// ignoring store settings and per-store category rules (issue #100).
+///
+/// This is the counterfactual half of the Aldi comparison: whether Aldi is
+/// switched off or its category rules exclude the item, the household still wants
+/// to know what Aldi would have charged. Only the item's own constraints are
+/// applied (a brand/size rule is about the product, not the store); under
+/// `substitution_policy = 'strict'` a merely suggested match is not a valid
+/// choice, so it is skipped. Returns the effective unit price, or `None` when
+/// Aldi has no qualifying offer.
+fn aldi_unit_price(
+    input: &OptimiserInput,
+    item_index: usize,
+    rows: &[(ProductMatch, RetailerProduct, ProductOffer)],
+) -> Option<Cents> {
+    let item = &input.items[item_index];
+    let strict = item
+        .constraints
+        .as_ref()
+        .map(|c| c.substitution_policy)
+        .unwrap_or(SubstitutionPolicy::Any)
+        == SubstitutionPolicy::Strict;
+    let mut best: Option<Candidate> = None;
+    for (m, product, offer) in rows {
+        if product.retailer != Retailer::Aldi {
+            continue;
+        }
+        match check_constraints(item.constraint_policy, item.constraints.as_ref(), product) {
+            ConstraintCheck::Pass => {}
+            // A config error already sent the item to `no_valid_offer_items`, so it
+            // cannot be in the recommended plan and never reaches this function;
+            // reject it here too rather than price an invalid item.
+            ConstraintCheck::ConfigError | ConstraintCheck::Reject => continue,
+        }
+        let accepted = m.status == MatchStatus::Accepted;
+        if strict && !accepted {
+            continue;
+        }
+        let cand = Candidate {
+            item_index,
+            retailer: Retailer::Aldi,
+            product: product.clone(),
+            offer: offer.clone(),
+            accepted,
+        };
+        if best.as_ref().is_none_or(|b| is_cheaper(&cand, b)) {
+            best = Some(cand);
+        }
+    }
+    best.map(|c| c.effective_unit_price())
+}
+
+/// Build the Aldi comparison against the recommended plan (issue #100).
+///
+/// For every item the recommended plan prices, Aldi's cheapest constraint-passing
+/// offer is looked up independently of the store-off and category-exclusion rules
+/// and totalled per fresh/packaged split. An item Aldi does not price is dropped
+/// from both sides, so the two totals always cover the same items. Returns `None`
+/// when there is no recommended plan (nothing to compare against).
+fn aldi_comparison(
+    input: &OptimiserInput,
+    priced_inputs: &BTreeMap<usize, Vec<(ProductMatch, RetailerProduct, ProductOffer)>>,
+    recommended: Option<&StorePlan>,
+) -> Option<AldiComparison> {
+    let plan = recommended?;
+    let mut packaged = AldiComparisonSplit::default();
+    let mut fresh = AldiComparisonSplit::default();
+    for line in &plan.lines {
+        let Some(rows) = priced_inputs.get(&line.item_index) else {
+            continue;
+        };
+        let Some(unit_price) = aldi_unit_price(input, line.item_index, rows) else {
+            continue;
+        };
+        let aldi_total = unit_price * i64::from(input.items[line.item_index].count);
+        let split = if input.items[line.item_index].is_fresh {
+            &mut fresh
+        } else {
+            &mut packaged
+        };
+        split.item_count += 1;
+        split.aldi_total_cents += aldi_total;
+        split.recommended_total_cents += line.line_total_cents;
+        split.saving_cents += line.line_total_cents - aldi_total;
+    }
+    Some(AldiComparison { packaged, fresh })
+}
+
 /// Build the full [`OptimiserOutput`] from already-fetched per-item rows. Shared
 /// by [`optimise`] and the in-memory tests.
 fn build_output(
@@ -2371,6 +2508,13 @@ fn build_output(
     // Reasons are derived from the same computation that produced the plans, so
     // each card's explanation cannot drift from the lines it describes.
     let reasons = build_reasons(input, &comp, &decision, &classification);
+    // The Aldi counterfactual is computed from the raw rows and the recommended
+    // plan, after the plans are fixed: it can never influence what is recommended.
+    let aldi_comparison = aldi_comparison(
+        input,
+        priced_inputs,
+        decision.recommendation.as_ref().map(|r| &r.plan),
+    );
     OptimiserOutput {
         basket_items: input
             .items
@@ -2390,6 +2534,7 @@ fn build_output(
         no_valid_offer_items: classification.no_valid_offer,
         needs_confirmation_items: classification.needs_confirmation,
         reasons,
+        aldi_comparison,
     }
 }
 
