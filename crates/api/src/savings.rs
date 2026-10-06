@@ -377,6 +377,9 @@ pub struct ListOutcome {
     pub total_lines: Option<usize>,
     /// The oldest observed offer date among the offers used.
     pub price_date: Option<String>,
+    /// Number of used offers without an observed date; `None` for old runs
+    /// without frozen coverage evidence.
+    pub undated_offer_count: Option<usize>,
     /// Short label naming the coverage and evidence date, e.g.
     /// `"Covered subtotal: 8 of 10 lines, prices as of 2026-06-01"`. `None` for
     /// an old run without a frozen snapshot.
@@ -522,6 +525,7 @@ async fn savings_summary(
                 covered_lines: coverage.as_ref().map(|c| c.covered_lines),
                 total_lines: coverage.as_ref().map(|c| c.total_lines),
                 price_date: coverage.as_ref().and_then(|c| c.price_date.clone()),
+                undated_offer_count: coverage.as_ref().map(|c| c.undated_offer_count),
                 covered_label: coverage.as_ref().map(|c| c.label.clone()),
                 chosen_basket_cost_cents,
                 basket_variance_cents,

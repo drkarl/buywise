@@ -1081,10 +1081,10 @@ async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
         .unwrap();
     assert_eq!(aldi_offer["source"], "basketwatch");
     assert_eq!(aldi_offer["observed_date"], Value::Null);
-    assert_eq!(
-        aldi_offer["usable_base_units"],
-        serde_json::json!({ "value": 1000.0, "basis": "ml" })
-    );
+    assert_eq!(aldi_offer["size_value"], 500.0);
+    assert_eq!(aldi_offer["size_unit"], "ml");
+    assert_eq!(aldi_offer["pack_count"], 2);
+    assert_eq!(aldi_offer["usable_base_units"], Value::Null);
     let coverage: Value =
         serde_json::from_str(before.coverage_json.as_deref().expect("coverage json"))
             .expect("valid json");

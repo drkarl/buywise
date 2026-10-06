@@ -17,6 +17,7 @@ const NO_COVERAGE = {
 	covered_lines: null,
 	total_lines: null,
 	price_date: null,
+	undated_offer_count: null,
 	covered_label: null
 };
 
@@ -206,16 +207,31 @@ describe('savings dashboard', () => {
 
 	it('shows undated offer evidence on an estimated ledger outcome', async () => {
 		const summary = fullSummary();
-		summary.lists[0].covered_label =
-			'Covered subtotal: 2 of 2 lines, prices as of 2026-06-02, 1 offer undated';
+		summary.lists[0].price_date = '2026-06-02';
+		summary.lists[0].undated_offer_count = 1;
+		summary.lists[0].covered_label = 'Prices refreshed with unknown-age offers';
 		stubSummary(summary);
 		render(Page);
 
-		expect(
-			await screen.findByText(
-				'Covered subtotal: 2 of 2 lines, prices as of 2026-06-02, 1 offer undated'
-			)
-		).toBeTruthy();
+		expect(await screen.findByText('Prices as of 2026-06-02, 1 offer undated')).toBeTruthy();
+	});
+
+	it('shows undated evidence on verified ledger outcomes too', async () => {
+		const summary = fullSummary();
+		summary.lists.push({
+			...summary.lists[0],
+			id: 'ev-verified',
+			list_id: 'list-verified',
+			list_name: 'Verified shop',
+			status: 'verified',
+			price_date: null,
+			undated_offer_count: 2,
+			covered_label: null
+		});
+		stubSummary(summary);
+		render(Page);
+
+		expect(await screen.findByText('Prices as of unknown, 2 offers undated')).toBeTruthy();
 	});
 
 	it('shows the "Enter actual spend" prompt only where no total was entered', async () => {
