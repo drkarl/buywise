@@ -160,7 +160,8 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
 ```
 
 `receipt_images` is metadata only: one entry per stored receipt photo, ordered by
-upload time. `expires_at` is the exact moment, 30 days after upload, when list and
+upload time. `uploaded_by` is null if the uploader's account has since been
+deleted. `expires_at` is the exact moment, 30 days after upload, when list and
 view access stops; the daily expiry sweep then reclaims the image and row. The
 retention behavior is owned by [`docs/data-flows.md`](data-flows.md) §4.4.
 `content_type` is detected from the file signature, not the type the client
@@ -208,7 +209,7 @@ The document is internally closed — the ids a record references resolve inside
 | `purchase_transactions[].lines[].transaction_id` / `revisions[].transaction_id` | → | `purchase_transactions[].id` |
 | `purchase_transactions[].lines[].retailer_product_id` | → | `retailer_products[].id` (null until matched) |
 | `purchase_transactions[].lines[].canonical_item_id` | → | `catalogue[].id` (null until matched) |
-| `receipt_images[].uploaded_by` | → | `members[].user_id` (null if the uploader account was deleted) |
+| `receipt_images[].uploaded_by` | → | `members[].user_id` (or `null` if the account was deleted) |
 | `preferences.purchase_dismissals[].canonical_item_id` | → | `catalogue[].id` |
 | `preferences.*[].category_id` / `subcategory_id` | → | `reference_data` |
 
