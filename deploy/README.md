@@ -359,9 +359,9 @@ journalctl -u caddy -n 50 --no-pager   # watch the certificate being issued
 ### 7.5 The opt-in setup step
 
 `sudo ./setup.sh` installs the Caddyfile to `/etc/caddy/Caddyfile` and enables
-and starts `caddy.service` **only when** the Caddyfile no longer contains the
+and starts `caddy.service` **only when** the site line no longer has the
 `<hostname>` placeholder, the `caddy` binary is already installed (7.3), and
-`deploy/Caddyfile` exists. With the placeholder still in place it prints
+`deploy/Caddyfile` exists. With the placeholder on the site line it prints
 guidance and leaves Caddy untouched, so a fresh host is never brought up with an
 invalid hostname. It mirrors how `setup.sh` installs the other units: the
 config is copied into place with `install`, then the service is enabled (and,

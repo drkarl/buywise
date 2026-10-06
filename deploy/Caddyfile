@@ -34,7 +34,6 @@
 		transport http {
 			read_timeout 0
 			write_timeout 0
-			dial_timeout 5s
 		}
 	}
 }
