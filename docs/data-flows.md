@@ -151,12 +151,13 @@ S3-compatible Cloudflare R2 bucket `buywise-backup`, prefix `db`.
   on them — that verification is not something this repository can make.
 - **Access:** whoever holds the R2 API token (and Cloudflare account holders with
   access to the bucket).
-- **Retention:** `deploy/litestream.yml` sets **no** `retention`, so Litestream's
-  default applies — for the pinned v0.3.13, snapshots and WAL files are kept for
-  `24h`, checked hourly, with a fresh snapshot written each time retention runs
+- **Retention:** `deploy/litestream.yml` sets `retention: 168h` (7 days) on the
+  R2 replica, so snapshots and WAL files are kept for 7 days, checked hourly, with
+  a fresh snapshot written each time retention runs; Litestream's own default
+  (what applied before this was set) would be `24h`
   ([Litestream v0.3 config reference](https://litestream.io/v0.3/reference/config)).
-  Practically: the replica holds roughly the last day of database history, so a
-  row deleted on the server can still exist in R2 for up to about a day. See §5.
+  Practically: the replica holds the last 7 days of database history, so a row
+  deleted on the server can still exist in R2 for up to about 7 days. See §5.3.
 - No automatic restore verification is configured (`validation-interval` is unset,
   hence disabled). The operator's manual restore drill is in `deploy/README.md`.
 
@@ -373,9 +374,10 @@ immediate nor complete in the backup (§2.4):
 
   (`VACUUM` rewrites the whole file and cannot run inside a transaction, hence the
   stop/restart.) This is optional and not run automatically by the CLI.
-- **R2 holds up to about a day of history** (Litestream's default 24 h retention,
-  §2.4). Until those frames age out, a restore of the replica can resurrect the
-  deleted household. Two consequences the household should expect:
+- **R2 holds up to about 7 days of history** (the explicit `retention: 168h`
+  set in `deploy/litestream.yml`, §2.4). Until those frames age out, a restore of
+  the replica can resurrect the deleted household. Two consequences the household
+  should expect:
   - *Restore resurrects.* After a disaster restore, re-run `delete-household
     --confirm` for any household deleted before the restore point, and then
     re-apply the `VACUUM` step. The deletion is not "remembered" by an older
@@ -408,24 +410,26 @@ Steps 1 and 3 can also be run by a household member from the app's settings scre
 ## 6. Backups, permissions, encryption and recovery: review
 
 Findings from reading `deploy/litestream.yml`, `deploy/setup.sh` and
-`deploy/systemd/`. None of this is changed by this document.
+`deploy/systemd/`. The retention and R2 token-scope rows now record the shipped
+decisions (issues #136/#142); the rest describes unchanged state.
 
 | Area | Current state | Assessment |
 | --- | --- | --- |
 | R2 credential storage | `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` in `/etc/buywise/buywise.env`, `root:root` `0600`; injected by systemd | Good file hygiene. But the keys are in the `litestream` process environment, readable by the `buywise` user via `/proc`. Consider an R2 token scoped to the single bucket, and whether Litestream should run as a distinct user. |
-| R2 token scope | Not recorded in the repository (operator-configured) | **Verify** the token is bucket-scoped, not account-wide, and read/write only. Record it in the runbook. |
+| R2 token scope | Bucket-scoped token (owner decision, issue #136); creation and verification steps in `deploy/README.md` §4.2 "Cloudflare R2 bucket and scoped token" | Bucket-scoped, read/write for the single `buywise-backup` bucket — not an account-wide token. Re-verify after any credential rotation. |
 | Transport | HTTPS to the R2 endpoint | Fine, provided `skip-verify` is never set (it is not). |
 | Encryption at rest | R2 server-side encryption only; no `age`, no customer key | The database (with password hashes and full purchase history) is readable by whoever holds the bucket. **Key custody is Cloudflare's.** Decide whether that is acceptable or whether `age` client-side encryption should be turned on — noting the age private key then becomes a new secret the household must hold out-of-band, without which restores are impossible. |
 | Local database at rest | Unencrypted file, `0750` directory owned by `buywise`; no `UMask=`/`ProtectSystem=` hardening in the units | Acceptable for a single-tenant host; tighten with a `UMask=0077` in `buywise.service` if other local accounts exist. |
 | Restore recovery | Documented manual drill in `deploy/README.md` with the writer-stop ordering; `validation-interval` unset so restores are never auto-verified | The ordering write-up is sound. There is **no rehearsal evidence in the repository**: run the drill at least once and record the outcome. Consider enabling `validation-interval` (costs egress). |
-| Retention | No `retention` set → Litestream's default 24 h | Deliberate or accidental? Setting an explicit `retention` documents the intent and makes the deletion story in §5.3 concrete. |
+| Retention | `retention: 168h` (7 days) set explicitly in `deploy/litestream.yml` (issue #142); Litestream's default would be 24 h | Explicit and documented; makes the deletion story in §5.3 concrete. |
 | Deletion vs backups | Covered in §5.3 | The gap is documented rather than papered over: deletion never promises immediate erasure from backups. |
 | Recovery time | Restore is a full-file restore plus WAL replay; snapshot cadence is Litestream's default | Acceptable for one household; record the measured restore time from the drill. |
 
-**Decisions needed** (owner): backup encryption and who holds the key; the R2 token
-scope; the explicit backup `retention`; whether to harden the service units'
-umask; and whether the aggregate `api_usage_events` counters (and one household's
-share of them) should also be purged on deletion.
+**Decisions needed** (owner): backup encryption and who holds the key; whether to
+harden the service units' umask; and whether the aggregate `api_usage_events`
+counters (and one household's share of them) should also be purged on deletion.
+The R2 token scope and the explicit backup `retention` are decided and shipped
+(bucket-scoped token, 7 days — issues #136/#142).
 
 ## 7. Decisions needed, in one place
 
@@ -434,7 +438,7 @@ share of them) should also be purged on deletion.
 | 1 | Receipt OCR: local or external? | (a) server-local OCR, external never used; (b) external opt-in per upload; (c) external by default | (a) as the default with (b) as an explicit per-upload upgrade, per §4. |
 | 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | 30 days, per §4.4, with derived lines kept as ordinary purchase records. |
 | 3 | Backup encryption and key custody | R2-managed keys only; or Litestream `age` with a household-held key | Decide explicitly. If `age` is used, the private key must be stored outside the server and off R2, or a disaster loses everything. |
-| 4 | R2 token scope and backup retention | account token vs bucket-scoped read/write token; default 24 h vs an explicit policy | Bucket-scoped token; set `retention` explicitly. |
+| 4 | R2 token scope and backup retention | account token vs bucket-scoped read/write token; default 24 h vs an explicit policy | **Decided and shipped (issues #136/#142):** bucket-scoped token; `retention: 168h` (7 days) set explicitly. |
 | 5 | Do aggregate usage counters count as household data? | leave `api_usage_events` (no household id) in place; or delete the household's share | Leaving unattributable totals is harmless; revisit if per-household attribution is added. |
 | 6 | Local on-disk remnant policy | document the `VACUUM` step only; or run it automatically | Keep it documented and operator-run (it briefly stops the service). |
 

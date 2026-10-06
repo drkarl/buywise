@@ -5,12 +5,13 @@
 # Idempotent: safe to re-run. It creates the service user and data directory,
 # installs the systemd units and the Litestream config, runs `daemon-reload`,
 # and prints the env vars you must set in /etc/buywise/buywise.env before
-# enabling the services. It does NOT enable or start the long-running services
-# (buywise/litestream — the binaries must be in place first); it prints the
-# exact commands to do so. It DOES `enable` (but deliberately does NOT `start`)
-# the weekly ingest *timer*: enabling persists it for the next boot, while
-# leaving the start to the post-env step prevents a Persistent=true catch-up
-# run from firing before the operator has set BASKETWATCH_API_KEY. It also
+# enabling the services. It enables NOTHING: the long-running buywise/litestream
+# units are left for the operator to enable once the binaries are in place, and
+# the optional weekly ingest timer (buywise-ingest.timer) is installed but
+# deliberately left disabled — the first deploy runs without price ingest, and a
+# Persistent=true timer enabled before BASKETWATCH_API_KEY is set would fire a
+# catch-up run and red the ingest with MissingApiKey. The operator enables the
+# timer on purpose later (deploy/README.md, "Weekly price ingest"). It also
 # installs and enables the Caddy HTTPS reverse proxy, then restarts it to load
 # the installed config, but ONLY once the operator has replaced the <hostname>
 # placeholder in Caddyfile and Caddy is already installed (see deploy/README.md
@@ -92,17 +93,23 @@ RUST_LOG=info
 LITESTREAM_ACCESS_KEY_ID=
 LITESTREAM_SECRET_ACCESS_KEY=
 
-# --- weekly ingest (buywise-ingest.service / .timer) ---
-# REQUIRED for the weekly ingest to succeed. BasketWatch API key. The
+# --- weekly ingest (buywise-ingest.service / .timer; OPTIONAL, disabled) ---
+# The timer is installed but NOT enabled by setup.sh, so the first deploy runs
+# without price ingest. Enable it later, once the live-savings validation
+# (issue #109) has confirmed supplier access, terms and cost:
+#   sudo systemctl enable --now buywise-ingest.timer
+# (deploy/README.md, "Weekly price ingest").
+#
+# REQUIRED once you enable the ingest. BasketWatch API key. The
 # ingest-basketwatch run (the primary, non-best-effort source) fails without
-# it, which reds the whole weekly unit. Set it before the first weekly fire.
+# it, which reds the whole weekly unit. Set it before enabling the timer.
 BASKETWATCH_API_KEY=
 # Optional. BasketWatch API host. Defaults to basketwatch.p.rapidapi.com when
 # unset; only set it to override (e.g. a different RapidAPI host).
 #BASKETWATCH_API_HOST=basketwatch.p.rapidapi.com
-# Optional. Source URL for the Lidl direct ingest adapter. If unset, the Lidl
-# half of the weekly ingest is best-effort and is skipped without failing the
-# timer; BasketWatch always runs. Set it to enable Lidl price ingest.
+# Optional. Source URL for the Lidl direct ingest adapter. There is no default
+# and no verified Lidl feed yet. If unset, the Lidl half of the weekly ingest is
+# best-effort and is skipped without failing the timer; BasketWatch always runs.
 LIDL_FEED_URL=
 
 # --- LLM resolution fallback (buywise-api; OPTIONAL, default OFF) ---
@@ -135,21 +142,15 @@ else
     echo "==> ${ENV_FILE} already exists, leaving it untouched"
 fi
 
-# Enable (NOT start) the weekly ingest TIMER. Enabling persists it so it arms on
-# the next boot; we deliberately do not `--now` it here. The timer has
-# Persistent=true, so activating it after the Mon 03:00 calendar point has
-# already elapsed makes systemd fire a catch-up run *immediately* — which on a
-# fresh deploy would red buywise-ingest.service with MissingApiKey before the
-# operator reaches the env-edit step. The post-env "Next steps" below starts the
-# timer once BASKETWATCH_API_KEY is configured. The long-running
-# buywise/litestream units are likewise left for the operator to enable.
-echo "==> Enabling buywise-ingest.timer (weekly price ingest; not started yet)"
-# This script targets a real systemd host. On a box without systemd as PID 1
-# (container/chroot/nspawn) `enable` exits non-zero; guard it so a failure warns
-# but does not abort the rest of the script (the "Next steps" guidance below)
-# under `set -euo pipefail`.
-systemctl enable buywise-ingest.timer \
-    || echo "WARN: could not enable timer (no running systemd?); enable manually after setting the env file: systemctl enable --now buywise-ingest.timer" >&2
+# Do NOT enable the weekly ingest timer. The units are installed above, but the
+# timer stays disabled on purpose: the first deploy runs without price ingest
+# (it needs a paid BasketWatch key whose terms and cost are still being
+# validated against issue #109), and the timer has Persistent=true, so an
+# enabled-but-unconfigured timer fires a catch-up run at the next boot and reds
+# buywise-ingest.service with MissingApiKey. The operator enables it on purpose
+# once the key is set; see deploy/README.md, "Weekly price ingest".
+echo "==> Installed buywise-ingest.timer (weekly price ingest) but did NOT enable it"
+echo "    Enable it later with: sudo systemctl enable --now buywise-ingest.timer"
 
 # Opt-in HTTPS reverse proxy. Installs the Caddyfile, enables Caddy, and
 # restarts it to load the new config only once the operator has replaced the
@@ -189,17 +190,19 @@ Next steps:
        LITESTREAM_ACCESS_KEY_ID       R2 access key id
        LITESTREAM_SECRET_ACCESS_KEY   R2 secret access key
 
-     weekly ingest:
-       BASKETWATCH_API_KEY            REQUIRED for the weekly ingest. Without it
+     weekly ingest (optional; the units are installed but NOT enabled):
+       BASKETWATCH_API_KEY            REQUIRED to enable the ingest. Without it
                                       the BasketWatch run fails and reds the
-                                      whole weekly unit. Set it before the first
-                                      weekly fire (Mon 03:00).
+                                      whole weekly unit. Leave it unset for the
+                                      first deploy; set it only once the
+                                      live-savings validation (issue #109) has
+                                      confirmed supplier access, terms and cost.
        BASKETWATCH_API_HOST           optional (defaults to
                                       basketwatch.p.rapidapi.com)
-       LIDL_FEED_URL                  optional Lidl feed source URL. If unset,
-                                      the Lidl half of the weekly ingest is
-                                      skipped (best-effort); BasketWatch always
-                                      runs.
+       LIDL_FEED_URL                  optional Lidl feed source URL. There is no
+                                      default and no verified feed yet; if unset
+                                      the Lidl half of the ingest is skipped
+                                      (best-effort); BasketWatch always runs.
 
      LLM resolution fallback (optional, default OFF; API runs fine without these):
        LLM_FALLBACK_ENABLED           optional master switch (default false).
@@ -214,35 +217,41 @@ Next steps:
    'buywise-cli seed-matches' (see docs/phase0-results.md).
 
    Also edit ${LITESTREAM_CONFIG} and replace <ACCOUNT_ID> in the endpoint
-   with your Cloudflare account id.
+   with your Cloudflare account id, and make sure the R2 token in
+   ${ENV_FILE} is scoped to the buywise-backup bucket only (see
+   deploy/README.md section 4.2).
 
 2. Ensure the binaries are installed:
        /usr/local/bin/buywise-api
        /usr/local/bin/buywise-cli   (needed by the weekly ingest timer)
        /usr/local/bin/litestream
 
+   And the built frontend is in place at
+   /var/lib/buywise/frontend/build (see deploy/README.md section 1).
+
 3. Enable and start the services (only after the env file is set in step 1):
 
        sudo systemctl enable --now buywise litestream
 
-   The weekly ingest timer (buywise-ingest.timer) was *enabled* by this script
-   but NOT started, so it cannot fire a Persistent=true catch-up run before the
-   env file exists. Start it now that BASKETWATCH_API_KEY is set:
+   The weekly ingest timer (buywise-ingest.timer) was installed but NOT enabled:
+   the first deploy runs without price ingest. Enable it only after issue #109
+   has confirmed supplier access, terms and cost, and after setting
+   BASKETWATCH_API_KEY:
 
-       sudo systemctl start buywise-ingest.timer
-
-   Inspect it and trigger a manual ingest run with:
-
-       systemctl list-timers buywise-ingest.timer
-       sudo systemctl start buywise-ingest.service   # run ingest now
+       sudo systemctl enable --now buywise-ingest.timer
+       sudo systemctl start buywise-ingest.service   # run an ingest now
        journalctl -u buywise-ingest -n 50 --no-pager
 
 4. Verify:
 
        systemctl status buywise
        systemctl status litestream
-       # Uses the default port 3000; adjust if you set PORT in ${ENV_FILE}.
-       curl -i http://localhost:3000/api/auth/me
+       # One-command check: health, PWA manifest + service worker, and, with
+       # credentials, an authenticated list read and a short SSE stream.
+       # Adjust the port if you set PORT in ${ENV_FILE}.
+       BUYWISE_SMOKE_EMAIL=owner@example.com \
+       BUYWISE_SMOKE_PASSWORD='<owner password>' \
+         ${SCRIPT_DIR}/smoke.sh http://localhost:3000
 
 5. To serve the app to phones over HTTPS, follow deploy/README.md section 7
    (Caddy reverse proxy). This script installs the Caddyfile to

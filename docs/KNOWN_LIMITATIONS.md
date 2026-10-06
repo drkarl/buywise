@@ -486,8 +486,9 @@ Open follow-ups:
 
 - When receipt ingestion is implemented, enforce a per-upload processing choice, provider
   disclosure, no-publication/no-training terms, image expiry and deletion.
-- Decide explicit backup retention, encryption and key custody; verify the deployed R2 token scope
-  and record a restore rehearsal.
+- Decide backup encryption and key custody; verify the deployed R2 token scope and record a restore
+  rehearsal (retention is now explicit at 7 days and the rehearsal is a required runbook step —
+  issue #142).
 - Consider recording deletion tombstones for post-restore reapplication, and a local vacuum option
   for deleted SQLite pages.
 - Revisit deletion of aggregate usage counters if they become household-attributable.
@@ -544,3 +545,123 @@ Open follow-ups:
   deleted only if they belong to no other household, but no email is sent and list data already
   cached in their browser (IndexedDB/localStorage) is not reachable from the server — the same
   limitation that applies to a deleted household.
+
+## Deploy health check and smoke test
+
+Issue #141, roadmap #114 (deploy issue #96). The API exposes an unauthenticated `GET /api/health`
+(database reachable, migrations applied) and `deploy/smoke.sh` checks health, the PWA
+manifest/service worker and — with credentials — auth and a short SSE connection.
+
+### 1. The health endpoint only proves the database and schema are ready
+
+**What happens.** `crates/api/src/health.rs` answers `200 {"status":"ok"}` after one trivial query
+and a check that every embedded migration is recorded as applied; otherwise
+`503 {"status":"unavailable"}`. It does not check the frontend build, the R2 replica, JSON1
+(asserted once at startup), disk space, or that the database file is writable. A deploy that serves
+a stale or missing `frontend/build` still reports healthy.
+
+**Why accepted.** The probe answers one question — may this process serve requests against a merged
+database — and must stay cheap and safe to expose without a session. Deeper checks belong in the
+human-run smoke test; growing the endpoint into a monitoring surface is a non-goal of issue #141.
+
+**Workaround.** Run `deploy/smoke.sh <base-url>`, which additionally proves the frontend assets are
+served and (with credentials) that login, an authenticated list read and the SSE stream work.
+
+**Follow-up.** If monitoring is ever wanted, add the extra checks to the smoke script or a separate
+probe rather than widening `/api/health`.
+
+### 2. The smoke script's authenticated checks are skipped when credentials or a list are absent
+
+**What happens.** `deploy/smoke.sh` always performs the health and PWA-asset checks, but the
+authenticated list read and the SSE connection need `BUYWISE_SMOKE_EMAIL`/`BUYWISE_SMOKE_PASSWORD`;
+when the account can see no list, the SSE check is skipped with a `SKIP:` line
+(`BUYWISE_SMOKE_LIST_ID` forces a target). A credential-less run therefore passes without exercising
+auth or live sync. The SSE wait is bounded (35 s default) and a bare frame is the only assertion —
+the stream's contents are not validated.
+
+**Why accepted.** The script must be runnable on a fresh host before any account exists, and a smoke
+test is a readiness gate rather than an end-to-end suite.
+
+**Workaround.** Run it with a real account after `bootstrap-household` (runbook section 6.1) to
+cover the authenticated paths.
+
+**Follow-up.** None planned; extend only if a specific failure mode needs it.
+
+## Backup retention and R2 token scope
+
+Issue #142, roadmap #114 (deploy issue #96). `deploy/litestream.yml` sets `retention: 168h`
+(7 days), and the runbook documents a bucket-scoped R2 token and a required restore rehearsal.
+
+### 1. The R2 token reaches every object in the bucket, not just Litestream's prefix
+
+**What happens.** Litestream writes under the `db` prefix, but Cloudflare R2 scopes an API token to
+whole buckets, not object prefixes (`Object Read & Write` applied to `buywise-backup`). The token
+can therefore read, write and delete any object in `buywise-backup`, including anything else the
+bucket later holds.
+
+**Why accepted.** Bucket scope is the narrowest R2 offers; the owner chose it over an account-wide
+token (issue #136), and the bucket holds only the replica. Client-side encryption remains a
+non-goal for now (provider-managed keys).
+
+**Workaround.** Keep `buywise-backup` dedicated to the Litestream replica.
+
+**Follow-up.** Revisit if the bucket must hold anything else, or when encryption with a
+household-held key is reconsidered (issue #136).
+
+### 2. A restore point can resurrect rows deleted up to 7 days ago
+
+**What happens.** With `retention: 168h` the replica keeps seven days of history, so a row — or a
+whole household — deleted on the live server can be resurrected by a disaster restore until those
+frames age out. Deletion is not immediate in the backup. Shortening retention shrinks that window
+but also shortens the recovery window for accidental deletions.
+
+**Why accepted.** Seven days is the owner's explicit choice (issue #136): long enough to recover a
+late-noticed deletion, short enough to bound how long deleted data survives in R2.
+`docs/data-flows.md` §5.3 documents the reapply-after-restore sequence.
+
+**Workaround.** After a restore that predates a deletion, re-run
+`buywise-cli delete-household --confirm`; to erase the frames sooner, purge the `db` prefix and let
+Litestream re-seed (this drops all older recovery points).
+
+**Follow-up.** Deletion tombstones, so a delete can be reapplied automatically after restoring an
+older backup (issue #136).
+
+### 3. The restore rehearsal is manual, and its record lives outside the repository
+
+**What happens.** The runbook requires a non-destructive restore rehearsal (Disaster recovery →
+Restore rehearsal) with a result table, but nothing runs or checks it automatically:
+`validation-interval` is unset, so Litestream never auto-verifies a restore, and the recorded result
+is a table the operator fills in outside this repository (the issue or deploy log). A deploy that
+skipped the rehearsal looks the same in the repository as one that passed.
+
+**Why accepted.** Automatic validation costs egress on every run, and the rehearsal is a human
+procedure; the runbook now makes it a required step with a place to record evidence.
+
+**Workaround.** None — run the rehearsal and record the result.
+
+**Follow-up.** Consider `validation-interval` once egress cost is acceptable, or persist rehearsal
+evidence somewhere durable (issue #136).
+
+## First deploy without the price ingest
+
+Issue #143, roadmap #114 (deploy issue #96). `setup.sh` installs the ingest units but does not
+enable `buywise-ingest.timer`, and the runbook says when and how to enable it.
+
+### 1. Price comparison stays empty until the ingest is enabled and matches are seeded
+
+**What happens.** A fresh deploy has no retailer offers and no `product_matches` rows, so the
+optimiser has nothing to price and the app shows no prices. The weekly ingest is installed but
+disabled, and once enabled it needs `BASKETWATCH_API_KEY`; `LIDL_FEED_URL` has no default and there
+is no verified Lidl feed. Enabling the timer is a deliberate later operator step, after the
+live-savings validation (issue #109) confirms supplier access, terms and cost.
+
+**Why accepted.** The owner decided to deploy without the price ingest (issue #143): the supplier
+terms and cost are unvalidated, and a timer enabled without the key reds the unit. The API and the
+shared lists work fully without prices.
+
+**Workaround.** Seed `product_matches` with `buywise-cli seed-matches` or accept in-app proposals,
+and enable the ingest per "Weekly price ingest" once issue #109 is resolved. Until offers exist,
+expect an empty price comparison.
+
+**Follow-up.** Enable the ingest after issue #109, add a Lidl feed only once one is verified; #109
+also decides whether the supplier is retained at all.
