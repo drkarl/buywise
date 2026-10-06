@@ -49,8 +49,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
-    bootstrap, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches, set_password,
-    validate,
+    bootstrap, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches,
+    set_password, validate,
 };
 
 #[derive(Parser)]
@@ -315,8 +315,10 @@ fn main() -> Result<()> {
         Command::ExpireReceipts { db, receipt_dir } => {
             receipts::expire_run(&db, receipt_dir.as_deref())
         }
-        Command::ImportPurchases { db, household_id, file } => {
-            purchases::import_run(&db, &household_id, &file)
-        }
+        Command::ImportPurchases {
+            db,
+            household_id,
+            file,
+        } => purchases::import_run(&db, &household_id, &file),
     }
 }
