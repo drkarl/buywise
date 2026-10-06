@@ -66,7 +66,9 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
 `list_entry_events.payload`, `recommendation_runs.plans_json`,
 `recommendation_runs.basket_snapshot_json`, `recommendation_runs.price_evidence_json`,
 `recommendation_runs.coverage_json`, `recommendation_runs.usual_profile_json`,
-`savings_events.chosen_stores`.
+`savings_events.chosen_stores`, `purchase_transactions.source_payload`,
+`purchase_transaction_revisions.source_payload`,
+`purchase_transaction_revisions.lines_json`.
 
 ## Document layout
 
@@ -137,7 +139,21 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
   } ],
 
   "purchase_events": [ { "id", "canonical_item_id", "list_id", "entry_id", "source",
-                         "occurred_at", "recorded_at" } ]
+                         "occurred_at", "recorded_at" } ],
+
+  "purchase_transactions": [ {
+    "id", "household_id", "retailer", "purchase_date", "source_kind",
+    "source_transaction_id", "transaction_identity", "identity_kind", "fingerprint",
+    "currency", "total_cents", "revision", "source_payload", "created_at", "updated_at",
+    "lines":     [ { "id", "transaction_id", "line_ordinal", "original_text", "name",
+                     "brand", "quantity", "size_value", "size_unit", "unit_price_cents",
+                     "line_total_cents", "line_discount_cents", "deposit_cents",
+                     "retailer_product_id", "canonical_item_id", "match_status",
+                     "revision", "created_at" } ],
+    "revisions": [ { "id", "transaction_id", "revision", "retailer", "purchase_date",
+                     "currency", "total_cents", "source_payload", "lines_json",
+                     "superseded_at" } ]
+  } ]
 }
 ```
 
@@ -176,6 +192,9 @@ The document is internally closed — the ids a record references resolve inside
 | `match_feedback[].product_match_id` | → | `product_matches[].id` |
 | `purchase_events[].canonical_item_id` | → | `catalogue[].id` |
 | `purchase_events[].list_id` / `entry_id` | → | `lists[].id` / `lists[].entries[].id` |
+| `purchase_transactions[].lines[].transaction_id` / `revisions[].transaction_id` | → | `purchase_transactions[].id` |
+| `purchase_transactions[].lines[].retailer_product_id` | → | `retailer_products[].id` (null until matched) |
+| `purchase_transactions[].lines[].canonical_item_id` | → | `catalogue[].id` (null until matched) |
 | `preferences.purchase_dismissals[].canonical_item_id` | → | `catalogue[].id` |
 | `preferences.*[].category_id` / `subcategory_id` | → | `reference_data` |
 

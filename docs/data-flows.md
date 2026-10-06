@@ -79,6 +79,7 @@ in `migrations/`, and serves; the CLI and the weekly ingest open the same file.
 | `recommendation_runs`, `savings_events` | optimiser runs (`plans_json`) and realised/estimated savings | savings history |
 | `product_matches`, `match_feedback` | accepted/rejected/suggested canonical↔retailer-product links, and accept/reject/prefer/undo feedback | price matching + learning |
 | `purchase_events`, `purchase_dismissals` | one row per observed purchase (`check_off` today), and per-item "not now" dismissals | purchase suggestions |
+| `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links) and their superseded revisions | the purchase ledger — what the household actually bought (issue #148) |
 
 **Shared, not household-identifiable tables** (no `household_id`, or keyed by a
 global id): `categories`, `subcategories`, `retailer_products`, `product_offers`,
@@ -279,6 +280,7 @@ buywise-cli bootstrap-household --db /var/lib/buywise/buywise.db --name "<househ
 buywise-cli export-household --db /var/lib/buywise/buywise.db --household-id <uuid> [--out household.json]
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --dry-run
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --confirm
+buywise-cli import-purchases --db /var/lib/buywise/buywise.db --household-id <uuid> --file purchases.json
 ```
 
 `bootstrap-household` (issue #139) creates the very first household and its owner
@@ -336,7 +338,8 @@ management").
 ### 5.2 What deletion removes
 
 In one transaction, in dependency order: `list_entry_events`, `savings_events`,
-`purchase_events`, `mutations`, `list_entries`, `recommendation_runs`,
+`purchase_events`, `purchase_transaction_revisions`, `purchase_lines`,
+`purchase_transactions`, `mutations`, `list_entries`, `recommendation_runs`,
 `shopping_lists`, `match_feedback`, `product_matches`, `item_constraints`,
 `item_aliases`, `purchase_dismissals`, `canonical_items`,
 `household_store_category_rules`, `household_store_settings`,

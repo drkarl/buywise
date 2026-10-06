@@ -201,6 +201,51 @@ pub async fn export_household(
     )
     .await?;
 
+    // The household's purchase ledger (issue #148): transactions with their
+    // lines and any superseded revisions nested under each transaction, like the
+    // list-scoped arrays below.
+    let mut purchase_transactions = fetch_rows_bound(
+        pool,
+        "SELECT id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
+                transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
+                source_payload, created_at, updated_at \
+         FROM purchase_transactions WHERE household_id = ?1 ORDER BY purchase_date, id",
+        household_id,
+    )
+    .await?;
+    attach_children_by(
+        &mut purchase_transactions,
+        "lines",
+        "transaction_id",
+        fetch_rows_bound(
+            pool,
+            "SELECT pl.id, pl.transaction_id, pl.line_ordinal, pl.original_text, pl.name, \
+                    pl.brand, pl.quantity, pl.size_value, pl.size_unit, pl.unit_price_cents, \
+                    pl.line_total_cents, pl.line_discount_cents, pl.deposit_cents, \
+                    pl.retailer_product_id, pl.canonical_item_id, pl.match_status, pl.revision, \
+                    pl.created_at \
+             FROM purchase_lines pl JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
+             WHERE pt.household_id = ?1 ORDER BY pl.transaction_id, pl.line_ordinal",
+            household_id,
+        )
+        .await?,
+    );
+    attach_children_by(
+        &mut purchase_transactions,
+        "revisions",
+        "transaction_id",
+        fetch_rows_bound(
+            pool,
+            "SELECT pr.id, pr.transaction_id, pr.revision, pr.retailer, pr.purchase_date, \
+                    pr.currency, pr.total_cents, pr.source_payload, pr.lines_json, pr.superseded_at \
+             FROM purchase_transaction_revisions pr \
+             JOIN purchase_transactions pt ON pt.id = pr.transaction_id \
+             WHERE pt.household_id = ?1 ORDER BY pr.transaction_id, pr.revision",
+            household_id,
+        )
+        .await?,
+    );
+
     let mut lists = fetch_rows_bound(
         pool,
         "SELECT id, name, status, current_revision, created_at, archived_at \
@@ -309,14 +354,23 @@ pub async fn export_household(
         "match_feedback": match_feedback,
         "lists": lists,
         "purchase_events": purchase_events,
+        "purchase_transactions": purchase_transactions,
     }))
 }
 
 /// Attach `children` (grouped by their `list_id`) to each list under `key`.
 fn attach_children(lists: &mut [Value], key: &str, children: Vec<Value>) {
-    let mut grouped = group_by(children, "list_id");
-    for list in lists.iter_mut() {
-        if let Value::Object(map) = list {
+    attach_children_by(lists, key, "list_id", children);
+}
+
+/// Attach `children` grouped by `parent_key` to each parent under `key`.
+///
+/// [`attach_children`] is the list case (`list_id`); the purchase ledger nests
+/// lines and revisions by `transaction_id`.
+fn attach_children_by(parents: &mut [Value], key: &str, parent_key: &str, children: Vec<Value>) {
+    let mut grouped = group_by(children, parent_key);
+    for parent in parents.iter_mut() {
+        if let Value::Object(map) = parent {
             let id = map
                 .get("id")
                 .and_then(Value::as_str)
@@ -384,6 +438,9 @@ pub const HOUSEHOLD_TABLES: &[&str] = &[
     "list_entry_events",
     "savings_events",
     "purchase_events",
+    "purchase_transaction_revisions",
+    "purchase_lines",
+    "purchase_transactions",
     "mutations",
     "list_entries",
     "recommendation_runs",
@@ -432,6 +489,20 @@ const DELETE_STEPS: &[DeleteStep] = &[
     DeleteStep {
         table: "purchase_events",
         delete_sql: "DELETE FROM purchase_events WHERE household_id = ?1",
+    },
+    DeleteStep {
+        table: "purchase_transaction_revisions",
+        delete_sql: "DELETE FROM purchase_transaction_revisions WHERE transaction_id IN \
+             (SELECT id FROM purchase_transactions WHERE household_id = ?1)",
+    },
+    DeleteStep {
+        table: "purchase_lines",
+        delete_sql: "DELETE FROM purchase_lines WHERE transaction_id IN \
+             (SELECT id FROM purchase_transactions WHERE household_id = ?1)",
+    },
+    DeleteStep {
+        table: "purchase_transactions",
+        delete_sql: "DELETE FROM purchase_transactions WHERE household_id = ?1",
     },
     DeleteStep {
         table: "mutations",

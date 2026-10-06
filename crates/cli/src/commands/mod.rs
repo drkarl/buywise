@@ -26,6 +26,7 @@ pub mod ingest_lidl;
 pub mod no_network;
 pub mod optimise;
 pub mod password_prompt;
+pub mod purchases;
 pub mod seed_matches;
 pub mod set_password;
 pub mod validate;
