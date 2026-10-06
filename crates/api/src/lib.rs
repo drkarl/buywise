@@ -24,9 +24,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::any;
+use axum::Router;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
