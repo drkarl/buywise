@@ -27,11 +27,12 @@
 	import { page } from '$app/state';
 	import { jsonMutationHeaders } from '$lib/api/csrf';
 	import { fetchSettings } from '$lib/api/settings';
+	import { db } from '$lib/db/dexie';
 	import { flushPendingMutations } from '$lib/sync';
 	import PlanCard from '$lib/components/PlanCard.svelte';
 	import { allocatePlan } from '$lib/shopping/allocatePlan';
 	import { saveChosenTrip } from '$lib/shopping/chosenTrip';
-	import { allEntries, type RetailerId } from '$lib/stores/shopping';
+	import { type RetailerId } from '$lib/stores/shopping';
 	import {
 		formatEuros,
 		retailerLabel,
@@ -47,13 +48,8 @@
 
 	const listId = $derived(page.params.id ?? '');
 
-	const all = $derived(allEntries(listId));
-	let quantityById = $state<Map<string, number>>(new Map());
-	let resultQuantities = $state<Map<string, number>>(new Map());
-	let resultCanonicalItemIds = $state<Map<string, string | null>>(new Map());
-	$effect(() => {
-		quantityById = new Map($all.map((e) => [e.id, e.quantity]));
-	});
+	let resultQuantities = new Map<string, number>();
+	let resultCanonicalItemIds = new Map<string, string | null>();
 
 	type Status = 'loading' | 'ready' | 'error';
 
@@ -300,9 +296,15 @@
 				status = 'error';
 				return;
 			}
-			const pricedQuantities = new Map(quantityById);
+			const pricedEntries = await db.list_entries.where('list_id').equals(id).toArray();
+			if (superseded()) return;
+			const pricedQuantities = new Map(
+				pricedEntries.map((entry): [string, number] => [entry.id, entry.quantity])
+			);
 			const pricedCanonicalItemIds = new Map<string, string | null>(
-				$all.map((entry): [string, string | null] => [entry.id, entry.canonical_item_id ?? null])
+				pricedEntries.map(
+					(entry): [string, string | null] => [entry.id, entry.canonical_item_id ?? null]
+				)
 			);
 
 			const res = await fetch('/api/optimise', {
