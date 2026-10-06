@@ -23,11 +23,21 @@
 //!
 //! * `set-password <email> --db <db>` — read a new password without echoing it,
 //!   argon2id-hash it, and update `users.password_hash` for the matching user.
+//!
+//! Plus two household data-control subcommands (issue #119):
+//!
+//! * `export-household --db <db> --household-id <uuid> [--out <path>]` — write
+//!   every household-scoped record as one documented JSON document
+//!   (`docs/household-export.md`).
+//! * `delete-household --db <db> --household-id <uuid> [--confirm] [--dry-run]`
+//!   — remove every household-scoped record in one transaction.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use buywise_cli::commands::{ingest, ingest_lidl, optimise, seed_matches, set_password, validate};
+use buywise_cli::commands::{
+    household, ingest, ingest_lidl, optimise, seed_matches, set_password, validate,
+};
 
 #[derive(Parser)]
 #[command(name = "buywise-cli", about = "BuyWise developer CLI")]
@@ -121,6 +131,52 @@ enum Command {
         #[arg(long)]
         db: String,
     },
+
+    /// Export one household's records as a single JSON document.
+    ///
+    /// Covers the household's catalogue (items, aliases, constraints),
+    /// preferences (thresholds, store settings, category rules, aisle orders,
+    /// purchase dismissals), product matches, lists with their entries and
+    /// history, purchase events and match feedback, with the shared reference
+    /// rows they point at. The layout is documented in
+    /// `docs/household-export.md`. Writes to stdout unless `--out` is given.
+    ExportHousehold {
+        /// SQLite database path to read.
+        #[arg(long)]
+        db: String,
+        /// Household UUID to export.
+        #[arg(long, value_parser = parse_household_id)]
+        household_id: String,
+        /// Write the JSON to this path instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Delete every record BuyWise holds for one household.
+    ///
+    /// Removes the household, its members, catalogue, preferences, lists,
+    /// entries, purchase history, matches and feedback in one transaction.
+    /// Shared reference data (categories, retailers, offers, usage counters) is
+    /// not household-identifiable and is left in place. Members left with no
+    /// other household are removed with their sessions. Backups taken before
+    /// the deletion are NOT rewritten — see `docs/data-flows.md`.
+    ///
+    /// Refuses to run without `--confirm`; `--dry-run` reports what would be
+    /// removed and rolls back.
+    DeleteHousehold {
+        /// SQLite database path to update.
+        #[arg(long)]
+        db: String,
+        /// Household UUID to delete.
+        #[arg(long, value_parser = parse_household_id)]
+        household_id: String,
+        /// Required to actually delete (ignored with `--dry-run`).
+        #[arg(long)]
+        confirm: bool,
+        /// Report the rows that would be deleted, then roll back.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Validate `--household-id` parses as a UUID at parse time, so a malformed id
@@ -157,5 +213,16 @@ fn main() -> Result<()> {
         } => seed_matches::run(&from, &db, &household_id),
         Command::GenerateFixtures => buywise_cli::generate::run(),
         Command::SetPassword { email, db } => set_password::run(&email, &db),
+        Command::ExportHousehold {
+            db,
+            household_id,
+            out,
+        } => household::export_run(&db, &household_id, out.as_deref()),
+        Command::DeleteHousehold {
+            db,
+            household_id,
+            confirm,
+            dry_run,
+        } => household::delete_run(&db, &household_id, confirm, dry_run),
     }
 }

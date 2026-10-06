@@ -18,6 +18,7 @@
 
 pub mod basket;
 pub mod fixture_db;
+pub mod household;
 pub mod ingest;
 pub mod ingest_lidl;
 pub mod no_network;
