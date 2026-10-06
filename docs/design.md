@@ -591,7 +591,7 @@ carries a `status` (migration 016) and the dashboard labels each figure with its
 baseline, evidence coverage, date, and included costs:
 
 * **`verified`** — line- and quantity-reconciled evidence. **Reserved**: no
-  production path writes it yet (it needs the purchase ledger of #116), so the
+  production path writes it yet (purchase-to-plan reconciliation is not implemented), so the
   aggregate the API calls `saved` is empty today and shows an honest empty state.
   Only `verified` rows may ever be counted as saved or net savings.
 * **`estimated`** — the best single store and the recommended plan price the same

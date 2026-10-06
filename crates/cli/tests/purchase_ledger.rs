@@ -189,7 +189,11 @@ async fn source_transaction_ids_are_scoped_by_normalized_retailer() {
         0
     );
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions WHERE revision != 1").await,
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM purchase_transactions WHERE revision != 1"
+        )
+        .await,
         0
     );
 }
@@ -485,7 +489,10 @@ async fn the_documented_example_parses() {
     let parsed = purchase_ledger::parse_import_document(&value).expect("example parses");
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].lines.len(), 2);
-    assert_eq!(parsed[0].source_transaction_id, parsed[1].source_transaction_id);
+    assert_eq!(
+        parsed[0].source_transaction_id,
+        parsed[1].source_transaction_id
+    );
     assert_ne!(parsed[0].retailer, parsed[1].retailer);
     assert_eq!(
         parsed[0].lines[1].match_status,
