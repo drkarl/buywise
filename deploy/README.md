@@ -177,9 +177,10 @@ sudo ./setup.sh
   before you configure `BASKETWATCH_API_KEY`. The long-running `buywise`/
   `litestream` units are likewise left for you to enable once the binaries are
   in place;
-- installs and enables the Caddy HTTPS reverse proxy **only** once you have set
-  the hostname in `deploy/Caddyfile` and installed Caddy — an opt-in step that
-  never enables the proxy with the placeholder still in place (see section 7);
+- installs the Caddy HTTPS reverse proxy, enables `caddy.service`, and restarts
+  it to load the config **only** once you have set the hostname in
+  `deploy/Caddyfile` and installed Caddy — an opt-in step that never enables the
+  proxy with the placeholder still in place (see section 7);
 - prints the next-step commands.
 
 ## 4. Set environment variables and the R2 endpoint
@@ -358,15 +359,13 @@ journalctl -u caddy -n 50 --no-pager   # watch the certificate being issued
 
 ### 7.5 The opt-in setup step
 
-`sudo ./setup.sh` installs the Caddyfile to `/etc/caddy/Caddyfile` and enables
-and starts `caddy.service` **only when** the site line no longer has the
-`<hostname>` placeholder, the `caddy` binary is already installed (7.3), and
-`deploy/Caddyfile` exists. With the placeholder on the site line it prints
-guidance and leaves Caddy untouched, so a fresh host is never brought up with an
-invalid hostname. It mirrors how `setup.sh` installs the other units: the
-config is copied into place with `install`, then the service is enabled (and,
-unlike `buywise`/`litestream`, started — Caddy has no separate binary-copy step
-to wait for).
+`sudo ./setup.sh` installs the Caddyfile to `/etc/caddy/Caddyfile`, enables
+`caddy.service`, and restarts it to load the new config **only when** the site
+line no longer has the `<hostname>` placeholder, the `caddy` binary is already
+installed (7.3), and `deploy/Caddyfile` exists. With the placeholder on the site
+line it prints guidance and leaves Caddy untouched, so a fresh host is never
+brought up with an invalid hostname. Restarting also applies the new file when
+the apt package has already started Caddy with its default config.
 
 ### 7.6 Proxy settings for the live-sync SSE stream
 

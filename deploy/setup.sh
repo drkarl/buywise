@@ -11,10 +11,10 @@
 # the weekly ingest *timer*: enabling persists it for the next boot, while
 # leaving the start to the post-env step prevents a Persistent=true catch-up
 # run from firing before the operator has set BASKETWATCH_API_KEY. It also
-# installs and enables the Caddy HTTPS reverse proxy, but ONLY once the operator
-# has replaced the <hostname> placeholder in Caddyfile and Caddy is already
-# installed (see deploy/README.md section 7); it never enables the proxy with the
-# placeholder still in place.
+# installs and enables the Caddy HTTPS reverse proxy, then restarts it to load
+# the installed config, but ONLY once the operator has replaced the <hostname>
+# placeholder in Caddyfile and Caddy is already installed (see deploy/README.md
+# section 7); it never enables the proxy with the placeholder still in place.
 #
 # Prerequisites (see deploy/README.md): the buywise-api, buywise-cli, and
 # litestream binaries must already be copied to /usr/local/bin/.
@@ -151,13 +151,10 @@ echo "==> Enabling buywise-ingest.timer (weekly price ingest; not started yet)"
 systemctl enable buywise-ingest.timer \
     || echo "WARN: could not enable timer (no running systemd?); enable manually after setting the env file: systemctl enable --now buywise-ingest.timer" >&2
 
-# Opt-in HTTPS reverse proxy. Installs the Caddyfile and enables/starts Caddy
-# only once the operator has replaced the <hostname> placeholder and installed
-# Caddy first: Caddy's automatic HTTPS would otherwise retry an invalid hostname
-# forever. This mirrors how the other units are installed (`install` into place,
-# then `systemctl enable`), except that Caddy is started here because serving
-# HTTPS is the point of the step and there is no separate binary-copy step to
-# wait for.
+# Opt-in HTTPS reverse proxy. Installs the Caddyfile, enables Caddy, and
+# restarts it to load the new config only once the operator has replaced the
+# <hostname> placeholder and installed Caddy first: automatic HTTPS would
+# otherwise retry an invalid hostname forever.
 echo "==> Installing Caddy HTTPS reverse proxy (opt-in)"
 CADDY_SOURCE="${SCRIPT_DIR}/Caddyfile"
 if [[ ! -f "${CADDY_SOURCE}" ]]; then
@@ -171,8 +168,8 @@ else
     install -d -m 0755 /etc/caddy
     install -m 0644 "${CADDY_SOURCE}" "${CADDY_CONFIG}"
     echo "    installed ${CADDY_CONFIG}"
-    systemctl enable --now caddy \
-        || echo "WARN: could not enable/start caddy (no running systemd?); enable manually: systemctl enable --now caddy" >&2
+    systemctl enable caddy && systemctl restart caddy \
+        || echo "WARN: could not enable/restart caddy (no running systemd?); enable and restart manually: systemctl enable caddy && systemctl restart caddy" >&2
 fi
 
 cat <<EOF
@@ -249,7 +246,7 @@ Next steps:
 
 5. To serve the app to phones over HTTPS, follow deploy/README.md section 7
    (Caddy reverse proxy). This script installs the Caddyfile to
-   ${CADDY_CONFIG} and enables caddy.service automatically once the
-   hostname is set in deploy/Caddyfile and Caddy is installed.
+   ${CADDY_CONFIG}, enables caddy.service, and restarts it to load the config
+   once the hostname is set in deploy/Caddyfile and Caddy is installed.
 
 EOF
