@@ -36,6 +36,10 @@ pub const ROLE_MEMBER: &str = "member";
 /// Errors produced by the membership operations.
 #[derive(Debug, thiserror::Error)]
 pub enum MembershipError {
+    /// A required user field contained only whitespace.
+    #[error("{0} cannot be blank")]
+    BlankUserField(&'static str),
+
     /// A `users` row with this email already exists (`users.email` is UNIQUE).
     /// The email is unique across the whole database, so this also covers a
     /// person who already belongs to another household.
@@ -169,6 +173,12 @@ pub async fn create_user(
     display_name: &str,
     password: &str,
 ) -> Result<(), MembershipError> {
+    if email.trim().is_empty() {
+        return Err(MembershipError::BlankUserField("email"));
+    }
+    if display_name.trim().is_empty() {
+        return Err(MembershipError::BlankUserField("display name"));
+    }
     validate_new_password(password)?;
     let hash = hash_password_for_storage(password).map_err(|e| MembershipError::Hash(e.to_string()))?;
 

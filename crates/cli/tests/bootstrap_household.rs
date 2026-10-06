@@ -109,3 +109,35 @@ fn bootstrap_refuses_a_database_that_already_has_an_account() {
         "the seeded default household plus the bootstrapped one"
     );
 }
+
+#[test]
+fn bootstrap_refuses_blank_owner_email_or_display_name() {
+    for (email, display_name) in [
+        (" \t ", "Owner"),
+        ("owner@example.test", " \n "),
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("buywise.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let err = block_on(buywise_cli::commands::bootstrap::bootstrap(
+            db_path,
+            "Our Home",
+            email,
+            display_name,
+            "owner-password",
+        ))
+        .expect_err("blank owner fields must be refused");
+        assert!(err.to_string().contains("cannot be blank"), "got: {err}");
+
+        let pool: SqlitePool = block_on(db::connect(&format!("sqlite://{db_path}")))
+            .expect("reopen migrated database");
+        let users: i64 = block_on(sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool))
+            .expect("count users");
+        assert_eq!(users, 0, "no owner account is created");
+        let household_count: i64 =
+            block_on(sqlx::query_scalar("SELECT COUNT(*) FROM households").fetch_one(&pool))
+                .expect("count households");
+        assert_eq!(household_count, 1, "only the seeded household remains");
+    }
+}
