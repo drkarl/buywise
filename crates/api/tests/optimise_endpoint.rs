@@ -497,11 +497,15 @@ async fn optimise_returns_four_plans_persists_run_and_explains() {
     );
     assert!(joined.contains("Prices as of 2026-06-01"), "got: {joined}");
 
-    // offer_snapshot_date is the latest among the recommended plan's offers.
-    assert!(
-        body["offer_snapshot_date"].is_string(),
-        "snapshot date present"
-    );
+    // offer_snapshot_date is the OLDEST observed date among the offers the run
+    // used (both plans price Aldi lines observed 2026-06-01 here).
+    assert_eq!(body["offer_snapshot_date"], "2026-06-01");
+
+    // Equal coverage: both plans price the same two lines, so the full-basket
+    // subtraction is available and no covered-subtotal suppression applies.
+    assert_eq!(body["coverage"]["status"], "comparable");
+    assert_eq!(body["coverage"]["covered_lines"], 2);
+    assert_eq!(body["coverage"]["total_lines"], 3);
 }
 
 #[tokio::test]
@@ -933,4 +937,220 @@ async fn aldi_comparison_reports_zero_coverage_without_aldi_prices() {
     assert_eq!(body["aldi_comparison"]["fresh"]["saving_cents"], 0);
     assert_eq!(body["aldi_comparison"]["packaged"]["item_count"], 0);
     assert_eq!(body["aldi_comparison"]["packaged"]["saving_cents"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Frozen evidence snapshot (issue #117, roadmap #114; slice 2)
+// ---------------------------------------------------------------------------
+
+/// The migration-018 snapshot columns of one run, compared for immutability.
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct SnapshotColumns {
+    snapshot_version: Option<i64>,
+    basket_snapshot_json: Option<String>,
+    price_evidence_json: Option<String>,
+    coverage_json: Option<String>,
+    snapshot_digest: Option<String>,
+    usual_profile_json: Option<String>,
+}
+
+async fn read_snapshot_columns(pool: &SqlitePool, run_id: &str) -> SnapshotColumns {
+    sqlx::query_as::<_, SnapshotColumns>(
+        "SELECT snapshot_version, basket_snapshot_json, price_evidence_json, coverage_json, \
+                snapshot_digest, usual_profile_json \
+         FROM recommendation_runs WHERE id = ?1",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .expect("run row")
+}
+
+/// A new run freezes its evidence (basket, offers, coverage, digest), reports the
+/// OLDEST offer date among the offers used, and neither a later list edit nor a
+/// refreshed offer can change the stored snapshot.
+#[tokio::test]
+async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    // Milk is far cheaper at Aldi (observed 2026-06-01); bread far cheaper at
+    // Tesco (2026-06-03). The saving clears the €10 default bar, so the two-store
+    // split is recommended and both plans price both lines.
+    seed_priced_match(
+        &pool,
+        "p-milk-aldi",
+        "aldi",
+        MILK_ID,
+        100,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_priced_match(
+        &pool,
+        "p-milk-tesco",
+        "tesco",
+        MILK_ID,
+        2000,
+        Some("2026-06-02"),
+    )
+    .await;
+    seed_priced_match(
+        &pool,
+        "p-bread-aldi",
+        "aldi",
+        BREAD_ID,
+        2200,
+        Some("2026-06-04"),
+    )
+    .await;
+    seed_priced_match(
+        &pool,
+        "p-bread-tesco",
+        "tesco",
+        BREAD_ID,
+        180,
+        Some("2026-06-03"),
+    )
+    .await;
+
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
+    seed_resolved_entry(&pool, "e-bread", "list-1", BREAD_ID, "pan", "user-a").await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["coverage"]["status"], "comparable", "{body:#}");
+    assert_eq!(body["coverage"]["covered_lines"], 2);
+    assert_eq!(body["coverage"]["total_lines"], 2);
+    // Oldest used offer date (2026-06-01), not the newest (2026-06-04/06-03).
+    assert_eq!(body["offer_snapshot_date"], "2026-06-01");
+
+    let run_id = body["run_id"].as_str().expect("run_id string").to_string();
+    let before = read_snapshot_columns(&pool, &run_id).await;
+
+    assert_eq!(before.snapshot_version, Some(1));
+    assert!(
+        before.usual_profile_json.is_none(),
+        "usual_profile is reserved and stays NULL in this slice"
+    );
+    assert_eq!(
+        before.snapshot_digest.as_deref().map(str::len),
+        Some(64),
+        "sha-256 hex digest"
+    );
+    let basket: Value =
+        serde_json::from_str(before.basket_snapshot_json.as_deref().expect("basket json"))
+            .expect("valid json");
+    assert_eq!(basket["version"], 1);
+    assert_eq!(basket["list_id"], "list-1");
+    assert_eq!(basket["entries"].as_array().unwrap().len(), 2);
+    let offers: Value =
+        serde_json::from_str(before.price_evidence_json.as_deref().expect("price json"))
+            .expect("valid json");
+    // Offers used = best-single ∪ recommended: Aldi milk, Tesco milk, Tesco bread.
+    assert_eq!(offers["offers"].as_array().unwrap().len(), 3);
+    let coverage: Value =
+        serde_json::from_str(before.coverage_json.as_deref().expect("coverage json"))
+            .expect("valid json");
+    assert_eq!(coverage["common_scope"].as_array().unwrap().len(), 2);
+
+    // Mutate the list and refresh an offer AFTER the run: the frozen snapshot
+    // must not move (this is the whole point of the slice).
+    sqlx::query(
+        "UPDATE list_entries SET display_name = 'milk revised', quantity = 5 WHERE id = 'e-milk'",
+    )
+    .execute(&pool)
+    .await
+    .expect("mutate entry");
+    sqlx::query("UPDATE list_entries SET status = 'deleted' WHERE id = 'e-bread'")
+        .execute(&pool)
+        .await
+        .expect("delete entry");
+    sqlx::query(
+        "INSERT INTO product_offers \
+             (id, retailer_product_id, price_cents, source_snapshot_date, fetched_at, \
+              source_confidence_at_ingest) \
+         VALUES ('offer-p-milk-tesco-2', 'p-milk-tesco', 50, '2026-07-01', ?1, 'high')",
+    )
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .expect("refresh offer");
+
+    let after = read_snapshot_columns(&pool, &run_id).await;
+    assert_eq!(
+        before, after,
+        "a mutated list or refreshed offer must not change a frozen run"
+    );
+}
+
+/// When the best-single and recommended plans price different lines, the response
+/// carries no full-basket saving figure and instead a labelled, bounded covered
+/// subtotal with its coverage numerator and denominator.
+#[tokio::test]
+async fn unequal_coverage_suppresses_full_basket_and_shows_covered_subtotal() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
+    seed_catalogue(&pool).await;
+
+    // Milk is stocked only at Aldi; bread only at Tesco. No single store prices
+    // both, so the recommended two-store split reaches a line the best single
+    // store cannot — unequal coverage.
+    seed_priced_match(
+        &pool,
+        "p-milk-aldi",
+        "aldi",
+        MILK_ID,
+        100,
+        Some("2026-06-01"),
+    )
+    .await;
+    seed_priced_match(
+        &pool,
+        "p-bread-tesco",
+        "tesco",
+        BREAD_ID,
+        180,
+        Some("2026-06-02"),
+    )
+    .await;
+
+    seed_list(&pool, "list-1").await;
+    seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
+    seed_resolved_entry(&pool, "e-bread", "list-1", BREAD_ID, "pan", "user-a").await;
+
+    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["coverage"]["status"], "unequal_coverage", "{body:#}");
+    assert!(
+        body["coverage"]["full_basket_saving_cents"].is_null(),
+        "the full-basket subtraction must be suppressed: {body:#}"
+    );
+    assert_eq!(body["coverage"]["covered_lines"], 1);
+    assert_eq!(body["coverage"]["total_lines"], 2);
+    // The bounded subtotal covers only the one commonly priced line (milk, €1.00).
+    assert_eq!(body["coverage"]["covered_subtotal_cents"], 100);
+    assert_eq!(
+        body["coverage"]["label"],
+        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01"
+    );
+
+    // The snapshot records the common scope and the recommended-only line.
+    let run_id = body["run_id"].as_str().expect("run_id string");
+    let coverage_json: String =
+        sqlx::query_scalar("SELECT coverage_json FROM recommendation_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("coverage_json persisted");
+    let coverage: Value = serde_json::from_str(&coverage_json).expect("valid json");
+    assert_eq!(coverage["common_scope"].as_array().unwrap().len(), 1);
+    assert_eq!(coverage["best_single_only"].as_array().unwrap().len(), 0);
+    assert_eq!(coverage["recommended_only"].as_array().unwrap().len(), 1);
 }

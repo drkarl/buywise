@@ -178,6 +178,28 @@ export interface AldiComparison {
 	fresh: AldiComparisonSplit;
 }
 
+/**
+ * The frozen coverage of the best-single versus recommended comparison
+ * (issue #117, slice 2). Mirrors the serde serialisation of
+ * `crates/api/src/run_snapshot.rs::CoverageSummary`.
+ *
+ * `status` is `comparable` (both plans price the same lines), `unequal_coverage`
+ * (they price different lines, so no full-basket saving is stated and only a
+ * bounded covered subtotal is shown), or `no_plan` (nothing priceable to
+ * compare). `covered_lines`/`total_lines` are the covered numerator and the
+ * active-line denominator; `label` names both plus the evidence date.
+ */
+export interface CoverageSummary {
+	status: 'comparable' | 'unequal_coverage' | 'no_plan';
+	label: string;
+	covered_lines: number;
+	total_lines: number;
+	covered_subtotal_cents: number | null;
+	covered_saving_cents: number | null;
+	full_basket_saving_cents: number | null;
+	price_date: string | null;
+}
+
 /** The full `POST /api/optimise` 200 response body. */
 export interface OptimiseResponse {
 	basket_items: BasketItemIdentity[];
@@ -197,6 +219,9 @@ export interface OptimiseResponse {
 	needs_confirmation_items: NeedsConfirmationItem[];
 	plain_language_explanation: string;
 	offer_snapshot_date: string | null;
+	// Issue #117 slice 2: frozen coverage of the comparison, with the bounded
+	// covered-subtotal figure shown when the two plans price different lines.
+	coverage: CoverageSummary;
 	// Issue #103: plain-language reasons per plan card, keyed by `plan`. Ordering
 	// is most important first; the UI renders at most four per card, and a plan
 	// with no (or no entry's) reasons renders nothing extra. May be empty.

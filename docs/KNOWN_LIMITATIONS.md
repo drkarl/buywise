@@ -417,26 +417,32 @@ supports it.
 **Follow-up.** #116/#117: reconcile planned versus purchased quantities/products (extra, skipped,
 substituted, unmatched lines) to produce `verified` events.
 
-### 2. The estimate's price/run evidence is not frozen
+### 2. The snapshot is frozen for new runs only, and it freezes prices, not purchases
 
-**What happens.** An event stores the plan totals and a `recommendation_run_id`, but not an
-immutable snapshot of the priced offers behind them, so there is no frozen receipt of the prices
-the household saw for a given estimate.
+**What happens.** Each run created since migration 018 freezes its input basket, the offers it used
+and the coverage result, so a later list edit or offer refresh cannot change it (see
+[`docs/design.md`](design.md) §10, "Frozen run evidence and the covered subtotal"). Two gaps
+remain: runs created **before** migration 018 keep NULL snapshot columns (they stay readable
+everywhere, but carry no frozen evidence), and the snapshot records the planned line/pack inputs and
+prices only — it does not reconcile what was actually bought.
 
-**Why accepted.** Frozen run evidence is out of scope for this slice (issue #117 lists
-"Preserve the recommendation/price snapshot"; the roadmap defers the snapshot itself).
+**Why accepted.** The slice's scope is freezing the evidence a run was computed from; purchase
+reconciliation is #116. Backfilling old runs is impossible — the input they used no longer exists —
+so they are deliberately left NULL rather than reconstructed from mutable data.
 
-**Workaround.** Treat the stored totals as the record; `recommendation_run_id` points at the run
-for audit.
+**Workaround.** Use a new run's snapshot for price and input evidence; for a pre-018 run the stored
+totals remain the only record.
 
-**Follow-up.** Add frozen run/price evidence snapshots (issue #117, roadmap #114).
+**Follow-up.** #116/#117: reconcile planned versus purchased lines and quantities on top of the
+frozen snapshot. #109: populate `usual_profile_json` with the household's written usual-shop quotes.
 
 ### 3. No usual-shop baseline
 
 **What happens.** The best single store estimate remains the comparison anchor for stored events.
 The household's written "usual shop" profile — recorded as the primary baseline for the live
 evaluation in `docs/design.md` §10 — is not implemented, so no saving is measured against what the
-household would normally have spent.
+household would normally have spent. `recommendation_runs.usual_profile_json` (migration 018) is
+reserved for these quotes and stays NULL.
 
 **Why accepted.** This slice adds no new baselines.
 
@@ -444,7 +450,7 @@ household would normally have spent.
 store estimate").
 
 **Follow-up.** #109: implement the usual-shop written profile as the primary live-evaluation
-baseline.
+baseline and populate `usual_profile_json`.
 
 ### 4. No receipt links and no automatic purchase matching
 
@@ -464,18 +470,21 @@ support multiple receipts per shop without double-counting.
 ### 5. The coverage guard compares priced lines, not quantities or pack sizes
 
 **What happens.** The archive-time guard (`optimiser::prices_same_lines`) compares the set of
-basket item indices both plans price — the same rule the optimise explanation uses to refuse a
-cross-plan cost comparison. Plan lines carry no quantity, so buying a larger pack or extra units is
-not detected as a coverage difference; the strict pack-size decision recorded in `docs/design.md`
-§10 is not enforced in this slice.
+basket item indices both plans price — the same rule the optimise explanation and the covered
+subtotal use to refuse a whole-basket cost comparison. Plan lines carry no quantity, so buying a
+larger pack or extra units is not detected as a coverage difference; the strict pack-size decision
+recorded in `docs/design.md` §10 is not enforced in this slice.
 
 **Why accepted.** Quantities are not part of a stored plan line; enforcing the pack-size rule needs
 the line-level reconciliation of the follow-up work.
 
-**Workaround.** Treat an `estimated` row as a line-coverage-only opportunity estimate.
+**Workaround.** Treat an `estimated` row as a line-coverage-only opportunity estimate; an
+`unreconciled` row shows only the bounded `Covered subtotal: N of M lines` figure, which is likewise
+line-scoped.
 
 **Follow-up.** Include quantities and equivalent pack sizes in the comparison when reconciliation
-lands (issue #117).
+lands (issue #117); the frozen basket and offer snapshots (migration 018) already carry the pack
+counts and sizes this will need.
 
 ## Household data controls
 

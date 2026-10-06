@@ -129,6 +129,16 @@ function fullResponse(): OptimiseResponse {
 				reasons: ['One trip covers your whole list.', 'No split between stores needed.']
 			}
 		],
+		coverage: {
+			status: 'comparable',
+			label: 'Covered subtotal: 1 of 4 lines, prices as of 2026-06-07',
+			covered_lines: 1,
+			total_lines: 4,
+			covered_subtotal_cents: 100,
+			covered_saving_cents: 200,
+			full_basket_saving_cents: 100,
+			price_date: '2026-06-07'
+		},
 		offer_snapshot_date: '2026-06-07',
 		aldi_comparison: {
 			fresh: {
@@ -242,6 +252,29 @@ describe('optimise page', () => {
 		const init = optimiseCallInit(fetchMock);
 		expect(init?.method).toBe('POST');
 		expect(JSON.parse(init?.body as string)).toEqual({ list_id: 'list-42', trip_retailers: [] });
+	});
+
+	it('shows a bounded covered-subtotal label when the plans price different lines', async () => {
+		const response = fullResponse();
+		response.coverage = {
+			status: 'unequal_coverage',
+			label: 'Covered subtotal: 1 of 4 lines, prices as of 2026-06-07',
+			covered_lines: 1,
+			total_lines: 4,
+			covered_subtotal_cents: 100,
+			covered_saving_cents: 200,
+			full_basket_saving_cents: null,
+			price_date: '2026-06-07'
+		};
+		stubOptimise(response);
+		render(Page);
+
+		// The label names the coverage numerator/denominator and the evidence date,
+		// and the covered subtotal is explicitly not a whole-basket saving.
+		expect(
+			await screen.findByText(/Covered subtotal: 1 of 4 lines, prices as of 2026-06-07/)
+		).toBeTruthy();
+		expect(screen.getByText(/not a whole-basket saving/)).toBeTruthy();
 	});
 
 	it('offers a trip toggle for occasional stores and re-optimises with the trip', async () => {
@@ -602,6 +635,16 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
+			coverage: {
+				status: 'no_plan',
+				label: 'Covered subtotal: 0 of 0 lines',
+				covered_lines: 0,
+				total_lines: 0,
+				covered_subtotal_cents: null,
+				covered_saving_cents: null,
+				full_basket_saving_cents: null,
+				price_date: null
+			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
 		};
@@ -731,6 +774,16 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
+			coverage: {
+				status: 'no_plan',
+				label: 'Covered subtotal: 0 of 0 lines',
+				covered_lines: 0,
+				total_lines: 0,
+				covered_subtotal_cents: null,
+				covered_saving_cents: null,
+				full_basket_saving_cents: null,
+				price_date: null
+			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
 		};
@@ -792,6 +845,16 @@ describe('optimise page', () => {
 			needs_confirmation_items: [],
 			plain_language_explanation: '',
 			plan_explanations: [],
+			coverage: {
+				status: 'no_plan',
+				label: 'Covered subtotal: 0 of 0 lines',
+				covered_lines: 0,
+				total_lines: 0,
+				covered_subtotal_cents: null,
+				covered_saving_cents: null,
+				full_basket_saving_cents: null,
+				price_date: null
+			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
 		};
@@ -841,6 +904,16 @@ describe('optimise page', () => {
 			],
 			plain_language_explanation: '',
 			plan_explanations: [],
+			coverage: {
+				status: 'no_plan',
+				label: 'Covered subtotal: 0 of 0 lines',
+				covered_lines: 0,
+				total_lines: 0,
+				covered_subtotal_cents: null,
+				covered_saving_cents: null,
+				full_basket_saving_cents: null,
+				price_date: null
+			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
 		};

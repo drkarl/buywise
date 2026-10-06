@@ -388,6 +388,17 @@
 			<p class="snapshot">Prices as of {result.offer_snapshot_date}.</p>
 		{/if}
 
+		{#if result.coverage.status === 'unequal_coverage'}
+			<p class="coverage-note" role="status">
+				{result.coverage.label}.
+				{#if result.coverage.covered_subtotal_cents !== null}
+					{formatEuros(result.coverage.covered_subtotal_cents)} for those shared lines.
+				{/if}
+				The two plans price different lines, so this is a bounded estimate on the lines they
+				both cover — not a whole-basket saving.
+			</p>
+		{/if}
+
 		{#if occasionalStores.length > 0}
 			<section class="trip" aria-label="Stores you are visiting today">
 				<h2>Going anywhere else today?</h2>
@@ -626,6 +637,15 @@
 		margin: 0;
 		font-size: 0.85rem;
 		color: #94a3b8;
+	}
+	.coverage-note {
+		margin: 0;
+		padding: 0.6rem 0.8rem;
+		border: 1px dashed #fcd34d;
+		border-radius: 0.5rem;
+		background: #fffbeb;
+		color: #92400e;
+		font-size: 0.85rem;
 	}
 	.trip {
 		border: 1px solid #e2e8f0;

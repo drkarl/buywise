@@ -23,10 +23,13 @@
 //!    `canonical_item_id` and `quantity` — so that step is a no-op here and the
 //!    resulting baskets match the CLI for already-resolved entries.
 //! 3. Run [`optimise`] against the pool.
-//! 4. Derive `offer_snapshot_date` (latest `source_snapshot_date` among the
-//!    offers backing the recommended plan's lines) and a deterministic
-//!    `plain_language_explanation` (per-category cheaper-for phrasing).
-//! 5. Persist one `recommendation_runs` row and return its id as `run_id`.
+//! 4. Freeze the run's evidence (issue #117, slice 2): the input basket, the
+//!    offers used, and the coverage/common-scope result (see
+//!    [`crate::run_snapshot`]). `offer_snapshot_date` is the OLDEST
+//!    `source_snapshot_date` among the offers used, and a deterministic
+//!    `plain_language_explanation` (per-category cheaper-for phrasing) is built.
+//! 5. Persist one `recommendation_runs` row (plans, snapshot evidence, digest) and
+//!    return its id as `run_id`.
 //!
 //! # Thresholds
 //!
@@ -65,6 +68,10 @@ use buywise_core::optimiser::{
 };
 
 use crate::middleware::AuthenticatedUser;
+use crate::run_snapshot::{
+    self, BasketSnapshot, CoverageSnapshot, CoverageSummary, OfferEvidence, PriceEvidence,
+    SNAPSHOT_VERSION,
+};
 use crate::AppState;
 
 /// Build the optimise route as a `Router<AppState>`, merged by [`crate::app`].
@@ -146,9 +153,18 @@ pub struct OptimiseResponse {
     /// Per-plan plain-language reasons (issue #103), ordered most-important-first.
     /// The UI renders two to four of each plan's reasons on its card.
     pub plan_explanations: Vec<PlanExplanation>,
-    /// Latest `source_snapshot_date` among the offers backing the recommended
-    /// plan (nullable: offers may not carry a snapshot date).
+    /// The OLDEST `source_snapshot_date` among the offers this run used (the
+    /// offers backing the best-single and recommended plans; nullable: offers may
+    /// not carry a snapshot date). Oldest, not latest: a basket compiled from a
+    /// mixture of evidence is only as fresh as its stalest line. See
+    /// `run_snapshot::oldest_observed_date`.
     pub offer_snapshot_date: Option<String>,
+    /// Frozen coverage of the comparison (issue #117, slice 2): which lines each
+    /// plan priced, the common scope priced by both, and — when the two plans
+    /// price different lines — no full-basket saving figure but a bounded,
+    /// labelled covered-subtotal figure with its coverage numerator and
+    /// denominator.
+    pub coverage: CoverageSummary,
     /// What Aldi would have cost the basket versus the recommended plan, split
     /// packaged versus fresh (issue #100). `null` when there is no recommended
     /// plan; a split with `item_count == 0` means Aldi has no qualifying price.
@@ -241,11 +257,22 @@ async fn optimise_list(
         .await
         .map_err(db_error("optimise_list.optimise"))?;
 
-    // Derive the snapshot date and the explanation from the plans. Both read
-    // category / offer metadata the core output does not carry.
-    let offer_snapshot_date = latest_offer_snapshot_date(pool, &output)
+    // Freeze the evidence the run was computed from (issue #117, slice 2): the
+    // input basket, the offers used, and the coverage/common-scope result. All
+    // three are built from the same in-memory data the optimiser just used, so a
+    // later list edit or offer refresh cannot change this run.
+    let price_evidence = load_price_evidence(pool, &output)
         .await
-        .map_err(db_error("optimise_list.snapshot_date"))?;
+        .map_err(db_error("optimise_list.price_evidence"))?;
+    // The snapshot date is the OLDEST observed date among the offers used, not
+    // the latest: a basket compiled from a mixture of evidence is only as fresh
+    // as its stalest line.
+    let offer_snapshot_date = run_snapshot::oldest_observed_date(&price_evidence.offers);
+    let basket_snapshot = run_snapshot::build_basket_snapshot(&body.list_id, &household_id, &input);
+    let coverage =
+        run_snapshot::build_coverage(&output, input.items.len(), offer_snapshot_date.clone());
+    let coverage_summary = CoverageSummary::from_snapshot(&coverage);
+
     let explanation = build_explanation(pool, &input, &output)
         .await
         .map_err(db_error("optimise_list.explanation"))?;
@@ -254,7 +281,11 @@ async fn optimise_list(
         &body.list_id,
         &household_id,
         &output,
-        offer_snapshot_date.as_deref(),
+        RunEvidence {
+            basket: &basket_snapshot,
+            price: &price_evidence,
+            coverage: &coverage,
+        },
         threshold_2,
         threshold_3,
     )
@@ -274,6 +305,7 @@ async fn optimise_list(
         plain_language_explanation: explanation.summary,
         plan_explanations: explanation.plans,
         offer_snapshot_date,
+        coverage: coverage_summary,
         aldi_comparison: output.aldi_comparison,
     }))
 }
@@ -606,50 +638,98 @@ async fn canonical_item_taxonomy(
 }
 
 // ---------------------------------------------------------------------------
-// offer_snapshot_date
+// Price evidence (frozen offers used)
 // ---------------------------------------------------------------------------
-/// The latest `source_snapshot_date` among the offers backing the recommended
-/// plan's lines, or `None` if no plan exists or none of its offers carry a date.
+/// The raw columns of one used offer, joined to its retailer product, for the
+/// [`OfferEvidence`] snapshot. `#[derive(sqlx::FromRow)]` maps by column name.
+#[derive(sqlx::FromRow)]
+struct OfferEvidenceRow {
+    id: String,
+    retailer: Retailer,
+    retailer_product_id: String,
+    name: String,
+    source_snapshot_date: Option<String>,
+    price_cents: Cents,
+    loyalty_price_cents: Option<Cents>,
+    loyalty_scheme: Option<String>,
+    unit_price_eur_micros: Option<i64>,
+    unit_price_basis: Option<String>,
+    pack_size_text: Option<String>,
+    size_value: Option<f64>,
+    size_unit: Option<String>,
+    pack_count: Option<i32>,
+    previous_price_cents: Option<Cents>,
+    offer_text: Option<String>,
+    offer_valid_until: Option<String>,
+}
+
+/// Freeze the offers this run used (the offers backing the best-single and
+/// recommended plans), read by the exact `offer_id`s those plans carry.
 ///
-/// The plan lines carry `offer_id`; the snapshot date lives on `product_offers`
-/// and is not echoed onto [`buywise_core::optimiser::PlanLine`], so it is fetched
-/// here. ISO-8601 dates sort lexicographically, so `MAX(...)` returns the latest.
-///
-/// Scope note: the date is derived *only* from the offers backing the recommended
-/// plan, not from every offer the optimiser considered. It is `None` when there is
-/// no recommended plan or none of its offers carry a snapshot date.
-async fn latest_offer_snapshot_date(
+/// `product_offers` is append-only, so a refreshed run inserts new rows and never
+/// rewrites these; the fetched row is therefore the immutable evidence the
+/// optimiser priced from. The oldest `observed_date` among the returned offers
+/// becomes the run's `offer_snapshot_date` (see
+/// [`run_snapshot::oldest_observed_date`]).
+async fn load_price_evidence(
     pool: &sqlx::SqlitePool,
     output: &OptimiserOutput,
-) -> Result<Option<String>, DbError> {
-    let Some(plan) = output.recommended.as_ref().map(|r| &r.plan) else {
-        return Ok(None);
-    };
-    if plan.lines.is_empty() {
-        return Ok(None);
-    }
+) -> Result<PriceEvidence, DbError> {
+    let offer_ids: Vec<String> = run_snapshot::used_offer_ids(output).into_iter().collect();
+    let mut offers = Vec::with_capacity(offer_ids.len());
 
-    // Chunk the IN(...) by IN_CHUNK_SIZE so a plan with more offer ids than
-    // SQLite's bound-parameter limit cannot turn a valid call into a 500. ISO-8601
-    // dates sort lexicographically, so the overall latest is the max of the
-    // per-chunk maxima.
-    let offer_ids: Vec<&str> = plan.lines.iter().map(|l| l.offer_id.as_str()).collect();
-    let mut latest: Option<String> = None;
+    // Chunk the IN(...) by IN_CHUNK_SIZE so a run with more used offers than
+    // SQLite's bound-parameter limit cannot turn a valid call into a 500.
     for chunk in offer_ids.chunks(IN_CHUNK_SIZE) {
         let placeholders = sql_placeholders(chunk.len());
         let sql = format!(
-            "SELECT MAX(source_snapshot_date) FROM product_offers WHERE id IN ({placeholders})"
+            "SELECT o.id AS id, p.retailer AS retailer, \
+                    o.retailer_product_id AS retailer_product_id, p.name AS name, \
+                    o.source_snapshot_date AS source_snapshot_date, \
+                    o.price_cents AS price_cents, o.loyalty_price_cents AS loyalty_price_cents, \
+                    o.loyalty_scheme AS loyalty_scheme, \
+                    o.unit_price_eur_micros AS unit_price_eur_micros, \
+                    o.unit_price_basis AS unit_price_basis, \
+                    p.pack_size_text AS pack_size_text, p.size_value AS size_value, \
+                    p.size_unit AS size_unit, p.pack_count AS pack_count, \
+                    o.previous_price_cents AS previous_price_cents, \
+                    o.offer_text AS offer_text, o.offer_valid_until AS offer_valid_until \
+             FROM product_offers o \
+             JOIN retailer_products p ON p.id = o.retailer_product_id \
+             WHERE o.id IN ({placeholders}) \
+             ORDER BY o.id"
         );
-        let mut query = sqlx::query_scalar::<_, Option<String>>(&sql);
+        let mut query = sqlx::query_as::<_, OfferEvidenceRow>(&sql);
         for id in chunk {
-            query = query.bind(*id);
+            query = query.bind(id);
         }
-        let chunk_max: Option<String> = query.fetch_one(pool).await?;
-        if chunk_max > latest {
-            latest = chunk_max;
+        for row in query.fetch_all(pool).await? {
+            offers.push(OfferEvidence {
+                offer_id: row.id,
+                retailer: row.retailer,
+                retailer_product_id: row.retailer_product_id,
+                product_name: row.name,
+                observed_date: row.source_snapshot_date,
+                shelf_price_cents: row.price_cents,
+                loyalty_price_cents: row.loyalty_price_cents,
+                loyalty_scheme: row.loyalty_scheme,
+                unit_price_eur_micros: row.unit_price_eur_micros,
+                unit_price_basis: row.unit_price_basis,
+                pack_size_text: row.pack_size_text,
+                size_value: row.size_value,
+                size_unit: row.size_unit,
+                pack_count: row.pack_count,
+                previous_price_cents: row.previous_price_cents,
+                offer_text: row.offer_text,
+                offer_valid_until: row.offer_valid_until,
+            });
         }
     }
-    Ok(latest)
+
+    Ok(PriceEvidence {
+        version: SNAPSHOT_VERSION,
+        offers,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1296,14 @@ struct PlansJson<'a> {
     aldi_comparison: Option<&'a AldiComparison>,
 }
 
+/// The three frozen payloads written for one run (issue #117 slice 2), bundled so
+/// `persist_run` stays within the argument-count lint.
+struct RunEvidence<'a> {
+    basket: &'a BasketSnapshot,
+    price: &'a PriceEvidence,
+    coverage: &'a CoverageSnapshot,
+}
+
 /// Insert one `recommendation_runs` row and return its id.
 ///
 /// `id` is a UUID v4 (matching `lists.rs`/`mutations.rs`); `run_at` is RFC3339
@@ -1223,12 +1311,20 @@ struct PlansJson<'a> {
 /// all four plans; `recommended_plan` is the `RecommendedKind` serde string
 /// (`single_store`/`two_store`), or `"none"` when no plan exists. Both effective
 /// thresholds (post-default) are persisted.
+///
+/// Issue #117 slice 2: the run also freezes the evidence it was computed from —
+/// the input basket, the offers used, and the coverage/common-scope result — in
+/// the migration-018 columns, with `snapshot_version` and a SHA-256
+/// `snapshot_digest` over the three payloads. `usual_profile_json` is RESERVED
+/// and stays NULL in this slice. Everything is written once here, at run
+/// creation, from the same in-memory data the optimiser just used, so a later
+/// list edit or offer refresh can never change this run.
 async fn persist_run(
     pool: &sqlx::SqlitePool,
     list_id: &str,
     household_id: &str,
     output: &OptimiserOutput,
-    offer_snapshot_date: Option<&str>,
+    evidence: RunEvidence<'_>,
     threshold_2: Cents,
     threshold_3: Cents,
 ) -> Result<String, DbError> {
@@ -1244,8 +1340,12 @@ async fn persist_run(
     };
     // serde_json on owned, already-validated data cannot fail in practice; treat
     // a failure as a 500 via DbError rather than panicking.
-    let plans_json = serde_json::to_string(&plans)
-        .map_err(|e| DbError::from(sqlx::Error::Protocol(format!("serialise plans_json: {e}"))))?;
+    let plans_json = serialise_snapshot(&plans, "plans_json")?;
+
+    let basket_json = serialise_snapshot(evidence.basket, "basket_snapshot_json")?;
+    let price_json = serialise_snapshot(evidence.price, "price_evidence_json")?;
+    let coverage_json = serialise_snapshot(evidence.coverage, "coverage_json")?;
+    let digest = run_snapshot::snapshot_digest(&basket_json, &price_json, &coverage_json);
 
     let recommended_plan = match output.recommended.as_ref().map(|r| r.kind) {
         Some(RecommendedKind::SingleStore) => "single_store",
@@ -1253,11 +1353,18 @@ async fn persist_run(
         None => "none",
     };
 
+    // The snapshot's evidence date is the oldest observed date among the offers
+    // used; it round-trips inside `coverage_json`, so take it from there rather
+    // than passing it twice.
+    let offer_snapshot_date = evidence.coverage.price_date.as_deref();
+
     sqlx::query(
         "INSERT INTO recommendation_runs \
              (id, list_id, household_id, run_at, offer_snapshot_date, plans_json, \
-              recommended_plan, convenience_threshold_2, convenience_threshold_3) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              recommended_plan, convenience_threshold_2, convenience_threshold_3, \
+              snapshot_version, basket_snapshot_json, price_evidence_json, coverage_json, \
+              snapshot_digest) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )
     .bind(&id)
     .bind(list_id)
@@ -1268,10 +1375,22 @@ async fn persist_run(
     .bind(recommended_plan)
     .bind(threshold_2)
     .bind(threshold_3)
+    .bind(SNAPSHOT_VERSION)
+    .bind(&basket_json)
+    .bind(&price_json)
+    .bind(&coverage_json)
+    .bind(&digest)
     .execute(pool)
     .await?;
 
     Ok(id)
+}
+
+/// Serialise one snapshot payload, mapping a (practically impossible) failure to
+/// a 500 via [`DbError`] rather than panicking.
+fn serialise_snapshot<T: Serialize>(value: &T, column: &'static str) -> Result<String, DbError> {
+    serde_json::to_string(value)
+        .map_err(|e| DbError::from(sqlx::Error::Protocol(format!("serialise {column}: {e}"))))
 }
 
 // ---------------------------------------------------------------------------

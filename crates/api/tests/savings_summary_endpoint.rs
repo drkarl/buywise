@@ -1008,4 +1008,135 @@ async fn mismatched_coverage_archive_stays_out_of_saved() {
         lists[0]["status_label"],
         "Not comparable — plans price different lines"
     );
+    // The run predates the frozen snapshot, so the outcome has no covered fields
+    // and still loads (the full-basket figure is not presented either).
+    assert!(lists[0]["covered_subtotal_cents"].is_null());
+    assert!(lists[0]["covered_label"].is_null());
+    assert!(lists[0]["full_basket_saving_cents"].is_null());
+}
+
+/// Issue #117 slice 2: an event's outcome exposes the run's frozen coverage —
+/// the bounded covered subtotal, its coverage numerator/denominator and evidence
+/// date — while suppressing the full-basket saving when the plans price different
+/// lines. A comparable row (or one whose run predates the snapshot) keeps its
+/// full-basket figure and carries no covered fields.
+#[tokio::test]
+async fn outcome_exposes_frozen_covered_subtotal_and_suppresses_full_basket() {
+    let pool = setup_pool().await;
+    let session = seed_household_and_user(&pool, HOUSEHOLD, "user-a", "a@example.test").await;
+
+    // Unreconciled event: a run with a frozen coverage snapshot whose plans price
+    // different lines.
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-1",
+        "Mismatched",
+        "2026-06-10T10:00:00Z",
+    )
+    .await;
+    let plans_json = serde_json::json!({
+        "best_single": { "stores": [], "lines": [{ "item_index": 0 }], "total_cents": 5000,
+            "missing_count": 0, "dunnes_voucher_offer_text": null },
+        "best_two_store": Value::Null,
+        "theoretical_minimum": { "stores": [], "lines": [{ "item_index": 0 }], "total_cents": 3900,
+            "missing_count": 0, "dunnes_voucher_offer_text": null },
+        "recommended": {
+            "kind": "two_store",
+            "plan": { "stores": [], "lines": [{ "item_index": 0 }, { "item_index": 1 }],
+                "total_cents": 4200, "missing_count": 0, "dunnes_voucher_offer_text": null },
+            "clears_convenience_threshold": true,
+            "two_store_saving_cents": 800
+        },
+    })
+    .to_string();
+    let coverage_json = serde_json::json!({
+        "version": 1, "basket_lines": 2, "has_best_single": true, "has_recommended": true,
+        "recommended_priced": [0, 1], "best_single_priced": [0], "common_scope": [0],
+        "best_single_only": [], "recommended_only": [1],
+        "missing": [], "unresolved": [], "confirmation_needed": [],
+        "covered_subtotal_cents": 3000, "covered_saving_cents": 2000,
+        "full_basket_saving_cents": null, "price_date": "2026-06-01"
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO recommendation_runs \
+             (id, list_id, household_id, run_at, plans_json, recommended_plan, \
+              convenience_threshold_2, convenience_threshold_3, snapshot_version, \
+              coverage_json, snapshot_digest) \
+         VALUES ('run-1', 'list-1', ?1, '2026-06-01T10:00:00Z', ?2, 'two_store', 1000, 2500, \
+                 1, ?3, 'digest')",
+    )
+    .bind(HOUSEHOLD)
+    .bind(&plans_json)
+    .bind(&coverage_json)
+    .execute(&pool)
+    .await
+    .expect("insert run");
+    sqlx::query(
+        "INSERT INTO savings_events \
+             (id, list_id, recommendation_run_id, baseline_cost_cents, recommended_cost_cents, \
+              theoretical_minimum_cost_cents, gross_saving_cents, created_at, status) \
+         VALUES ('ev-1', 'list-1', 'run-1', 5000, 4200, 3900, 800, \
+                 '2026-06-10T10:00:00Z', 'unreconciled')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert event");
+
+    // Comparable event whose run predates the snapshot: no covered fields.
+    seed_list(
+        &pool,
+        HOUSEHOLD,
+        "list-2",
+        "Estimated",
+        "2026-06-11T10:00:00Z",
+    )
+    .await;
+    seed_event(
+        &pool,
+        "ev-2",
+        "list-2",
+        "2026-06-11T10:00:00Z",
+        "estimated",
+        5000,
+        800,
+        None,
+        None,
+    )
+    .await;
+
+    let resp = get_summary(&pool, &session).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let lists = body["lists"].as_array().unwrap();
+    assert_eq!(lists.len(), 2);
+
+    // Newest archive date first: the estimated list-2 leads.
+    let estimated = &lists[0];
+    assert_eq!(estimated["status"], "estimated");
+    assert_eq!(
+        estimated["full_basket_saving_cents"], 800,
+        "a comparable row keeps its full-basket figure: {estimated:#}"
+    );
+    assert!(estimated["covered_subtotal_cents"].is_null());
+    assert!(estimated["covered_label"].is_null());
+
+    let unreconciled = &lists[1];
+    assert_eq!(unreconciled["status"], "unreconciled");
+    assert!(
+        unreconciled["full_basket_saving_cents"].is_null(),
+        "the full-basket saving is suppressed on unequal coverage: {unreconciled:#}"
+    );
+    assert_eq!(unreconciled["covered_subtotal_cents"], 3000);
+    assert_eq!(unreconciled["covered_saving_cents"], 2000);
+    assert_eq!(unreconciled["covered_lines"], 1);
+    assert_eq!(unreconciled["total_lines"], 2);
+    assert_eq!(unreconciled["price_date"], "2026-06-01");
+    assert_eq!(
+        unreconciled["covered_label"],
+        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01"
+    );
+    // The audit gross figure is still stored on the row.
+    assert_eq!(unreconciled["gross_saving_cents"], 800);
 }
