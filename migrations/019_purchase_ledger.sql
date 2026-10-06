@@ -29,8 +29,8 @@
 --   * `transaction_identity` is the caller's `source_transaction_id` when one
 --     was given, otherwise the computed stable `fingerprint` of
 --     retailer + purchase date + total + the ordered line texts. It is NOT NULL,
---     and `UNIQUE(household_id, source_kind, transaction_identity)` is the
---     idempotency key: re-importing the same identity upserts the one row
+--     and `UNIQUE(household_id, retailer, source_kind, transaction_identity)`
+--     is the idempotency key: re-importing the same identity upserts the one row
 --     instead of creating a duplicate. An expression index over
 --     `COALESCE(source_transaction_id, fingerprint)` is deliberately avoided:
 --     SQLite does not treat NULLs as equal in a unique index, so a plain
@@ -84,10 +84,10 @@ CREATE TABLE purchase_transactions (
     updated_at            TEXT NOT NULL
 );
 
--- The household-scoped idempotency key: one transaction per (source kind,
--- identity) per household. Re-importing the same identity upserts this row.
+-- The household- and retailer-scoped idempotency key: one transaction per
+-- (retailer, source kind, identity) per household.
 CREATE UNIQUE INDEX idx_purchase_transactions_identity
-    ON purchase_transactions(household_id, source_kind, transaction_identity);
+    ON purchase_transactions(household_id, retailer, source_kind, transaction_identity);
 
 -- Per-household history lookups by date.
 CREATE INDEX idx_purchase_transactions_household_date
