@@ -276,10 +276,14 @@ ledger; a later matching pass may link it.
 The API returns transaction summaries from `GET .../purchases` (id, retailer,
 purchase date, source kind, source id and identity kind, fingerprint, currency,
 total, revision, line count, linked receipt photo and timestamps) and a full
-transaction from `GET .../purchases/{id}`: the summary plus its current `lines`
-and its `revisions` (each with the superseded header, source payload, `lines` as
-JSON and `superseded_at`). `DELETE .../purchases/{id}` removes one transaction;
-its lines and revision history are removed with it.
+transaction from `GET .../purchases/{id}`: the summary, its current `source_payload`
+as JSON text, its current `lines`, and its `revisions` (each with the superseded
+header, source payload, `lines` as JSON and `superseded_at`). For a manual
+purchase, the live payload preserves the submitted request body, including
+whether `total_cents` was omitted; for an import it is the supplied
+`source_payload` or, by default, the imported transaction object.
+`DELETE .../purchases/{id}` removes one transaction; its lines and revision
+history are removed with it.
 
 ## Manual purchases and the receipt-photo link
 
