@@ -430,12 +430,38 @@ describe('purchases', () => {
 		await typeInto('Line total (€)', '1.00');
 		await fireEvent.click(screen.getByRole('button', { name: 'Save purchase' }));
 
-		expect(await screen.findByText('Purchase saved, but the list could not be refreshed. Try again later.')).toBeTruthy();
+		expect(await screen.findByText('Purchase saved, but the list could not be refreshed. It may be out of date.')).toBeTruthy();
 		expect(await screen.findByText('Entered by hand')).toBeTruthy();
 		expect(fetchMock.mock.calls.filter(([input, init]) => {
 			const url = typeof input === 'string' ? input : input.toString();
 			return url.endsWith('/purchases/manual') && init?.method === 'POST';
 		})).toHaveLength(1);
+	});
+
+	it('shows the deleted list state when refreshing after deletion fails', async () => {
+		const store = makeStore([detail()]);
+		stubApi(store, true);
+		render(Page);
+		await fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+		await fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
+
+		expect(await screen.findByText('Purchase deleted, but the list could not be refreshed. It may be out of date.')).toBeTruthy();
+		expect(await screen.findByText(/No purchases yet/)).toBeTruthy();
+		expect(screen.queryByText('Couldn’t delete the purchase. Check your connection and try again.')).toBeNull();
+	});
+
+	it('keeps an unlinked photo cleared when refreshing the list fails', async () => {
+		const store = makeStore([detail({ receipt_image_id: 'rc-1' })], [receipt()]);
+		stubApi(store, true);
+		render(Page);
+		await fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Remove photo' }));
+
+		expect(await screen.findByText('Photo link cleared, but the list could not be refreshed. It may be out of date.')).toBeTruthy();
+		expect(await screen.findByText(/No photo linked/)).toBeTruthy();
+		expect(screen.queryByText('Couldn’t remove the photo link. Please try again.')).toBeNull();
+		expect(store.purchases[0].receipt_image_id).toBeNull();
 	});
 
 	it('deletes a purchase only after the inline confirmation', async () => {
