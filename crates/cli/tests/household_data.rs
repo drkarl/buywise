@@ -572,7 +572,11 @@ async fn delete_removes_only_the_target_household() {
         0
     );
     assert_eq!(
-        scalar(&pool, "SELECT COUNT(*) FROM sessions WHERE id = 'sess-unrelated'").await,
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM sessions WHERE id = 'sess-unrelated'"
+        )
+        .await,
         1,
         "the unrelated user's session must survive"
     );
