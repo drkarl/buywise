@@ -22,9 +22,9 @@
 //! Every imported transaction has a `transaction_identity`: the caller's
 //! `source_transaction_id` when supplied, otherwise the computed [`fingerprint`]
 //! of retailer + purchase date + total + the ordered line texts. The unique key
-//! `(household_id, source_kind, transaction_identity)` is what makes a re-import
-//! idempotent: the same identity upserts the one row instead of duplicating it,
-//! so totals are never summed over duplicate links.
+//! `(household_id, retailer, source_kind, transaction_identity)` is what makes a
+//! re-import idempotent: the same identity at the same retailer upserts the one
+//! row instead of duplicating it, so totals are never summed over duplicate links.
 //!
 //! * An import whose content is byte-for-byte the stored content is a no-op
 //!   that reports [`ImportStatus::Unchanged`].
@@ -922,9 +922,11 @@ async fn import_one(
 
     let target_id: String = sqlx::query_scalar(
         "SELECT id FROM purchase_transactions \
-         WHERE household_id = ?1 AND source_kind = ?2 AND transaction_identity = ?3",
+         WHERE household_id = ?1 AND retailer = ?2 AND source_kind = ?3 \
+         AND transaction_identity = ?4",
     )
     .bind(household_id)
+    .bind(&transaction.retailer)
     .bind(SOURCE_KIND_IMPORT)
     .bind(identity)
     .fetch_one(&mut *conn)
@@ -1020,7 +1022,7 @@ async fn insert_transaction(
           transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
           source_payload, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
-         ON CONFLICT(household_id, source_kind, transaction_identity) DO NOTHING",
+         ON CONFLICT(household_id, retailer, source_kind, transaction_identity) DO NOTHING",
     )
     .bind(id)
     .bind(household_id)

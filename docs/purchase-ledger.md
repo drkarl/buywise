@@ -137,9 +137,13 @@ Every transaction has an **identity**, which is decisive for idempotency:
 - Otherwise the identity is a **stable fingerprint** computed by this build
   (`identity_kind = "fingerprint"`).
 
-The stored unique key is `(household_id, "import", identity)`. Re-importing a
-document is therefore idempotent: the same transaction yields **one transaction
-row and one set of lines**, and totals are never summed over duplicate links.
+The stored unique key is `(household_id, retailer, "import", identity)`.
+Retailer names are trimmed and lowercased before they are used in this key, so
+`Tesco` and `tesco` identify the same retailer. Source transaction IDs are
+scoped to their retailer: two retailers may use the same ID without replacing
+each other's purchase. Re-importing a document is therefore idempotent: the
+same transaction yields **one transaction row and one set of lines**, and totals
+are never summed over duplicate links.
 
 ### Fingerprint algorithm
 
@@ -213,7 +217,7 @@ fixed at once.
   "format_version": 1,
   "transactions": [
     {
-      "source_transaction_id": "TESCO-2026-05-01-0042",
+      "source_transaction_id": "2026-05-01-0042",
       "retailer": "tesco",
       "purchase_date": "2026-05-01",
       "currency": "EUR",
@@ -237,15 +241,27 @@ fixed at once.
           "line_total_cents": 600
         }
       ]
+    },
+    {
+      "source_transaction_id": "2026-05-01-0042",
+      "retailer": "lidl",
+      "purchase_date": "2026-05-01",
+      "currency": "EUR",
+      "total_cents": 199,
+      "lines": [
+        { "original_text": "Lidl Bread", "line_total_cents": 199 }
+      ]
     }
   ]
 }
 ```
 <!-- purchase-ledger-example:end -->
 
-The second line supplies only the two required fields: its product is unknown,
-so it is stored with `match_status = "unmatched"` and every other field `NULL`.
-It stays in the ledger; a later matching pass may link it.
+The Tesco and Lidl transactions may share a source ID because retailer is part
+of the idempotency key. In the Tesco transaction, the mystery line supplies
+only the two required fields: its product is unknown, so it is stored with
+`match_status = "unmatched"` and every other field `NULL`. It stays in the
+ledger; a later matching pass may link it.
 
 ## Reading and deleting a ledger
 

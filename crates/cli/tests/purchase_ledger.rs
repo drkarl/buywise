@@ -150,6 +150,48 @@ async fn a_correction_bumps_the_revision_and_keeps_the_earlier_one() {
 }
 
 #[tokio::test]
+async fn source_transaction_ids_are_scoped_by_normalized_retailer() {
+    let pool = setup_pool().await;
+    let tesco = document(Some("SRC-SHARED"), 500);
+    let mut tesco_mixed_case = tesco.clone();
+    tesco_mixed_case["transactions"][0]["retailer"] = json!("  Tesco  ");
+    let mut lidl = document(Some("SRC-SHARED"), 700);
+    lidl["transactions"][0]["retailer"] = json!("LIDL");
+
+    let tesco_result = import(&pool, &tesco).await;
+    let lidl_result = import(&pool, &lidl).await;
+    let same_tesco = import(&pool, &tesco_mixed_case).await;
+
+    assert_eq!(tesco_result.results[0].status, ImportStatus::Inserted);
+    assert_eq!(lidl_result.results[0].status, ImportStatus::Inserted);
+    assert_ne!(
+        tesco_result.results[0].transaction_id,
+        lidl_result.results[0].transaction_id
+    );
+    assert_eq!(same_tesco.results[0].status, ImportStatus::Unchanged);
+    assert_eq!(
+        same_tesco.results[0].transaction_id,
+        tesco_result.results[0].transaction_id
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions").await,
+        2
+    );
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM purchase_transaction_revisions WHERE revision = 1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM purchase_transactions WHERE revision != 1").await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn fingerprint_identity_is_stable_and_only_corrects_non_identity_fields() {
     let pool = setup_pool().await;
     let doc = document(None, 500);
@@ -436,8 +478,10 @@ async fn the_documented_example_parses() {
 
     let value: Value = serde_json::from_str(&json_text).expect("example is valid JSON");
     let parsed = purchase_ledger::parse_import_document(&value).expect("example parses");
-    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].lines.len(), 2);
+    assert_eq!(parsed[0].source_transaction_id, parsed[1].source_transaction_id);
+    assert_ne!(parsed[0].retailer, parsed[1].retailer);
     assert_eq!(
         parsed[0].lines[1].match_status,
         purchase_ledger::MATCH_UNMATCHED
