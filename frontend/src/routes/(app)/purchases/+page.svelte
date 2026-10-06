@@ -169,8 +169,12 @@
 			receiptTotalCents !== lineSumCents
 	);
 
-	/** The photo currently linked, when the household still holds it. */
-	let linkedReceipt = $derived(receipts.find((r) => r.id === receiptImageId) ?? null);
+	function findReceipt(id: string | null): Receipt | null {
+		return id === null ? null : (receipts.find((receipt) => receipt.id === id) ?? null);
+	}
+
+	let linkedReceipt = $derived(findReceipt(receiptImageId));
+	let detailLinkedReceipt = $derived(findReceipt(detail?.receipt_image_id ?? null));
 
 	async function load() {
 		status = 'loading';
@@ -233,8 +237,23 @@
 		formId = record.id;
 		retailer = retailerLabel(record.retailer);
 		purchaseDate = record.purchase_date;
-		receiptTotal = toEurosInput(record.total_cents);
-		receiptImageId = record.receipt_image_id;
+		let payloadTotal: unknown;
+		let payloadReadable = false;
+		try {
+			const payload: unknown = JSON.parse(record.source_payload);
+			payloadReadable = true;
+			if (payload !== null && typeof payload === 'object' && !Array.isArray(payload)) {
+				payloadTotal = (payload as Record<string, unknown>).total_cents;
+			}
+		} catch {
+			payloadReadable = false;
+		}
+		receiptTotal = payloadReadable
+			? typeof payloadTotal === 'number'
+				? toEurosInput(payloadTotal)
+				: ''
+			: toEurosInput(record.total_cents);
+		receiptImageId = findReceipt(record.receipt_image_id) ? record.receipt_image_id : null;
 		lines = record.lines.map((line) => ({
 			key: nextLineKey++,
 			description: line.original_text,
@@ -320,14 +339,14 @@
 
 		formErrors = [];
 		saving = true;
+		let saved: PurchaseDetail;
 		try {
-			const saved =
+			saved =
 				formId === null
 					? await createManualPurchase(household.id, input)
-					: await updateManualPurchase(household.id, formId, input);
-			await refreshList();
-			await openDetail(saved.id);
+				: await updateManualPurchase(household.id, formId, input);
 		} catch (err) {
+			saving = false;
 			if (err instanceof HttpResponseError && err.status === 401) {
 				redirectToSignIn();
 				return;
@@ -336,8 +355,19 @@
 				err instanceof PurchaseValidationError && err.messages.length > 0
 					? err.messages
 					: ['Couldn’t save the purchase. Check your connection and try again.'];
-		} finally {
-			saving = false;
+			return;
+		}
+		saving = false;
+		detail = saved;
+		detailStatus = 'ready';
+		detailError = '';
+		confirmingDelete = false;
+		zoomed = false;
+		view = 'detail';
+		try {
+			await refreshList();
+		} catch {
+			detailError = 'Purchase saved, but the list could not be refreshed. Try again later.';
 		}
 	}
 
@@ -465,8 +495,9 @@
 								<span class="lines">
 									{purchase.line_count} {purchase.line_count === 1 ? 'line' : 'lines'}
 								</span>
-								<span class="photo-flag" class:linked={purchase.receipt_image_id !== null}>
-									{purchase.receipt_image_id === null ? 'No photo' : 'Photo linked'}
+								{@const rowReceipt = findReceipt(purchase.receipt_image_id)}
+								<span class="photo-flag" class:linked={rowReceipt !== null}>
+									{rowReceipt ? 'Photo linked' : 'No photo'}
 								</span>
 							</div>
 							<button type="button" class="secondary" onclick={() => openDetail(purchase.id)}>
@@ -757,11 +788,11 @@
 				</table>
 
 				<h3>Receipt photo</h3>
-				{#if record.receipt_image_id !== null}
+				{#if detailLinkedReceipt}
 					<figure class="photo">
 						<img
 							class:zoomed
-							src={linePhotoUrl(record.receipt_image_id)}
+							src={linePhotoUrl(detailLinkedReceipt.id)}
 							alt="Linked receipt"
 						/>
 						<figcaption>
@@ -775,7 +806,7 @@
 							</button>
 							<a
 								class="secondary"
-								href={linePhotoUrl(record.receipt_image_id)}
+								href={linePhotoUrl(detailLinkedReceipt.id)}
 								target="_blank"
 								rel="noopener">Open full size</a
 							>

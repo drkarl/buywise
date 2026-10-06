@@ -37,6 +37,7 @@ function detail(overrides: Partial<PurchaseDetail> = {}): PurchaseDetail {
 		revision: 1,
 		line_count: 2,
 		receipt_image_id: null,
+		source_payload: '{}',
 		lines: [
 			{
 				id: 'ln-1',
@@ -156,6 +157,7 @@ function detailFromInput(id: string, input: PurchaseInputLike, revision = 1): Pu
 		line_count: lines.length,
 		revision,
 		receipt_image_id: input.receipt_image_id,
+		source_payload: JSON.stringify(input),
 		lines,
 		source_transaction_id: `uuid-${id}`
 	});
@@ -175,7 +177,8 @@ interface PurchaseInputLike {
  * update, delete and the receipt-photo link, plus the households's receipt list
  * and an upload. Every request is recorded for assertions.
  */
-function stubApi(store: Store) {
+function stubApi(store: Store, failListAfterInitialLoad = false) {
+	let listCalls = 0;
 	const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input.toString();
 		const method = init?.method ?? 'GET';
@@ -192,6 +195,8 @@ function stubApi(store: Store) {
 			return json(receipt({ id: 'rc-new', image_url: `${BASE}/receipts/rc-new` }), 201);
 		}
 		if (url === `${BASE}/purchases` && method === 'GET') {
+			listCalls += 1;
+			if (failListAfterInitialLoad && listCalls > 1) throw new Error('network unavailable');
 			return json(store.purchases.map(summary));
 		}
 		if (url === `${BASE}/purchases/manual` && method === 'POST') {
@@ -368,6 +373,69 @@ describe('purchases', () => {
 		// One purchase, now at revision 2.
 		expect(store.purchases).toHaveLength(1);
 		expect(await screen.findByText('Revision 2')).toBeTruthy();
+	});
+
+	it('keeps a derived receipt total blank when editing and saves it as null', async () => {
+		const store = makeStore([
+			detail({
+				total_cents: 437,
+				source_payload: JSON.stringify({ total_cents: null }),
+				lines: [
+					{ ...detail().lines[0], line_total_cents: 500, line_discount_cents: 0 }
+				],
+				line_count: 1
+			})
+		]);
+		stubApi(store);
+		render(Page);
+
+		await fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+		await fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+		expect((screen.getByLabelText('Receipt total (€, optional)') as HTMLInputElement).value).toBe('');
+		expect(screen.queryByText(/The lines and the receipt total do not match/)).toBeNull();
+		await typeInto('Line total (€)', '6.00');
+		expect(screen.queryByText(/The lines and the receipt total do not match/)).toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: 'Save purchase' }));
+
+		await waitFor(() => expect(store.requests.some((r) => r.method === 'PUT')).toBe(true));
+		const call = store.requests.find((r) => r.method === 'PUT')!;
+		expect((call.body as { total_cents: number | null }).total_cents).toBeNull();
+	});
+
+	it('drops expired receipt ids from edits and hides unavailable detail photos', async () => {
+		const store = makeStore([detail({ receipt_image_id: 'rc-expired' })]);
+		stubApi(store);
+		render(Page);
+
+		const open = await screen.findByRole('button', { name: 'Open' });
+		expect(open.closest('li')?.textContent).toContain('No photo');
+		await fireEvent.click(open);
+		expect(screen.queryByRole('img', { name: 'Linked receipt' })).toBeNull();
+		expect(screen.getByText(/No photo linked/)).toBeTruthy();
+		await fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Save purchase' }));
+
+		await waitFor(() => expect(store.requests.some((r) => r.method === 'PUT')).toBe(true));
+		const call = store.requests.find((r) => r.method === 'PUT')!;
+		expect((call.body as { receipt_image_id: string | null }).receipt_image_id).toBeNull();
+	});
+
+	it('keeps the saved detail open when refreshing the list fails', async () => {
+		const store = makeStore();
+		const fetchMock = stubApi(store, true);
+		render(Page);
+		await fireEvent.click(await screen.findByRole('button', { name: 'Add purchase' }));
+		await typeInto('Retailer', 'Tesco');
+		await typeInto('Description', 'Milk');
+		await typeInto('Line total (€)', '1.00');
+		await fireEvent.click(screen.getByRole('button', { name: 'Save purchase' }));
+
+		expect(await screen.findByText('Purchase saved, but the list could not be refreshed. Try again later.')).toBeTruthy();
+		expect(await screen.findByText('Entered by hand')).toBeTruthy();
+		expect(fetchMock.mock.calls.filter(([input, init]) => {
+			const url = typeof input === 'string' ? input : input.toString();
+			return url.endsWith('/purchases/manual') && init?.method === 'POST';
+		})).toHaveLength(1);
 	});
 
 	it('deletes a purchase only after the inline confirmation', async () => {
