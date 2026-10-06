@@ -83,7 +83,20 @@ function fullResponse(): OptimiseResponse {
 			two_store_saving_cents: 100,
 			plan: {
 				stores: ['tesco', 'aldi'],
-				lines: [],
+				lines: Array.from({ length: 4 }, (_, item_index) => ({
+					item_index,
+					entry_id: `e-${item_index}`,
+					display_text: `Item ${item_index}`,
+					product_name: `Product ${item_index}`,
+					canonical_item_id: `ci-${item_index}`,
+					retailer: 'tesco' as const,
+					retailer_product_id: `rp-${item_index}`,
+					offer_id: `of-${item_index}`,
+					unit_price_cents: 100,
+					line_total_cents: 100,
+					loyalty_applied: false,
+					freshness_confidence: 'high' as const
+				})),
 				total_cents: 400,
 				missing_count: 0,
 				dunnes_voucher_offer_text: null
@@ -888,14 +901,30 @@ describe('optimise page', () => {
 		render(Page);
 
 		const section = await screen.findByRole('region', { name: 'Aldi comparison' });
-		// Total saving is the sum of both splits: €1.50 + €0.20 = €1.70.
+		// Total saving is the sum of both splits and covers 3 of 4 priced plan items.
 		expect(
-			within(section).getByText(/Aldi would have saved €1\.70 on this list/)
+			within(section).getByText(
+				/Aldi would have saved €1\.70 on this list \(covers 3 of 4 plan items\)/
+			)
 		).toBeTruthy();
 		expect(within(section).getByText(/Fresh food: €1\.50 cheaper/)).toBeTruthy();
 		expect(within(section).getByText(/Packaged food: €0\.20 cheaper/)).toBeTruthy();
 		// The section states it never affects the recommendation.
 		expect(within(section).getByText(/never changes which plan is recommended/)).toBeTruthy();
+	});
+
+	it('shows comparison coverage when Aldi would cost more', async () => {
+		const response = fullResponse();
+		response.aldi_comparison!.packaged.saving_cents = -200;
+		stubOptimise(response);
+		render(Page);
+
+		const section = await screen.findByRole('region', { name: 'Aldi comparison' });
+		expect(
+			within(section).getByText(
+				/Aldi would have cost €0\.50 more than your plan \(covers 3 of 4 plan items\)/
+			)
+		).toBeTruthy();
 	});
 
 	it('says there is nothing to compare when Aldi prices none of the plan', async () => {
