@@ -711,8 +711,6 @@ async fn load_price_evidence(
             query = query.bind(id);
         }
         for row in query.fetch_all(pool).await? {
-            let usable_base_units =
-                usable_base_units(row.size_value, row.size_unit.as_deref(), row.pack_count);
             offers.push(OfferEvidence {
                 offer_id: row.id,
                 retailer: row.retailer,
@@ -729,7 +727,7 @@ async fn load_price_evidence(
                 size_value: row.size_value,
                 size_unit: row.size_unit,
                 pack_count: row.pack_count,
-                usable_base_units,
+                usable_base_units: None,
                 previous_price_cents: row.previous_price_cents,
                 offer_text: row.offer_text,
                 offer_valid_until: row.offer_valid_until,
@@ -740,24 +738,6 @@ async fn load_price_evidence(
     Ok(PriceEvidence {
         version: SNAPSHOT_VERSION,
         offers,
-    })
-}
-
-fn usable_base_units(
-    size_value: Option<f64>,
-    size_unit: Option<&str>,
-    pack_count: Option<i32>,
-) -> Option<run_snapshot::BaseUnit> {
-    let value = size_value?;
-    let unit = size_unit?;
-    let count = pack_count?;
-    if count < 1 || !value.is_finite() || value <= 0.0 {
-        return None;
-    }
-    let basis = buywise_core::domain::SizeBasis::from_db_str(unit).ok()?;
-    Some(run_snapshot::BaseUnit {
-        value: value * f64::from(count),
-        basis,
     })
 }
 

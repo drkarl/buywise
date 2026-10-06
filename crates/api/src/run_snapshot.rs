@@ -202,8 +202,7 @@ pub struct OfferEvidence {
     pub size_unit: Option<String>,
     /// Number of units in the pack, when known.
     pub pack_count: Option<i32>,
-    /// Usable base units in the priced pack, when its size, unit and pack count
-    /// are all known and the unit can be normalized.
+    /// Total usable base units, when retailer size semantics define them.
     #[serde(default)]
     pub usable_base_units: Option<BaseUnit>,
     /// The offer's previous price, the discount assumption it may carry.

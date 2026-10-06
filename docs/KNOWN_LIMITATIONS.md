@@ -436,6 +436,11 @@ totals remain the only record.
 **Follow-up.** #116/#117: reconcile planned versus purchased lines and quantities on top of the
 frozen snapshot. #109: populate `usual_profile_json` with the household's written usual-shop quotes.
 
+The retailer-product ingest contract does not define whether `size_value` is per unit or per pack.
+Offer evidence therefore freezes `size_value`, `size_unit` and `pack_count` as stored, while derived
+usable base units remain NULL. The later reconciliation slice needs this contract defined before it
+can derive total usable units.
+
 ### 3. No usual-shop baseline
 
 **What happens.** The best single store estimate remains the comparison anchor for stored events.

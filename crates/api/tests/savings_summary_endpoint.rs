@@ -1122,6 +1122,7 @@ async fn outcome_exposes_frozen_covered_subtotal_and_suppresses_full_basket() {
     );
     assert!(estimated["covered_subtotal_cents"].is_null());
     assert!(estimated["covered_label"].is_null());
+    assert!(estimated["undated_offer_count"].is_null());
 
     let unreconciled = &lists[1];
     assert_eq!(unreconciled["status"], "unreconciled");
@@ -1134,6 +1135,7 @@ async fn outcome_exposes_frozen_covered_subtotal_and_suppresses_full_basket() {
     assert_eq!(unreconciled["covered_lines"], 1);
     assert_eq!(unreconciled["total_lines"], 2);
     assert_eq!(unreconciled["price_date"], "2026-06-01");
+    assert_eq!(unreconciled["undated_offer_count"], 1);
     assert_eq!(
         unreconciled["covered_label"],
         "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01, 1 offer undated"

@@ -193,9 +193,6 @@
 										Estimated difference {formatEuros(
 											l.full_basket_saving_cents ?? l.gross_saving_cents
 										)}
-										{#if l.covered_label?.includes('undated')}
-											<br /><small class="outcome-evidence">{l.covered_label}</small>
-										{/if}
 									</span>
 								{:else if l.status === 'unreconciled' && l.covered_label !== null}
 									<span class="outcome-gross">
@@ -207,6 +204,12 @@
 									<span class="outcome-gross"
 										>Stored figure {formatEuros(l.gross_saving_cents)} (no saving claimed)</span
 									>
+								{/if}
+								{#if l.status !== 'unreconciled' && (l.undated_offer_count ?? 0) > 0}
+									<small class="outcome-evidence">
+										Prices as of {l.price_date ?? 'unknown'}, {l.undated_offer_count}
+										{l.undated_offer_count === 1 ? 'offer' : 'offers'} undated
+									</small>
 								{/if}
 								{#if l.chosen_basket_cost_cents === null}
 									<a class="enter-spend" href="/list/{l.list_id}">Enter actual spend</a>

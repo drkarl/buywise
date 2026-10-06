@@ -649,9 +649,10 @@ written once at run creation from the same in-memory input the optimiser used:
   and the trip retailers admitted for this run.
 * `price_evidence_json` — one row per offer the run used: offer id, retailer,
   product and its source, **observed `source_snapshot_date`**, shelf and loyalty
-  price, loyalty scheme, unit price, pack size and usable base units where the
-  offer data supplies a recognized size, unit and pack count, and the discount
-  assumptions (`previous_price_cents`, `offer_text`, `offer_valid_until`).
+  price, loyalty scheme, unit price, pack size and the raw size, unit and pack
+  count. Derived usable base units stay unknown until the ingest contract defines
+  whether size is per unit or per pack. It also records the discount assumptions
+  (`previous_price_cents`, `offer_text`, `offer_valid_until`).
   "Offers used" is the union of the offers backing the best-single and
   recommended plans — the two plans the savings figure compares.
 * `coverage_json` — which lines each plan priced, the common-scope set priced by

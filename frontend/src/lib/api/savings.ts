@@ -90,6 +90,8 @@ export interface ListOutcome {
 	total_lines: number | null;
 	/** Oldest observed offer date among the offers used; null when undated. */
 	price_date: string | null;
+	/** Number of used offers without an observed date; null without a snapshot. */
+	undated_offer_count: number | null;
 	/** Short "Covered subtotal: N of M lines, prices as of DATE" label. */
 	covered_label: string | null;
 	chosen_basket_cost_cents: number | null;
