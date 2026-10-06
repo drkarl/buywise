@@ -608,21 +608,20 @@ and should still expect restored rows without files to read as missing.
 **Follow-up.** Decide whether the receipt directory is backed up alongside the database, and record
 the answer in the runbook next to the restore rehearsal (issue #142).
 
-### 3. The sweep runs daily, and unlinking a file is not secure erasure
+### 3. Expiry cleanup is daily, and unlinking is not secure erasure
 
-**What happens.** `expires_at` is exact (30 days after upload), but the timer that enforces it runs
-once a day, so an image can outlive its expiry by up to a day; a host that was off at the scheduled
-time sweeps on the next boot (the timer is `Persistent`). Deletion unlinks the file: the blocks are
-freed but the bytes may remain readable on the disk until overwritten. There is no application-level
-encryption of the receipt directory at rest, just as there is none of the database.
+**What happens.** `expires_at` is exact (30 days after upload), and receipt list/view routes hide an
+image once that time passes. The timer reclaims its file and row once a day; a host that was off at
+the scheduled time sweeps on the next boot (the timer is `Persistent`). Deletion unlinks the file:
+the blocks are freed but the bytes may remain readable on the disk until overwritten. There is no
+application-level encryption of the receipt directory at rest, just as there is none of the database.
 
-**Why accepted.** A daily sweep bounds the retention window to "30 days plus less than a day", which
-is what the policy asks for; a continuously running pruner would add a background process for no
-practical gain. Secure erasure of individual files is not achievable on a running filesystem without
-encryption at rest, which is a host-level decision (issue #142).
+**Why accepted.** A daily sweep reclaims storage without a continuously running pruner; read-time
+expiry makes the 30-day retention exact. Secure erasure of individual files is not achievable on a
+running filesystem without encryption at rest, which is a host-level decision (issue #142).
 
-**Workaround.** Run `buywise-cli expire-receipts --db <db>` by hand to enforce expiry immediately
-(for example before a maintenance window). Rely on full-disk encryption for an at-rest guarantee.
+**Workaround.** Run `buywise-cli expire-receipts --db <db>` by hand to reclaim expired storage before
+the scheduled run. Rely on full-disk encryption for an at-rest guarantee.
 
 **Follow-up.** None until backup encryption and key custody are decided (issue #142); revisit if the
 household owner asks for encrypted storage of receipt images.
@@ -699,6 +698,9 @@ member administration and the household delete require the owner role. The endpo
 in [`docs/data-flows.md`](data-flows.md) (§5.1a).
 
 Open follow-ups:
+
+- **Removing a member can fail when older household records reference their account.** Issue #152
+  tracks the general foreign-key problem in list-entry and mutation user references.
 
 - **Roles cannot be changed.** There is no promote/demote action, so an owner cannot hand ownership
   to another member or demote a co-owner; the last-owner guard only prevents *removing* the final

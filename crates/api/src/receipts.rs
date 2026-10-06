@@ -52,18 +52,17 @@
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use buywise_core::receipts::{self, ImageKind, ReceiptConfig, ReceiptError, ReceiptImage};
 
+use crate::AppState;
 use crate::household::require_member;
 use crate::middleware::AuthenticatedUser;
-use crate::AppState;
 
 /// Query parameters of an upload. `processing` defaults to `local` when absent.
 #[derive(Debug, Default, Deserialize)]
@@ -90,8 +89,8 @@ pub struct ReceiptSummary {
     pub byte_size: i64,
     /// SHA-256 of the stored bytes, hex.
     pub sha256_hex: String,
-    /// `users.id` of the member who uploaded the image.
-    pub uploaded_by: String,
+    /// `users.id` of the member who uploaded the image, or `None` after account deletion.
+    pub uploaded_by: Option<String>,
     /// Processing choice taken at upload; `local` today.
     pub processing: String,
     /// Authenticated path serving the bytes.
@@ -151,7 +150,7 @@ async fn list_receipts(
     Path(household_id): Path<String>,
 ) -> Result<Response, StatusCode> {
     require_member(&state, &user.user_id, &household_id).await?;
-    let records = receipts::list_receipts(&state.pool, &household_id)
+    let records = receipts::list_receipts(&state.pool, &household_id, (state.clock)())
         .await
         .map_err(receipt_error("receipts.list"))?;
     let summaries: Vec<ReceiptSummary> = records
@@ -188,7 +187,7 @@ async fn upload_receipt(
         &user.user_id,
         processing,
         &body,
-        Utc::now(),
+        (state.clock)(),
     )
     .await
     .map_err(upload_error)?;
@@ -215,9 +214,10 @@ async fn download_receipt(
         .await
         .map_err(IntoResponse::into_response)?;
 
-    let Some(record) = receipts::get_receipt(&state.pool, &household_id, &receipt_id)
-        .await
-        .map_err(|err| internal_error("receipts.download_lookup", err))?
+    let Some(record) =
+        receipts::get_receipt(&state.pool, &household_id, &receipt_id, (state.clock)())
+            .await
+            .map_err(|err| internal_error("receipts.download_lookup", err))?
     else {
         return Err(StatusCode::NOT_FOUND.into_response());
     };
