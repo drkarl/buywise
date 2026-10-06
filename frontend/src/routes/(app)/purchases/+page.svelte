@@ -74,6 +74,7 @@
 	let household = $state<Household | null>(null);
 	let purchases = $state<PurchaseSummary[]>([]);
 	let receipts = $state<Receipt[]>([]);
+	let listError = $state('');
 
 	let view = $state<View>('list');
 
@@ -178,6 +179,7 @@
 
 	async function load() {
 		status = 'loading';
+		listError = '';
 		try {
 			household = await fetchHousehold();
 			purchases = await listPurchases(household.id);
@@ -195,6 +197,15 @@
 	async function refreshList() {
 		if (!household) return;
 		purchases = await listPurchases(household.id);
+	}
+
+	async function refreshListAfterMutation(action: string) {
+		try {
+			await refreshList();
+			listError = '';
+		} catch {
+			listError = `${action}, but the list could not be refreshed. It may be out of date.`;
+		}
 	}
 
 	/** "2026-10-01" → "1 Oct 2026", without a timezone shift. */
@@ -344,7 +355,7 @@
 			saved =
 				formId === null
 					? await createManualPurchase(household.id, input)
-				: await updateManualPurchase(household.id, formId, input);
+					: await updateManualPurchase(household.id, formId, input);
 		} catch (err) {
 			saving = false;
 			if (err instanceof HttpResponseError && err.status === 401) {
@@ -364,11 +375,7 @@
 		confirmingDelete = false;
 		zoomed = false;
 		view = 'detail';
-		try {
-			await refreshList();
-		} catch {
-			detailError = 'Purchase saved, but the list could not be refreshed. Try again later.';
-		}
+		await refreshListAfterMutation('Purchase saved');
 	}
 
 	async function confirmDelete() {
@@ -377,19 +384,22 @@
 		deleting = true;
 		try {
 			await deletePurchase(household.id, detail.id);
-			detail = null;
-			confirmingDelete = false;
-			await refreshList();
-			view = 'list';
 		} catch (err) {
+			deleting = false;
 			if (err instanceof HttpResponseError && err.status === 401) {
 				redirectToSignIn();
 				return;
 			}
 			detailError = 'Couldn’t delete the purchase. Check your connection and try again.';
-		} finally {
-			deleting = false;
+			return;
 		}
+		deleting = false;
+		const deletedId = detail.id;
+		detail = null;
+		confirmingDelete = false;
+		purchases = purchases.filter((purchase) => purchase.id !== deletedId);
+		view = 'list';
+		await refreshListAfterMutation('Purchase deleted');
 	}
 
 	/** Clear a purchase's photo link from the detail view. */
@@ -397,15 +407,20 @@
 		if (!household || !detail) return;
 		detailError = '';
 		try {
-			detail = await setPurchaseReceipt(household.id, detail.id, null);
-			await refreshList();
+			const updated = await setPurchaseReceipt(household.id, detail.id, null);
+			detail = updated;
+			purchases = purchases.map((purchase) =>
+				purchase.id === updated.id ? { ...purchase, receipt_image_id: null } : purchase
+			);
 		} catch (err) {
 			if (err instanceof HttpResponseError && err.status === 401) {
 				redirectToSignIn();
 				return;
 			}
 			detailError = 'Couldn’t remove the photo link. Please try again.';
+			return;
 		}
+		await refreshListAfterMutation('Photo link cleared');
 	}
 
 	function chooseFile(event: Event) {
@@ -463,6 +478,9 @@
 		<h1>Purchases</h1>
 		<a class="back" href="/">Home</a>
 	</header>
+	{#if listError}
+		<p class="error-panel" role="status">{listError}</p>
+	{/if}
 
 	{#if status === 'loading'}
 		<p class="loading" role="status" aria-live="polite">Loading your purchases…</p>
