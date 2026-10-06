@@ -231,4 +231,67 @@ describe('shopping page', () => {
 		await waitFor(() => expect(screen.getByText('Apples')).toBeTruthy());
 		expect(screen.queryByText('Milk')).toBeNull();
 	});
+
+	it('warns that the plan is stale after a planned quantity is edited', async () => {
+		await seed();
+		saveChosenTrip({
+			listId: LIST,
+			runId: 'run-1',
+			planKind: 'two_store',
+			title: 'Recommended split',
+			savedAt: '2026-01-01T00:00:00Z',
+			allocation: {
+				stores: ['tesco', 'aldi'],
+				byStore: [
+					{
+						retailer: 'tesco',
+						lines: [
+							{
+								entryId: 'e-milk',
+								retailer: 'tesco',
+								retailerProductId: 'rp-milk',
+								productName: 'Tesco Whole Milk 2L',
+								unitPriceCents: 120,
+								lineTotalCents: 120,
+								loyaltyApplied: false,
+								freshnessConfidence: 'high'
+							}
+						]
+					},
+					{
+						retailer: 'aldi',
+						lines: [
+							{
+								entryId: 'e-apple',
+								retailer: 'aldi',
+								retailerProductId: 'rp-apple',
+								productName: 'Aldi Gala Apples',
+								unitPriceCents: 90,
+								lineTotalCents: 90,
+								loyaltyApplied: false,
+								freshnessConfidence: 'high'
+							}
+						]
+					}
+				],
+				unallocated: [],
+				entryIds: ['e-milk', 'e-apple']
+			},
+			// Snapshot matching the seeded quantities (both 1).
+			quantities: { 'e-milk': 1, 'e-apple': 1 }
+		});
+
+		render(Page);
+		await waitFor(() => expect(screen.getByText('Milk')).toBeTruthy());
+		// The plan still matches the list, so no warning yet.
+		expect(screen.queryByRole('alert')).toBeNull();
+
+		// A quantity edit (what `setQuantity` writes to Dexie) makes it stale.
+		await db.list_entries.update('e-milk', { quantity: 3 });
+
+		const banner = await screen.findByRole('alert');
+		expect(banner.textContent).toMatch(/list has changed/i);
+		const review = screen.getByRole('link', { name: 'Review and choose a plan again' });
+		expect(review.getAttribute('href')).toBe('/list/list-42/optimise');
+	});
 });

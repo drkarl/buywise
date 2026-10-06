@@ -31,7 +31,7 @@
 	import PlanCard from '$lib/components/PlanCard.svelte';
 	import { allocatePlan } from '$lib/shopping/allocatePlan';
 	import { saveChosenTrip } from '$lib/shopping/chosenTrip';
-	import type { RetailerId } from '$lib/stores/shopping';
+	import { allEntries, type RetailerId } from '$lib/stores/shopping';
 	import {
 		formatEuros,
 		retailerLabel,
@@ -46,6 +46,19 @@
 	} from '$lib/api/optimise';
 
 	const listId = $derived(page.params.id ?? '');
+
+	/**
+	 * The current quantity per list-entry id, kept live (the same Dexie view the
+	 * trip and shopping pages read). `choosePlan` snapshots this into the chosen
+	 * cache so a later `setQuantity` edit is detectable as staleness. Mirrored
+	 * into plain `$state` because `choosePlan` reads it from a click handler, not
+	 * a reactive context, so the read alone would not open the live query.
+	 */
+	const all = $derived(allEntries(listId));
+	let quantityById = $state<Map<string, number>>(new Map());
+	$effect(() => {
+		quantityById = new Map($all.map((e) => [e.id, e.quantity]));
+	});
 
 	type Status = 'loading' | 'ready' | 'error';
 
@@ -221,18 +234,28 @@
 	 */
 	function choosePlan(title: string, plan: StorePlan) {
 		if (!result) return;
+		const allocation = allocatePlan({
+			plan,
+			unresolvedItems: result.unresolved_items,
+			noValidOfferItems: result.no_valid_offer_items,
+			needsConfirmationItems: result.needs_confirmation_items,
+			basketItems: result.basket_items
+		});
+		// Snapshot the quantity of every planned entry (issue #104 follow-up): the
+		// optimiser prices the current quantities, so a later `setQuantity` edit
+		// that keeps the entry id must still be detected as staleness.
+		const quantities: Record<string, number> = {};
+		for (const entryId of allocation.entryIds) {
+			const quantity = quantityById.get(entryId);
+			if (quantity !== undefined) quantities[entryId] = quantity;
+		}
 		saveChosenTrip({
 			listId,
 			runId: result.run_id,
 			planKind: plan.stores.length > 1 ? 'two_store' : 'single_store',
 			title,
-			allocation: allocatePlan({
-				plan,
-				unresolvedItems: result.unresolved_items,
-				noValidOfferItems: result.no_valid_offer_items,
-				needsConfirmationItems: result.needs_confirmation_items,
-				basketItems: result.basket_items
-			}),
+			allocation,
+			quantities,
 			savedAt: new Date().toISOString()
 		});
 	}
