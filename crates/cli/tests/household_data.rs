@@ -537,7 +537,10 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
     assert_eq!(receipt["processing"], "local");
     assert_eq!(receipt["uploaded_by"], "u-a");
     assert!(receipt["expires_at"].is_string());
-    assert!(receipt.get("storage_key").is_none(), "the internal file name must not be exported");
+    assert!(
+        receipt.get("storage_key").is_none(),
+        "the internal file name must not be exported"
+    );
 
     // Reference data the links resolve against is embedded, not assumed.
     let category_ids: Vec<&str> = doc["reference_data"]["categories"]
