@@ -547,15 +547,16 @@ store estimate").
 **Follow-up.** #109: implement the usual-shop written profile as the primary live-evaluation
 baseline and populate `usual_profile_json`.
 
-### 4. No receipt links and no automatic purchase matching
+### 4. No purchase links to recommendations and no automatic matching
 
-**What happens.** Imported purchase records and receipts are not linked to recommendations or
-lists. For savings, the only realised input remains a manual whole-basket total, which is why
-every reconciled-by-hand event is `legacy_total_only`.
+**What happens.** Purchase records are not linked to recommendations or lists, and no purchase
+lines are matched to products. Receipt photos can be linked to purchases by a member, but not to
+recommendations or list lines. For savings, the only realised input remains a manual whole-basket
+total, which is why every reconciled-by-hand event is `legacy_total_only`.
 
-**Why accepted.** Receipt capture is now implemented as private, expiring image storage (#149),
-but receipts are not linked to recommendations or purchase records; the manual evaluation remains
-independent of receipt capture.
+**Why accepted.** Purchase-to-list reconciliation is still out of scope; the hand-chosen photo link
+supports recording a purchase beside its receipt, but does not reconcile its contents or feed the
+manual savings evaluation.
 
 **Workaround.** Enter actual spend manually to get a legacy basket variance; it is labelled as
 unverified.
