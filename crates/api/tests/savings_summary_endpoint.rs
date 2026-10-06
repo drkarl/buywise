@@ -356,9 +356,7 @@ async fn manual_total_never_appears_as_saved_money() {
     assert_eq!(body["legacy"]["monthly"][0]["manual_total_cents"], 1000);
     assert_eq!(body["legacy"]["monthly"][0]["travel_cents"], 0);
     assert_eq!(body["legacy"]["monthly"][0]["variance_cents"], 1000);
-    assert!(body["legacy"]["monthly"][0]
-        .get("gross_cents")
-        .is_none());
+    assert!(body["legacy"]["monthly"][0].get("gross_cents").is_none());
 }
 
 /// Realised figures group by the list's archive date, not the row's creation
