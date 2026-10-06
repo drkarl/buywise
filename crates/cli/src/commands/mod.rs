@@ -27,6 +27,7 @@ pub mod no_network;
 pub mod optimise;
 pub mod password_prompt;
 pub mod purchases;
+pub mod receipts;
 pub mod seed_matches;
 pub mod set_password;
 pub mod validate;

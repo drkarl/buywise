@@ -5,14 +5,17 @@
 //! (`crates/api/src/household.rs`, issue #136), so the two never drift:
 //!
 //! * [`export_household`] builds every household-scoped record as one JSON
-//!   document. The layout is documented in `docs/household-export.md`; it is
+//!   document, including the household's receipt-image METADATA (never the image
+//!   bytes, which live on disk). The layout is documented in
+//!   `docs/household-export.md`; it is
 //!   plain `serde_json::Value` (no app domain types) so the document is a
 //!   stable, self-describing interchange format rather than a dump of internal
 //!   structs.
 //! * [`delete_household`] removes every household-scoped record in one
-//!   transaction. `dry_run` runs the whole delete inside a transaction and
-//!   ROLLS IT BACK, so it reports the exact rows a real run would remove without
-//!   guessing at per-table predicates.
+//!   transaction, and unlinks the household's receipt-image files in that same
+//!   transaction ([`crate::receipts`]). `dry_run` runs the whole delete inside a
+//!   transaction and ROLLS IT BACK, so it reports the exact rows a real run
+//!   would remove without guessing at per-table predicates.
 //!
 //! Both functions are READ-ONLY against the schema (neither runs migrations) and
 //! expect a database the API or an operator has already migrated. What is
@@ -23,12 +26,14 @@
 //! carries no household identity.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde_json::{json, Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Column, Row, SqliteConnection, SqlitePool};
 
 use crate::db;
+use crate::receipts;
 
 /// `format` field of the export document. Bump-incompatible changes accompany a
 /// [`EXPORT_FORMAT_VERSION`] bump; consumers MUST check both.
@@ -47,6 +52,10 @@ pub enum HouseholdDataError {
     /// A query or transaction failed at the sqlx layer.
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+
+    /// A receipt image file could not be removed while deleting a household.
+    #[error(transparent)]
+    Receipts(#[from] crate::receipts::ReceiptError),
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +254,20 @@ pub async fn export_household(
         )
         .await?,
     );
+    // Receipt-image METADATA only. The bytes are not in SQLite and are not part
+    // of a database export; `storage_key` is deliberately omitted because it is
+    // an internal file name, not something a consumer can resolve. Each image
+    // stays retrievable through the app (its `id` is the handle) until its 30-day
+    // expiry removes it — see `docs/household-export.md` and
+    // `docs/data-flows.md` §4.
+    let receipt_images = fetch_rows_bound(
+        pool,
+        "SELECT id, uploaded_by, uploaded_at, expires_at, content_type, byte_size, \
+                sha256_hex, processing \
+         FROM receipt_images WHERE household_id = ?1 ORDER BY uploaded_at, id",
+        household_id,
+    )
+    .await?;
 
     let mut lists = fetch_rows_bound(
         pool,
@@ -355,6 +378,7 @@ pub async fn export_household(
         "lists": lists,
         "purchase_events": purchase_events,
         "purchase_transactions": purchase_transactions,
+        "receipt_images": receipt_images,
     }))
 }
 
@@ -455,6 +479,9 @@ pub const HOUSEHOLD_TABLES: &[&str] = &[
     "household_store_settings",
     "household_settings",
     "store_category_orders",
+    // The receipt-image rows. Their bytes are unlinked in the same transaction
+    // by the `DELETE ... RETURNING storage_key` step below, file before commit.
+    "receipt_images",
     "household_members",
     "households",
     "sessions",
@@ -564,6 +591,13 @@ const DELETE_STEPS: &[DeleteStep] = &[
         table: "store_category_orders",
         delete_sql: "DELETE FROM store_category_orders WHERE household_id = ?1",
     },
+    // The one step whose statement RETURNS values: the storage keys of the rows
+    // it removes, so `delete_household` can unlink those files in the same
+    // transaction. `receipts::RECEIPT_IMAGES_TABLE` names this step.
+    DeleteStep {
+        table: receipts::RECEIPT_IMAGES_TABLE,
+        delete_sql: "DELETE FROM receipt_images WHERE household_id = ?1 RETURNING storage_key",
+    },
     DeleteStep {
         table: "household_members",
         delete_sql: "DELETE FROM household_members WHERE household_id = ?1",
@@ -645,16 +679,26 @@ pub async fn delete_orphaned_accounts(
     Ok(removed)
 }
 
-/// Delete every household-scoped row for `household_id` in one transaction.
+/// Delete every household-scoped row for `household_id` in one transaction,
+/// including the household's receipt-image files on disk.
 ///
 /// With `dry_run`, the same statements run and the transaction is rolled back,
 /// so the returned `(table, rows_affected)` pairs are exactly what a real run
-/// would remove. Errors with [`HouseholdDataError::NoSuchHousehold`] if the
-/// household does not exist.
+/// would remove — and no file is touched. Errors with
+/// [`HouseholdDataError::NoSuchHousehold`] if the household does not exist.
+///
+/// `receipt_dir` is the directory holding receipt-image bytes (the same value
+/// [`crate::receipts::ReceiptConfig::dir`] carries). It is required rather than
+/// optional: the rows name those files, and a delete that skipped them would
+/// leave every household image on disk after the household itself was gone.
+/// The files are unlinked inside the transaction, before it commits, so a failed
+/// unlink aborts the delete (leaving the rows to retry) rather than orphaning an
+/// image.
 pub async fn delete_household(
     pool: &SqlitePool,
     household_id: &str,
     dry_run: bool,
+    receipt_dir: &Path,
 ) -> Result<Vec<(&'static str, u64)>, HouseholdDataError> {
     household_name(pool, household_id).await?;
 
@@ -671,6 +715,19 @@ pub async fn delete_household(
 
     let mut counts = Vec::with_capacity(DELETE_STEPS.len() + 2);
     for step in DELETE_STEPS {
+        if step.table == receipts::RECEIPT_IMAGES_TABLE {
+            // The one statement that returns values: the storage keys of the
+            // rows it removes, so the bytes go with them (file first).
+            let storage_keys: Vec<String> = sqlx::query_scalar(step.delete_sql)
+                .bind(household_id)
+                .fetch_all(&mut *tx)
+                .await?;
+            if !dry_run {
+                receipts::delete_household_receipt_files(receipt_dir, &storage_keys)?;
+            }
+            counts.push((step.table, storage_keys.len() as u64));
+            continue;
+        }
         let result = sqlx::query(step.delete_sql)
             .bind(household_id)
             .execute(&mut *tx)

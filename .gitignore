@@ -4,6 +4,11 @@ target/
 *.db-shm
 *.db-wal
 
+# Local receipt images (the default RECEIPT_DIR: `receipts/` beside the database).
+# Anchored to the repository root so the frontend's `(app)/receipts` route is not
+# caught by it.
+/receipts/
+
 # Local git worktrees
 .worktrees/
 

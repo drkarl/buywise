@@ -825,6 +825,8 @@ mod tests {
             "purchase_transactions",
             "purchase_lines",
             "purchase_transaction_revisions",
+            // Receipt images (020, issue #149)
+            "receipt_images",
         ];
 
         for name in expected {
@@ -834,7 +836,7 @@ mod tests {
 
         // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category + 1
         // store-settings + 2 purchase-suggestion + 1 store-category-rules + 3
-        // purchase-ledger application tables (excluding sqlx bookkeeping).
+        // purchase-ledger + 1 receipt-image application tables (excluding sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -1078,8 +1080,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 30,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules, purchase suggestion and purchase ledger tables in the file-backed database"
+            count, 31,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules, purchase suggestion, purchase ledger and receipt image tables in the file-backed database"
         );
 
         pool.close().await;

@@ -5,7 +5,10 @@
 //! `/api/items`, the offline-sync mutation endpoint (P1-T4) at `/api/mutations`,
 //! the Server-Sent Events stream (P1-T5) at `/api/sse/:list_id`, the basket
 //! optimiser (P4-T1) at `/api/optimise`, and the household product-preference
-//! screen (issue #102) at `/api/items/{id}/preferences`. The unauthenticated
+//! screen (issue #102) at `/api/items/{id}/preferences`, and the receipt-image
+//! routes (issue #149) under `/api/household/{id}/receipts` (upload, list, view,
+//! delete — the bytes live on the server filesystem and only an authenticated
+//! handler serves them). The unauthenticated
 //! readiness probe (issue #141) is `GET /api/health`, registered outside
 //! authentication and CSRF. The shared
 //! [`AppState`] carries the SQLite pool that handlers and the
@@ -45,6 +48,7 @@ pub mod mutations;
 pub mod optimise;
 pub mod preferences;
 pub mod purchases;
+pub mod receipts;
 pub mod resolution;
 pub mod run_snapshot;
 pub mod savings;
@@ -81,6 +85,13 @@ pub struct AppState {
     /// [`llm::LlmConfig::from_env`]); integration tests inject a fake via
     /// [`AppState::with_llm_client`] so they never touch the network.
     pub llm_client: Arc<dyn llm::LlmClient>,
+    /// Where receipt-image bytes are stored and how much each household may keep
+    /// (issue #149). Built from the environment by [`AppState::new`]
+    /// ([`buywise_core::receipts::ReceiptConfig::from_env`]: the `RECEIPT_DIR` directory and
+    /// the quota overrides); integration tests point it at a temporary directory
+    /// with [`AppState::with_receipt_config`] so no test writes into the
+    /// repository.
+    pub receipt_config: buywise_core::receipts::ReceiptConfig,
 }
 
 impl AppState {
@@ -93,6 +104,7 @@ impl AppState {
             sse_channels: Arc::new(DashMap::new()),
             sse_config: sse::SseConfig::default(),
             llm_client: llm::client_from_env(),
+            receipt_config: buywise_core::receipts::ReceiptConfig::from_env(),
         }
     }
 
@@ -107,6 +119,13 @@ impl AppState {
     /// step-3 fallback runs deterministically without a network call).
     pub fn with_llm_client(mut self, client: Arc<dyn llm::LlmClient>) -> Self {
         self.llm_client = client;
+        self
+    }
+
+    /// Override the receipt-image storage configuration (used by tests to point
+    /// uploads at a temporary directory and to exercise the quota limits).
+    pub fn with_receipt_config(mut self, config: buywise_core::receipts::ReceiptConfig) -> Self {
+        self.receipt_config = config;
         self
     }
 }
@@ -158,6 +177,10 @@ pub fn api_router(state: AppState) -> Router {
         // `purchases::router` carries `/api/household/{id}/purchases[...]`: the
         // household purchase ledger import/read/delete (issue #148).
         .merge(purchases::router())
+        // `receipts::router` carries `/api/household/{id}/receipts[...]`: the
+        // receipt-image upload, list, view and delete (issue #149). It needs the
+        // storage config at build time for the per-image body limit.
+        .merge(receipts::router(&state.receipt_config))
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,

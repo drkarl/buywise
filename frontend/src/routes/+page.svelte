@@ -7,8 +7,8 @@
 	//   * logged out (GET /api/auth/me → 401) → a login form that POSTs to
 	//     /api/auth/login (which sets the session + csrf cookies);
 	//   * logged in → the household's active lists (GET /api/lists) as links into
-	//     /list/<id>, a "new list" action, a link to the savings ledger, and
-	//     logout.
+	//     /list/<id>, a "new list" action, links to the settings, savings-ledger
+	//     and receipts pages, and logout.
 	//
 	// SSR/prerender are disabled globally (src/routes/+layout.ts), so every fetch
 	// here runs in the browser with the session cookie attached automatically.
@@ -282,6 +282,7 @@
 			<p class="ledger-link">
 				<a href="/settings">Store settings →</a>
 				· <a href="/savings">View your savings ledger →</a>
+				· <a href="/receipts">Receipts →</a>
 			</p>
 		</div>
 	{/if}

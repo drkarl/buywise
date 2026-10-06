@@ -183,7 +183,14 @@ cargo run -p buywise-cli -- export-household --db buywise.db --household-id <uui
 # See what deletion would remove, then delete it (--confirm is required to delete).
 cargo run -p buywise-cli -- delete-household --db buywise.db --household-id <uuid> --dry-run
 cargo run -p buywise-cli -- delete-household --db buywise.db --household-id <uuid> --confirm
+
+# Receipt photos are kept 30 days; the daily timer runs this sweep, and it can be run by hand.
+cargo run -p buywise-cli -- expire-receipts --db buywise.db
 ```
+
+Receipt photos live on the server filesystem (not in SQLite and not in the database backup) and are
+served only to the household through the app's **Receipts** page, which uploads, lists, views and
+deletes them; `docs/data-flows.md` §4 has the storage layout, limits and retention rules.
 
 Deletion clears the household from the live database immediately; it does not rewrite backups, and
 a restore can resurrect it — `docs/data-flows.md` §5 explains the expiry and restore handling.

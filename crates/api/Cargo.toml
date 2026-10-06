@@ -32,6 +32,9 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Receipt-image tests write real files under the configurable receipt directory;
+# each test gets its own temporary directory so nothing touches the checkout.
+tempfile = { workspace = true }
 # SSE integration tests bind a real TCP server and read the streaming response
 # incrementally (a `oneshot` would block on the never-ending stream body).
 # `cookies` lets the P1-T6 server-wiring smoke tests carry the session/csrf

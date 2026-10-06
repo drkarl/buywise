@@ -49,7 +49,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
-    bootstrap, household, ingest, ingest_lidl, optimise, purchases, seed_matches, set_password,
+    bootstrap, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches, set_password,
     validate,
 };
 
@@ -214,6 +214,26 @@ enum Command {
         /// Report the rows that would be deleted, then roll back.
         #[arg(long)]
         dry_run: bool,
+        /// Receipt-image directory whose files are removed with the household
+        /// (defaults to `RECEIPT_DIR`, else beside the database).
+        #[arg(long)]
+        receipt_dir: Option<String>,
+    },
+
+    /// Delete receipt images whose 30-day retention has expired.
+    ///
+    /// Removes each expired image's file (tolerating one already gone) and then
+    /// its record, so running it twice changes nothing. Run daily by the
+    /// `buywise-expire-receipts.timer` systemd timer. The image directory is
+    /// `--receipt-dir`, else `RECEIPT_DIR`, else a `receipts/` directory beside
+    /// the database.
+    ExpireReceipts {
+        /// SQLite database path to update.
+        #[arg(long)]
+        db: String,
+        /// Receipt-image directory (defaults to `RECEIPT_DIR`, else beside the database).
+        #[arg(long)]
+        receipt_dir: Option<String>,
     },
 
     /// Import purchase transactions into a household's ledger.
@@ -290,11 +310,13 @@ fn main() -> Result<()> {
             household_id,
             confirm,
             dry_run,
-        } => household::delete_run(&db, &household_id, confirm, dry_run),
-        Command::ImportPurchases {
-            db,
-            household_id,
-            file,
-        } => purchases::import_run(&db, &household_id, &file),
+            receipt_dir,
+        } => household::delete_run(&db, &household_id, confirm, dry_run, receipt_dir.as_deref()),
+        Command::ExpireReceipts { db, receipt_dir } => {
+            receipts::expire_run(&db, receipt_dir.as_deref())
+        }
+        Command::ImportPurchases { db, household_id, file } => {
+            purchases::import_run(&db, &household_id, &file)
+        }
     }
 }

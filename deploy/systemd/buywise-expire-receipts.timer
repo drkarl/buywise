@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily BuyWise receipt-expiry sweep schedule
+# Drives buywise-expire-receipts.service. Receipt images are retained for 30
+# days by policy and then deleted; a daily run keeps each sweep small and
+# bounded instead of letting a large backlog accumulate.
+
+[Timer]
+# Daily 03:30 local time: a low-traffic window (overnight) so a single-writer
+# delete never contends with daytime API traffic. A daily sweep is enough
+# because expiry is measured in whole days — anything that expires today is
+# removed within a day, and no finer granularity buys anything. (Unlike the
+# weekly ingest, this job needs no network and no credentials, so setup.sh
+# installs AND enables it; there is nothing for the operator to configure.)
+OnCalendar=*-*-* 03:30:00
+# Catch up a run that was missed because the host was down at the scheduled
+# time (fires once on next boot instead of waiting a full day).
+Persistent=true
+Unit=buywise-expire-receipts.service
+
+[Install]
+WantedBy=timers.target
