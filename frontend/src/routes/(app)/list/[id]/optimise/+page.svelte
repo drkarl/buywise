@@ -384,8 +384,12 @@
 			<button type="button" class="retry" onclick={retry}>Try again</button>
 		</div>
 	{:else if result}
-		{#if result.offer_snapshot_date}
-			<p class="snapshot">Prices as of {result.offer_snapshot_date}.</p>
+		{#if result.offer_snapshot_date || result.coverage.undated_offer_count > 0}
+			<p class="snapshot">
+				Prices as of {result.offer_snapshot_date ?? 'unknown'}{#if result.coverage.undated_offer_count > 0},
+					{result.coverage.undated_offer_count}
+					{result.coverage.undated_offer_count === 1 ? 'offer' : 'offers'} undated{/if}.
+			</p>
 		{/if}
 
 		{#if result.coverage.status === 'unequal_coverage'}
