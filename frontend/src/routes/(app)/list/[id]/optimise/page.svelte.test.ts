@@ -83,20 +83,22 @@ function fullResponse(): OptimiseResponse {
 			two_store_saving_cents: 100,
 			plan: {
 				stores: ['tesco', 'aldi'],
-				lines: Array.from({ length: 4 }, (_, item_index) => ({
-					item_index,
-					entry_id: `e-${item_index}`,
-					display_text: `Item ${item_index}`,
-					product_name: `Product ${item_index}`,
-					canonical_item_id: `ci-${item_index}`,
-					retailer: 'tesco' as const,
-					retailer_product_id: `rp-${item_index}`,
-					offer_id: `of-${item_index}`,
-					unit_price_cents: 100,
-					line_total_cents: 100,
-					loyalty_applied: false,
-					freshness_confidence: 'high' as const
-				})),
+				lines: [
+					{
+						item_index: 0,
+						entry_id: 'e-0',
+						display_text: 'Milk 2L',
+						product_name: 'Product 0',
+						canonical_item_id: 'ci-0',
+						retailer: 'tesco',
+						retailer_product_id: 'rp-0',
+						offer_id: 'of-0',
+						unit_price_cents: 100,
+						line_total_cents: 100,
+						loyalty_applied: false,
+						freshness_confidence: 'high'
+					}
+				],
 				total_cents: 400,
 				missing_count: 0,
 				dunnes_voucher_offer_text: null
@@ -143,6 +145,25 @@ function fullResponse(): OptimiseResponse {
 			}
 		}
 	};
+}
+
+function responseWithFourPricedPlanLines(): OptimiseResponse {
+	const response = fullResponse();
+	response.recommended!.plan.lines = Array.from({ length: 4 }, (_, item_index) => ({
+		item_index,
+		entry_id: `e-${item_index}`,
+		display_text: `Item ${item_index}`,
+		product_name: `Product ${item_index}`,
+		canonical_item_id: `ci-${item_index}`,
+		retailer: 'tesco',
+		retailer_product_id: `rp-${item_index}`,
+		offer_id: `of-${item_index}`,
+		unit_price_cents: 100,
+		line_total_cents: 100,
+		loyalty_applied: false,
+		freshness_confidence: 'high'
+	}));
+	return response;
 }
 
 /**
@@ -897,7 +918,7 @@ describe('optimise page', () => {
 	});
 
 	it('shows the Aldi comparison split fresh versus packaged', async () => {
-		stubOptimise(fullResponse());
+		stubOptimise(responseWithFourPricedPlanLines());
 		render(Page);
 
 		const section = await screen.findByRole('region', { name: 'Aldi comparison' });
@@ -914,7 +935,7 @@ describe('optimise page', () => {
 	});
 
 	it('shows comparison coverage when Aldi would cost more', async () => {
-		const response = fullResponse();
+		const response = responseWithFourPricedPlanLines();
 		response.aldi_comparison!.packaged.saving_cents = -200;
 		stubOptimise(response);
 		render(Page);
