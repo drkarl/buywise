@@ -32,6 +32,8 @@ Both the trip page (`trip/+page.svelte:155-157`) and store-scoped shopping mode
 It is driven by `isTripStale` (`chosenTrip.ts:93-106`), which flags an `active` entry absent from the
 plan and a planned entry whose quantity differs from the snapshot taken when the plan was chosen
 (the `quantities` map on the cached trip, populated by `choosePlan` in `optimise/+page.svelte`).
+It also flags a planned entry whose canonical item changes after the plan was priced
+(`canonicalItemIds` on the cached trip); older caches check only fields they contain.
 The store-scoped view still renders only the plan's allocated lines (`storeEntryIds`,
 `shopping/+page.svelte:80`), so an entry added after choosing is counted by the "N item(s) not in a
 store list — View whole trip" link (`shopping/+page.svelte:85-93`, `:156-166`) but has no per-item
@@ -45,10 +47,10 @@ plan-time prices, not a live re-price.
 still flows through the normal offline queue, so devices converge on the entries even though each
 holds its own plan snapshot. `localStorage` avoids a Dexie schema migration for a small, per-device
 snapshot, and design §10 records the per-device cache, the replace-by-reselecting workflow, and the
-frozen-price snapshot as deliberate volume-one scope. The stale warning now covers both added
-entries and quantity edits without moving the plan to server state; giving a later-added entry its
-own per-item view inside the trip views, and sharing the chosen plan between devices, are larger
-changes left to follow-ups.
+frozen-price snapshot as deliberate volume-one scope. The stale warning now covers added entries,
+quantity edits, and canonical-item changes without moving the plan to server state; giving a
+later-added entry its own per-item view inside the trip views, and sharing the chosen plan between
+devices, are larger changes left to follow-ups.
 
 **Workaround.** Open `/list/<id>` to view and check off an entry added after choosing a plan. Open
 `/list/<id>/trip` for the whole trip — its stale banner links back to the optimiser. Re-optimise and

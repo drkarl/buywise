@@ -50,6 +50,7 @@
 	const all = $derived(allEntries(listId));
 	let quantityById = $state<Map<string, number>>(new Map());
 	let resultQuantities = $state<Map<string, number>>(new Map());
+	let resultCanonicalItemIds = $state<Map<string, string | null>>(new Map());
 	$effect(() => {
 		quantityById = new Map($all.map((e) => [e.id, e.quantity]));
 	});
@@ -236,9 +237,13 @@
 			basketItems: result.basket_items
 		});
 		const quantities: Record<string, number> = {};
+		const canonicalItemIds: Record<string, string | null> = {};
 		for (const entryId of allocation.entryIds) {
 			const quantity = resultQuantities.get(entryId);
 			if (quantity !== undefined) quantities[entryId] = quantity;
+			if (resultCanonicalItemIds.has(entryId)) {
+				canonicalItemIds[entryId] = resultCanonicalItemIds.get(entryId)!;
+			}
 		}
 		saveChosenTrip({
 			listId,
@@ -247,6 +252,7 @@
 			title,
 			allocation,
 			quantities,
+			canonicalItemIds,
 			savedAt: new Date().toISOString()
 		});
 	}
@@ -294,6 +300,10 @@
 				status = 'error';
 				return;
 			}
+			const pricedQuantities = new Map(quantityById);
+			const pricedCanonicalItemIds = new Map<string, string | null>(
+				$all.map((entry): [string, string | null] => [entry.id, entry.canonical_item_id ?? null])
+			);
 
 			const res = await fetch('/api/optimise', {
 				method: 'POST',
@@ -309,7 +319,8 @@
 			const body = (await res.json()) as OptimiseResponse;
 			// Re-check after the async body read in case a newer run started meanwhile.
 			if (superseded()) return;
-			resultQuantities = new Map(quantityById);
+			resultQuantities = pricedQuantities;
+			resultCanonicalItemIds = pricedCanonicalItemIds;
 			result = body;
 			status = 'ready';
 		} catch {

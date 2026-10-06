@@ -8,7 +8,11 @@ import {
 	type ChosenTrip
 } from './chosenTrip';
 
-function trip(entryIds: string[], quantities?: Record<string, number>): ChosenTrip {
+function trip(
+	entryIds: string[],
+	quantities?: Record<string, number>,
+	canonicalItemIds?: Record<string, string | null>
+): ChosenTrip {
 	return {
 		listId: 'list-1',
 		runId: 'run-1',
@@ -24,7 +28,8 @@ function trip(entryIds: string[], quantities?: Record<string, number>): ChosenTr
 			unallocated: entryIds.map((entryId) => ({ entryId, reason: 'unresolved' as const })),
 			entryIds
 		},
-		quantities
+		quantities,
+		canonicalItemIds
 	};
 }
 
@@ -90,9 +95,17 @@ describe('chosenTrip', () => {
 		// report stale just because the entries now carry quantities.
 		expect(
 			isTripStale(trip(['e-1', 'e-2']), [
-				{ id: 'e-1', status: 'active', quantity: 5 },
-				{ id: 'e-2', status: 'active', quantity: 9 }
+				{ id: 'e-1', status: 'active', quantity: 5, canonical_item_id: 'ci-1' },
+				{ id: 'e-2', status: 'active', quantity: 9, canonical_item_id: 'ci-2' }
 			])
 		).toBe(false);
+	});
+
+	it('treats resolving a planned ambiguous entry as stale', () => {
+		expect(
+			isTripStale(trip(['e-1'], undefined, { 'e-1': null }), [
+				{ id: 'e-1', status: 'active', canonical_item_id: 'ci-milk' }
+			])
+		).toBe(true);
 	});
 });

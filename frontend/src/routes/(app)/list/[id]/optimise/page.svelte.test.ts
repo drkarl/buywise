@@ -192,6 +192,7 @@ function listEntry(id: string, quantity: number) {
 	return {
 		id,
 		list_id: 'list-42',
+		canonical_item_id: `ci-${id}`,
 		resolution_status: 'resolved' as const,
 		raw_text: id,
 		display_name: id,
@@ -308,7 +309,6 @@ describe('optimise page', () => {
 	});
 
 	it('persists plan-specific misses in the chosen trip coverage', async () => {
-		stubOptimise(fullResponse());
 		// Seed the entries the plan covers, with a non-default quantity on e-0, so
 		// the cache snapshots what the optimiser priced.
 		await db.list_entries.bulkPut([
@@ -317,11 +317,25 @@ describe('optimise page', () => {
 			listEntry('e-2', 1),
 			listEntry('e-3', 1)
 		]);
+		let finishOptimise: (() => void) | undefined;
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = typeof input === 'string' ? input : input.toString();
+				if (url.includes('/api/optimise')) {
+					await new Promise<void>((resolve) => (finishOptimise = resolve));
+					return new Response(JSON.stringify(fullResponse()), { status: 200 });
+				}
+				return new Response('not found', { status: 404 });
+			})
+		);
 		render(Page);
-
-		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
+		await waitFor(() => expect(finishOptimise).toBeDefined());
 		await db.list_entries.update('e-0', { quantity: 5 });
 		await new Promise((resolve) => setTimeout(resolve, 0));
+		finishOptimise!();
+
+		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
 		document.addEventListener('click', (event) => event.preventDefault(), {
 			capture: true,
 			once: true
@@ -337,6 +351,12 @@ describe('optimise page', () => {
 		// The chosen cache snapshots each planned entry's quantity, so a later
 		// `setQuantity` edit can be detected as staleness.
 		expect(saved.quantities).toEqual({ 'e-0': 2, 'e-1': 1, 'e-2': 1, 'e-3': 1 });
+		expect(saved.canonicalItemIds).toEqual({
+			'e-0': 'ci-e-0',
+			'e-1': 'ci-e-1',
+			'e-2': 'ci-e-2',
+			'e-3': 'ci-e-3'
+		});
 	});
 
 	it('renders the plain-language explanation', async () => {
