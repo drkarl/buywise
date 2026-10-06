@@ -163,12 +163,13 @@
 	);
 
 	/** Headline: Aldi's total saving across both splits, or the cost if it is pricier. */
-	function aldiSummary(comparison: AldiComparison): string {
+	function aldiSummary(comparison: AldiComparison, recommendedItemCount: number): string {
+		const comparedItemCount = comparison.fresh.item_count + comparison.packaged.item_count;
 		const total = comparison.fresh.saving_cents + comparison.packaged.saving_cents;
 		if (total >= 0) {
-			return `Aldi would have saved ${formatEuros(total)} on this list.`;
+			return `Aldi would have saved ${formatEuros(total)} on this list (covers ${comparedItemCount} of ${recommendedItemCount} plan items).`;
 		}
-		return `Aldi would have cost ${formatEuros(Math.abs(total))} more than your plan.`;
+		return `Aldi would have cost ${formatEuros(Math.abs(total))} more than your plan (covers ${comparedItemCount} of ${recommendedItemCount} plan items).`;
 	}
 
 	/** One split's line: the saving (or extra cost) and the two totals it compares. */
@@ -441,7 +442,9 @@
 			<section class="aldi" aria-label="Aldi comparison">
 				<h2>Aldi comparison</h2>
 				{#if aldiCovered}
-					<p class="aldi-summary">{aldiSummary(aldiComparison)}</p>
+					<p class="aldi-summary">
+						{aldiSummary(aldiComparison, result.recommended?.plan.lines.length ?? 0)}
+					</p>
 					<ul class="aldi-splits">
 						{#if aldiComparison.fresh.item_count > 0}
 							<li>{aldiSplitLine('Fresh food', aldiComparison.fresh)}</li>
