@@ -901,3 +901,292 @@ async fn assert_role(pool: &SqlitePool, household_id: &str, user_id: &str, expec
     .unwrap();
     assert_eq!(role, expected, "{household_id}/{user_id}");
 }
+
+/// Migration 021 rebuilds `purchase_transactions` — the only way SQLite can widen
+/// a CHECK — to admit `source_kind = 'manual'` and to add the nullable
+/// `receipt_image_id` reference. This pins that the rebuild is lossless for data
+/// already written under migration 020: the seeded transactions, lines and
+/// superseded revisions all survive field for field, the identity index is
+/// recreated and still rejects a duplicate, `ON DELETE CASCADE` still takes the
+/// lines and revisions with their transaction, and `ON DELETE SET NULL` still
+/// clears a purchase's receipt-photo link when the image goes.
+#[tokio::test]
+async fn migration_021_rebuild_preserves_ledger_rows_and_foreign_keys() {
+    use sqlx::Row;
+
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory");
+
+    // Apply migrations 001..020 only, so everything seeded below predates the
+    // rebuild rather than being written through the new schema.
+    let mut up_to_020 = sqlx::migrate!("../../migrations");
+    up_to_020.migrations.to_mut().retain(|m| m.version <= 20);
+    up_to_020.run(&pool).await.expect("migrate to 020");
+
+    sqlx::query("INSERT INTO households (id, name, created_at) VALUES ('h1', 'Home', 't')")
+        .execute(&pool)
+        .await
+        .expect("insert household");
+
+    // Pre-conditions that make the rebuild necessary: no link column yet, and the
+    // `manual` source kind the Purchases screen writes is still rejected (the
+    // household exists, so only the CHECK can fail this insert).
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('purchase_transactions')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !columns.iter().any(|name| name == "receipt_image_id"),
+        "020 has no receipt link column"
+    );
+    let manual = sqlx::query(
+        "INSERT INTO purchase_transactions \
+         (id, household_id, retailer, purchase_date, source_kind, transaction_identity, \
+          identity_kind, fingerprint, total_cents, source_payload, created_at, updated_at) \
+         VALUES ('tx-manual', 'h1', 'lidl', '2026-05-02', 'manual', 'u1', 'source_id', \
+                 'pl1:x', 1, '{}', 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    let manual_error = manual.expect_err("020 must reject the manual source kind");
+    assert!(
+        manual_error.to_string().contains("CHECK"),
+        "expected the source_kind CHECK to reject it, got: {manual_error}"
+    );
+
+    // The ledger as written before the rebuild: one receipt image, one imported
+    // transaction at revision 2, two lines and one superseded revision.
+    sqlx::query(
+        "INSERT INTO receipt_images \
+         (id, household_id, uploaded_by, uploaded_at, expires_at, content_type, byte_size, \
+          sha256_hex, storage_key, processing) \
+         VALUES ('img-1', 'h1', NULL, 't', '2999-01-01T00:00:00.000Z', 'image/jpeg', 4, 'aa', \
+                 '00112233445566778899aabbccddeeff.jpg', 'local')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert receipt image");
+    sqlx::query(
+        "INSERT INTO purchase_transactions \
+         (id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
+          transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
+          source_payload, created_at, updated_at) \
+         VALUES ('tx-1', 'h1', 'tesco', '2026-05-01', 'import', 'SRC-1', 'SRC-1', 'source_id', \
+                 'pl1:abc', 'EUR', 858, 2, '{\"a\":1}', 't1', 't2')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert transaction");
+    sqlx::query(
+        "INSERT INTO purchase_lines \
+         (id, transaction_id, line_ordinal, original_text, name, brand, quantity, size_value, \
+          size_unit, unit_price_cents, line_total_cents, line_discount_cents, deposit_cents, \
+          retailer_product_id, canonical_item_id, match_status, revision, created_at) \
+         VALUES ('ln-1', 'tx-1', 0, 'Milk 1L', 'Milk', 'Tesco', 2.0, 1.0, 'l', 129, 258, 0, 0, \
+                 NULL, NULL, 'unmatched', 2, 't3')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert first line");
+    sqlx::query(
+        "INSERT INTO purchase_lines \
+         (id, transaction_id, line_ordinal, original_text, line_total_cents, match_status, \
+          revision, created_at) \
+         VALUES ('ln-2', 'tx-1', 1, 'Bread', 600, 'unmatched', 2, 't4')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert second line");
+    sqlx::query(
+        "INSERT INTO purchase_transaction_revisions \
+         (id, transaction_id, revision, retailer, purchase_date, currency, total_cents, \
+          source_payload, lines_json, superseded_at) \
+         VALUES ('rv-1', 'tx-1', 1, 'tesco', '2026-05-01', 'EUR', 800, '{\"old\":true}', \
+                 '[{\"original_text\":\"Milk\"}]', 't5')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert revision");
+
+    // Run the full set again: only 021 is pending.
+    db::run_migrations(&pool).await.expect("migrate 021");
+
+    // The transaction survived field for field, with the new link starting NULL.
+    let tx = sqlx::query("SELECT * FROM purchase_transactions WHERE id = 'tx-1'")
+        .fetch_one(&pool)
+        .await
+        .expect("transaction survived the rebuild");
+    assert_eq!(tx.get::<String, _>("household_id"), "h1");
+    assert_eq!(tx.get::<String, _>("retailer"), "tesco");
+    assert_eq!(tx.get::<String, _>("purchase_date"), "2026-05-01");
+    assert_eq!(tx.get::<String, _>("source_kind"), "import");
+    assert_eq!(
+        tx.get::<Option<String>, _>("source_transaction_id")
+            .as_deref(),
+        Some("SRC-1")
+    );
+    assert_eq!(tx.get::<String, _>("transaction_identity"), "SRC-1");
+    assert_eq!(tx.get::<String, _>("identity_kind"), "source_id");
+    assert_eq!(tx.get::<String, _>("fingerprint"), "pl1:abc");
+    assert_eq!(tx.get::<String, _>("currency"), "EUR");
+    assert_eq!(tx.get::<i64, _>("total_cents"), 858);
+    assert_eq!(tx.get::<i64, _>("revision"), 2);
+    assert_eq!(tx.get::<String, _>("source_payload"), "{\"a\":1}");
+    assert_eq!(tx.get::<String, _>("created_at"), "t1");
+    assert_eq!(tx.get::<String, _>("updated_at"), "t2");
+    assert!(tx.get::<Option<String>, _>("receipt_image_id").is_none());
+
+    // Every line survived, including the nullable fields of the bare one.
+    let lines = sqlx::query("SELECT * FROM purchase_lines ORDER BY line_ordinal")
+        .fetch_all(&pool)
+        .await
+        .expect("lines survived the rebuild");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].get::<String, _>("id"), "ln-1");
+    assert_eq!(lines[0].get::<String, _>("transaction_id"), "tx-1");
+    assert_eq!(lines[0].get::<i64, _>("line_ordinal"), 0);
+    assert_eq!(lines[0].get::<String, _>("original_text"), "Milk 1L");
+    assert_eq!(
+        lines[0].get::<Option<String>, _>("name").as_deref(),
+        Some("Milk")
+    );
+    assert_eq!(
+        lines[0].get::<Option<String>, _>("brand").as_deref(),
+        Some("Tesco")
+    );
+    assert_eq!(lines[0].get::<Option<f64>, _>("quantity"), Some(2.0));
+    assert_eq!(lines[0].get::<Option<f64>, _>("size_value"), Some(1.0));
+    assert_eq!(
+        lines[0].get::<Option<String>, _>("size_unit").as_deref(),
+        Some("l")
+    );
+    assert_eq!(
+        lines[0].get::<Option<i64>, _>("unit_price_cents"),
+        Some(129)
+    );
+    assert_eq!(lines[0].get::<i64, _>("line_total_cents"), 258);
+    assert_eq!(lines[0].get::<i64, _>("line_discount_cents"), 0);
+    assert_eq!(lines[0].get::<i64, _>("deposit_cents"), 0);
+    assert_eq!(lines[0].get::<String, _>("match_status"), "unmatched");
+    assert_eq!(lines[0].get::<i64, _>("revision"), 2);
+    assert_eq!(lines[0].get::<String, _>("created_at"), "t3");
+    assert_eq!(lines[1].get::<String, _>("id"), "ln-2");
+    assert_eq!(lines[1].get::<i64, _>("line_ordinal"), 1);
+    assert_eq!(lines[1].get::<i64, _>("line_total_cents"), 600);
+    assert_eq!(lines[1].get::<Option<f64>, _>("quantity"), None);
+    assert_eq!(lines[1].get::<Option<String>, _>("name"), None);
+
+    // The superseded revision survived too.
+    let rev = sqlx::query("SELECT * FROM purchase_transaction_revisions WHERE id = 'rv-1'")
+        .fetch_one(&pool)
+        .await
+        .expect("revision survived the rebuild");
+    assert_eq!(rev.get::<String, _>("transaction_id"), "tx-1");
+    assert_eq!(rev.get::<i64, _>("revision"), 1);
+    assert_eq!(rev.get::<String, _>("retailer"), "tesco");
+    assert_eq!(rev.get::<String, _>("purchase_date"), "2026-05-01");
+    assert_eq!(rev.get::<String, _>("currency"), "EUR");
+    assert_eq!(rev.get::<i64, _>("total_cents"), 800);
+    assert_eq!(rev.get::<String, _>("source_payload"), "{\"old\":true}");
+    assert_eq!(
+        rev.get::<String, _>("lines_json"),
+        "[{\"original_text\":\"Milk\"}]"
+    );
+    assert_eq!(rev.get::<String, _>("superseded_at"), "t5");
+
+    // Both indexes were recreated with the table.
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'purchase_transactions'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_purchase_transactions_identity"),
+        "the identity index must be recreated: {indexes:?}"
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_purchase_transactions_household_date"),
+        "the date index must be recreated: {indexes:?}"
+    );
+
+    // The widened CHECK now accepts a hand-entered purchase...
+    sqlx::query(
+        "INSERT INTO purchase_transactions \
+         (id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
+          transaction_identity, identity_kind, fingerprint, total_cents, source_payload, \
+          created_at, updated_at) \
+         VALUES ('tx-manual', 'h1', 'lidl', '2026-05-02', 'manual', 'u1', 'u1', 'source_id', \
+                 'pl1:x', 1, '{}', 't', 't')",
+    )
+    .execute(&pool)
+    .await
+    .expect("021 accepts the manual source kind");
+
+    // ...while the recreated identity index still rejects a duplicate identity.
+    let duplicate = sqlx::query(
+        "INSERT INTO purchase_transactions \
+         (id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
+          transaction_identity, identity_kind, fingerprint, total_cents, source_payload, \
+          created_at, updated_at) \
+         VALUES ('tx-dup', 'h1', 'tesco', '2026-05-01', 'import', 'SRC-1', 'SRC-1', 'source_id', \
+                 'pl1:abc', 858, '{}', 't', 't')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the identity index must still reject a duplicate identity"
+    );
+
+    // ON DELETE SET NULL: linking a photo then deleting the image clears the link
+    // while the purchase and its lines stay.
+    sqlx::query("UPDATE purchase_transactions SET receipt_image_id = 'img-1' WHERE id = 'tx-1'")
+        .execute(&pool)
+        .await
+        .expect("link the image");
+    sqlx::query("DELETE FROM receipt_images WHERE id = 'img-1'")
+        .execute(&pool)
+        .await
+        .expect("delete the image");
+    let link: Option<String> =
+        sqlx::query_scalar("SELECT receipt_image_id FROM purchase_transactions WHERE id = 'tx-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(link.is_none(), "deleting the image must clear the link");
+    let lines_left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM purchase_lines WHERE transaction_id = 'tx-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(lines_left, 2, "the purchase and its lines stay");
+
+    // ON DELETE CASCADE: deleting the purchase takes its lines and revisions.
+    sqlx::query("DELETE FROM purchase_transactions WHERE id = 'tx-1'")
+        .execute(&pool)
+        .await
+        .expect("delete the purchase");
+    let lines_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM purchase_lines WHERE transaction_id = 'tx-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let revisions_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM purchase_transaction_revisions WHERE transaction_id = 'tx-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lines_after, 0, "lines cascade with their transaction");
+    assert_eq!(
+        revisions_after, 0,
+        "revisions cascade with their transaction"
+    );
+}
