@@ -311,6 +311,12 @@ pub struct TransactionDetail {
     /// Header fields of the live transaction.
     #[serde(flatten)]
     pub transaction: TransactionSummary,
+    /// The live revision's original source payload (JSON text): for a manual
+    /// purchase the request body exactly as submitted — so a reader can tell a
+    /// printed total from one derived from the lines — and for an import the
+    /// transaction object from the document. Superseded revisions carry their
+    /// own payloads.
+    pub source_payload: String,
     /// Current lines, in ordinal order.
     pub lines: Vec<LineView>,
     /// Superseded revisions, oldest first.
@@ -1593,6 +1599,14 @@ pub async fn get_transaction(
         return Ok(None);
     };
 
+    let source_payload: String = sqlx::query_scalar(
+        "SELECT source_payload FROM purchase_transactions WHERE id = ?1 AND household_id = ?2",
+    )
+    .bind(transaction_id)
+    .bind(household_id)
+    .fetch_one(pool)
+    .await?;
+
     let lines = sqlx::query_as::<_, LineView>(
         "SELECT id, transaction_id, line_ordinal, original_text, name, brand, quantity, \
                 size_value, size_unit, unit_price_cents, line_total_cents, line_discount_cents, \
@@ -1627,6 +1641,7 @@ pub async fn get_transaction(
 
     Ok(Some(TransactionDetail {
         transaction,
+        source_payload,
         lines,
         revisions,
     }))
