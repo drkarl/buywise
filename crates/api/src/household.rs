@@ -41,8 +41,9 @@
 //! `POST .../members` takes the new member's email, display name and an initial
 //! password the owner shares out of band (it is never emailed and never returned
 //! again); a duplicate email is a 409. `DELETE .../members/{user_id}` ends the
-//! member's sessions immediately, removes their membership, and deletes their
-//! account only if they belong to no other household; removing the last owner is
+//! member's sessions immediately, removes their membership, and then deletes
+//! their account when it belongs to no other household and nothing references it
+//! (deactivating it in place when history still does); removing the last owner is
 //! a 409. Every one of these is a mutating request, so the [`AuthenticatedUser`]
 //! extractor enforces the same CSRF check as the other mutations.
 
@@ -315,10 +316,11 @@ async fn add_member(
 /// `DELETE /api/household/{household_id}/members/{user_id}` — remove a member.
 ///
 /// Owner-only (403 otherwise). Ends the member's sessions immediately, removes
-/// their membership, and deletes their account only if they belong to no other
-/// household. Refuses (409) to remove the household's last owner, and (404) a
-/// user who is not a member. CSRF is enforced by [`AuthenticatedUser`] (a
-/// DELETE).
+/// their membership, and then either deletes their account (they belong to no
+/// other household and nothing references it) or deactivates it in place (they
+/// belong to no other household but the household's history still does). Refuses
+/// (409) to remove the household's last owner, and (404) a user who is not a
+/// member. CSRF is enforced by [`AuthenticatedUser`] (a DELETE).
 async fn remove_member(
     State(state): State<AppState>,
     user: AuthenticatedUser,

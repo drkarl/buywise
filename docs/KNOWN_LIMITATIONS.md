@@ -695,13 +695,22 @@ depending on the firewall.
 Issue #139, roadmap #114. An owner adds and removes members from **Settings → Household members**
 (or the API), and `bootstrap-household` creates the very first household and owner on a fresh
 database. The roles (`owner` / `member`) are enforced: export stays available to every member, while
-member administration and the household delete require the owner role. The endpoints and rules are
-in [`docs/data-flows.md`](data-flows.md) (§5.1a).
+member administration and the household delete require the owner role. Removing a member always
+succeeds: their sessions end and their membership goes, and their account is then deleted when
+nothing references it or deactivated in place when the household's history does. The endpoints and
+rules are in [`docs/data-flows.md`](data-flows.md) (§5.1a).
 
 Open follow-ups:
 
-- **Removing a member can fail when older household records reference their account.** Issue #152
-  tracks the general foreign-key problem in list-entry and mutation user references.
+- **A removed member with history leaves an anonymised account row behind.** Their `users` row
+  cannot be deleted while the household still keeps what they contributed (a list entry they
+  added, a receipt they uploaded, an audit event), because those rows carry a foreign key to it.
+  Removal therefore deactivates the account in place instead (issue #152): the password becomes an
+  unusable value, the display name becomes "Former member", and the email is replaced by a unique
+  tombstone on the reserved `.invalid` domain, which frees the real address to register again. No
+  password or session can sign in, and the account is not a member, but the row itself is never
+  removed and its id stays on the history it keeps. Reassigning that history to another member, or
+  restoring a removed member, is out of scope.
 
 - **Roles cannot be changed.** There is no promote/demote action, so an owner cannot hand ownership
   to another member or demote a co-owner; the last-owner guard only prevents *removing* the final
@@ -710,8 +719,10 @@ Open follow-ups:
 - **Bootstrap is one-time and single-household.** `bootstrap-household` refuses once any account
   exists, so creating a second household — and re-running it after a partial setup — is out of
   scope. There is still no self-registration or email invite flow (both deliberate non-goals).
-- **Removing a member notifies nobody.** Their sessions end immediately and their account is
-  deleted only if they belong to no other household, but no email is sent and list data already
+- **Removing a member notifies nobody.** Their sessions end immediately, their membership goes, and
+  their account is then deleted (they belong to no other household and nothing references it) or
+  deactivated and anonymised (the household still keeps history they contributed); a member of
+  another household keeps their account. No email is sent, and list data already
   cached in their browser (IndexedDB/localStorage) is not reachable from the server — the same
   limitation that applies to a deleted household.
 

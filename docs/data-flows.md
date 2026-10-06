@@ -416,8 +416,16 @@ cleared, so the client returns to the sign-in page.
 Adding a member takes an email, a display name and an initial password the owner
 shares out of band — it is never emailed and the server never returns it; a
 duplicate email is `409`. Removing a member ends their sessions immediately (their
-next request is `401`), removes their membership, and deletes their account only
-if they belong to no other household; removing the household's last owner is
+next request is `401`) and removes their membership. Their account is then
+deleted when they belong to no other household and nothing references it;
+when they belong to no other household but the household still keeps history that
+does (an item they added, a receipt they uploaded, an audit event), the account is
+deactivated in place instead — the `users` row stays so the history keeps its
+attribution, with an unusable password, the display name "Former member" and a
+unique tombstone email on the reserved `.invalid` domain that frees the real
+address to register again. No password or session can sign a deactivated account
+in, and it is not a member; a member who also belongs to another household keeps a
+normal account. Removing the household's last owner is
 `409`. The very first household and owner are created on a fresh database by
 `bootstrap-household` (§5.1). See
 [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) ("Household member
@@ -438,7 +446,10 @@ with **no other household** (`crates/core/src/household_data.rs`,
 the same transaction, before it commits, so the rows never outlive their bytes on
 a successful delete (§4.5). A member who also belongs to another household keeps
 their account, their other membership and their session; only the deleted
-household's membership goes.
+household's membership goes. An account left with no household but still
+referenced by a row outside the deleted household is deactivated rather than
+deleted, exactly as member removal does (§5.1a), so the cleanup can never violate
+a `users(id)` foreign key.
 
 Deliberately kept, because it is not household-identifiable: the shared
 `categories`, `subcategories`, `retailer_products`, `product_offers`,

@@ -46,8 +46,10 @@ export interface MemberRemoval {
 	removed_user_id: string;
 	/** How many of their session rows were deleted. */
 	sessions_ended: number;
-	/** Whether their account was deleted (only when they had no other household). */
+	/** Whether their account was deleted (only when it had no other household). */
 	account_deleted: boolean;
+	/** Whether their account was deactivated instead, keeping their history. */
+	account_deactivated: boolean;
 }
 
 /** An error carrying the HTTP status, so callers can react to a specific one. */
@@ -156,9 +158,10 @@ export async function addMember(
 
 /**
  * Remove a member via `DELETE /api/household/{id}/members/{user_id}`
- * (CSRF-protected, owner-only). The server ends their sessions immediately,
- * removes their membership, and deletes their account only if they belong to no
- * other household; removing the last owner is a 409.
+ * (CSRF-protected, owner-only). The server ends their sessions immediately and
+ * removes their membership; their account is then deleted when nothing
+ * references it, or deactivated and anonymised when the household still keeps
+ * history they contributed. Removing the last owner is a 409.
  */
 export async function removeMember(
 	householdId: string,
