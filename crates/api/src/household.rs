@@ -395,7 +395,9 @@ fn membership_error(context: &'static str) -> impl Fn(MembershipError) -> Status
         MembershipError::DuplicateEmail(_) | MembershipError::LastOwner(_) => {
             StatusCode::CONFLICT
         }
-        MembershipError::Password(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        MembershipError::Password(_) | MembershipError::BlankUserField(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         MembershipError::NoSuchHousehold(_) | MembershipError::NotAMember { .. } => {
             StatusCode::NOT_FOUND
         }

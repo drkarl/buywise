@@ -567,6 +567,37 @@ async fn an_empty_initial_password_is_refused() {
     );
 }
 
+/// Whitespace-only identity fields are refused by the endpoint and create
+/// neither an account nor a membership.
+#[tokio::test]
+async fn blank_email_and_display_name_are_refused() {
+    let pool = setup_pool().await;
+    let owner = seed_household_owner(&pool, HH_A, HH_A_NAME, "user-a", "a@example.test").await;
+
+    for body in [
+        json!({
+            "email": " \t ",
+            "display_name": "Member",
+            "password": MEMBER_PASSWORD,
+        }),
+        json!({
+            "email": "member@example.test",
+            "display_name": " \n ",
+            "password": MEMBER_PASSWORD,
+        }),
+    ] {
+        let resp = add_member(&pool, &owner, HH_A, body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM users").await, 1);
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM household_members WHERE household_id = 'hh-a'")
+            .await,
+        1
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Remove-member
 // ---------------------------------------------------------------------------
