@@ -64,6 +64,8 @@ Money is always integer cents, never a float. Several columns are **JSON stored 
 TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
 `mutations.payload`, `mutations.response_json`, `list_entries.resolution_candidates_json`,
 `list_entry_events.payload`, `recommendation_runs.plans_json`,
+`recommendation_runs.basket_snapshot_json`, `recommendation_runs.price_evidence_json`,
+`recommendation_runs.coverage_json`, `recommendation_runs.usual_profile_json`,
 `savings_events.chosen_stores`.
 
 ## Document layout
@@ -122,7 +124,9 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
                               "server_revision", "status", "response_json" } ],
     "recommendation_runs":[ { "id", "list_id", "run_at", "offer_snapshot_date", "plans_json",
                               "recommended_plan", "convenience_threshold_2",
-                              "convenience_threshold_3" } ],
+                              "convenience_threshold_3", "snapshot_version",
+                              "basket_snapshot_json", "price_evidence_json", "coverage_json",
+                              "usual_profile_json", "snapshot_digest" } ],
     "savings_events":     [ { "id", "list_id", "recommendation_run_id", "baseline_cost_cents",
                               "recommended_cost_cents", "theoretical_minimum_cost_cents",
                               "chosen_basket_cost_cents", "chosen_plan", "chosen_stores",
