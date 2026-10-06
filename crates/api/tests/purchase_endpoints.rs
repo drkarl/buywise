@@ -569,6 +569,21 @@ async fn a_manual_purchase_is_created_listed_and_edited_as_one_revision() {
         .expect("a manual purchase has a generated identity");
     assert!(!identity.is_empty());
 
+    // The detail carries the request body verbatim as the live source payload,
+    // which is how a reader tells a printed total from one derived from the
+    // lines (this body omitted `total_cents`).
+    let payload: Value = serde_json::from_str(
+        created["source_payload"]
+            .as_str()
+            .expect("the detail must expose the live source payload"),
+    )
+    .expect("the source payload is JSON");
+    assert_eq!(payload["retailer"], "Tesco");
+    assert!(
+        payload.get("total_cents").is_none(),
+        "the body left the printed total out: {payload}"
+    );
+
     let list = json_body(get(&pool, &a, &format!("/api/household/{HH_A}/purchases")).await).await;
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["id"], id.as_str());
@@ -605,6 +620,14 @@ async fn a_manual_purchase_is_created_listed_and_edited_as_one_revision() {
         edited["source_transaction_id"], created["source_transaction_id"],
         "an edit keeps the purchase's identity"
     );
+    let edited_payload: Value = serde_json::from_str(
+        edited["source_payload"]
+            .as_str()
+            .expect("the corrected revision's payload is exposed"),
+    )
+    .expect("the source payload is JSON");
+    assert_eq!(edited_payload["retailer"], "Lidl");
+    assert_eq!(edited_payload["total_cents"], 500);
     assert_eq!(edited["revisions"].as_array().unwrap().len(), 1);
     assert_eq!(edited["revisions"][0]["revision"], 1);
 
