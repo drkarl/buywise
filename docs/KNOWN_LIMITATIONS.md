@@ -514,14 +514,15 @@ baseline and populate `usual_profile_json`.
 lists. For savings, the only realised input remains a manual whole-basket total, which is why
 every reconciled-by-hand event is `legacy_total_only`.
 
-**Why accepted.** Receipt capture is a bounded validation experiment (#116), not a prerequisite
-for the manual evaluation.
+**Why accepted.** Receipt capture is now implemented as private, expiring image storage (#149),
+but receipts are not linked to recommendations or purchase records; the manual evaluation remains
+independent of receipt capture.
 
 **Workaround.** Enter actual spend manually to get a legacy basket variance; it is labelled as
 unverified.
 
-**Follow-up.** #116: add receipt ingestion; #117: link imported purchases to lists and
-recommendations and reconcile them without double-counting.
+**Follow-up.** #117: link imported purchases to lists and recommendations and reconcile them
+without double-counting.
 
 ### 5. The coverage guard compares priced lines, not quantities or pack sizes
 
