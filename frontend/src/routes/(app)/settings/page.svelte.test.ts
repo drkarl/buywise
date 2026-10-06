@@ -248,6 +248,9 @@ describe('household data controls', () => {
 		const fetchMock = stubSettings(baseSettings());
 		render(Page);
 		await screen.findByText(/Download everything BuyWise holds/);
+		expect(
+			screen.getByText(/Any member account with no other household is also deleted and signed out\./)
+		).toBeTruthy();
 
 		await fillDeleteForm(HOUSEHOLD.name, 'secret');
 		await fireEvent.click(screen.getByRole('button', { name: 'Delete household data' }));
