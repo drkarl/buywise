@@ -285,6 +285,30 @@ run without `--confirm`, and `--dry-run` executes the real statements inside a
 transaction and rolls it back, printing exactly what a run would remove. Neither
 command runs migrations or creates a missing database file.
 
+### 5.1a The member-facing controls
+
+A household member does not need an operator (issue #136): the settings screen
+(**Your data**) offers a **Download export** button and a **Delete household
+data** action, backed by the API and the same shared implementation
+(`buywise_core::household_data`) the CLI calls, so the two cannot drift.
+
+| Request | Purpose |
+| --- | --- |
+| `GET /api/household` | the caller's household `{ id, name }` |
+| `GET /api/household/{household_id}/export` | download the document above as an attachment |
+| `POST /api/household/{household_id}/delete` | guarded delete, then end the session |
+
+Every endpoint requires a live session and membership of the named household
+(`household_members`): a member of another household is refused with `403`, so
+one household can never read or delete another's data. The delete additionally
+requires the household name typed exactly and the member's own password
+re-entered; either mismatch is `422` and changes nothing. On success the
+household's rows are removed by the same dependency-ordered transaction as the
+CLI, the caller's session row is deleted and the `session` / `csrf` cookies are
+cleared, so the client returns to the sign-in page. There is no owner/admin
+concept in the code, so any member may export and delete — see
+[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) ("Household data controls").
+
 ### 5.2 What deletion removes
 
 In one transaction, in dependency order: `list_entry_events`, `savings_events`,
@@ -294,7 +318,7 @@ In one transaction, in dependency order: `list_entry_events`, `savings_events`,
 `household_store_category_rules`, `household_store_settings`,
 `household_settings`, `store_category_orders`, `household_members`,
 `households`, then `sessions` and `users` for members left with **no other
-household** (`crates/cli/src/commands/household.rs`, `HOUSEHOLD_TABLES`). A member
+household** (`crates/core/src/household_data.rs`, `HOUSEHOLD_TABLES`). A member
 who also belongs to another household keeps their account, their other membership
 and their session; only the deleted household's membership goes.
 
@@ -345,6 +369,9 @@ immediate nor complete in the backup (§2.4):
 
 ### 5.4 Recommended operator sequence for a household leaving
 
+Steps 1 and 3 can also be run by a household member from the app's settings screen
+(§5.1a) without an operator; the sequence below is the operator path.
+
 1. `export-household` and store the JSON somewhere the household controls.
 2. Tell the household that uploads stop when the account is gone and that members'
    clients may still hold list data in IndexedDB/localStorage until they clear site
@@ -391,6 +418,6 @@ share of them) should also be purged on deletion.
 ## 8. Known gaps and follow-ups
 
 Recorded in [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) under "Household
-data controls": the CLI-only slice (no UI), receipt ingestion and its
-external-processing gate being policy-only, deletion not reaching backups
-immediately, and no receipt-image path to delete yet.
+data controls": deletion not being restricted to a household owner, receipt
+ingestion and its external-processing gate being policy-only, deletion not
+reaching backups immediately, and no receipt-image path to delete yet.

@@ -188,10 +188,20 @@ async fn logout(
         })?;
 
     let mut headers = HeaderMap::new();
-    append_cookie(&mut headers, &clear_cookie(SESSION_COOKIE, true))?;
-    append_cookie(&mut headers, &clear_cookie(CSRF_COOKIE, false))?;
+    clear_auth_cookies(&mut headers)?;
 
     Ok((StatusCode::NO_CONTENT, headers))
+}
+
+/// Append `Set-Cookie` headers that clear both auth cookies.
+///
+/// Shared by [`logout`] and the household delete endpoint
+/// (`crate::household`), which both end the caller's session: a deleted
+/// household's session must not outlive it.
+pub(crate) fn clear_auth_cookies(headers: &mut HeaderMap) -> Result<(), StatusCode> {
+    append_cookie(headers, &clear_cookie(SESSION_COOKIE, true))?;
+    append_cookie(headers, &clear_cookie(CSRF_COOKIE, false))?;
+    Ok(())
 }
 
 /// `GET /api/auth/me`.

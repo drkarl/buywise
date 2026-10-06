@@ -1,8 +1,19 @@
-import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import type { Settings } from '$lib/api/settings';
 
+// Keep the real household API helpers, but replace the browser redirect with a
+// spy so the post-delete sign-out is observable in jsdom.
+vi.mock('$lib/api/household', async (importOriginal) => {
+	const actual = (await importOriginal()) as Record<string, unknown>;
+	return { ...actual, redirectToSignIn: vi.fn() };
+});
+
+import { redirectToSignIn } from '$lib/api/household';
 import Page from './+page.svelte';
+
+/** The household `GET /api/household` reports for these tests. */
+const HOUSEHOLD = { id: 'hh-settings', name: 'Our Household' };
 
 /** A stubbed `fetch` (as installed by {@link stubSettings}). */
 type FetchMock = Mock<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>;
@@ -44,10 +55,30 @@ function baseSettings(): Settings {
  * Stub global fetch: GET `/api/settings` answers with `settings`; a PATCH echoes
  * its own request body back (the endpoint returns the merged settings, and the
  * patch here carries every field, so echoing is equivalent for these tests).
+ * `GET /api/household` answers with {@link HOUSEHOLD}; the household export and
+ * delete endpoints answer with `options`, defaulting to success.
  */
-function stubSettings(settings: Settings): FetchMock {
+function stubSettings(
+	settings: Settings,
+	options: { deleteStatus?: number; exportStatus?: number } = {}
+): FetchMock {
 	const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input.toString();
+		if (url.includes('/api/household')) {
+			if (url.endsWith('/delete')) {
+				const status = options.deleteStatus ?? 200;
+				return new Response(status === 200 ? JSON.stringify({ removed_rows: 3 }) : 'refused', {
+					status
+				});
+			}
+			if (url.endsWith('/export')) {
+				const status = options.exportStatus ?? 200;
+				return new Response(status === 200 ? '{"format":"buywise-household-export"}' : 'failed', {
+					status
+				});
+			}
+			return new Response(JSON.stringify(HOUSEHOLD), { status: 200 });
+		}
 		if (!url.includes('/api/settings')) {
 			return new Response('not found', { status: 404 });
 		}
@@ -67,9 +98,17 @@ function patchBody(fetchMock: FetchMock) {
 	return JSON.parse(call[1]!.body as string);
 }
 
+beforeEach(() => {
+	// The delete is a mutating request; the page reads the CSRF token from this
+	// cookie (mirrors the convention used by the component tests).
+	document.cookie = 'csrf=tok-123';
+});
+
 afterEach(() => {
+	document.cookie = 'csrf=; Max-Age=0';
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
+	vi.clearAllMocks();
 });
 
 describe('store settings', () => {
@@ -173,5 +212,73 @@ describe('store settings', () => {
 			{ category_id: 'cat-pantry', subcategory_id: null, allowed: false },
 			{ category_id: 'cat-pantry', subcategory_id: 'sub-breakfast', allowed: true }
 		]);
+	});
+});
+
+describe('household data controls', () => {
+	/** Fill the guarded delete form. */
+	async function fillDeleteForm(name: string, password: string) {
+		await fireEvent.input(screen.getByLabelText(/type the household name/i), {
+			target: { value: name }
+		});
+		await fireEvent.input(screen.getByLabelText('Your password'), {
+			target: { value: password }
+		});
+	}
+
+	it('disables delete until the exact household name and a password are given', async () => {
+		stubSettings(baseSettings());
+		render(Page);
+		const button = (await screen.findByRole('button', {
+			name: 'Delete household data'
+		})) as HTMLButtonElement;
+		expect(button.disabled).toBe(true);
+
+		await fillDeleteForm('Not our household', 'secret');
+		expect(button.disabled).toBe(true);
+
+		await fillDeleteForm(HOUSEHOLD.name, '');
+		expect(button.disabled).toBe(true);
+
+		await fillDeleteForm(HOUSEHOLD.name, 'secret');
+		expect(button.disabled).toBe(false);
+	});
+
+	it('deletes with the exact name and password, then returns to the sign-in page', async () => {
+		const fetchMock = stubSettings(baseSettings());
+		render(Page);
+		await screen.findByText(/Download everything BuyWise holds/);
+
+		await fillDeleteForm(HOUSEHOLD.name, 'secret');
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete household data' }));
+
+		await waitFor(() => expect(redirectToSignIn).toHaveBeenCalledTimes(1));
+
+		const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/delete'));
+		expect(call).toBeTruthy();
+		expect(JSON.parse(call![1]!.body as string)).toEqual({
+			household_name: HOUSEHOLD.name,
+			password: 'secret'
+		});
+		expect(new Headers(call![1]!.headers).get('X-CSRF-Token')).toBe('tok-123');
+	});
+
+	it('shows an error and does not sign out when the server refuses the delete', async () => {
+		stubSettings(baseSettings(), { deleteStatus: 422 });
+		render(Page);
+		await screen.findByText(/Download everything BuyWise holds/);
+
+		await fillDeleteForm(HOUSEHOLD.name, 'wrong-password');
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete household data' }));
+
+		expect(await screen.findByText(/didn’t match/)).toBeTruthy();
+		expect(redirectToSignIn).not.toHaveBeenCalled();
+	});
+
+	it('shows an error when the export download fails', async () => {
+		stubSettings(baseSettings(), { exportStatus: 500 });
+		render(Page);
+		await fireEvent.click(await screen.findByRole('button', { name: 'Download export' }));
+		expect(await screen.findByText(/Couldn’t download your export/)).toBeTruthy();
 	});
 });

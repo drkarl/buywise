@@ -16,9 +16,23 @@ The command is read-only (it never runs migrations or changes the database) and
 fails if the database file or the household does not exist, so a mistyped path or
 id cannot produce a plausible-looking empty document.
 
-Implementation: `crates/cli/src/commands/household.rs`
-(`EXPORT_FORMAT`, `EXPORT_FORMAT_VERSION`, `export_household`).
-Tests: `crates/cli/tests/household_data.rs`.
+## Downloading it from the app
+
+A household member does not need an operator: the settings screen (**Your data**)
+has a **Download export** button, which calls
+`GET /api/household/{household_id}/export` (issue #136). The endpoint is
+authenticated and requires the caller to be a member of that household; it
+returns **the same document** as the CLI, as
+`Content-Disposition: attachment; filename="buywise-household-<id>.json"`, so a
+browser saves the file instead of rendering it. `GET /api/household` returns the
+caller's `{ id, name }` and the app uses that id.
+
+The document is built by `buywise_core::household_data::export_household`;
+`crates/cli/src/commands/household.rs` and `crates/api/src/household.rs` are thin
+front ends over the same function. Tests: `crates/cli/tests/household_data.rs`
+(layout and links) and `crates/api/tests/household_endpoints.rs` (authorisation,
+download, and the guarded delete). `EXPORT_FORMAT` and `EXPORT_FORMAT_VERSION`
+are defined in `crates/core/src/household_data.rs`.
 
 ## Envelope
 

@@ -12,6 +12,14 @@
 // integer cents on the wire; the inputs convert to/from euros here.
 
 import { retailerLabel } from '$lib/api/optimise';
+import {
+	deleteHousehold,
+	downloadHouseholdExport,
+	fetchHousehold,
+	HttpResponseError,
+	redirectToSignIn,
+	type Household
+} from '$lib/api/household';
 import { fetchSettings, updateSettings } from '$lib/api/settings';
 import type {
 	Category,
@@ -39,6 +47,23 @@ let threshold3Euros = $state('25.00');
 let saving = $state(false);
 let savedMessage = $state('');
 let saveError = $state('');
+
+// Household data controls (issue #136): the household's id/name, the guarded
+// delete form, and the export download. Loaded separately from the settings so
+// a failure in one does not blank the other.
+let householdStatus = $state<Status>('loading');
+let household = $state<Household | null>(null);
+let confirmName = $state('');
+let confirmPassword = $state('');
+let deleting = $state(false);
+let deleteError = $state('');
+let exporting = $state(false);
+let exportError = $state('');
+
+/** The delete runs only once the exact household name and a password are given. */
+let canDelete = $derived(
+	household !== null && confirmName === household.name && confirmPassword.length > 0
+);
 
 /** The status options, in the order they render, with their labels. */
 const STATUS_OPTIONS: { value: StoreStatus; label: string }[] = [
@@ -101,6 +126,7 @@ async function load() {
 
 $effect(() => {
 	load();
+	loadHousehold();
 });
 
 function retry() {
@@ -144,6 +170,61 @@ async function save(event: SubmitEvent) {
 		saveError = 'Couldn’t save your settings. Check your connection and try again.';
 	} finally {
 		saving = false;
+	}
+}
+
+/** Load the caller's household (id + name) for the data-controls section. */
+async function loadHousehold() {
+	householdStatus = 'loading';
+	try {
+		household = await fetchHousehold();
+		householdStatus = 'ready';
+	} catch {
+		householdStatus = 'error';
+	}
+}
+
+/** Download the household export as a file. */
+async function downloadExport() {
+	if (!household) return;
+	exportError = '';
+	exporting = true;
+	try {
+		await downloadHouseholdExport(household.id);
+	} catch (err) {
+		// A 401 means the session has gone: send the member back to sign in.
+		if (err instanceof HttpResponseError && err.status === 401) {
+			redirectToSignIn();
+			return;
+		}
+		exportError = 'Couldn’t download your export. Please try again.';
+	} finally {
+		exporting = false;
+	}
+}
+
+/** Delete the household after the typed-name + password guard, then sign out. */
+async function removeHousehold(event: SubmitEvent) {
+	event.preventDefault();
+	if (!household || !canDelete) return;
+	deleteError = '';
+	deleting = true;
+	try {
+		await deleteHousehold(household.id, confirmName, confirmPassword);
+		// The server ended the session; leave for the sign-in page.
+		redirectToSignIn();
+	} catch (err) {
+		confirmPassword = '';
+		if (err instanceof HttpResponseError && err.status === 401) {
+			redirectToSignIn();
+			return;
+		}
+		deleteError =
+			err instanceof HttpResponseError && err.status === 422
+				? 'The household name or your password didn’t match. Nothing was deleted.'
+				: 'Couldn’t delete your household data. Please try again.';
+	} finally {
+		deleting = false;
 	}
 }
 </script>
@@ -300,6 +381,54 @@ async function save(event: SubmitEvent) {
 				{saving ? 'Saving…' : 'Save settings'}
 			</button>
 		</form>
+
+		<section class="data-controls" aria-label="Your data">
+			<h2>Your data</h2>
+			{#if householdStatus === 'loading'}
+				<p class="hint" role="status">Loading your household…</p>
+			{:else if householdStatus === 'error'}
+				<p class="error" role="alert">Couldn’t load your household details.</p>
+			{:else if household}
+				<p class="hint">
+					Download everything BuyWise holds for <strong>{household.name}</strong>, or delete it.
+				</p>
+				<button type="button" class="secondary" onclick={downloadExport} disabled={exporting}>
+					{exporting ? 'Preparing…' : 'Download export'}
+				</button>
+				{#if exportError}
+					<p class="error" role="alert">{exportError}</p>
+				{/if}
+
+				<div class="danger-zone">
+					<h3>Delete household data</h3>
+					<p class="hint">
+						This permanently removes your household’s records from the live server: lists,
+						catalogue, matches, preferences and purchase history. Backups expire on their own
+						schedule (up to about a day), aggregate usage counters with no household id remain,
+						and clearing any copies left on disk is an operator step.
+					</p>
+					<form class="delete-form" onsubmit={removeHousehold}>
+						<label for="confirm-name">
+							Type the household name (<strong>{household.name}</strong>) to confirm
+						</label>
+						<input id="confirm-name" type="text" autocomplete="off" bind:value={confirmName} />
+						<label for="confirm-password">Your password</label>
+						<input
+							id="confirm-password"
+							type="password"
+							autocomplete="current-password"
+							bind:value={confirmPassword}
+						/>
+						{#if deleteError}
+							<p class="error" role="alert">{deleteError}</p>
+						{/if}
+						<button class="danger" type="submit" disabled={deleting || !canDelete}>
+							{deleting ? 'Deleting…' : 'Delete household data'}
+						</button>
+					</form>
+				</div>
+			{/if}
+		</section>
 	{/if}
 </main>
 
@@ -459,6 +588,65 @@ async function save(event: SubmitEvent) {
 	}
 	.save:disabled {
 		opacity: 0.6;
+		cursor: default;
+	}
+	.data-controls {
+		display: flex;
+		flex-direction: column;
+		gap: 0.6rem;
+		border-top: 1px solid #e2e8f0;
+		padding-top: 1.25rem;
+	}
+	.secondary {
+		align-self: flex-start;
+		padding: 0.5rem 1.1rem;
+		border: 1px solid #0f766e;
+		border-radius: 0.5rem;
+		background: #fff;
+		color: #0f766e;
+		font-size: 0.95rem;
+		cursor: pointer;
+	}
+	.secondary:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.danger-zone {
+		border: 1px solid #fecaca;
+		border-radius: 0.5rem;
+		padding: 0.75rem 1rem;
+		background: #fff7f7;
+	}
+	.danger-zone h3 {
+		font-size: 1rem;
+		margin: 0 0 0.35rem;
+		color: #991b1b;
+	}
+	.delete-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.delete-form label {
+		font-size: 0.9rem;
+	}
+	.delete-form input {
+		padding: 0.35rem 0.5rem;
+		border: 1px solid #cbd5e1;
+		border-radius: 0.4rem;
+	}
+	.danger {
+		align-self: flex-start;
+		padding: 0.5rem 1.1rem;
+		border: none;
+		border-radius: 0.5rem;
+		background: #b91c1c;
+		color: #fff;
+		font-size: 0.95rem;
+		cursor: pointer;
+	}
+	.danger:disabled {
+		opacity: 0.5;
 		cursor: default;
 	}
 </style>

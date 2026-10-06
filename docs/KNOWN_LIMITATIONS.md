@@ -396,8 +396,10 @@ Issue #119, roadmap #114. The authoritative policy, behaviour, procedures and ex
 
 Open follow-ups:
 
-- Add a member-facing settings screen, export download and guarded delete; today these controls
-  require an operator.
+- Deletion is not restricted to a household owner: `household_members.role` (`owner` / `member`) is
+  stored but not enforced anywhere, so any member may export, and any member may delete after typing
+  the household name and re-entering their own password. Enforce the owner role if a household ever
+  needs a single member to hold the delete right.
 - When receipt ingestion is implemented, enforce a per-upload processing choice, provider
   disclosure, no-publication/no-training terms, image expiry and deletion.
 - Decide explicit backup retention, encryption and key custody; verify the deployed R2 token scope
