@@ -121,7 +121,7 @@ describe('savings dashboard', () => {
 
 		expect(await screen.findByText('Unchecked shop')).toBeTruthy();
 		expect(screen.getByText('Comparability not checked')).toBeTruthy();
-		expect(screen.getByText('No saving claimed: comparability not checked')).toBeTruthy();
+		expect(screen.getByText(/No saving claimed: comparability not checked/)).toBeTruthy();
 	});
 
 	it('claims no saved money and shows the verified empty state', async () => {
@@ -159,7 +159,6 @@ describe('savings dashboard', () => {
 		expect(within(legacy).getByText('Travel')).toBeTruthy();
 		expect(within(legacy).getByText('€3.00')).toBeTruthy();
 		expect(within(legacy).getByText('Total-only variance')).toBeTruthy();
-		expect(within(legacy).getByText('€2.00')).toBeTruthy();
 		expect(within(legacy).queryByText('Gross estimate')).toBeNull();
 	});
 

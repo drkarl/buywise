@@ -26,7 +26,7 @@ The app is worth building only if it saves money beyond its running cost:
 | Good | €150–€250 |
 | Excellent | €300+ |
 
-The app must track actual savings (gross theoretical, accepted practical, net of API and travel cost) so the household can judge whether the effort and subscription are justified.
+The app must track savings evidence so the household can judge whether the effort and subscription are justified. Only line- and quantity-reconciled results may be counted as actual saved money; theoretical estimates and total-only basket variances remain separately labelled until then (see §10).
 
 **First milestone before writing application code:** build a CLI validation tool that estimates savings using real BasketWatch data against a reconstructed typical weekly shop. If savings are below €50/month realistically, stop.
 
@@ -372,6 +372,7 @@ savings_events      (id, list_id, recommendation_run_id,
                      travel_cost_cents,               -- manual: extra petrol/time cost for multi-store trip
                      subscription_cost_alloc_cents,   -- pro-rated monthly API subscription cost for this list
                      net_saving_cents,                -- accepted_savings - travel_cost - subscription_cost_alloc
+                     status,                          -- verified | estimated | unreconciled | unchecked | legacy_total_only (migration 016)
                      created_at)
 ```
 
@@ -622,8 +623,9 @@ before costs must never be described as practical live savings.
    amount count as matching the plan; extra stock (buying a larger pack, or more
    units than planned) is shown separately and never claimed as saving.
 3. **Legacy total-only label.** Existing total-only events are relabelled
-   `legacy_total_only` and presented under their own heading with their original
-   figures, rather than being migrated or silently re-presented as verified.
+   `legacy_total_only` by migration 016 when an actual-spend total is present and
+   presented separately as a basket variance. Rows without an actual-spend total
+   remain `unchecked`; neither status is counted as verified savings.
 
 ---
 
