@@ -12,6 +12,10 @@
 //!     read and used as the password; no confirmation is required and nothing
 //!     is echoed.
 //!
+//! The prompting and the password policy live in
+//! [`super::password_prompt`] / [`buywise_core::password`], shared with
+//! `bootstrap-household` so the two commands read and validate identically.
+//!
 //! The password is **never** accepted as a plaintext CLI argument and never
 //! printed. It is hashed with argon2id via the shared
 //! [`buywise_core::password::hash_password_for_storage`] (the same helper the
@@ -19,13 +23,14 @@
 //! `UPDATE users SET password_hash = ? WHERE email = ?`. An email that matches
 //! no user is a hard error and exits non-zero.
 
-use std::io::{BufRead, IsTerminal};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use buywise_core::db;
 use buywise_core::password::hash_password_for_storage;
 use sqlx::SqlitePool;
+
+use super::password_prompt::read_password;
 
 /// Entry point for `buywise-cli set-password <email> --db <db>`.
 pub fn run(email: &str, db_path: &str) -> Result<()> {
@@ -83,59 +88,6 @@ pub async fn set_user_password(pool: &SqlitePool, email: &str, password: &str) -
         bail!("no user with email {email:?}");
     }
     Ok(())
-}
-
-/// Read the new password without echoing it.
-///
-/// Interactive (stdin is a TTY): prompt twice with a hidden prompt and require
-/// the two entries to match. Non-interactive (piped stdin): read one line from
-/// stdin and use it verbatim (scripting path); no confirmation, since there is
-/// no second stream to compare against. Either way the password is never echoed
-/// and an empty password is rejected.
-fn read_password() -> Result<String> {
-    if std::io::stdin().is_terminal() {
-        let first = rpassword::prompt_password("New password: ")
-            .context("reading password from terminal")?;
-        let confirm = rpassword::prompt_password("Confirm password: ")
-            .context("reading password confirmation from terminal")?;
-        validate_password(first, Some(confirm))
-    } else {
-        let line = read_password_from_stdin(&mut std::io::stdin().lock())?;
-        validate_password(line, None)
-    }
-}
-
-/// Validate (and return) a password drawn from either input path.
-///
-/// Rejects an empty password and, when a `confirmation` is supplied (the
-/// interactive path), requires the two entries to match. Pure over plain
-/// strings so the rejection branches can be unit-tested without a TTY.
-fn validate_password(password: String, confirmation: Option<String>) -> Result<String> {
-    if let Some(confirm) = confirmation {
-        if password != confirm {
-            bail!("passwords did not match");
-        }
-    }
-    if password.is_empty() {
-        bail!("password must not be empty");
-    }
-    Ok(password)
-}
-
-/// Read a password from a non-TTY reader (the scripting path).
-///
-/// Reads a single line, trimming a trailing `\n`/`\r\n` (so
-/// `echo secret | buywise-cli …` works) but preserving any other whitespace the
-/// caller intended as part of the password. Only the first line is consumed —
-/// the reader is not drained to EOF, so a long piped stream is not slurped into
-/// memory. Factored out so it can be unit tested without a real stdin.
-fn read_password_from_stdin(reader: &mut impl BufRead) -> Result<String> {
-    let mut buf = String::new();
-    reader
-        .read_line(&mut buf)
-        .context("reading password from stdin")?;
-    let line = buf.strip_suffix('\n').unwrap_or(&buf);
-    Ok(line.strip_suffix('\r').unwrap_or(line).to_string())
 }
 
 #[cfg(test)]
@@ -234,54 +186,5 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, "placeholder-not-a-real-hash");
-    }
-
-    #[test]
-    fn validate_password_rejects_empty() {
-        let err = validate_password(String::new(), None).expect_err("empty must be rejected");
-        assert!(err.to_string().contains("must not be empty"), "got: {err}");
-
-        // Empty is rejected even when it "matches" an empty confirmation.
-        let err = validate_password(String::new(), Some(String::new()))
-            .expect_err("empty must be rejected");
-        assert!(err.to_string().contains("must not be empty"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_password_rejects_confirmation_mismatch() {
-        let err = validate_password("hunter2".into(), Some("hunter3".into()))
-            .expect_err("mismatch must be rejected");
-        assert!(err.to_string().contains("did not match"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_password_accepts_matching_nonempty() {
-        // Interactive path: matching confirmation.
-        assert_eq!(
-            validate_password("hunter2".into(), Some("hunter2".into())).unwrap(),
-            "hunter2"
-        );
-        // Scripting path: no confirmation required.
-        assert_eq!(
-            validate_password("hunter2".into(), None).unwrap(),
-            "hunter2"
-        );
-    }
-
-    #[test]
-    fn stdin_reader_takes_first_line_trimming_newline() {
-        let mut input = "hunter2\n".as_bytes();
-        assert_eq!(read_password_from_stdin(&mut input).unwrap(), "hunter2");
-
-        let mut crlf = "hunter2\r\n".as_bytes();
-        assert_eq!(read_password_from_stdin(&mut crlf).unwrap(), "hunter2");
-
-        // Only the first line is used; a trailing second line is ignored.
-        let mut multi = "secret\nignored\n".as_bytes();
-        assert_eq!(read_password_from_stdin(&mut multi).unwrap(), "secret");
-
-        // No trailing newline still works.
-        let mut bare = "secret".as_bytes();
-        assert_eq!(read_password_from_stdin(&mut bare).unwrap(), "secret");
     }
 }

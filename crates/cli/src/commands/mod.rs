@@ -3,7 +3,8 @@
 //! Each submodule is a thin orchestrator over the existing `crates/core` and
 //! `crates/ingest` APIs. Shared plumbing — the basket fixture format, the
 //! resolution + constraint-merge pre-step, and small money/printing helpers —
-//! lives here in [`mod@self`].
+//! lives here in [`mod@self`]. The hidden password prompt shared by
+//! `set-password` and `bootstrap-household` lives in [`password_prompt`].
 //!
 //! Fixture mode vs live mode: the read-only commands [`validate`] and
 //! [`optimise`] choose their data source from the **presence of `--db`**. With
@@ -17,12 +18,14 @@
 //! require a `--db` and never use fixture mode.
 
 pub mod basket;
+pub mod bootstrap;
 pub mod fixture_db;
 pub mod household;
 pub mod ingest;
 pub mod ingest_lidl;
 pub mod no_network;
 pub mod optimise;
+pub mod password_prompt;
 pub mod seed_matches;
 pub mod set_password;
 pub mod validate;

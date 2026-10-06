@@ -24,6 +24,12 @@
 //! * `set-password <email> --db <db>` — read a new password without echoing it,
 //!   argon2id-hash it, and update `users.password_hash` for the matching user.
 //!
+//! Plus the first-household bootstrap (issue #139):
+//!
+//! * `bootstrap-household --name <name> --email <email> [--display-name <name>]
+//!   --db <db>` — create the very first household and its owner (role `owner`) on
+//!   a fresh database, prompting for the owner's password.
+//!
 //! Plus two household data-control subcommands (issue #119):
 //!
 //! * `export-household --db <db> --household-id <uuid> [--out <path>]` — write
@@ -36,7 +42,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
-    household, ingest, ingest_lidl, optimise, seed_matches, set_password, validate,
+    bootstrap, household, ingest, ingest_lidl, optimise, seed_matches, set_password, validate,
 };
 
 #[derive(Parser)]
@@ -132,6 +138,30 @@ enum Command {
         db: String,
     },
 
+    /// Create the very first household and its owner on a fresh database.
+    ///
+    /// One-time bootstrap for a new deployment: creates the household, the
+    /// owner's account (with an argon2id hash of the password you are prompted
+    /// for) and an `owner` membership in one transaction. Refuses if the
+    /// database already has any user. The database file is created and migrated
+    /// if it does not exist, so this is the first command to run on a new
+    /// server. After it, sign in as the owner and add the rest of the household
+    /// from Settings → Household members.
+    BootstrapHousehold {
+        /// The household's display name.
+        #[arg(long)]
+        name: String,
+        /// The owner's email — they sign in with this.
+        #[arg(long)]
+        email: String,
+        /// The owner's display name (defaults to the email's local part).
+        #[arg(long)]
+        display_name: Option<String>,
+        /// SQLite database path (created if missing).
+        #[arg(long)]
+        db: String,
+    },
+
     /// Export one household's records as a single JSON document.
     ///
     /// Covers the household's catalogue (items, aliases, constraints),
@@ -213,6 +243,12 @@ fn main() -> Result<()> {
         } => seed_matches::run(&from, &db, &household_id),
         Command::GenerateFixtures => buywise_cli::generate::run(),
         Command::SetPassword { email, db } => set_password::run(&email, &db),
+        Command::BootstrapHousehold {
+            name,
+            email,
+            display_name,
+            db,
+        } => bootstrap::run(&name, &email, display_name.as_deref(), &db),
         Command::ExportHousehold {
             db,
             household_id,

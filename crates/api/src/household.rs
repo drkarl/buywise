@@ -1,26 +1,31 @@
-//! Member-facing household data controls (issue #136, roadmap #114).
+//! Member-facing household data controls and member administration (issues #136
+//! and #139, roadmap #114).
 //!
 //! The operator commands `export-household` / `delete-household` in
 //! `buywise-cli` require shell access to the server host. These endpoints let a
-//! signed-in household member export and delete the household's records from the
-//! app instead, reusing the same shared implementation
-//! ([`buywise_core::household_data`]) so the API and the CLI cannot drift.
+//! signed-in household owner export and delete the household's records, and add
+//! and remove its members, from the app instead, reusing the shared
+//! implementations ([`buywise_core::household_data`] and
+//! [`buywise_core::members`]) so the API and the CLI cannot drift.
 //!
-//! | Route | Method | Purpose |
-//! | --- | --- | --- |
-//! | `/api/household` | `GET` | the caller's household `{ id, name }` |
-//! | `/api/household/{household_id}/export` | `GET` | download the documented JSON export |
-//! | `/api/household/{household_id}/delete` | `POST` | guarded delete, then end the session |
+//! | Route | Method | Who | Purpose |
+//! | --- | --- | --- | --- |
+//! | `/api/household` | `GET` | any member | the caller's household `{ id, name, role }` |
+//! | `/api/household/{id}/export` | `GET` | any member | download the documented JSON export |
+//! | `/api/household/{id}/delete` | `POST` | owner | guarded delete, then end the session |
+//! | `/api/household/{id}/members` | `GET` | owner | list members with their roles |
+//! | `/api/household/{id}/members` | `POST` | owner | add a member by email, display name and initial password |
+//! | `/api/household/{id}/members/{user_id}` | `DELETE` | owner | remove a member |
 //!
 //! # Authorisation
 //!
 //! The household id is explicit in the path and every handler requires the
-//! caller to be a member of *that* household (`household_members`, via
-//! [`crate::lists::is_member`]) — a member of another household is refused with
-//! 403, never another household's data. There is no owner/admin concept in the
-//! code (migration 003's `household_members.role` is stored but unenforced), so
-//! any member may export, and any member may delete after re-entering their own
-//! password and typing the household name; see `docs/KNOWN_LIMITATIONS.md`.
+//! caller to be a member of *that* household (`household_members`) — a member of
+//! another household is refused with 403, never another household's data.
+//! `household_members.role` (migration 003) is enforced here: export is
+//! available to **every** member, while **member administration and the
+//! household delete require the `owner` role** ([`require_owner`]). See
+//! `docs/KNOWN_LIMITATIONS.md` for the remaining limits.
 //!
 //! # Guarded delete
 //!
@@ -30,21 +35,32 @@
 //! mismatch is a 422 and changes nothing. On success the household's rows are
 //! removed in one transaction, the caller's session row is deleted and both auth
 //! cookies are cleared, so the client returns to the sign-in page.
+//!
+//! # Members
+//!
+//! `POST .../members` takes the new member's email, display name and an initial
+//! password the owner shares out of band (it is never emailed and never returned
+//! again); a duplicate email is a 409. `DELETE .../members/{user_id}` ends the
+//! member's sessions immediately, removes their membership, and deletes their
+//! account only if they belong to no other household; removing the last owner is
+//! a 409. Every one of these is a mutating request, so the [`AuthenticatedUser`]
+//! extractor enforces the same CSRF check as the other mutations.
 
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use buywise_core::household_data::{self, HouseholdDataError};
+use buywise_core::members::{self, MembershipError};
 
 use crate::auth;
 use crate::middleware::AuthenticatedUser;
 use crate::AppState;
 
-/// Build the household data-controls routes as a `Router<AppState>`, merged by
+/// Build the household routes as a `Router<AppState>`, merged by
 /// [`crate::api_router`]. Paths are absolute, like the sibling modules.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -56,6 +72,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/household/{household_id}/delete",
             post(delete_household),
+        )
+        .route(
+            "/api/household/{household_id}/members",
+            get(list_members).post(add_member),
+        )
+        .route(
+            "/api/household/{household_id}/members/{user_id}",
+            delete(remove_member),
         )
 }
 
@@ -70,6 +94,10 @@ pub struct HouseholdSummary {
     pub id: String,
     /// `households.name` — the exact string the delete confirmation must repeat.
     pub name: String,
+    /// The caller's `household_members.role` in this household: `owner` or
+    /// `member`. The app shows member administration and the delete action to
+    /// owners only.
+    pub role: String,
 }
 
 /// Body for `POST /api/household/{id}/delete`.
@@ -88,11 +116,22 @@ pub struct DeleteHouseholdResponse {
     pub removed_rows: u64,
 }
 
+/// Body for `POST /api/household/{id}/members`.
+#[derive(Debug, Deserialize)]
+pub struct AddMemberRequest {
+    /// The new member's email (`users.email`, unique across the database).
+    pub email: String,
+    /// The new member's display name.
+    pub display_name: String,
+    /// The initial password the owner shares out of band. Never returned again.
+    pub password: String,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /api/household` — the caller's household id and name.
+/// `GET /api/household` — the caller's household id, name and their role in it.
 ///
 /// 404 if the caller belongs to no household. Like `GET /api/settings`, this
 /// assumes the single-household MVP model and picks the caller's first
@@ -101,8 +140,8 @@ async fn get_household(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<HouseholdSummary>, StatusCode> {
-    let household_id: Option<String> = sqlx::query_scalar(
-        "SELECT household_id FROM household_members WHERE user_id = ?1 \
+    let membership: Option<(String, String)> = sqlx::query_as(
+        "SELECT household_id, role FROM household_members WHERE user_id = ?1 \
          ORDER BY household_id LIMIT 1",
     )
     .bind(&user.user_id)
@@ -110,7 +149,7 @@ async fn get_household(
     .await
     .map_err(db_error("household.caller_membership"))?;
 
-    let Some(household_id) = household_id else {
+    let Some((household_id, role)) = membership else {
         return Err(StatusCode::NOT_FOUND);
     };
 
@@ -121,6 +160,7 @@ async fn get_household(
     Ok(Json(HouseholdSummary {
         id: household_id,
         name,
+        role,
     }))
 }
 
@@ -156,19 +196,20 @@ async fn export_household(
 }
 
 /// `POST /api/household/{household_id}/delete` — delete the household's records
-/// after re-entering the household name and the member's password.
+/// after re-entering the household name and the owner's password.
 ///
-/// 403 unless the caller is a member of `household_id`; 422 if the confirmation
-/// name or the password does not match (nothing is changed). On success the rows
-/// are removed, the caller's session is ended (row deleted, cookies cleared) and
-/// a summary is returned. CSRF is enforced by [`AuthenticatedUser`] (a POST).
+/// 403 unless the caller is an *owner* of `household_id` (a plain member may
+/// export but never delete); 422 if the confirmation name or the password does
+/// not match (nothing is changed). On success the rows are removed, the caller's
+/// session is ended (row deleted, cookies cleared) and a summary is returned.
+/// CSRF is enforced by [`AuthenticatedUser`] (a POST).
 async fn delete_household(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(household_id): Path<String>,
     Json(body): Json<DeleteHouseholdRequest>,
 ) -> Result<Response, StatusCode> {
-    require_member(&state, &user.user_id, &household_id).await?;
+    require_owner(&state, &user.user_id, &household_id).await?;
 
     // The typed name must match the stored name exactly; look the name up first
     // so a household deleted a moment ago is a 404, not a name mismatch.
@@ -221,6 +262,72 @@ async fn delete_household(
         .into_response())
 }
 
+/// `GET /api/household/{household_id}/members` — list the household's members,
+/// with roles, for the member administration screen.
+///
+/// Owner-only: a plain member is refused with 403, so the member list is never
+/// visible to non-owners.
+async fn list_members(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(household_id): Path<String>,
+) -> Result<Json<Vec<members::Member>>, StatusCode> {
+    require_owner(&state, &user.user_id, &household_id).await?;
+    let member_list = members::list_members(&state.pool, &household_id)
+        .await
+        .map_err(membership_error("household.list_members"))?;
+    Ok(Json(member_list))
+}
+
+/// `POST /api/household/{household_id}/members` — add a member with role
+/// `member` by email, display name and an initial password.
+///
+/// Owner-only (403 otherwise); the password must pass the shared policy (422 when
+/// empty); a duplicate email is 409; a vanished household is 404. The password is
+/// never returned — the owner shares it with the member out of band. CSRF is
+/// enforced by [`AuthenticatedUser`] (a POST).
+async fn add_member(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(household_id): Path<String>,
+    Json(body): Json<AddMemberRequest>,
+) -> Result<(StatusCode, Json<members::Member>), StatusCode> {
+    require_owner(&state, &user.user_id, &household_id).await?;
+
+    let member = members::add_member(
+        &state.pool,
+        &household_id,
+        body.email.trim(),
+        body.display_name.trim(),
+        &body.password,
+    )
+    .await
+    .map_err(membership_error("household.add_member"))?;
+
+    Ok((StatusCode::CREATED, Json(member)))
+}
+
+/// `DELETE /api/household/{household_id}/members/{user_id}` — remove a member.
+///
+/// Owner-only (403 otherwise). Ends the member's sessions immediately, removes
+/// their membership, and deletes their account only if they belong to no other
+/// household. Refuses (409) to remove the household's last owner, and (404) a
+/// user who is not a member. CSRF is enforced by [`AuthenticatedUser`] (a
+/// DELETE).
+async fn remove_member(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((household_id, member_user_id)): Path<(String, String)>,
+) -> Result<Json<members::MemberRemoval>, StatusCode> {
+    require_owner(&state, &user.user_id, &household_id).await?;
+
+    let removal = members::remove_member(&state.pool, &household_id, &member_user_id)
+        .await
+        .map_err(membership_error("household.remove_member"))?;
+
+    Ok(Json(removal))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -245,12 +352,59 @@ async fn require_member(
         })
 }
 
+/// Refuse with 403 unless `user_id` is an *owner* of `household_id`.
+///
+/// A plain member, a member of another household and a non-member all get 403 —
+/// the household's member list and delete action are never exposed to them. A DB
+/// error is a logged 500 (fail closed).
+async fn require_owner(
+    state: &AppState,
+    user_id: &str,
+    household_id: &str,
+) -> Result<(), StatusCode> {
+    let role = members::member_role(&state.pool, household_id, user_id)
+        .await
+        .map_err(membership_error("household.is_owner"))?;
+    match role.as_deref() {
+        Some(members::ROLE_OWNER) => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 /// Map a household-data error: a vanished household is 404, anything else is a
 /// logged 500.
 fn core_error(context: &'static str) -> impl Fn(HouseholdDataError) -> StatusCode {
     move |err| match err {
         HouseholdDataError::NoSuchHousehold(_) => StatusCode::NOT_FOUND,
         HouseholdDataError::Sqlx(err) => {
+            tracing::error!(error = %err, "{context}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Map a membership error to its HTTP status, logging the unexpected ones.
+///
+/// A duplicate email or an attempt to remove the last owner is a 409 (the
+/// request conflicts with the household's current state); an unacceptable
+/// password is 422; an unknown household or a non-member target is 404. Those
+/// cases are expected client outcomes; a hash or database failure is a logged
+/// 500.
+fn membership_error(context: &'static str) -> impl Fn(MembershipError) -> StatusCode {
+    move |err| match &err {
+        MembershipError::DuplicateEmail(_) | MembershipError::LastOwner(_) => {
+            StatusCode::CONFLICT
+        }
+        MembershipError::Password(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        MembershipError::NoSuchHousehold(_) | MembershipError::NotAMember { .. } => {
+            StatusCode::NOT_FOUND
+        }
+        MembershipError::AlreadyBootstrapped => StatusCode::CONFLICT,
+        MembershipError::Hash(detail) => {
+            tracing::error!(error = %detail, "{context}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        MembershipError::Sqlx(err) => {
             tracing::error!(error = %err, "{context}");
             StatusCode::INTERNAL_SERVER_ERROR
         }

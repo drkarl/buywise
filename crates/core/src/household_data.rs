@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::{Column, Row, SqliteConnection, SqlitePool};
 
 use crate::db;
 
@@ -413,9 +413,10 @@ struct DeleteStep {
 }
 
 /// The delete statements, in dependency order. Every statement binds `?1` to the
-/// household id (directly or through a subquery). The `sessions`/`users` steps
-/// run last and use the member ids captured before the membership rows are
-/// removed, so unrelated membership-less accounts are not affected.
+/// household id (directly or through a subquery). The `sessions`/`users` cleanup
+/// is not here: it runs last through [`delete_orphaned_sessions`] and
+/// [`delete_orphaned_accounts`], which need the member ids captured before the
+/// membership rows are removed.
 const DELETE_STEPS: &[DeleteStep] = &[
     DeleteStep {
         table: "list_entry_events",
@@ -500,21 +501,78 @@ const DELETE_STEPS: &[DeleteStep] = &[
         table: "households",
         delete_sql: "DELETE FROM households WHERE id = ?1",
     },
-    DeleteStep {
-        table: "sessions",
-        delete_sql: "DELETE FROM sessions WHERE user_id IN \
-             (SELECT user_id FROM household_delete_candidates WHERE household_id = ?1 \
-              AND NOT EXISTS (SELECT 1 FROM household_members m \
-                              WHERE m.user_id = household_delete_candidates.user_id))",
-    },
-    DeleteStep {
-        table: "users",
-        delete_sql: "DELETE FROM users WHERE id IN \
-             (SELECT user_id FROM household_delete_candidates WHERE household_id = ?1 \
-              AND NOT EXISTS (SELECT 1 FROM household_members m \
-                              WHERE m.user_id = household_delete_candidates.user_id))",
-    },
 ];
+
+/// Delete every session row of each user in `user_ids`; returns the rows removed.
+///
+/// Used by member removal ([`crate::members::remove_member`]): a removed member's
+/// open sessions must stop working on their very next request, even when they
+/// still belong to another household. The account itself is handled separately
+/// by [`delete_orphaned_accounts`].
+pub async fn delete_sessions_for_users(
+    conn: &mut SqliteConnection,
+    user_ids: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut removed = 0u64;
+    for user_id in user_ids {
+        let result = sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&mut *conn)
+            .await?;
+        removed += result.rows_affected();
+    }
+    Ok(removed)
+}
+
+/// Delete the session rows of each user in `user_ids` who belongs to no
+/// household; returns the rows removed.
+///
+/// The household-delete rule: a member shared with another household keeps their
+/// session (they are still signed in elsewhere), while a member left with no
+/// household is signed out. Callers delete the relevant `household_members` rows
+/// first, so a membership just removed no longer counts.
+pub async fn delete_orphaned_sessions(
+    conn: &mut SqliteConnection,
+    user_ids: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut removed = 0u64;
+    for user_id in user_ids {
+        let result = sqlx::query(
+            "DELETE FROM sessions WHERE user_id = ?1 AND NOT EXISTS \
+             (SELECT 1 FROM household_members m WHERE m.user_id = ?1)",
+        )
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+        removed += result.rows_affected();
+    }
+    Ok(removed)
+}
+
+/// Delete the account of each user in `user_ids` who belongs to no household;
+/// returns the rows removed.
+///
+/// The one account-deletion rule, shared by [`delete_household`] and by member
+/// removal ([`crate::members::remove_member`]): a user who also belongs to
+/// another household keeps their account. Callers delete the relevant
+/// `household_members` rows first.
+pub async fn delete_orphaned_accounts(
+    conn: &mut SqliteConnection,
+    user_ids: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut removed = 0u64;
+    for user_id in user_ids {
+        let result = sqlx::query(
+            "DELETE FROM users WHERE id = ?1 AND NOT EXISTS \
+             (SELECT 1 FROM household_members m WHERE m.user_id = ?1)",
+        )
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+        removed += result.rows_affected();
+    }
+    Ok(removed)
+}
 
 /// Delete every household-scoped row for `household_id` in one transaction.
 ///
@@ -530,21 +588,17 @@ pub async fn delete_household(
     household_name(pool, household_id).await?;
 
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "CREATE TEMP TABLE household_delete_candidates \
-         (household_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (household_id, user_id))",
-    )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO household_delete_candidates (household_id, user_id) \
-         SELECT household_id, user_id FROM household_members WHERE household_id = ?1",
-    )
-    .bind(household_id)
-    .execute(&mut *tx)
-    .await?;
 
-    let mut counts = Vec::with_capacity(DELETE_STEPS.len());
+    // Capture the member ids before their membership rows go: the account and
+    // session cleanup below needs to tell a member shared with another household
+    // (keep the account) from one left membership-less (remove it).
+    let candidate_user_ids: Vec<String> =
+        sqlx::query_scalar("SELECT user_id FROM household_members WHERE household_id = ?1")
+            .bind(household_id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+    let mut counts = Vec::with_capacity(DELETE_STEPS.len() + 2);
     for step in DELETE_STEPS {
         let result = sqlx::query(step.delete_sql)
             .bind(household_id)
@@ -552,9 +606,13 @@ pub async fn delete_household(
             .await?;
         counts.push((step.table, result.rows_affected()));
     }
-    sqlx::query("DROP TABLE household_delete_candidates")
-        .execute(&mut *tx)
-        .await?;
+
+    let (sessions, users) = (
+        delete_orphaned_sessions(&mut tx, &candidate_user_ids).await?,
+        delete_orphaned_accounts(&mut tx, &candidate_user_ids).await?,
+    );
+    counts.push(("sessions", sessions));
+    counts.push(("users", users));
 
     if dry_run {
         tx.rollback().await?;
