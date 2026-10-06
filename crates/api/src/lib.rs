@@ -45,6 +45,7 @@ pub mod mutations;
 pub mod optimise;
 pub mod preferences;
 pub mod resolution;
+pub mod run_snapshot;
 pub mod savings;
 pub mod settings;
 pub mod sse;

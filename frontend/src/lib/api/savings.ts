@@ -60,6 +60,12 @@ export interface LegacySavingsAggregate {
  * `legacy_total_only` (a manual whole-basket total). `verified` is reserved and
  * never produced yet. A null `chosen_basket_cost_cents` drives the "Enter actual
  * spend" prompt in the UI.
+ *
+ * Issue #117 slice 2: `covered_subtotal_cents`/`covered_lines`/`total_lines`/
+ * `price_date`/`covered_label` come from the run's frozen coverage snapshot.
+ * `full_basket_saving_cents` is null when the plans price different lines — the
+ * full-basket subtraction is suppressed and the covered subtotal shown instead.
+ * All covered fields are null for an event whose run predates the snapshot.
  */
 export interface ListOutcome {
 	id: string;
@@ -72,6 +78,20 @@ export interface ListOutcome {
 	coverage_label: string;
 	costs_note: string;
 	gross_saving_cents: number;
+	/** The claimable full-basket saving; null when coverage is unequal. */
+	full_basket_saving_cents: number | null;
+	/** Recommended plan's cost over the common scope; null without a snapshot. */
+	covered_subtotal_cents: number | null;
+	/** `best_single − recommended` over the common scope; null without a snapshot. */
+	covered_saving_cents: number | null;
+	/** Lines both plans price (the covered numerator); null without a snapshot. */
+	covered_lines: number | null;
+	/** Active basket lines submitted (the denominator); null without a snapshot. */
+	total_lines: number | null;
+	/** Oldest observed offer date among the offers used; null when undated. */
+	price_date: string | null;
+	/** Short "Covered subtotal: N of M lines, prices as of DATE" label. */
+	covered_label: string | null;
 	chosen_basket_cost_cents: number | null;
 	basket_variance_cents: number | null;
 }

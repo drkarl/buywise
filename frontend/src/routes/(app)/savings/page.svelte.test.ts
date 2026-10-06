@@ -9,6 +9,17 @@ const META = {
 	costs_note: 'Travel included where entered; service and data costs excluded.'
 };
 
+/** Null covered fields for an event whose run predates the frozen snapshot. */
+const NO_COVERAGE = {
+	full_basket_saving_cents: null,
+	covered_subtotal_cents: null,
+	covered_saving_cents: null,
+	covered_lines: null,
+	total_lines: null,
+	price_date: null,
+	covered_label: null
+};
+
 /**
  * A summary with an empty verified aggregate (nothing is reconciled yet), a
  * populated legacy total-only variance, and one event of each honest status.
@@ -48,6 +59,8 @@ function fullSummary(): SavingsSummary {
 				status_label: 'Estimated opportunity (not verified)',
 				coverage_label: 'Both plans price the same lines; quantities not reconciled',
 				...META,
+				...NO_COVERAGE,
+				full_basket_saving_cents: 2000,
 				gross_saving_cents: 2000,
 				chosen_basket_cost_cents: null,
 				basket_variance_cents: null
@@ -61,6 +74,13 @@ function fullSummary(): SavingsSummary {
 				status_label: 'Not comparable — plans price different lines',
 				coverage_label: 'No saving claimed: the plans price different lines',
 				...META,
+				...NO_COVERAGE,
+				covered_subtotal_cents: 800,
+				covered_saving_cents: 120,
+				covered_lines: 4,
+				total_lines: 6,
+				price_date: '2026-04-01',
+				covered_label: 'Covered subtotal: 4 of 6 lines, prices as of 2026-04-01',
 				gross_saving_cents: 999,
 				chosen_basket_cost_cents: null,
 				basket_variance_cents: null
@@ -74,6 +94,7 @@ function fullSummary(): SavingsSummary {
 				status_label: 'Legacy total-only basket variance',
 				coverage_label: 'Whole-basket total only; quantities and purchases unverified',
 				...META,
+				...NO_COVERAGE,
 				gross_saving_cents: 3000,
 				chosen_basket_cost_cents: 4500,
 				basket_variance_cents: 200
@@ -112,6 +133,7 @@ describe('savings dashboard', () => {
 			status_label: 'Comparability not checked',
 			coverage_label: 'No saving claimed: comparability not checked',
 			...META,
+			...NO_COVERAGE,
 			gross_saving_cents: 2000,
 			chosen_basket_cost_cents: null,
 			basket_variance_cents: null
@@ -222,6 +244,20 @@ describe('savings dashboard', () => {
 		expect(
 			screen.getByText('Your archived lists will appear here with their outcomes.')
 		).toBeTruthy();
+	});
+
+	it('shows a bounded covered subtotal instead of a saving for an unreconciled event', async () => {
+		stubSummary(fullSummary());
+		render(Page);
+
+		await waitFor(() => expect(screen.getByText('Unreconciled shop')).toBeTruthy());
+		// The frozen-coverage label names the coverage and evidence date, and the
+		// covered subtotal replaces the suppressed full-basket figure.
+		expect(
+			screen.getByText(/Covered subtotal: 4 of 6 lines, prices as of 2026-04-01/)
+		).toBeTruthy();
+		expect(screen.getByText(/bounded estimate, not a saving/)).toBeTruthy();
+		expect(screen.queryByText(/Stored figure €9.99/)).toBeNull();
 	});
 
 	it('shows an error with a retry on a non-OK response', async () => {

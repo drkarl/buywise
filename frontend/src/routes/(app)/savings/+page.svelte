@@ -190,8 +190,16 @@
 									>
 								{:else if l.status === 'estimated'}
 									<span class="outcome-gross"
-										>Estimated difference {formatEuros(l.gross_saving_cents)}</span
+										>Estimated difference {formatEuros(
+											l.full_basket_saving_cents ?? l.gross_saving_cents
+										)}</span
 									>
+								{:else if l.status === 'unreconciled' && l.covered_label !== null}
+									<span class="outcome-gross">
+										{l.covered_label}{#if l.covered_subtotal_cents !== null}
+											· {formatEuros(l.covered_subtotal_cents)} for those lines{/if} (bounded
+										estimate, not a saving)
+									</span>
 								{:else}
 									<span class="outcome-gross"
 										>Stored figure {formatEuros(l.gross_saving_cents)} (no saving claimed)</span

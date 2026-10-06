@@ -34,6 +34,14 @@
 //! never create a row from actual spend, so a 404 cleanly signals "nothing to
 //! attribute spend to".
 //!
+//! **Frozen coverage (issue #117, slice 2).** Each outcome also carries the run's
+//! frozen coverage snapshot (migration 018), read through the event's
+//! `recommendation_run_id`: the common-scope line count and denominator, the
+//! bounded covered subtotal, the evidence date, and a short label. A non-comparable
+//! (`unreconciled`) event exposes no full-basket saving (`full_basket_saving_cents`
+//! is null) and points at the covered subtotal instead. An event whose run predates
+//! the snapshot carries null covered fields and stays readable.
+//!
 //! Authorization mirrors `lists::patch_list`: the [`AuthenticatedUser`] extractor
 //! enforces a live session (401) and CSRF on this POST (403); the list is then
 //! looked up (404 if missing) and the caller's household membership verified (403
@@ -50,6 +58,7 @@ use buywise_core::domain::Cents;
 
 use crate::lists::is_member;
 use crate::middleware::AuthenticatedUser;
+use crate::run_snapshot::{self, CoverageSummary};
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -350,6 +359,28 @@ pub struct ListOutcome {
     /// The stored gross figure (a like-for-like estimate, or an audit-only value
     /// when the row is `unreconciled`).
     pub gross_saving_cents: Cents,
+    /// The full-basket saving that may be presented, when the plans are
+    /// comparable (`estimated`/`verified`). `None` when they are not — the
+    /// full-basket subtraction is suppressed rather than shown as a saving. For
+    /// an `unreconciled` row, prefer the bounded [`Self::covered_subtotal_cents`].
+    pub full_basket_saving_cents: Option<Cents>,
+    /// The recommended plan's cost over the common scope (lines both plans price),
+    /// read from the run's frozen coverage snapshot (migration 018). `None` for an
+    /// old run without a snapshot.
+    pub covered_subtotal_cents: Option<Cents>,
+    /// `best_single − recommended` over the common scope — the bounded
+    /// opportunity estimate, never presented as a verified saving.
+    pub covered_saving_cents: Option<Cents>,
+    /// Lines both plans price (the covered numerator).
+    pub covered_lines: Option<usize>,
+    /// Active basket lines submitted (the denominator).
+    pub total_lines: Option<usize>,
+    /// The oldest observed offer date among the offers used.
+    pub price_date: Option<String>,
+    /// Short label naming the coverage and evidence date, e.g.
+    /// `"Covered subtotal: 8 of 10 lines, prices as of 2026-06-01"`. `None` for
+    /// an old run without a frozen snapshot.
+    pub covered_label: Option<String>,
     /// Actual basket cost the household paid, NULL until actual-spend is posted.
     pub chosen_basket_cost_cents: Option<Cents>,
     /// The total-only basket variance, NULL until actual-spend is posted.
@@ -423,7 +454,10 @@ async fn savings_summary(
     .await
     .map_err(db_error("savings_summary.legacy"))?;
 
-    // Per-event outcomes, newest archive date first.
+    // Per-event outcomes, newest archive date first. The LEFT JOIN keeps a
+    // legacy event with no recommendation run (or an old run without a frozen
+    // snapshot) readable: `coverage_json` is then NULL and the covered fields
+    // stay `None`.
     let lists = sqlx::query_as::<
         _,
         (
@@ -435,14 +469,16 @@ async fn savings_summary(
             Cents,
             Option<Cents>,
             Option<Cents>,
+            Option<String>,
         ),
     >(
         "SELECT se.id, se.list_id, sl.name, \
                 COALESCE(sl.archived_at, se.created_at) AS archived_at, \
                 se.status, se.gross_saving_cents, se.chosen_basket_cost_cents, \
-                se.net_saving_cents \
+                se.net_saving_cents, rr.coverage_json \
          FROM savings_events se \
          JOIN shopping_lists sl ON sl.id = se.list_id \
+         LEFT JOIN recommendation_runs rr ON rr.id = se.recommendation_run_id \
          WHERE sl.household_id = ?1 \
          ORDER BY archived_at DESC, se.id DESC",
     )
@@ -461,22 +497,38 @@ async fn savings_summary(
             gross_saving_cents,
             chosen_basket_cost_cents,
             basket_variance_cents,
-        )| ListOutcome {
-            id,
-            list_id,
-            list_name,
-            status_label: status_label(&status).to_string(),
-            coverage_label: coverage_label(&status).to_string(),
-            archived_at,
-            status,
-            baseline_label: BASELINE_LABEL.to_string(),
-            costs_note: COSTS_NOTE.to_string(),
-            gross_saving_cents,
-            chosen_basket_cost_cents,
-            basket_variance_cents,
+            coverage_json,
+        )| {
+            let coverage =
+                coverage_from_run(coverage_json).map_err(db_error("savings_summary.coverage"))?;
+            // Only a comparable row (`estimated`/`verified`) may present a
+            // full-basket saving; an `unreconciled` row suppresses it and shows
+            // the bounded covered subtotal instead.
+            let comparable = status == STATUS_ESTIMATED || status == STATUS_VERIFIED;
+            Ok(ListOutcome {
+                id,
+                list_id,
+                list_name,
+                status_label: status_label(&status).to_string(),
+                coverage_label: coverage_label(&status).to_string(),
+                archived_at,
+                status,
+                baseline_label: BASELINE_LABEL.to_string(),
+                costs_note: COSTS_NOTE.to_string(),
+                gross_saving_cents,
+                full_basket_saving_cents: comparable.then_some(gross_saving_cents),
+                covered_subtotal_cents: coverage.as_ref().and_then(|c| c.covered_subtotal_cents),
+                covered_saving_cents: coverage.as_ref().and_then(|c| c.covered_saving_cents),
+                covered_lines: coverage.as_ref().map(|c| c.covered_lines),
+                total_lines: coverage.as_ref().map(|c| c.total_lines),
+                price_date: coverage.as_ref().and_then(|c| c.price_date.clone()),
+                covered_label: coverage.as_ref().map(|c| c.label.clone()),
+                chosen_basket_cost_cents,
+                basket_variance_cents,
+            })
         },
     )
-    .collect();
+    .collect::<Result<Vec<_>, StatusCode>>()?;
 
     Ok(Json(SavingsSummaryResponse {
         saved,
@@ -609,6 +661,23 @@ async fn aggregate_legacy_for(
         cumulative_cents,
         monthly,
     })
+}
+
+/// Parse a run's frozen coverage snapshot (migration 018) into the response
+/// summary.
+///
+/// A NULL column (an event whose run predates the snapshot, or has no run) is
+/// `None`. A malformed payload is a genuine error — our own writer produces it —
+/// so it surfaces as a 500 rather than silently dropping the evidence.
+fn coverage_from_run(
+    coverage_json: Option<String>,
+) -> Result<Option<CoverageSummary>, sqlx::Error> {
+    let Some(json) = coverage_json else {
+        return Ok(None);
+    };
+    let snapshot: run_snapshot::CoverageSnapshot = serde_json::from_str(&json)
+        .map_err(|e| sqlx::Error::Protocol(format!("deserialise coverage_json: {e}")))?;
+    Ok(Some(CoverageSummary::from_snapshot(&snapshot)))
 }
 
 /// The (single) household the caller belongs to, or `None` if they belong to no
