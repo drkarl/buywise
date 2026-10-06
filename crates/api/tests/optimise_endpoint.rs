@@ -975,18 +975,10 @@ async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
     let session = seed_household_and_user(&pool, "user-a", "a@example.test").await;
     seed_catalogue(&pool).await;
 
-    // Milk is far cheaper at Aldi (observed 2026-06-01); bread far cheaper at
-    // Tesco (2026-06-03). The saving clears the €10 default bar, so the two-store
+    // Milk is far cheaper at Aldi (undated); bread far cheaper at Tesco
+    // (2026-06-03). The saving clears the €10 default bar, so the two-store
     // split is recommended and both plans price both lines.
-    seed_priced_match(
-        &pool,
-        "p-milk-aldi",
-        "aldi",
-        MILK_ID,
-        100,
-        Some("2026-06-01"),
-    )
-    .await;
+    seed_priced_match(&pool, "p-milk-aldi", "aldi", MILK_ID, 100, None).await;
     seed_priced_match(
         &pool,
         "p-milk-tesco",
@@ -1019,15 +1011,32 @@ async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
     seed_resolved_entry(&pool, "e-milk", "list-1", MILK_ID, "leche", "user-a").await;
     seed_resolved_entry(&pool, "e-bread", "list-1", BREAD_ID, "pan", "user-a").await;
 
-    let resp = post_optimise(&pool, &session, serde_json::json!({ "list_id": "list-1" })).await;
+    sqlx::query("UPDATE retailer_products SET size_value = 500, size_unit = 'ml', pack_count = 2 WHERE id = 'p-milk-aldi'")
+        .execute(&pool)
+        .await
+        .expect("set pack size evidence");
+
+    set_store_status(&pool, "aldi", "occasional").await;
+
+    let resp = post_optimise(
+        &pool,
+        &session,
+        serde_json::json!({ "list_id": "list-1", "trip_retailers": ["aldi"] }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
 
     assert_eq!(body["coverage"]["status"], "comparable", "{body:#}");
     assert_eq!(body["coverage"]["covered_lines"], 2);
     assert_eq!(body["coverage"]["total_lines"], 2);
-    // Oldest used offer date (2026-06-01), not the newest (2026-06-04/06-03).
-    assert_eq!(body["offer_snapshot_date"], "2026-06-01");
+    // Undated used offers are visible while the oldest dated offer remains frozen.
+    assert_eq!(body["offer_snapshot_date"], "2026-06-02");
+    assert_eq!(body["coverage"]["undated_offer_count"], 1);
+    assert_eq!(
+        body["coverage"]["label"],
+        "Covered subtotal: 2 of 2 lines, prices as of 2026-06-02, 1 offer undated"
+    );
 
     let run_id = body["run_id"].as_str().expect("run_id string").to_string();
     let before = read_snapshot_columns(&pool, &run_id).await;
@@ -1048,11 +1057,34 @@ async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
     assert_eq!(basket["version"], 1);
     assert_eq!(basket["list_id"], "list-1");
     assert_eq!(basket["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(basket["trip_retailers"], serde_json::json!(["aldi"]));
+    assert_eq!(basket["store_settings"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        basket["store_settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|store| store["retailer"] == "aldi")
+            .unwrap()["status"],
+        "occasional"
+    );
     let offers: Value =
         serde_json::from_str(before.price_evidence_json.as_deref().expect("price json"))
             .expect("valid json");
     // Offers used = best-single ∪ recommended: Aldi milk, Tesco milk, Tesco bread.
     assert_eq!(offers["offers"].as_array().unwrap().len(), 3);
+    let aldi_offer = offers["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|offer| offer["retailer"] == "aldi")
+        .unwrap();
+    assert_eq!(aldi_offer["source"], "basketwatch");
+    assert_eq!(aldi_offer["observed_date"], Value::Null);
+    assert_eq!(
+        aldi_offer["usable_base_units"],
+        serde_json::json!({ "value": 1000.0, "basis": "ml" })
+    );
     let coverage: Value =
         serde_json::from_str(before.coverage_json.as_deref().expect("coverage json"))
             .expect("valid json");
@@ -1080,6 +1112,14 @@ async fn snapshot_is_frozen_and_uses_the_oldest_offer_date() {
     .execute(&pool)
     .await
     .expect("refresh offer");
+    sqlx::query(
+        "UPDATE household_store_settings SET status = 'off' \
+         WHERE household_id = ?1 AND retailer = 'aldi'",
+    )
+    .bind(HOUSEHOLD)
+    .execute(&pool)
+    .await
+    .expect("change store setting after run");
 
     let after = read_snapshot_columns(&pool, &run_id).await;
     assert_eq!(
@@ -1100,15 +1140,7 @@ async fn unequal_coverage_suppresses_full_basket_and_shows_covered_subtotal() {
     // Milk is stocked only at Aldi; bread only at Tesco. No single store prices
     // both, so the recommended two-store split reaches a line the best single
     // store cannot — unequal coverage.
-    seed_priced_match(
-        &pool,
-        "p-milk-aldi",
-        "aldi",
-        MILK_ID,
-        100,
-        Some("2026-06-01"),
-    )
-    .await;
+    seed_priced_match(&pool, "p-milk-aldi", "aldi", MILK_ID, 100, None).await;
     seed_priced_match(
         &pool,
         "p-bread-tesco",
@@ -1138,7 +1170,7 @@ async fn unequal_coverage_suppresses_full_basket_and_shows_covered_subtotal() {
     assert_eq!(body["coverage"]["covered_subtotal_cents"], 100);
     assert_eq!(
         body["coverage"]["label"],
-        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-01"
+        "Covered subtotal: 1 of 2 lines, prices as of 2026-06-02, 1 offer undated"
     );
 
     // The snapshot records the common scope and the recommended-only line.
@@ -1153,4 +1185,5 @@ async fn unequal_coverage_suppresses_full_basket_and_shows_covered_subtotal() {
     assert_eq!(coverage["common_scope"].as_array().unwrap().len(), 1);
     assert_eq!(coverage["best_single_only"].as_array().unwrap().len(), 0);
     assert_eq!(coverage["recommended_only"].as_array().unwrap().len(), 1);
+    assert_eq!(coverage["undated_offer_count"], 1);
 }

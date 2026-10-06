@@ -26,8 +26,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use buywise_core::domain::{Cents, ConstraintPolicy, ItemConstraints, Retailer, SizeBasis};
-use buywise_core::optimiser::{OptimiserInput, OptimiserOutput, StorePlan};
+use buywise_core::domain::{
+    Cents, ConstraintPolicy, ItemConstraints, Retailer, SizeBasis, StoreStatus,
+};
+use buywise_core::optimiser::{OptimiserInput, OptimiserOutput, StorePlan, StoreSetting};
 
 /// Snapshot schema version written into `recommendation_runs.snapshot_version`
 /// and round-tripped inside each payload, so a later reader can tell which
@@ -94,6 +96,13 @@ pub struct BasketSnapshot {
     pub household_id: String,
     /// One entry per input basket line, in optimiser order.
     pub entries: Vec<BasketSnapshotEntry>,
+    /// Effective store settings used by the optimiser, including defaults for
+    /// retailers with no stored setting.
+    #[serde(default)]
+    pub store_settings: Vec<StoreSetting>,
+    /// Occasional stores admitted for this run.
+    #[serde(default)]
+    pub trip_retailers: Vec<Retailer>,
 }
 
 /// Build the basket snapshot from the exact [`OptimiserInput`] the run used.
@@ -122,6 +131,23 @@ pub fn build_basket_snapshot(
         list_id: list_id.to_string(),
         household_id: household_id.to_string(),
         entries,
+        store_settings: Retailer::ALL
+            .iter()
+            .map(|&retailer| {
+                input
+                    .store_settings
+                    .iter()
+                    .find(|setting| setting.retailer == retailer)
+                    .cloned()
+                    .unwrap_or(StoreSetting {
+                        retailer,
+                        status: StoreStatus::Active,
+                        nearby: false,
+                        category_rules: Vec::new(),
+                    })
+            })
+            .collect(),
+        trip_retailers: input.trip_retailers.clone(),
     }
 }
 
@@ -150,6 +176,9 @@ pub struct OfferEvidence {
     pub retailer: Retailer,
     /// `retailer_products.id` the offer belongs to.
     pub retailer_product_id: String,
+    /// Feed or source that supplied the retailer product, when known.
+    #[serde(default)]
+    pub source: Option<String>,
     /// The product's display name at run time.
     pub product_name: String,
     /// The offer's `source_snapshot_date` — the date the price was observed.
@@ -173,6 +202,10 @@ pub struct OfferEvidence {
     pub size_unit: Option<String>,
     /// Number of units in the pack, when known.
     pub pack_count: Option<i32>,
+    /// Usable base units in the priced pack, when its size, unit and pack count
+    /// are all known and the unit can be normalized.
+    #[serde(default)]
+    pub usable_base_units: Option<BaseUnit>,
     /// The offer's previous price, the discount assumption it may carry.
     pub previous_price_cents: Option<Cents>,
     /// Free-text offer description (e.g. a promotion), when present.
@@ -224,6 +257,14 @@ pub fn oldest_observed_date(offers: &[OfferEvidence]) -> Option<String> {
     offers.iter().filter_map(|o| o.observed_date.clone()).min()
 }
 
+/// Number of used offers whose observed date is unknown.
+pub fn undated_offer_count(offers: &[OfferEvidence]) -> usize {
+    offers
+        .iter()
+        .filter(|offer| offer.observed_date.is_none())
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Coverage snapshot
 // ---------------------------------------------------------------------------
@@ -271,6 +312,9 @@ pub struct CoverageSnapshot {
     /// The oldest observed date among the offers used, for the "prices as of"
     /// label. Mirrors `recommendation_runs.offer_snapshot_date`.
     pub price_date: Option<String>,
+    /// Number of used offers without an observed date.
+    #[serde(default)]
+    pub undated_offer_count: usize,
 }
 
 impl CoverageSnapshot {
@@ -299,6 +343,7 @@ pub fn build_coverage(
     output: &OptimiserOutput,
     basket_lines: usize,
     price_date: Option<String>,
+    undated_offer_count: usize,
 ) -> CoverageSnapshot {
     let best_single = output.best_single.as_ref();
     let recommended = output.recommended.as_ref().map(|r| &r.plan);
@@ -356,6 +401,7 @@ pub fn build_coverage(
         covered_saving_cents,
         full_basket_saving_cents,
         price_date,
+        undated_offer_count,
     }
 }
 
@@ -412,6 +458,8 @@ pub struct CoverageSummary {
     pub full_basket_saving_cents: Option<Cents>,
     /// The oldest observed offer date among the offers used, or `None`.
     pub price_date: Option<String>,
+    /// Number of used offers without an observed date.
+    pub undated_offer_count: usize,
 }
 
 impl CoverageSummary {
@@ -424,6 +472,7 @@ impl CoverageSummary {
                 snapshot.common_scope.len(),
                 snapshot.basket_lines,
                 snapshot.price_date.as_deref(),
+                snapshot.undated_offer_count,
             ),
             status: status.to_string(),
             covered_lines: snapshot.common_scope.len(),
@@ -432,6 +481,7 @@ impl CoverageSummary {
             covered_saving_cents: snapshot.covered_saving_cents,
             full_basket_saving_cents: snapshot.full_basket_saving_cents,
             price_date: snapshot.price_date.clone(),
+            undated_offer_count: snapshot.undated_offer_count,
         }
     }
 
@@ -441,18 +491,39 @@ impl CoverageSummary {
         output: &OptimiserOutput,
         basket_lines: usize,
         price_date: Option<String>,
+        undated_offer_count: usize,
     ) -> Self {
-        Self::from_snapshot(&build_coverage(output, basket_lines, price_date))
+        Self::from_snapshot(&build_coverage(
+            output,
+            basket_lines,
+            price_date,
+            undated_offer_count,
+        ))
     }
 }
 
-/// The short covered-subtotal label. The date clause is omitted when no offer
-/// carried an observed date.
-pub fn covered_subtotal_label(covered: usize, total: usize, price_date: Option<&str>) -> String {
-    match price_date {
-        Some(date) => format!("Covered subtotal: {covered} of {total} lines, prices as of {date}"),
-        None => format!("Covered subtotal: {covered} of {total} lines"),
+/// The short covered-subtotal label. Undated used offers are named explicitly.
+pub fn covered_subtotal_label(
+    covered: usize,
+    total: usize,
+    price_date: Option<&str>,
+    undated_offer_count: usize,
+) -> String {
+    let mut label = format!("Covered subtotal: {covered} of {total} lines");
+    if let Some(date) = price_date {
+        label.push_str(&format!(", prices as of {date}"));
+    } else if undated_offer_count > 0 {
+        label.push_str(", prices as of unknown");
     }
+    if undated_offer_count > 0 {
+        let noun = if undated_offer_count == 1 {
+            "offer"
+        } else {
+            "offers"
+        };
+        label.push_str(&format!(", {undated_offer_count} {noun} undated"));
+    }
+    label
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +602,7 @@ mod tests {
             Some(plan(&[(0, 300), (1, 200)])),
             Some(plan(&[(0, 250), (1, 150)])),
         );
-        let coverage = build_coverage(&out, 2, Some("2026-06-01".into()));
+        let coverage = build_coverage(&out, 2, Some("2026-06-01".into()), 0);
         assert_eq!(coverage.status(), COVERAGE_COMPARABLE);
         assert_eq!(coverage.full_basket_saving_cents, Some(100));
         assert_eq!(coverage.common_scope, vec![0, 1]);
@@ -544,7 +615,7 @@ mod tests {
             Some(plan(&[(0, 300), (1, 200)])),
             Some(plan(&[(0, 250), (1, 150), (2, 100)])),
         );
-        let coverage = build_coverage(&out, 3, Some("2026-06-01".into()));
+        let coverage = build_coverage(&out, 3, Some("2026-06-01".into()), 0);
         assert_eq!(coverage.status(), COVERAGE_UNEQUAL);
         assert_eq!(coverage.full_basket_saving_cents, None);
         assert_eq!(coverage.common_scope, vec![0, 1]);
@@ -557,7 +628,7 @@ mod tests {
     #[test]
     fn no_plan_reports_no_plan_status() {
         let out = output(None, None);
-        let coverage = build_coverage(&out, 4, None);
+        let coverage = build_coverage(&out, 4, None, 0);
         assert_eq!(coverage.status(), COVERAGE_NO_PLAN);
         assert_eq!(coverage.full_basket_saving_cents, None);
         assert_eq!(coverage.covered_subtotal_cents, None);
@@ -566,22 +637,31 @@ mod tests {
     #[test]
     fn label_names_coverage_and_date() {
         assert_eq!(
-            covered_subtotal_label(8, 10, Some("2026-06-01")),
+            covered_subtotal_label(8, 10, Some("2026-06-01"), 0),
             "Covered subtotal: 8 of 10 lines, prices as of 2026-06-01"
         );
         assert_eq!(
-            covered_subtotal_label(8, 10, None),
+            covered_subtotal_label(8, 10, None, 0),
             "Covered subtotal: 8 of 10 lines"
+        );
+        assert_eq!(
+            covered_subtotal_label(8, 10, Some("2026-06-01"), 1),
+            "Covered subtotal: 8 of 10 lines, prices as of 2026-06-01, 1 offer undated"
+        );
+        assert_eq!(
+            covered_subtotal_label(8, 10, None, 2),
+            "Covered subtotal: 8 of 10 lines, prices as of unknown, 2 offers undated"
         );
     }
 
     #[test]
-    fn oldest_observed_date_picks_the_minimum_and_ignores_nulls() {
+    fn oldest_observed_date_picks_the_minimum_and_counts_nulls() {
         let offers = vec![
             OfferEvidence {
                 offer_id: "a".into(),
                 retailer: Retailer::Tesco,
                 retailer_product_id: "p".into(),
+                source: Some("basketwatch".into()),
                 product_name: "p".into(),
                 observed_date: Some("2026-06-03".into()),
                 shelf_price_cents: 1,
@@ -593,6 +673,7 @@ mod tests {
                 size_value: None,
                 size_unit: None,
                 pack_count: None,
+                usable_base_units: None,
                 previous_price_cents: None,
                 offer_text: None,
                 offer_valid_until: None,
@@ -601,6 +682,7 @@ mod tests {
                 offer_id: "b".into(),
                 retailer: Retailer::Aldi,
                 retailer_product_id: "q".into(),
+                source: Some("manual".into()),
                 product_name: "q".into(),
                 observed_date: None,
                 shelf_price_cents: 1,
@@ -612,6 +694,7 @@ mod tests {
                 size_value: None,
                 size_unit: None,
                 pack_count: None,
+                usable_base_units: None,
                 previous_price_cents: None,
                 offer_text: None,
                 offer_valid_until: None,
@@ -620,6 +703,7 @@ mod tests {
                 offer_id: "c".into(),
                 retailer: Retailer::Dunnes,
                 retailer_product_id: "r".into(),
+                source: None,
                 product_name: "r".into(),
                 observed_date: Some("2026-05-30".into()),
                 shelf_price_cents: 1,
@@ -631,12 +715,14 @@ mod tests {
                 size_value: None,
                 size_unit: None,
                 pack_count: None,
+                usable_base_units: None,
                 previous_price_cents: None,
                 offer_text: None,
                 offer_valid_until: None,
             },
         ];
         assert_eq!(oldest_observed_date(&offers).as_deref(), Some("2026-05-30"));
+        assert_eq!(undated_offer_count(&offers), 1);
     }
 
     #[test]
