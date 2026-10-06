@@ -45,6 +45,8 @@ deploy/
   litestream.yml   Litestream → Cloudflare R2 config
 docs/
   design.md        Architecture and design document
+  data-flows.md    Data-flow inventory, external processing, retention, deletion and backup review
+  household-export.md  The household export JSON layout
   KNOWN_LIMITATIONS.md  Accepted gaps and their follow-ups
 ```
 
@@ -185,6 +187,26 @@ build-and-serve flow above to exercise the full app.
 ## Design document
 
 See [`docs/design.md`](docs/design.md) for the full architecture, schema, sync protocol, bilingual resolution cascade, and phased build plan.
+
+## Household data controls
+
+What leaves the device and the server, who can read it and how long it is kept is inventoried in
+[`docs/data-flows.md`](docs/data-flows.md) — including the optional external LLM fallback
+(`LLM_FALLBACK_ENABLED`, off by default), the Litestream → Cloudflare R2 backup review, and the
+deletion and raw-receipt retention policy. The JSON layout produced by export is documented in
+[`docs/household-export.md`](docs/household-export.md).
+
+```bash
+# Export a household's records as one JSON document (read-only; omit --out for stdout).
+cargo run -p buywise-cli -- export-household --db buywise.db --household-id <uuid> --out household.json
+
+# See what deletion would remove, then delete it (--confirm is required to delete).
+cargo run -p buywise-cli -- delete-household --db buywise.db --household-id <uuid> --dry-run
+cargo run -p buywise-cli -- delete-household --db buywise.db --household-id <uuid> --confirm
+```
+
+Deletion clears the household from the live database immediately; it does not rewrite backups, and
+a restore can resurrect it — `docs/data-flows.md` §5 explains the expiry and restore handling.
 
 ## Known limitations
 

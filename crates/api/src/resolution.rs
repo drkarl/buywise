@@ -197,10 +197,11 @@ async fn resolve_no_match_via_llm(
         // A real failure (HTTP, status, malformed): log and leave unresolved. No
         // retry — the user will see the entry flagged for clarification instead.
         Err(e) => {
+            // Deliberately no `raw_text` here: routine logs must not carry
+            // household content (list terms). `entry_id` is enough to correlate.
             tracing::warn!(
                 error = %e,
                 entry_id = %job.entry_id,
-                raw_text = %job.raw_text,
                 "resolution: LLM fallback failed; entry left unresolved"
             );
             return Ok(());
@@ -235,10 +236,10 @@ async fn resolve_no_match_via_llm(
         .collect();
     let [canonical_item_id] = matched.as_slice() else {
         // Zero matches (hallucination) or, defensively, more than one: do not bind.
+        // Deliberately no `raw_text`/`answer` here — routine logs must not carry
+        // household content (list terms) or model output derived from it.
         tracing::info!(
             entry_id = %job.entry_id,
-            raw_text = %job.raw_text,
-            answer = %answer,
             "resolution: LLM answer did not uniquely match a canonical item; left unresolved"
         );
         return Ok(());
