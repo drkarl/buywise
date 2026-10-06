@@ -162,8 +162,8 @@ echo "==> Installing Caddy HTTPS reverse proxy (opt-in)"
 CADDY_SOURCE="${SCRIPT_DIR}/Caddyfile"
 if [[ ! -f "${CADDY_SOURCE}" ]]; then
     echo "    ${CADDY_SOURCE} not found; skipping the reverse-proxy step"
-elif grep -q '<hostname>' "${CADDY_SOURCE}"; then
-    echo "    placeholder <hostname> still present in ${CADDY_SOURCE}; NOT installing the Caddyfile or enabling Caddy."
+elif grep -q '^[[:space:]]*<hostname>[[:space:]]*{' "${CADDY_SOURCE}"; then
+    echo "    placeholder site address <hostname> still present in ${CADDY_SOURCE}; NOT installing the Caddyfile or enabling Caddy."
     echo "    Set the hostname, install Caddy, then re-run setup.sh (see deploy/README.md section 7)."
 elif ! command -v caddy >/dev/null 2>&1; then
     echo "    caddy binary not found; install Caddy first, then re-run setup.sh (see deploy/README.md section 7)." >&2
