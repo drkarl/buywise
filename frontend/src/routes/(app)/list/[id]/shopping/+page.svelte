@@ -55,8 +55,8 @@
 
 	/**
 	 * True when the list no longer matches the chosen plan (an entry added, or a
-	 * planned entry's quantity edited). Mirrors the trip page so shopping mode
-	 * scoped to one store surfaces the same review path.
+	 * planned entry's quantity or canonical item changed). Mirrors the trip page so
+	 * shopping mode scoped to one store surfaces the same review path.
 	 */
 	const stale = $derived(trip ? isTripStale(trip, $all) : false);
 

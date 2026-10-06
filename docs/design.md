@@ -517,6 +517,10 @@ optimiser from the basket item) plus the chosen product, so a trip list is a
   only the plan's stores and shows only the selected store's allocated items.
   A link to the whole trip shows how many active items are outside that store's
   allocation, including unallocated items and entries added after plan selection.
+  Both the trip page and store-scoped shopping mode show the stale-plan warning
+  when an active entry is added, or a planned entry's quantity or canonical item
+  changes after the plan is priced. Older cached plans check only snapshot fields
+  they contain.
 - Check-offs in either view reuse the same optimistic `mark_bought` mutation
   (§11), so an offline check-off queues and drains like any other edit and
   converges across devices.
@@ -524,9 +528,9 @@ optimiser from the basket item) plus the chosen product, so a trip list is a
 The chosen allocation is a small client-side cache (per device, `localStorage`),
 not server state. Volume one replaces the allocation by re-selecting a plan — there
 is no per-line manual reassignment — and three-store routing is a non-goal. When
-the list gains an item the plan does not cover, the trip view shows a stale-plan
-warning linking back to the optimiser; plan prices are a snapshot and a
-re-optimise refreshes them.
+the list gains an item the plan does not cover, or a planned entry's quantity or
+canonical item changes, both trip views show a stale-plan warning linking back to
+the optimiser; plan prices are a snapshot and a re-optimise refreshes them.
 
 ### Plan explanations
 
