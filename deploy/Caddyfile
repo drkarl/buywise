@@ -1,0 +1,40 @@
+# BuyWise HTTPS reverse proxy (Caddy) — deploy/Caddyfile.
+#
+# Caddy terminates TLS for the household hostname and reverse-proxies to the
+# BuyWise API/SPA, which the single buywise-api binary serves on 127.0.0.1:3000.
+# Caddy obtains and renews the certificate automatically from Let's Encrypt once:
+#   * the placeholder below is replaced with the real hostname,
+#   * that hostname's DNS A (and AAAA, if the host has IPv6) records point at
+#     this server, and
+#   * inbound TCP 80 and 443 are reachable through the firewall.
+# See deploy/README.md, section "HTTPS reverse proxy (Caddy)".
+#
+# deploy/setup.sh installs this file to /etc/caddy/Caddyfile only after the
+# placeholder has been replaced; it never enables the proxy with the
+# placeholder still in place.
+
+# Replace <hostname> with the household hostname (e.g. buywise.example.com).
+<hostname> {
+	# Every request goes to the loopback API/SPA listener owned by
+	# buywise.service. Port 3000 is never opened in the firewall, so this
+	# proxy is the only way in.
+	reverse_proxy 127.0.0.1:3000 {
+		# /api/sse/{list_id} is a long-lived text/event-stream connection.
+		# Caddy already flushes a text/event-stream response immediately,
+		# but flush_interval -1 makes low-latency mode explicit and
+		# unconditional: response buffering is disabled and each frame (a
+		# mutation or the 30-second heartbeat) is written straight to the
+		# phone.
+		flush_interval -1
+
+		# The stream is idle between mutations, so the proxy must impose no
+		# read/write timeout of its own. 0 = no timeout, which is already
+		# Caddy's default for these two; they are stated here so the intent
+		# survives a future edit that might otherwise lower them.
+		transport http {
+			read_timeout 0
+			write_timeout 0
+			dial_timeout 5s
+		}
+	}
+}
