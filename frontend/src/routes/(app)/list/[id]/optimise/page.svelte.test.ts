@@ -137,7 +137,8 @@ function fullResponse(): OptimiseResponse {
 			covered_subtotal_cents: 100,
 			covered_saving_cents: 200,
 			full_basket_saving_cents: 100,
-			price_date: '2026-06-07'
+			price_date: '2026-06-07',
+			undated_offer_count: 0
 		},
 		offer_snapshot_date: '2026-06-07',
 		aldi_comparison: {
@@ -264,7 +265,8 @@ describe('optimise page', () => {
 			covered_subtotal_cents: 100,
 			covered_saving_cents: 200,
 			full_basket_saving_cents: null,
-			price_date: '2026-06-07'
+			price_date: '2026-06-07',
+			undated_offer_count: 0
 		};
 		stubOptimise(response);
 		render(Page);
@@ -275,6 +277,25 @@ describe('optimise page', () => {
 			await screen.findByText(/Covered subtotal: 1 of 4 lines, prices as of 2026-06-07/)
 		).toBeTruthy();
 		expect(screen.getByText(/not a whole-basket saving/)).toBeTruthy();
+	});
+
+	it('shows undated offer counts beside the prices-as-of date', async () => {
+		const response = fullResponse();
+		response.coverage.undated_offer_count = 2;
+		stubOptimise(response);
+		render(Page);
+
+		expect(await screen.findByText('Prices as of 2026-06-07, 2 offers undated.')).toBeTruthy();
+	});
+
+	it('marks the price date unknown when every used offer is undated', async () => {
+		const response = fullResponse();
+		response.offer_snapshot_date = null;
+		response.coverage.undated_offer_count = 1;
+		stubOptimise(response);
+		render(Page);
+
+		expect(await screen.findByText('Prices as of unknown, 1 offer undated.')).toBeTruthy();
 	});
 
 	it('offers a trip toggle for occasional stores and re-optimises with the trip', async () => {
@@ -643,7 +664,8 @@ describe('optimise page', () => {
 				covered_subtotal_cents: null,
 				covered_saving_cents: null,
 				full_basket_saving_cents: null,
-				price_date: null
+				price_date: null,
+				undated_offer_count: 0
 			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
@@ -782,7 +804,8 @@ describe('optimise page', () => {
 				covered_subtotal_cents: null,
 				covered_saving_cents: null,
 				full_basket_saving_cents: null,
-				price_date: null
+				price_date: null,
+				undated_offer_count: 0
 			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
@@ -853,7 +876,8 @@ describe('optimise page', () => {
 				covered_subtotal_cents: null,
 				covered_saving_cents: null,
 				full_basket_saving_cents: null,
-				price_date: null
+				price_date: null,
+				undated_offer_count: 0
 			},
 			offer_snapshot_date: null,
 			aldi_comparison: null
@@ -912,7 +936,8 @@ describe('optimise page', () => {
 				covered_subtotal_cents: null,
 				covered_saving_cents: null,
 				full_basket_saving_cents: null,
-				price_date: null
+				price_date: null,
+				undated_offer_count: 0
 			},
 			offer_snapshot_date: null,
 			aldi_comparison: null

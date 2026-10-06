@@ -204,6 +204,20 @@ describe('savings dashboard', () => {
 		expect(screen.getAllByText(/Baseline: best single store estimate/)).toHaveLength(5);
 	});
 
+	it('shows undated offer evidence on an estimated ledger outcome', async () => {
+		const summary = fullSummary();
+		summary.lists[0].covered_label =
+			'Covered subtotal: 2 of 2 lines, prices as of 2026-06-02, 1 offer undated';
+		stubSummary(summary);
+		render(Page);
+
+		expect(
+			await screen.findByText(
+				'Covered subtotal: 2 of 2 lines, prices as of 2026-06-02, 1 offer undated'
+			)
+		).toBeTruthy();
+	});
+
 	it('shows the "Enter actual spend" prompt only where no total was entered', async () => {
 		stubSummary(fullSummary());
 		render(Page);

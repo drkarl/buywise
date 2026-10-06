@@ -189,11 +189,14 @@
 										>Basket variance {formatEuros(l.basket_variance_cents)}</span
 									>
 								{:else if l.status === 'estimated'}
-									<span class="outcome-gross"
-										>Estimated difference {formatEuros(
+									<span class="outcome-gross">
+										Estimated difference {formatEuros(
 											l.full_basket_saving_cents ?? l.gross_saving_cents
-										)}</span
-									>
+										)}
+										{#if l.covered_label?.includes('undated')}
+											<br /><small class="outcome-evidence">{l.covered_label}</small>
+										{/if}
+									</span>
 								{:else if l.status === 'unreconciled' && l.covered_label !== null}
 									<span class="outcome-gross">
 										{l.covered_label}{#if l.covered_subtotal_cents !== null}
@@ -383,6 +386,10 @@
 	}
 	.outcome-gross {
 		color: #475569;
+	}
+	.outcome-evidence {
+		color: #92400e;
+		font-size: 0.8rem;
 	}
 	.outcome-net {
 		font-weight: 600;
