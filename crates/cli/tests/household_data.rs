@@ -48,6 +48,22 @@ const HOUSEHOLD_ROW_COUNTS: &[(&str, &str)] = &[
         "SELECT COUNT(*) FROM purchase_events WHERE household_id = ?1",
     ),
     (
+        "purchase_transaction_revisions",
+        "SELECT COUNT(*) FROM purchase_transaction_revisions pr \
+         JOIN purchase_transactions pt ON pt.id = pr.transaction_id \
+         WHERE pt.household_id = ?1",
+    ),
+    (
+        "purchase_lines",
+        "SELECT COUNT(*) FROM purchase_lines pl \
+         JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
+         WHERE pt.household_id = ?1",
+    ),
+    (
+        "purchase_transactions",
+        "SELECT COUNT(*) FROM purchase_transactions WHERE household_id = ?1",
+    ),
+    (
         "mutations",
         "SELECT COUNT(*) FROM mutations WHERE list_id IN \
          (SELECT id FROM shopping_lists WHERE household_id = ?1)",
@@ -326,6 +342,41 @@ async fn seed_fixture(pool: &SqlitePool) {
          VALUES ('pd-a', '{HH_A}', 'ci-a', 'u-a', '{T}')"
     ))
     .await;
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO purchase_transactions \
+             (id, household_id, retailer, purchase_date, source_kind, source_transaction_id, \
+              transaction_identity, identity_kind, fingerprint, currency, total_cents, revision, \
+              source_payload, created_at, updated_at) \
+         VALUES ('pt-a', '{HH_A}', 'tesco', '2026-05-01', 'import', 'SRC-A', 'SRC-A', 'source_id', \
+                 'pl1:aaaa', 'EUR', 500, 2, '{{\"source\":\"a\"}}', '{T}', '{T}'), \
+                ('pt-b', '{HH_B}', 'lidl', '2026-05-02', 'import', NULL, 'pl1:bbbb', 'fingerprint', \
+                 'pl1:bbbb', 'EUR', 700, 1, '{{}}', '{T}', '{T}')"
+        ),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO purchase_lines \
+             (id, transaction_id, line_ordinal, original_text, name, quantity, line_total_cents, \
+              retailer_product_id, canonical_item_id, match_status, revision, created_at) \
+         VALUES ('pl-a', 'pt-a', 0, 'Apples 1kg', 'Apples', 1, 500, 'rp-1', 'ci-a', 'matched', 2, '{T}'), \
+                ('pl-b', 'pt-b', 0, 'Bread', NULL, 1, 700, NULL, NULL, 'unmatched', 1, '{T}')"
+        ),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO purchase_transaction_revisions \
+             (id, transaction_id, revision, retailer, purchase_date, currency, total_cents, \
+              source_payload, lines_json, superseded_at) \
+         VALUES ('ptr-a', 'pt-a', 1, 'tesco', '2026-05-01', 'EUR', 500, '{{}}', '[]', '{T}')"
+        ),
+    )
+    .await;
 }
 
 /// Per-table household row counts, computed with the test's own queries.
@@ -431,6 +482,18 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
     assert_eq!(array_len(&doc, "/purchase_events"), 1);
     assert_eq!(doc["purchase_events"][0]["id"], "pe-a");
 
+    // Purchase ledger: transactions nest their lines and superseded revisions.
+    assert_eq!(array_len(&doc, "/purchase_transactions"), 1);
+    let tx = &doc["purchase_transactions"][0];
+    assert_eq!(tx["id"], "pt-a");
+    assert_eq!(tx["revision"], 2);
+    assert_eq!(tx["source_transaction_id"], "SRC-A");
+    assert_eq!(array_len(tx, "/lines"), 1);
+    assert_eq!(tx["lines"][0]["original_text"], "Apples 1kg");
+    assert_eq!(tx["lines"][0]["match_status"], "matched");
+    assert_eq!(array_len(tx, "/revisions"), 1);
+    assert_eq!(tx["revisions"][0]["revision"], 1);
+
     // Reference data the links resolve against is embedded, not assumed.
     let category_ids: Vec<&str> = doc["reference_data"]["categories"]
         .as_array()
@@ -466,6 +529,24 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
             .as_str()
             .unwrap()
     ));
+    for row in doc["purchase_transactions"][0]["lines"].as_array().unwrap() {
+        assert_eq!(
+            row["transaction_id"], "pt-a",
+            "line lost its transaction link"
+        );
+        if let Some(id) = row["canonical_item_id"].as_str() {
+            assert!(catalogue_ids.contains(&id));
+        }
+        if let Some(id) = row["retailer_product_id"].as_str() {
+            assert!(product_ids.contains(&id));
+        }
+    }
+    for row in doc["purchase_transactions"][0]["revisions"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(row["transaction_id"], "pt-a");
+    }
     for child in [
         "entries",
         "entry_events",
@@ -481,6 +562,7 @@ async fn export_contains_the_documented_household_records_with_intact_links() {
     // Household B must not leak into A's export.
     assert!(!doc.to_string().contains("ci-b"));
     assert!(!doc.to_string().contains("list-b"));
+    assert!(!doc.to_string().contains("pt-b"));
 }
 
 #[tokio::test]

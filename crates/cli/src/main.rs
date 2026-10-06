@@ -37,12 +37,20 @@
 //!   (`docs/household-export.md`).
 //! * `delete-household --db <db> --household-id <uuid> [--confirm] [--dry-run]`
 //!   — remove every household-scoped record in one transaction.
+//!
+//! Plus the purchase-ledger import (issue #148):
+//!
+//! * `import-purchases --db <db> --household-id <uuid> --file <json>` — import
+//!   one document of purchase transactions and their lines (idempotent by
+//!   identity; corrections keep the previous revision). Format:
+//!   `docs/purchase-ledger.md`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
-    bootstrap, household, ingest, ingest_lidl, optimise, seed_matches, set_password, validate,
+    bootstrap, household, ingest, ingest_lidl, optimise, purchases, seed_matches, set_password,
+    validate,
 };
 
 #[derive(Parser)]
@@ -207,6 +215,29 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Import purchase transactions into a household's ledger.
+    ///
+    /// Reads one JSON document in the format documented in
+    /// `docs/purchase-ledger.md`, versioned by `format_version`. A transaction
+    /// is identified by its `source_transaction_id` when given, otherwise by a
+    /// stable fingerprint of retailer, date, total and the ordered line texts:
+    /// re-importing the same identity is idempotent (one transaction, one set of
+    /// lines), and a corrected import keeps the previous revision for audit.
+    /// Unmatched lines are kept, never dropped or guessed. All transactions in
+    /// the document are imported in one database transaction. The database must
+    /// already be migrated (the API is the usual migrator).
+    ImportPurchases {
+        /// SQLite database path to write into.
+        #[arg(long)]
+        db: String,
+        /// Household UUID the purchases belong to.
+        #[arg(long, value_parser = parse_household_id)]
+        household_id: String,
+        /// JSON import document path.
+        #[arg(long)]
+        file: String,
+    },
 }
 
 /// Validate `--household-id` parses as a UUID at parse time, so a malformed id
@@ -260,5 +291,10 @@ fn main() -> Result<()> {
             confirm,
             dry_run,
         } => household::delete_run(&db, &household_id, confirm, dry_run),
+        Command::ImportPurchases {
+            db,
+            household_id,
+            file,
+        } => purchases::import_run(&db, &household_id, &file),
     }
 }

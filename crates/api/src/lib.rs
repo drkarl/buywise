@@ -44,6 +44,7 @@ pub mod middleware;
 pub mod mutations;
 pub mod optimise;
 pub mod preferences;
+pub mod purchases;
 pub mod resolution;
 pub mod run_snapshot;
 pub mod savings;
@@ -154,6 +155,9 @@ pub fn api_router(state: AppState) -> Router {
         // `household::router` carries `/api/household[...]`: the member-facing
         // export download and guarded delete (issue #136).
         .merge(household::router())
+        // `purchases::router` carries `/api/household/{id}/purchases[...]`: the
+        // household purchase ledger import/read/delete (issue #148).
+        .merge(purchases::router())
         // Catch-all 404 for any unmatched `/api/...` path. Without this, the SPA
         // `fallback_service` in `app` would swallow unknown API URLs once
         // `frontend/build/200.html` exists and serve the HTML shell with a `200`,

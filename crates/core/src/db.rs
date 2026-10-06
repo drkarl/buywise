@@ -821,6 +821,10 @@ mod tests {
             "purchase_dismissals",
             // Per-store category rules (014, issue #99)
             "household_store_category_rules",
+            // Purchase ledger (019, issue #148)
+            "purchase_transactions",
+            "purchase_lines",
+            "purchase_transaction_revisions",
         ];
 
         for name in expected {
@@ -829,8 +833,8 @@ mod tests {
         }
 
         // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category + 1
-        // store-settings + 2 purchase-suggestion + 1 store-category-rules
-        // application tables (excluding sqlx bookkeeping).
+        // store-settings + 2 purchase-suggestion + 1 store-category-rules + 3
+        // purchase-ledger application tables (excluding sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -1074,8 +1078,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 27,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules and purchase suggestion tables in the file-backed database"
+            count, 30,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules, purchase suggestion and purchase ledger tables in the file-backed database"
         );
 
         pool.close().await;
