@@ -139,7 +139,7 @@ S3-compatible Cloudflare R2 bucket `buywise-backup`, prefix `db`.
 - **Transport and authorisation:** HTTPS to
   `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`, authenticated with an R2 S3
   access key. The keys are **not** in the repository: they live in
-  `/etc/buywise/buywise.env` (`root:root`, mode `600`, `deploy/setup.sh:127-128`)
+  `/etc/buywise/buywise.env` (`root:root`, mode `600`, `deploy/setup.sh:132-133`)
   and are injected into `litestream.service` by systemd's `EnvironmentFile`
   (`deploy/systemd/litestream.service`). Because they are in that process's
   environment, the `buywise` user can read them from `/proc/<litestream-pid>/environ`.

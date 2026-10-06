@@ -7,7 +7,9 @@ replicates the SQLite database to Cloudflare R2.
 
 ## Architecture
 
-Two long-running systemd services run side by side, plus a weekly ingest timer:
+Two long-running systemd services run side by side, plus a weekly ingest timer
+(and, once you serve the app to phones, the optional Caddy reverse proxy from
+section 7):
 
 - `buywise.service` — runs `/usr/local/bin/buywise-api` as the `buywise` user.
 - `litestream.service` — runs `/usr/local/bin/litestream replicate` against the
@@ -175,6 +177,9 @@ sudo ./setup.sh
   before you configure `BASKETWATCH_API_KEY`. The long-running `buywise`/
   `litestream` units are likewise left for you to enable once the binaries are
   in place;
+- installs and enables the Caddy HTTPS reverse proxy **only** once you have set
+  the hostname in `deploy/Caddyfile` and installed Caddy — an opt-in step that
+  never enables the proxy with the placeholder still in place (see section 7);
 - prints the next-step commands.
 
 ## 4. Set environment variables and the R2 endpoint
@@ -200,6 +205,10 @@ sudo systemctl start buywise-ingest.timer
 ```
 
 ## 6. Smoke test (matches acceptance criteria)
+
+> These checks exercise the loopback HTTP listener directly. To serve the app to
+> phones over `https://<hostname>`, complete section 7 (HTTPS reverse proxy) and
+> run its verification block.
 
 **Service is active:**
 
@@ -250,6 +259,204 @@ sqlite3 /tmp/verify.db 'PRAGMA integrity_check; SELECT count(*) FROM sqlite_mast
 sqlite3 /var/lib/buywise/buywise.db 'SELECT count(*) FROM sqlite_master;'
 sudo rm -f /tmp/verify.db  # written by root
 ```
+
+## 7. HTTPS reverse proxy (Caddy)
+
+Section 6 tests the raw listener on the loopback interface. A phone can only
+install the PWA and use offline mode over HTTPS on a real hostname, because the
+API sets its session cookie `Secure` and `SameSite=Strict`
+(`crates/api/src/auth.rs`). Caddy is the supported TLS-terminating proxy: it
+obtains and renews a certificate from Let's Encrypt automatically and forwards
+every request to the API/SPA on `127.0.0.1:3000`. This is the one supported way
+to serve BuyWise over HTTPS — do not put another proxy in front of it.
+
+### 7.1 Point DNS at the server
+
+Create these records at your DNS provider (choosing the hostname is out of scope
+for this runbook):
+
+| Type | Name | Value |
+| --- | --- | --- |
+| `A` | `<hostname>` | the server's public IPv4 address |
+| `AAAA` | `<hostname>` | the server's public IPv6 address (if the server has one) |
+
+Confirm they resolve to this host before continuing — Caddy asks Let's Encrypt
+to validate the name, and certificate issuance fails until the records
+propagate:
+
+```bash
+dig +short A <hostname>
+dig +short AAAA <hostname>
+```
+
+### 7.2 Firewall: SSH and HTTPS only
+
+Open SSH, HTTP and HTTPS, and nothing else. **Ports 80 and 443 must both be
+reachable**: Caddy's automatic HTTPS uses port 80 for the ACME HTTP-01 challenge
+and for the HTTP→HTTPS redirect, and port 443 for the TLS-ALPN-01 challenge and
+for serving the app. The API port (`3000`) is deliberately **not** opened: the
+API binds `0.0.0.0:3000` (a known limitation — see
+[`docs/KNOWN_LIMITATIONS.md`](../docs/KNOWN_LIMITATIONS.md)), and only Caddy,
+over loopback, reaches it.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH   # use `sudo ufw allow 22/tcp` if the profile is missing
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status verbose
+```
+
+`ufw status` must list `22`, `80` and `443` only (for both IPv4 and IPv6).
+Nothing else — in particular no `3000` — is reachable from the internet.
+
+### 7.3 Install Caddy (official repository, ARM64)
+
+Caddy is installed from its official apt repository ([Caddy install docs]),
+whose packages cover Ubuntu `arm64`. The package provides the `caddy.service`
+unit that runs the proxy.
+
+```bash
+sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update
+sudo apt-get install -y caddy
+caddy version
+```
+
+The package installs *and starts* `caddy.service` with a default Caddyfile. You
+replace that file in 7.4.
+
+[Caddy install docs]: https://caddyserver.com/docs/install#debian-ubuntu-raspbian
+
+### 7.4 Set the hostname and install the Caddyfile
+
+`deploy/Caddyfile` is the supported configuration, with the hostname left as a
+placeholder. Replace **only** the `<hostname>` token on the site line — the rest
+of the file already carries the SSE-safe proxy settings:
+
+```bash
+# From the deploy/ directory:
+sed -i 's/<hostname>/buywise.example.com/' Caddyfile   # use the real hostname
+```
+
+Install it and restart Caddy by hand (or use the opt-in `setup.sh` step in 7.5):
+
+```bash
+sudo install -m 0644 Caddyfile /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+journalctl -u caddy -n 50 --no-pager   # watch the certificate being issued
+```
+
+### 7.5 The opt-in setup step
+
+`sudo ./setup.sh` installs the Caddyfile to `/etc/caddy/Caddyfile` and enables
+and starts `caddy.service` **only when** the Caddyfile no longer contains the
+`<hostname>` placeholder, the `caddy` binary is already installed (7.3), and
+`deploy/Caddyfile` exists. With the placeholder still in place it prints
+guidance and leaves Caddy untouched, so a fresh host is never brought up with an
+invalid hostname. It mirrors how `setup.sh` installs the other units: the
+config is copied into place with `install`, then the service is enabled (and,
+unlike `buywise`/`litestream`, started — Caddy has no separate binary-copy step
+to wait for).
+
+### 7.6 Proxy settings for the live-sync SSE stream
+
+The live-sync endpoint `/api/sse/{list_id}` is a long-lived
+`text/event-stream` connection. The settings that matter in `deploy/Caddyfile`
+are:
+
+- `flush_interval -1` puts the proxy in low-latency mode: response buffering is
+  disabled and Caddy flushes immediately after each write to the client. Caddy
+  already flushes a `text/event-stream` response immediately even without this
+  setting, but stating it explicitly makes live sync independent of that
+  content-type inference — each frame (a `mutation`, or the API's 30-second
+  `heartbeat`) is written straight to the phone.
+- `read_timeout 0` / `write_timeout 0` keep the proxy's own read/write timeouts
+  disabled (0 = no timeout, Caddy's default), because the stream is idle between
+  mutations and only carries the heartbeat. They are stated explicitly so a
+  future edit does not lower them. The API emits that heartbeat precisely so
+  intermediaries do not drop an idle connection (`crates/api/src/sse.rs`).
+
+There is no `encode` directive, so Caddy does not compress the event stream.
+
+### 7.7 Cookies behind the proxy
+
+No proxy setting changes cookie behaviour, and none is needed:
+
+- Caddy forwards the API's `Set-Cookie` headers unchanged and terminates TLS, so
+  the browser sees `https://<hostname>` and keeps the `Secure` flag on both
+  cookies.
+- `SameSite=Strict` is satisfied because the SPA and the API share one origin
+  (`https://<hostname>`): the login POST, the session cookie and the SSE
+  connection are all same-site.
+- Caddy sets `X-Forwarded-For`/`X-Forwarded-Proto` by default, but the API does
+  not read them and does not alter cookie flags based on them.
+
+Confirm the flags hold through the proxy in 7.8 step 3.
+
+### 7.8 HTTPS verification
+
+Run these once DNS resolves and Caddy is up (replace `<hostname>`).
+
+**1. Certificate is live and the app is served.**
+
+```bash
+curl -sSI https://<hostname>/ | head -n 1
+# expect: HTTP/2 200  (or HTTP/1.1 200)
+
+echo | openssl s_client -connect <hostname>:443 -servername <hostname> 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+# expect: subject=CN = <hostname>; issuer=... Let's Encrypt ...; notBefore/notAfter dates
+```
+
+**2. The API answers over HTTPS, and unauthenticated `/api/auth/me` is 401.**
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://<hostname>/
+curl -sS -o /dev/null -w '%{http_code}\n' https://<hostname>/api/auth/me
+# expect: 200 then 401
+```
+
+**3. Login cookie flags are intact behind the proxy.**
+
+```bash
+curl -sS -D - -o /dev/null -X POST https://<hostname>/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"<email>","password":"<password>"}' | grep -i '^set-cookie:'
+# expect two Set-Cookie lines:
+#   session=...; Path=/; HttpOnly; Secure; SameSite=Strict
+#   csrf=...; Path=/; Secure; SameSite=Strict
+```
+
+**4. The SSE stream works through the proxy (i.e. it is not buffered).**
+
+Use the `session` cookie from step 3 and a list id the logged-in household
+owns. The connection must stay open and a frame must arrive **while it is
+open** — an immediate `mutation`, or the 30-second `event: heartbeat`:
+
+```bash
+curl -sS -N --max-time 40 \
+  -H 'Cookie: session=<session-token-from-step-3>' \
+  'https://<hostname>/api/sse/<list-id>'
+# expect: the connection stays open and prints `event: heartbeat` (and any
+# `event: mutation` frames) before curl's 40s limit closes it. If nothing
+# prints until the connection closes, something along the path is buffering:
+# confirm flush_interval -1 is present in /etc/caddy/Caddyfile and that no
+# other intermediary buffers the stream.
+```
+
+Once this passes, open `https://<hostname>/` on each phone and install the PWA.
+Serving the app over HTTPS satisfies the PWA's secure-context requirement, so
+offline mode and live sync work on both phones.
 
 ## Weekly price ingest
 

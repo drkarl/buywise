@@ -496,3 +496,33 @@ Open follow-ups:
   for deleted SQLite pages.
 - Revisit deletion of aggregate usage counters if they become household-attributable.
 - Consider an encrypted export option for the point-in-time JSON snapshot.
+
+## HTTPS reverse proxy (deploy runbook)
+
+Issue #140, roadmap #114 (deploy issue #96). Caddy terminates TLS in front of the
+BuyWise API/SPA; see `deploy/README.md` section 7 and `deploy/Caddyfile`.
+
+### 1. The API hardcodes its bind address, so port 3000 is kept private by the host firewall rather than by the app
+
+**What happens.** `buywise-api` binds `0.0.0.0:PORT` unconditionally
+(`crates/api/src/main.rs`: `SocketAddr::from(([0, 0, 0, 0], port))`); only the
+port is configurable (`PORT`). The process therefore listens on every interface,
+including the public one, and the deploy runbook relies on the host firewall
+(ufw: SSH/80/443 only) to keep port 3000 unreachable from the internet. The
+inside-the-host port stays reachable to any local process, and the listener is
+not "closed" at the socket level — it is only blocked at the packet filter.
+
+**Why accepted.** Binding the API to loopback is the clean fix, but it needs a
+code change to read a bind address from the environment, and this issue's scope
+is documentation and deploy configuration only. The firewall is the captain's
+chosen control ("a firewall allowing SSH and HTTPS only with the API port closed
+to the public"), and it is sufficient on this single-host deploy where Caddy is
+the only public listener.
+
+**Workaround.** Keep the firewall rules as documented in `deploy/README.md`
+section 7.2 and confirm `sudo ufw status verbose` lists only SSH, 80 and 443.
+
+**Follow-up.** Add a bind-address environment variable (e.g. `BIND_ADDRESS`,
+defaulting to `0.0.0.0`) to `crates/api/src/main.rs` and set it to `127.0.0.1`
+in `deploy/systemd/buywise.service`, so the port is loopback-only without
+depending on the firewall.

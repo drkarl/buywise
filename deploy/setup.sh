@@ -10,7 +10,11 @@
 # exact commands to do so. It DOES `enable` (but deliberately does NOT `start`)
 # the weekly ingest *timer*: enabling persists it for the next boot, while
 # leaving the start to the post-env step prevents a Persistent=true catch-up
-# run from firing before the operator has set BASKETWATCH_API_KEY.
+# run from firing before the operator has set BASKETWATCH_API_KEY. It also
+# installs and enables the Caddy HTTPS reverse proxy, but ONLY once the operator
+# has replaced the <hostname> placeholder in Caddyfile and Caddy is already
+# installed (see deploy/README.md section 7); it never enables the proxy with the
+# placeholder still in place.
 #
 # Prerequisites (see deploy/README.md): the buywise-api, buywise-cli, and
 # litestream binaries must already be copied to /usr/local/bin/.
@@ -28,6 +32,7 @@ readonly ENV_DIR="/etc/buywise"
 readonly ENV_FILE="${ENV_DIR}/buywise.env"
 readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly LITESTREAM_CONFIG="/etc/litestream.yml"
+readonly CADDY_CONFIG="/etc/caddy/Caddyfile"
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "Error: this script must be run as root (use: sudo ./setup.sh)." >&2
@@ -146,6 +151,30 @@ echo "==> Enabling buywise-ingest.timer (weekly price ingest; not started yet)"
 systemctl enable buywise-ingest.timer \
     || echo "WARN: could not enable timer (no running systemd?); enable manually after setting the env file: systemctl enable --now buywise-ingest.timer" >&2
 
+# Opt-in HTTPS reverse proxy. Installs the Caddyfile and enables/starts Caddy
+# only once the operator has replaced the <hostname> placeholder and installed
+# Caddy first: Caddy's automatic HTTPS would otherwise retry an invalid hostname
+# forever. This mirrors how the other units are installed (`install` into place,
+# then `systemctl enable`), except that Caddy is started here because serving
+# HTTPS is the point of the step and there is no separate binary-copy step to
+# wait for.
+echo "==> Installing Caddy HTTPS reverse proxy (opt-in)"
+CADDY_SOURCE="${SCRIPT_DIR}/Caddyfile"
+if [[ ! -f "${CADDY_SOURCE}" ]]; then
+    echo "    ${CADDY_SOURCE} not found; skipping the reverse-proxy step"
+elif grep -q '<hostname>' "${CADDY_SOURCE}"; then
+    echo "    placeholder <hostname> still present in ${CADDY_SOURCE}; NOT installing the Caddyfile or enabling Caddy."
+    echo "    Set the hostname, install Caddy, then re-run setup.sh (see deploy/README.md section 7)."
+elif ! command -v caddy >/dev/null 2>&1; then
+    echo "    caddy binary not found; install Caddy first, then re-run setup.sh (see deploy/README.md section 7)." >&2
+else
+    install -d -m 0755 /etc/caddy
+    install -m 0644 "${CADDY_SOURCE}" "${CADDY_CONFIG}"
+    echo "    installed ${CADDY_CONFIG}"
+    systemctl enable --now caddy \
+        || echo "WARN: could not enable/start caddy (no running systemd?); enable manually: systemctl enable --now caddy" >&2
+fi
+
 cat <<EOF
 
 ==> Setup complete.
@@ -217,5 +246,10 @@ Next steps:
        systemctl status litestream
        # Uses the default port 3000; adjust if you set PORT in ${ENV_FILE}.
        curl -i http://localhost:3000/api/auth/me
+
+5. To serve the app to phones over HTTPS, follow deploy/README.md section 7
+   (Caddy reverse proxy). This script installs the Caddyfile to
+   ${CADDY_CONFIG} and enables caddy.service automatically once the
+   hostname is set in deploy/Caddyfile and Caddy is installed.
 
 EOF
