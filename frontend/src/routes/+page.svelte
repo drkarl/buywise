@@ -282,6 +282,7 @@
 			<p class="ledger-link">
 				<a href="/settings">Store settings →</a>
 				· <a href="/savings">View your savings ledger →</a>
+				· <a href="/purchases">Purchases →</a>
 				· <a href="/receipts">Receipts →</a>
 			</p>
 		</div>

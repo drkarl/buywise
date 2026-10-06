@@ -145,6 +145,7 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
     "id", "household_id", "retailer", "purchase_date", "source_kind",
     "source_transaction_id", "transaction_identity", "identity_kind", "fingerprint",
     "currency", "total_cents", "revision", "source_payload", "created_at", "updated_at",
+    "receipt_image_id",
     "lines":     [ { "id", "transaction_id", "line_ordinal", "original_text", "name",
                      "brand", "quantity", "size_value", "size_unit", "unit_price_cents",
                      "line_total_cents", "line_discount_cents", "deposit_cents",

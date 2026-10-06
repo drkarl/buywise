@@ -85,7 +85,7 @@ in `migrations/`, and serves; the CLI and the weekly ingest open the same file.
 | `recommendation_runs`, `savings_events` | optimiser runs (`plans_json`) and realised/estimated savings | savings history |
 | `product_matches`, `match_feedback` | accepted/rejected/suggested canonical↔retailer-product links, and accept/reject/prefer/undo feedback | price matching + learning |
 | `purchase_events`, `purchase_dismissals` | one row per observed purchase (`check_off` today), and per-item "not now" dismissals | purchase suggestions |
-| `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links) and their superseded revisions | the purchase ledger — what the household actually bought (issue #148) |
+| `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported and hand-entered (`source_kind = manual`) purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links), their superseded revisions, and an optional receipt-photo link (`receipt_image_id`, cleared if the image goes) | the purchase ledger — what the household actually bought (issues #148, #156) |
 | `receipt_images` | metadata for each stored receipt photo: household, uploader, upload and expiry timestamps, detected content type, size, SHA-256, storage key and processing choice | §4; the image **bytes are not here** — they are files in the receipt directory |
 
 **Receipt-image bytes live outside this file.** `receipt_images.storage_key` names
@@ -263,8 +263,10 @@ upload path stores that choice as `local`, but does not read or process the imag
 Raw images are kept 30 days with the derived purchase lines kept as
 ordinary purchase records; no community publication and no model training.
 **Reading the image is not implemented** — this slice stores and serves the photo;
-OCR, linking an image to purchase lines and an offline upload queue are not part
-of it (§4.6).
+OCR and an offline upload queue are not part of it (§4.6). A member may link one
+image to one purchase by hand at the Purchases screen (issue #156, §5.1b), and the
+link clears — leaving the purchase and its lines — when the image is deleted or
+expires.
 
 ### 4.1 Where the bytes live
 
@@ -349,9 +351,10 @@ records and are not touched by expiry.
 ### 4.6 Not in this slice
 
 No reading (OCR) of the image, no external processing, no offline upload queueing,
-no image editing or EXIF stripping (a camera's EXIF, including any location tag,
-is stored verbatim — see [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md)), and
-no link between an image and the purchase records it documents.
+and no image editing or EXIF stripping (a camera's EXIF, including any location
+tag, is stored verbatim — see [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md)).
+An image may be linked to one purchase by hand (issue #156, §5.1b), but nothing
+reads the image and nothing verifies that the purchase's lines match it.
 
 ## 5. Retention and deletion
 
@@ -430,6 +433,36 @@ normal account. Removing the household's last owner is
 `bootstrap-household` (§5.1). See
 [`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) ("Household member
 management").
+
+### 5.1b The purchases screen
+
+A household member adds, edits, opens and deletes purchases by hand at the
+Purchases screen (issue #156), beside the photo of the receipt that documents
+them. Hand-entered purchases are written to the same ledger as imported ones
+(`source_kind = manual`) with a generated UUID as their identity, so a later edit
+is a correction of the same transaction — a revision, never a second purchase —
+through the ledger's existing correction rule; deleting uses the ledger's delete.
+Lines are stored `unmatched`, and an imported purchase is corrected by
+re-importing rather than by hand. A purchase may link one of the household's own
+receipt photos: the link is stored in `purchase_transactions.receipt_image_id`
+and is cleared, leaving the purchase and its lines intact, when that image is
+deleted or expires (`ON DELETE SET NULL`, migration 021).
+
+| Request | Method | Who | Purpose |
+| --- | --- | --- | --- |
+| `GET /api/household/{id}/purchases` | `GET` | any member | list transactions, no lines (the same path's `POST` is the operator import) |
+| `GET /api/household/{id}/purchases/{txid}` | `GET` | any member | one transaction with its lines and revisions |
+| `POST /api/household/{id}/purchases/manual` | `POST` | any member | add one purchase typed by hand |
+| `PUT /api/household/{id}/purchases/{txid}` | `PUT` | any member | correct a hand-entered purchase (a revision) |
+| `PUT /api/household/{id}/purchases/{txid}/receipt` | `PUT` | any member | set or clear the linked receipt photo |
+| `DELETE /api/household/{id}/purchases/{txid}` | `DELETE` | any member | delete one transaction; its lines and revisions go with it |
+
+Every route requires membership of the named household (`403` otherwise; a
+transaction of another household reads `404`). Money is integer cents on the
+wire; the screen converts the euro amounts a member types. The ledger and its
+import format are documented in [`docs/purchase-ledger.md`](purchase-ledger.md),
+and the screen's known gaps (no offline entry queue, no product matching) in
+[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md).
 
 ### 5.2 What deletion removes
 

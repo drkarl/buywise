@@ -45,12 +45,13 @@
 //! never run migrations themselves. Every read and write filters on the
 //! household id, so one household can never see or change another's ledger.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
-use crate::db;
+use crate::{db, receipts};
 
 /// The only import layout this build reads. Bumping it accompanies an
 /// incompatible change to the format documented in `docs/purchase-ledger.md`.
@@ -62,6 +63,11 @@ pub const DEFAULT_CURRENCY: &str = "EUR";
 
 /// The `source_kind` imports write (`receipt` is reserved for receipt reading).
 pub const SOURCE_KIND_IMPORT: &str = "import";
+
+/// The `source_kind` a purchase typed by hand at the Purchases screen writes
+/// (issue #156). Its identity is a generated UUID, so an edit corrects the same
+/// row rather than creating a second purchase.
+pub const SOURCE_KIND_MANUAL: &str = "manual";
 
 /// Unmatched status value for a purchase line.
 pub const MATCH_UNMATCHED: &str = "unmatched";
@@ -93,6 +99,17 @@ pub enum ImportError {
     /// The target household does not exist.
     #[error("no household with id {0}")]
     NoSuchHousehold(String),
+
+    /// No such transaction in this household — a transaction of another
+    /// household is indistinguishable from a missing one.
+    #[error("no purchase transaction {0} in this household")]
+    NoSuchTransaction(String),
+
+    /// A hand edit named a transaction that was not entered by hand. Imported
+    /// purchases are corrected by re-importing; the manual endpoint refuses them
+    /// so it can never silently turn an import into a manual purchase.
+    #[error("purchase transaction {0} was not entered by hand and cannot be edited here")]
+    NotManual(String),
 
     /// A query or transaction failed at the sqlx layer.
     #[error(transparent)]
@@ -221,6 +238,9 @@ pub struct TransactionSummary {
     pub updated_at: String,
     /// Number of lines on the current revision.
     pub line_count: i64,
+    /// `receipt_images.id` of the linked receipt photo, or `None` when the
+    /// purchase has no photo (or the linked image was deleted or expired).
+    pub receipt_image_id: Option<String>,
 }
 
 /// One stored line of a transaction.
@@ -776,20 +796,21 @@ pub async fn import_transactions(
     document: &Value,
 ) -> Result<ImportOutcome, ImportError> {
     let transactions = parse_import_document(document)?;
-
-    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM households WHERE id = ?1")
-        .bind(household_id)
-        .fetch_optional(pool)
-        .await?;
-    if exists.is_none() {
-        return Err(ImportError::NoSuchHousehold(household_id.to_string()));
-    }
-
+    require_household(pool, household_id).await?;
     validate_line_links(pool, household_id, &transactions).await?;
     let mut conn = pool.begin().await?;
     let mut results = Vec::with_capacity(transactions.len());
     for transaction in &transactions {
-        results.push(import_one(&mut conn, household_id, transaction).await?);
+        results.push(
+            write_transaction(
+                &mut conn,
+                household_id,
+                SOURCE_KIND_IMPORT,
+                transaction,
+                None,
+            )
+            .await?,
+        );
     }
     conn.commit().await?;
 
@@ -807,6 +828,17 @@ pub async fn import_transactions(
         }
     }
     Ok(outcome)
+}
+
+async fn require_household(pool: &SqlitePool, household_id: &str) -> Result<(), ImportError> {
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM households WHERE id = ?1")
+        .bind(household_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(ImportError::NoSuchHousehold(household_id.to_string()));
+    }
+    Ok(())
 }
 
 async fn validate_line_links(
@@ -884,10 +916,24 @@ struct LineRow {
     match_status: String,
 }
 
-async fn import_one(
+/// Write one parsed transaction under `source_kind`.
+///
+/// `target_id` is `None` for a fresh write, where the row is found by the
+/// ledger's `(household_id, retailer, source_kind, identity)` key — the import
+/// path — and `Some(id)` to correct one known row in place, the manual-edit
+/// path, where the retailer (part of that key) may have changed and the
+/// identity alone would no longer resolve it.
+///
+/// Both callers share the ledger's correction rule: content identical to the
+/// stored row is [`ImportStatus::Unchanged`], and differing content snapshots
+/// the previous revision into `purchase_transaction_revisions` before the live
+/// row's revision is bumped and its lines are replaced.
+async fn write_transaction(
     conn: &mut SqliteConnection,
     household_id: &str,
+    source_kind: &str,
     transaction: &ParsedTransaction,
+    target_id: Option<&str>,
 ) -> Result<TransactionResult, ImportError> {
     let fingerprint = transaction.fingerprint();
     let (source_id, identity_kind) = transaction.identity();
@@ -898,39 +944,47 @@ async fn import_one(
     };
 
     let now = db::now_iso();
-    let id = uuid::Uuid::new_v4().to_string();
-    let inserted = insert_transaction(
-        conn,
-        &id,
-        household_id,
-        transaction,
-        identity,
-        identity_kind,
-        &fingerprint,
-        1,
-        &now,
-    )
-    .await?;
-    if inserted {
-        insert_lines(conn, &id, &transaction.lines, 1, &now).await?;
-        return Ok(TransactionResult {
-            transaction_id: id,
-            revision: 1,
-            status: ImportStatus::Inserted,
-        });
-    }
+    let target_id: String = match target_id {
+        Some(id) => id.to_string(),
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let inserted = insert_transaction(
+                conn,
+                &id,
+                household_id,
+                source_kind,
+                transaction,
+                identity,
+                identity_kind,
+                &fingerprint,
+                1,
+                &now,
+            )
+            .await?;
+            if inserted {
+                insert_lines(conn, &id, &transaction.lines, 1, &now).await?;
+                return Ok(TransactionResult {
+                    transaction_id: id,
+                    revision: 1,
+                    status: ImportStatus::Inserted,
+                });
+            }
 
-    let target_id: String = sqlx::query_scalar(
-        "SELECT id FROM purchase_transactions \
-         WHERE household_id = ?1 AND retailer = ?2 AND source_kind = ?3 \
-         AND transaction_identity = ?4",
-    )
-    .bind(household_id)
-    .bind(&transaction.retailer)
-    .bind(SOURCE_KIND_IMPORT)
-    .bind(identity)
-    .fetch_one(&mut *conn)
-    .await?;
+            // The identity is already stored: resolve the row it names and fall
+            // through to the comparison and correction path below.
+            sqlx::query_scalar(
+                "SELECT id FROM purchase_transactions \
+                 WHERE household_id = ?1 AND retailer = ?2 AND source_kind = ?3 \
+                 AND transaction_identity = ?4",
+            )
+            .bind(household_id)
+            .bind(&transaction.retailer)
+            .bind(source_kind)
+            .bind(identity)
+            .fetch_one(&mut *conn)
+            .await?
+        }
+    };
 
     let stored: StoredTransaction = sqlx::query_as(
         "SELECT retailer, purchase_date, currency, total_cents, revision, source_payload \
@@ -1009,6 +1063,7 @@ async fn insert_transaction(
     conn: &mut SqliteConnection,
     id: &str,
     household_id: &str,
+    source_kind: &str,
     transaction: &ParsedTransaction,
     identity: &str,
     identity_kind: &str,
@@ -1028,7 +1083,7 @@ async fn insert_transaction(
     .bind(household_id)
     .bind(&transaction.retailer)
     .bind(&transaction.purchase_date)
-    .bind(SOURCE_KIND_IMPORT)
+    .bind(source_kind)
     .bind(&transaction.source_transaction_id)
     .bind(identity)
     .bind(identity_kind)
@@ -1122,6 +1177,385 @@ fn parsed_content(transaction: &ParsedTransaction) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Manual purchases (issue #156)
+// ---------------------------------------------------------------------------
+
+/// A hand-entered purchase after parsing and validation, before it is written.
+///
+/// `total_cents` is always set: the printed receipt total when the caller
+/// supplied one, otherwise the sum of the line amounts (`line_total_cents`
+/// minus `line_discount_cents`). `source_payload` is the request body stored
+/// verbatim, so a manual purchase carries the same auditable original payload
+/// an import does.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParsedManualPurchase {
+    /// Retailer token, trimmed and lowercased.
+    pub retailer: String,
+    /// Calendar date of the purchase (`YYYY-MM-DD`).
+    pub purchase_date: String,
+    /// Total in integer cents: as printed, or the line sum when omitted.
+    pub total_cents: i64,
+    /// `receipt_images.id` of the chosen photo, if any.
+    pub receipt_image_id: Option<String>,
+    /// The transaction's lines, in ordinal order, all unmatched.
+    pub lines: Vec<ParsedLine>,
+    /// The request body stored verbatim as the source payload.
+    pub source_payload: String,
+}
+
+/// Parse and validate the body of a manual purchase (create or edit).
+///
+/// The field names match the import format's transaction and line fields so the
+/// screen's payload and an importer share one vocabulary: `retailer`,
+/// `purchase_date`, `total_cents` (optional), `receipt_image_id` (optional) and
+/// `lines` of `original_text`, `quantity`, `line_total_cents`,
+/// `line_discount_cents`. Unknown fields, wrong types and missing required
+/// fields are reported together with their field paths, exactly as the import
+/// parser reports them.
+///
+/// Money is integer cents. A negative `total_cents` or `line_total_cents` is
+/// refused. A line's `line_discount_cents` is the one place a negative amount is
+/// accepted (a surcharge, or the only way to express a reduction on a line whose
+/// printed total already excludes it) — the import path still refuses negative
+/// discounts. Every line is stored `unmatched`; nothing links it to a product.
+pub fn parse_manual_purchase(body: &Value) -> Result<ParsedManualPurchase, ImportError> {
+    let mut errors: Vec<String> = Vec::new();
+    let Some(map) = body.as_object() else {
+        return Err(ImportError::Malformed(vec![
+            "$: expected a JSON object".to_string()
+        ]));
+    };
+    reject_unknown_keys(
+        map,
+        "$",
+        &[
+            "retailer",
+            "purchase_date",
+            "total_cents",
+            "receipt_image_id",
+            "lines",
+        ],
+        &mut errors,
+    );
+
+    let retailer = req_string(map, "$", "retailer", &mut errors).map(|s| s.to_lowercase());
+    let purchase_date = req_date(map, "$", "purchase_date", &mut errors);
+    let printed_total = opt_i64(map, "$", "total_cents", &mut errors);
+    if matches!(printed_total, Some(total) if total < 0) {
+        errors.push("$.total_cents: must not be negative".to_string());
+    }
+    let receipt_image_id = opt_string(map, "$", "receipt_image_id", &mut errors);
+
+    let lines = match map.get("lines") {
+        None => {
+            errors.push("$.lines: missing required field".to_string());
+            Vec::new()
+        }
+        Some(Value::Array(array)) => {
+            if array.len() > MAX_LINES_PER_TRANSACTION {
+                errors.push(format!(
+                    "$.lines: at most {MAX_LINES_PER_TRANSACTION} lines per purchase"
+                ));
+            }
+            array
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    parse_manual_line(line, &format!("lines[{index}]"), &mut errors)
+                })
+                .collect()
+        }
+        Some(_) => {
+            errors.push("$.lines: expected an array".to_string());
+            Vec::new()
+        }
+    };
+
+    // The printed total wins when supplied; otherwise the lines are the total.
+    let total_cents = printed_total.unwrap_or_else(|| {
+        lines
+            .iter()
+            .map(|line| line.line_total_cents - line.line_discount_cents)
+            .sum()
+    });
+
+    if !errors.is_empty() {
+        return Err(ImportError::Malformed(errors));
+    }
+
+    // `req_string`/`req_date` push an error on failure, so no errors above means
+    // both required fields parsed.
+    Ok(ParsedManualPurchase {
+        retailer: retailer.expect("retailer validated above"),
+        purchase_date: purchase_date.expect("purchase_date validated above"),
+        total_cents,
+        receipt_image_id,
+        lines,
+        source_payload: compact_json(body),
+    })
+}
+
+/// One hand-entered line: the printed description, an optional quantity, the
+/// line total and an optional (possibly negative) discount. Everything the
+/// ledger can carry but the form cannot ask for stays `NULL`.
+fn parse_manual_line(value: &Value, path: &str, errors: &mut Vec<String>) -> Option<ParsedLine> {
+    let Some(map) = value.as_object() else {
+        errors.push(format!("{path}: expected an object"));
+        return None;
+    };
+    reject_unknown_keys(
+        map,
+        path,
+        &[
+            "original_text",
+            "quantity",
+            "line_total_cents",
+            "line_discount_cents",
+        ],
+        errors,
+    );
+
+    let original_text = req_string(map, path, "original_text", errors);
+    let quantity = opt_positive_f64(map, path, "quantity", errors);
+    let line_total_cents = req_i64(map, path, "line_total_cents", errors);
+    if matches!(line_total_cents, Some(total) if total < 0) {
+        errors.push(format!("{path}.line_total_cents: must not be negative"));
+    }
+    let line_discount_cents = opt_i64(map, path, "line_discount_cents", errors).unwrap_or(0);
+
+    Some(ParsedLine {
+        original_text: original_text?,
+        name: None,
+        brand: None,
+        quantity,
+        size_value: None,
+        size_unit: None,
+        unit_price_cents: None,
+        line_total_cents: line_total_cents?,
+        line_discount_cents,
+        deposit_cents: 0,
+        retailer_product_id: None,
+        canonical_item_id: None,
+        match_status: MATCH_UNMATCHED.to_string(),
+    })
+}
+
+/// Create one manual purchase for `household_id`.
+///
+/// The purchase is written with [`SOURCE_KIND_MANUAL`] and a generated UUID as
+/// its `source_transaction_id`, so it has a stable identity from the first
+/// write and every later edit is a correction of this row. `now` is the
+/// injected clock, used only to decide whether a chosen receipt photo is still
+/// live. Returns the stored transaction with its lines and revisions.
+pub async fn create_manual_purchase(
+    pool: &SqlitePool,
+    household_id: &str,
+    body: &Value,
+    now: DateTime<Utc>,
+) -> Result<TransactionDetail, ImportError> {
+    let parsed = parse_manual_purchase(body)?;
+    require_household(pool, household_id).await?;
+    let receipt_image_id =
+        validate_receipt_link(pool, household_id, parsed.receipt_image_id.as_deref(), now).await?;
+
+    let transaction = ParsedTransaction {
+        source_transaction_id: Some(uuid::Uuid::new_v4().to_string()),
+        retailer: parsed.retailer,
+        purchase_date: parsed.purchase_date,
+        currency: DEFAULT_CURRENCY.to_string(),
+        total_cents: parsed.total_cents,
+        source_payload: parsed.source_payload,
+        lines: parsed.lines,
+    };
+
+    let mut conn = pool.begin().await?;
+    let result = write_transaction(
+        &mut conn,
+        household_id,
+        SOURCE_KIND_MANUAL,
+        &transaction,
+        None,
+    )
+    .await?;
+    if let Some(image_id) = &receipt_image_id {
+        set_stored_link(
+            &mut conn,
+            household_id,
+            &result.transaction_id,
+            Some(image_id),
+        )
+        .await?;
+    }
+    conn.commit().await?;
+
+    fetch_detail(pool, household_id, &result.transaction_id).await
+}
+
+/// Correct one manual purchase of `household_id` in place.
+///
+/// The transaction must already be [`SOURCE_KIND_MANUAL`]: an imported purchase
+/// is corrected by re-importing, so the manual endpoint refuses it rather than
+/// silently turning an import into a hand-entered one. The edit keeps the stored
+/// identity, so it is a correction of the same row and never a second purchase:
+/// identical content is a no-op and differing content snapshots the previous
+/// revision and bumps the live revision, the ledger's one correction rule. The
+/// body's `receipt_image_id` replaces the stored link (absent or null clears
+/// it), which by itself does not change the content or the revision. Returns the
+/// stored transaction with its lines and revisions.
+pub async fn update_manual_purchase(
+    pool: &SqlitePool,
+    household_id: &str,
+    transaction_id: &str,
+    body: &Value,
+    now: DateTime<Utc>,
+) -> Result<TransactionDetail, ImportError> {
+    let parsed = parse_manual_purchase(body)?;
+
+    let stored: Option<(String, String)> = sqlx::query_as(
+        "SELECT source_kind, transaction_identity FROM purchase_transactions \
+         WHERE id = ?1 AND household_id = ?2",
+    )
+    .bind(transaction_id)
+    .bind(household_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((source_kind, identity)) = stored else {
+        return Err(ImportError::NoSuchTransaction(transaction_id.to_string()));
+    };
+    if source_kind != SOURCE_KIND_MANUAL {
+        return Err(ImportError::NotManual(transaction_id.to_string()));
+    }
+
+    let receipt_image_id =
+        validate_receipt_link(pool, household_id, parsed.receipt_image_id.as_deref(), now).await?;
+
+    let transaction = ParsedTransaction {
+        source_transaction_id: Some(identity),
+        retailer: parsed.retailer,
+        purchase_date: parsed.purchase_date,
+        currency: DEFAULT_CURRENCY.to_string(),
+        total_cents: parsed.total_cents,
+        source_payload: parsed.source_payload,
+        lines: parsed.lines,
+    };
+
+    let mut conn = pool.begin().await?;
+    write_transaction(
+        &mut conn,
+        household_id,
+        SOURCE_KIND_MANUAL,
+        &transaction,
+        Some(transaction_id),
+    )
+    .await?;
+    set_stored_link(
+        &mut conn,
+        household_id,
+        transaction_id,
+        receipt_image_id.as_deref(),
+    )
+    .await?;
+    conn.commit().await?;
+
+    fetch_detail(pool, household_id, transaction_id).await
+}
+
+/// Set or clear the receipt photo linked to one purchase of `household_id`.
+///
+/// Any purchase in the household may be linked — imported or manual — and the
+/// link is not part of the purchase's content, so this changes neither the
+/// revision nor the lines. `receipt_image_id` must name one of the household's
+/// own unexpired receipt photos; `None` clears the link. Errors with
+/// [`ImportError::NoSuchTransaction`] when the household has no such purchase,
+/// so a cross-household call changes nothing.
+pub async fn set_receipt_link(
+    pool: &SqlitePool,
+    household_id: &str,
+    transaction_id: &str,
+    receipt_image_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), ImportError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM purchase_transactions WHERE id = ?1 AND household_id = ?2)",
+    )
+    .bind(transaction_id)
+    .bind(household_id)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Err(ImportError::NoSuchTransaction(transaction_id.to_string()));
+    }
+
+    let image_id = validate_receipt_link(pool, household_id, receipt_image_id, now).await?;
+    let mut conn = pool.begin().await?;
+    set_stored_link(&mut conn, household_id, transaction_id, image_id.as_deref()).await?;
+    conn.commit().await?;
+    Ok(())
+}
+
+/// Validate a chosen receipt photo and return the id to store.
+///
+/// The photo must belong to the same household and must not be past its expiry,
+/// so a purchase is never linked to another household's image or to one the next
+/// sweep will delete. `None` passes through as "no link".
+async fn validate_receipt_link(
+    pool: &SqlitePool,
+    household_id: &str,
+    receipt_image_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, ImportError> {
+    let Some(id) = receipt_image_id else {
+        return Ok(None);
+    };
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM receipt_images WHERE id = ?1 AND household_id = ?2 AND expires_at > ?3",
+    )
+    .bind(id)
+    .bind(household_id)
+    .bind(receipts::iso(now))
+    .fetch_optional(pool)
+    .await?;
+    match found {
+        Some(id) => Ok(Some(id)),
+        None => Err(ImportError::Malformed(vec![
+            "receipt_image_id: no unexpired receipt photo with that id in this household"
+                .to_string(),
+        ])),
+    }
+}
+
+/// Write one row's receipt link (and its `updated_at`) on an open transaction.
+async fn set_stored_link(
+    conn: &mut SqliteConnection,
+    household_id: &str,
+    transaction_id: &str,
+    receipt_image_id: Option<&str>,
+) -> Result<(), ImportError> {
+    sqlx::query(
+        "UPDATE purchase_transactions SET receipt_image_id = ?1, updated_at = ?2 \
+         WHERE id = ?3 AND household_id = ?4",
+    )
+    .bind(receipt_image_id)
+    .bind(db::now_iso())
+    .bind(transaction_id)
+    .bind(household_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Fetch one transaction of `household_id` that the caller just wrote.
+async fn fetch_detail(
+    pool: &SqlitePool,
+    household_id: &str,
+    transaction_id: &str,
+) -> Result<TransactionDetail, ImportError> {
+    get_transaction(pool, household_id, transaction_id)
+        .await?
+        .ok_or_else(|| ImportError::NoSuchTransaction(transaction_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Reads and deletes
 // ---------------------------------------------------------------------------
 
@@ -1133,7 +1567,7 @@ pub async fn list_transactions(
     let rows = sqlx::query_as::<_, TransactionSummary>(
         "SELECT t.id, t.household_id, t.retailer, t.purchase_date, t.source_kind, \
                 t.source_transaction_id, t.identity_kind, t.fingerprint, t.currency, \
-                t.total_cents, t.revision, t.created_at, t.updated_at, \
+                t.total_cents, t.revision, t.created_at, t.updated_at, t.receipt_image_id, \
                 (SELECT COUNT(*) FROM purchase_lines pl WHERE pl.transaction_id = t.id) AS line_count \
          FROM purchase_transactions t WHERE t.household_id = ?1 \
          ORDER BY t.purchase_date, t.id",
@@ -1218,7 +1652,7 @@ async fn fetch_transaction_summary(
     sqlx::query_as::<_, TransactionSummary>(
         "SELECT t.id, t.household_id, t.retailer, t.purchase_date, t.source_kind, \
                 t.source_transaction_id, t.identity_kind, t.fingerprint, t.currency, \
-                t.total_cents, t.revision, t.created_at, t.updated_at, \
+                t.total_cents, t.revision, t.created_at, t.updated_at, t.receipt_image_id, \
                 (SELECT COUNT(*) FROM purchase_lines pl WHERE pl.transaction_id = t.id) AS line_count \
          FROM purchase_transactions t WHERE t.id = ?1 AND t.household_id = ?2",
     )
