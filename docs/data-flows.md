@@ -415,7 +415,7 @@ decisions (issues #136/#142); the rest describes unchanged state.
 
 | Area | Current state | Assessment |
 | --- | --- | --- |
-| R2 credential storage | `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` in `/etc/buywise/buywise.env`, `root:root` `0600`; injected by systemd | Good file hygiene. But the keys are in the `litestream` process environment, readable by the `buywise` user via `/proc`. Consider an R2 token scoped to the single bucket, and whether Litestream should run as a distinct user. |
+| R2 credential storage | `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` in `/etc/buywise/buywise.env`, `root:root` `0600`; injected by systemd | Good file hygiene. The keys are in the `litestream` process environment, readable by the `buywise` user via `/proc`; consider whether Litestream should run as a distinct user. The token is bucket-scoped; see the next row and `deploy/README.md` §4.2. |
 | R2 token scope | Bucket-scoped token (owner decision, issue #136); creation and verification steps in `deploy/README.md` §4.2 "Cloudflare R2 bucket and scoped token" | Bucket-scoped, read/write for the single `buywise-backup` bucket — not an account-wide token. Re-verify after any credential rotation. |
 | Transport | HTTPS to the R2 endpoint | Fine, provided `skip-verify` is never set (it is not). |
 | Encryption at rest | R2 server-side encryption only; no `age`, no customer key | The database (with password hashes and full purchase history) is readable by whoever holds the bucket. **Key custody is Cloudflare's.** Decide whether that is acceptable or whether `age` client-side encryption should be turned on — noting the age private key then becomes a new secret the household must hold out-of-band, without which restores are impossible. |
@@ -437,7 +437,7 @@ The R2 token scope and the explicit backup `retention` are decided and shipped
 | --- | --- | --- | --- |
 | 1 | Receipt OCR: local or external? | (a) server-local OCR, external never used; (b) external opt-in per upload; (c) external by default | (a) as the default with (b) as an explicit per-upload upgrade, per §4. |
 | 2 | Raw-receipt retention | e.g. 7 / 30 / 90 days, or keep until deleted | 30 days, per §4.4, with derived lines kept as ordinary purchase records. |
-| 3 | Backup encryption and key custody | R2-managed keys only; or Litestream `age` with a household-held key | Decide explicitly. If `age` is used, the private key must be stored outside the server and off R2, or a disaster loses everything. |
+| 3 | Backup encryption and key custody | R2-managed keys; or Litestream `age` with a household-held key | **Decided for now:** use provider-managed R2 keys. Revisit client-side encryption only if key custody and restore procedures are agreed. |
 | 4 | R2 token scope and backup retention | account token vs bucket-scoped read/write token; default 24 h vs an explicit policy | **Decided and shipped (issues #136/#142):** bucket-scoped token; `retention: 168h` (7 days) set explicitly. |
 | 5 | Do aggregate usage counters count as household data? | leave `api_usage_events` (no household id) in place; or delete the household's share | Leaving unattributable totals is harmless; revisit if per-household attribution is added. |
 | 6 | Local on-disk remnant policy | document the `VACUUM` step only; or run it automatically | Keep it documented and operator-run (it briefly stops the service). |
