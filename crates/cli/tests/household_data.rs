@@ -150,7 +150,8 @@ async fn seed_fixture(pool: &SqlitePool) {
             "INSERT INTO users (id, email, password_hash, display_name, created_at) VALUES \
          ('u-a', 'a@example.test', 'hash', 'Ann', '{T}'), \
          ('u-shared', 's@example.test', 'hash', 'Sam', '{T}'), \
-         ('u-b', 'b@example.test', 'hash', 'Bob', '{T}')"
+         ('u-b', 'b@example.test', 'hash', 'Bob', '{T}'), \
+         ('u-unrelated', 'unrelated@example.test', 'hash', 'Unaffiliated', '{T}')"
         ),
     )
     .await;
@@ -171,7 +172,8 @@ async fn seed_fixture(pool: &SqlitePool) {
         "INSERT INTO sessions (id, user_id, token_hash, csrf_token, created_at, expires_at) VALUES \
          ('sess-a', 'u-a', 'th-a', 'csrf-a', '{T}', '2030-01-01T00:00:00Z'), \
          ('sess-shared', 'u-shared', 'th-s', 'csrf-s', '{T}', '2030-01-01T00:00:00Z'), \
-         ('sess-b', 'u-b', 'th-b', 'csrf-b', '{T}', '2030-01-01T00:00:00Z')"
+         ('sess-b', 'u-b', 'th-b', 'csrf-b', '{T}', '2030-01-01T00:00:00Z'), \
+         ('sess-unrelated', 'u-unrelated', 'th-u', 'csrf-u', '{T}', '2030-01-01T00:00:00Z')"
     ),
     )
     .await;
@@ -561,8 +563,18 @@ async fn delete_removes_only_the_target_household() {
         1
     );
     assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM users WHERE id = 'u-unrelated'").await,
+        1,
+        "a membership-less user outside the target household must survive"
+    );
+    assert_eq!(
         scalar(&pool, "SELECT COUNT(*) FROM sessions WHERE id = 'sess-a'").await,
         0
+    );
+    assert_eq!(
+        scalar(&pool, "SELECT COUNT(*) FROM sessions WHERE id = 'sess-unrelated'").await,
+        1,
+        "the unrelated user's session must survive"
     );
     assert_eq!(
         scalar(

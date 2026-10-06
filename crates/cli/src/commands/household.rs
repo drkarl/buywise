@@ -426,9 +426,8 @@ struct DeleteStep {
 
 /// The delete statements, in dependency order. Every statement binds `?1` to the
 /// household id (directly or through a subquery). The `sessions`/`users` steps
-/// run last and reach orphaned members through a `NOT EXISTS` on
-/// `household_members` AFTER the membership rows are gone, so a user who still
-/// belongs to another household survives.
+/// run last and use the member ids captured before the membership rows are
+/// removed, so unrelated membership-less accounts are not affected.
 const DELETE_STEPS: &[DeleteStep] = &[
     DeleteStep {
         table: "list_entry_events",
@@ -516,13 +515,16 @@ const DELETE_STEPS: &[DeleteStep] = &[
     DeleteStep {
         table: "sessions",
         delete_sql: "DELETE FROM sessions WHERE user_id IN \
-             (SELECT id FROM users WHERE NOT EXISTS \
-                  (SELECT 1 FROM household_members m WHERE m.user_id = users.id))",
+             (SELECT user_id FROM household_delete_candidates WHERE household_id = ?1 \
+              AND NOT EXISTS (SELECT 1 FROM household_members m \
+                              WHERE m.user_id = household_delete_candidates.user_id))",
     },
     DeleteStep {
         table: "users",
-        delete_sql: "DELETE FROM users WHERE NOT EXISTS \
-             (SELECT 1 FROM household_members m WHERE m.user_id = users.id)",
+        delete_sql: "DELETE FROM users WHERE id IN \
+             (SELECT user_id FROM household_delete_candidates WHERE household_id = ?1 \
+              AND NOT EXISTS (SELECT 1 FROM household_members m \
+                              WHERE m.user_id = household_delete_candidates.user_id))",
     },
 ];
 
@@ -578,6 +580,22 @@ pub async fn delete_household(
     household_name(pool, household_id).await?;
 
     let mut tx = pool.begin().await.context("beginning transaction")?;
+    sqlx::query(
+        "CREATE TEMP TABLE household_delete_candidates \
+         (household_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (household_id, user_id))",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("creating household deletion candidates")?;
+    sqlx::query(
+        "INSERT INTO household_delete_candidates (household_id, user_id) \
+         SELECT household_id, user_id FROM household_members WHERE household_id = ?1",
+    )
+    .bind(household_id)
+    .execute(&mut *tx)
+    .await
+    .context("capturing household members for deletion")?;
+
     let mut counts = Vec::with_capacity(DELETE_STEPS.len());
     for step in DELETE_STEPS {
         let result = sqlx::query(step.delete_sql)
@@ -587,6 +605,10 @@ pub async fn delete_household(
             .with_context(|| format!("deleting from {}", step.table))?;
         counts.push((step.table, result.rows_affected()));
     }
+    sqlx::query("DROP TABLE household_delete_candidates")
+        .execute(&mut *tx)
+        .await
+        .context("dropping household deletion candidates")?;
 
     if dry_run {
         tx.rollback().await.context("rolling back dry run")?;
