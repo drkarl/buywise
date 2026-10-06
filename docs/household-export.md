@@ -189,7 +189,9 @@ from the Receipts page before then.
 
 ## Reading the links
 
-The document is internally closed — the ids a record references resolve inside it:
+The document's structural ids resolve inside it. Contributor ids may have no
+matching member record after that contributor is removed; they remain in the
+export to preserve the history's attribution:
 
 | From | Field | To |
 | --- | --- | --- |
@@ -197,7 +199,7 @@ The document is internally closed — the ids a record references resolve inside
 | `catalogue[].aliases[].canonical_item_id` | → | `catalogue[].id` |
 | `catalogue[].constraint.canonical_item_id` | → | `catalogue[].id` |
 | `lists[].entries[].canonical_item_id` | → | `catalogue[].id` (null until resolved) |
-| `lists[].entries[].added_by` / `bought_by` | → | `members[].user_id` |
+| `lists[].entries[].added_by` / `bought_by` | → | `members[].user_id` when the contributor is still a member; removed contributors may retain an id with no matching member |
 | `lists[].entry_events[].entry_id` | → | `lists[].entries[].id` |
 | `lists[].mutations[].entity_id` | → | `lists[].entries[].id` for entry operations |
 | `lists[].recommendation_runs[].id` | ← | `lists[].savings_events[].recommendation_run_id` |
@@ -209,7 +211,7 @@ The document is internally closed — the ids a record references resolve inside
 | `purchase_transactions[].lines[].transaction_id` / `revisions[].transaction_id` | → | `purchase_transactions[].id` |
 | `purchase_transactions[].lines[].retailer_product_id` | → | `retailer_products[].id` (null until matched) |
 | `purchase_transactions[].lines[].canonical_item_id` | → | `catalogue[].id` (null until matched) |
-| `receipt_images[].uploaded_by` | → | `members[].user_id` (or `null` if the account was deleted) |
+| `receipt_images[].uploaded_by` | → | `members[].user_id` when the uploader is still a member; removed contributors may retain an id with no matching member, or `null` if the account was deleted |
 | `preferences.purchase_dismissals[].canonical_item_id` | → | `catalogue[].id` |
 | `preferences.*[].category_id` / `subcategory_id` | → | `reference_data` |
 
