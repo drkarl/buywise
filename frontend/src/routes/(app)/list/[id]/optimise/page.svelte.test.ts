@@ -320,6 +320,8 @@ describe('optimise page', () => {
 		render(Page);
 
 		const chooseLinks = await screen.findAllByRole('link', { name: /shop this plan/i });
+		await db.list_entries.update('e-0', { quantity: 5 });
+		await new Promise((resolve) => setTimeout(resolve, 0));
 		document.addEventListener('click', (event) => event.preventDefault(), {
 			capture: true,
 			once: true

@@ -47,15 +47,9 @@
 
 	const listId = $derived(page.params.id ?? '');
 
-	/**
-	 * The current quantity per list-entry id, kept live (the same Dexie view the
-	 * trip and shopping pages read). `choosePlan` snapshots this into the chosen
-	 * cache so a later `setQuantity` edit is detectable as staleness. Mirrored
-	 * into plain `$state` because `choosePlan` reads it from a click handler, not
-	 * a reactive context, so the read alone would not open the live query.
-	 */
 	const all = $derived(allEntries(listId));
 	let quantityById = $state<Map<string, number>>(new Map());
+	let resultQuantities = $state<Map<string, number>>(new Map());
 	$effect(() => {
 		quantityById = new Map($all.map((e) => [e.id, e.quantity]));
 	});
@@ -241,12 +235,9 @@
 			needsConfirmationItems: result.needs_confirmation_items,
 			basketItems: result.basket_items
 		});
-		// Snapshot the quantity of every planned entry (issue #104 follow-up): the
-		// optimiser prices the current quantities, so a later `setQuantity` edit
-		// that keeps the entry id must still be detected as staleness.
 		const quantities: Record<string, number> = {};
 		for (const entryId of allocation.entryIds) {
-			const quantity = quantityById.get(entryId);
+			const quantity = resultQuantities.get(entryId);
 			if (quantity !== undefined) quantities[entryId] = quantity;
 		}
 		saveChosenTrip({
@@ -318,6 +309,7 @@
 			const body = (await res.json()) as OptimiseResponse;
 			// Re-check after the async body read in case a newer run started meanwhile.
 			if (superseded()) return;
+			resultQuantities = new Map(quantityById);
 			result = body;
 			status = 'ready';
 		} catch {
