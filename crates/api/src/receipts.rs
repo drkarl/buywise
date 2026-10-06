@@ -52,7 +52,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -60,9 +60,9 @@ use serde::{Deserialize, Serialize};
 
 use buywise_core::receipts::{self, ImageKind, ReceiptConfig, ReceiptError, ReceiptImage};
 
-use crate::AppState;
 use crate::household::require_member;
 use crate::middleware::AuthenticatedUser;
+use crate::AppState;
 
 /// Query parameters of an upload. `processing` defaults to `local` when absent.
 #[derive(Debug, Default, Deserialize)]

@@ -160,13 +160,14 @@ TEXT** and are exported verbatim as strings, not re-parsed, so nothing is lost:
 ```
 
 `receipt_images` is metadata only: one entry per stored receipt photo, ordered by
-upload time. `expires_at` is the moment the daily expiry sweep removes the image
-(30 days after upload); `content_type` is the type detected from the file
-signature, not the type the client claimed; `processing` is the per-upload reading
-choice, `local` (see `docs/data-flows.md` §4). The image itself is not in the
-document: it stays on the server, and the app retrieves it by this `id` until it
-expires, so a household that wants the pictures saves them from the Receipts page
-before then.
+upload time. `expires_at` is the exact moment, 30 days after upload, when list and
+view access stops; the daily expiry sweep then reclaims the image and row. The
+retention behavior is owned by [`docs/data-flows.md`](data-flows.md) §4.4.
+`content_type` is detected from the file signature, not the type the client
+claimed; `processing` is the per-upload choice, `local` (see §4 there). The image
+itself is not in the document: it stays on the server, and the app retrieves it
+by this `id` until it expires, so a household that wants the pictures saves them
+from the Receipts page before then.
 
 ## What is not in the document
 
