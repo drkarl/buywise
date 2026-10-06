@@ -114,13 +114,16 @@ async fn reimporting_a_transaction_is_idempotent() {
         scalar(&pool, "SELECT COUNT(*) FROM purchase_lines").await,
         2
     );
-    // The identity key means the total is never summed over a duplicate link.
-    assert_eq!(
-        purchase_ledger::household_total_cents(&pool, HH_A)
-            .await
-            .unwrap(),
-        600
-    );
+    let total_eur: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(total_cents), 0) FROM purchase_transactions \
+         WHERE household_id = ?1 AND currency = ?2",
+    )
+    .bind(HH_A)
+    .bind("EUR")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(total_eur, 600);
 }
 
 #[tokio::test]
@@ -266,9 +269,11 @@ async fn the_ledger_is_household_scoped() {
             .unwrap()
     );
     assert_eq!(
-        purchase_ledger::household_total_cents(&pool, HH_B)
-            .await
-            .unwrap(),
+        scalar(
+            &pool,
+            "SELECT COUNT(*) FROM purchase_transactions WHERE household_id = 'hh-b'"
+        )
+        .await,
         0
     );
     // The other household's failed delete changed nothing.

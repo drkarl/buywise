@@ -1244,20 +1244,3 @@ pub async fn delete_transaction(
             .await?;
     Ok(result.rows_affected() > 0)
 }
-
-/// The household's total spend across its live ledger rows, in integer cents.
-///
-/// Duplicate links cannot inflate it: the identity unique key means one row per
-/// purchase identity.
-pub async fn household_total_cents(
-    pool: &SqlitePool,
-    household_id: &str,
-) -> Result<i64, ImportError> {
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(total_cents), 0) FROM purchase_transactions WHERE household_id = ?1",
-    )
-    .bind(household_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(total)
-}

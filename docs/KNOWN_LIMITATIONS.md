@@ -80,24 +80,23 @@ author would read it.
 ### 4. No currency conversion and a request-size cap
 
 **What happens.** Each transaction stores its own ISO-4217 `currency` (default
-`EUR`), but nothing converts between currencies: `household_total_cents` sums the
-raw cents of every row regardless of currency, so a household importing more than
-one currency gets a meaningless single total from that helper. Separately, one
-import document is capped at 1000 transactions / 1000 lines per transaction, and
-the API body at 1 MiB; a larger history must be split.
+`EUR`), but nothing converts amounts between currencies, so values from different
+currencies cannot be combined into a meaningful total. Separately, one import
+document is capped at 1000 transactions / 1000 lines per transaction, and the
+API body at 1 MiB; a larger history must be split.
 
 **Why accepted.** The pilot household shops in one currency, and the ledger's
 stated job is to keep the source's amounts faithfully, not to become an FX
 ledger. The caps bound the memory one request can allocate without a streaming
 parser.
 
-**Workaround.** Group and sum by `currency` when a household has more than one;
-split a large export into several documents and import them in sequence (imports
-are idempotent, so re-running is safe).
+**Workaround.** Keep amounts grouped by their `currency`; split a large export
+into several documents and import them in sequence (imports are idempotent, so
+re-running is safe).
 
-**Follow-up.** If a household ever imports multiple currencies for reporting,
-add a converted total with a dated rate source, or an explicit per-currency
-summary, and revisit the caps.
+**Follow-up.** If a household ever needs combined multi-currency reporting,
+define an explicit conversion policy with a dated rate source, and revisit the
+caps.
 
 ## Per-store trip view
 

@@ -273,9 +273,6 @@ revision, line count and timestamps) and a full transaction from
 `superseded_at`). `DELETE .../purchases/{id}` removes one transaction; its lines
 and revision history are removed with it.
 
-The core also exposes `household_total_cents`, the sum of the household's live
-ledger rows; the identity key means it cannot count one purchase twice.
-
 ## Export and household deletion
 
 A household's ledger — every `purchase_transactions` row with its `lines` and
