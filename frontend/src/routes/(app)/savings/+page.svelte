@@ -147,16 +147,20 @@
 							</div>
 							<dl class="month-figures">
 								<div>
-									<dt>Gross estimate</dt>
-									<dd>{formatEuros(m.gross_cents)}</dd>
+									<dt>Best-single estimate</dt>
+									<dd>{formatEuros(m.baseline_cents)}</dd>
 								</div>
 								<div>
-									<dt>Basket total diff.</dt>
-									<dd>{formatEuros(m.accepted_cents)}</dd>
+									<dt>Manual total</dt>
+									<dd>{formatEuros(m.manual_total_cents)}</dd>
 								</div>
 								<div>
-									<dt>Net variance</dt>
-									<dd class="net">{formatEuros(m.net_cents)}</dd>
+									<dt>Travel</dt>
+									<dd>{formatEuros(m.travel_cents)}</dd>
+								</div>
+								<div>
+									<dt>Total-only variance</dt>
+									<dd class="net">{formatEuros(m.variance_cents)}</dd>
 								</div>
 							</dl>
 						</li>

@@ -26,9 +26,16 @@ function fullSummary(): SavingsSummary {
 			label: 'Legacy total-only basket variance',
 			note: 'Whole-basket actual spend recorded against the best single store estimate; quantities and purchases unverified.',
 			...META,
-			cumulative_cents: 700,
+			cumulative_cents: 200,
 			monthly: [
-				{ month: '2026-05', gross_cents: 3000, accepted_cents: 500, net_cents: 200, lists: 1 }
+				{
+					month: '2026-05',
+					baseline_cents: 5000,
+					manual_total_cents: 4500,
+					travel_cents: 300,
+					variance_cents: 200,
+					lists: 1
+				}
 			]
 		},
 		lists: [
@@ -69,7 +76,7 @@ function fullSummary(): SavingsSummary {
 				...META,
 				gross_saving_cents: 3000,
 				chosen_basket_cost_cents: 4500,
-				basket_variance_cents: 2500
+				basket_variance_cents: 200
 			}
 		]
 	};
@@ -127,8 +134,8 @@ describe('savings dashboard', () => {
 		expect(
 			within(region).getByText('Only line-reconciled results count as saved. There are none yet.')
 		).toBeTruthy();
-		// The legacy variance (€7.00) must never appear inside the saved aggregate.
-		expect(within(region).queryByText('€7.00')).toBeNull();
+		// The legacy variance (€2.00) must never appear inside the saved aggregate.
+		expect(within(region).queryByText('€2.00')).toBeNull();
 		expect(
 			screen.getByText('No verified savings by month yet — nothing here is counted as saved.')
 		).toBeTruthy();
@@ -142,11 +149,18 @@ describe('savings dashboard', () => {
 			name: 'Legacy total-only basket variance'
 		});
 		expect(within(legacy).getByText('Legacy total-only basket variance')).toBeTruthy();
-		expect(within(legacy).getByText('€7.00')).toBeTruthy();
+		expect(within(legacy).getAllByText('€2.00')).toHaveLength(2);
 		// Month bucket grouped by the archive date, with the original figures.
 		expect(within(legacy).getByText('May 2026')).toBeTruthy();
-		expect(within(legacy).getByText('€30.00')).toBeTruthy();
+		expect(within(legacy).getByText('Best-single estimate')).toBeTruthy();
+		expect(within(legacy).getByText('€50.00')).toBeTruthy();
+		expect(within(legacy).getByText('Manual total')).toBeTruthy();
+		expect(within(legacy).getByText('€45.00')).toBeTruthy();
+		expect(within(legacy).getByText('Travel')).toBeTruthy();
+		expect(within(legacy).getByText('€3.00')).toBeTruthy();
+		expect(within(legacy).getByText('Total-only variance')).toBeTruthy();
 		expect(within(legacy).getByText('€2.00')).toBeTruthy();
+		expect(within(legacy).queryByText('Gross estimate')).toBeNull();
 	});
 
 	it('labels every event with its status, baseline, coverage and costs', async () => {
@@ -181,7 +195,7 @@ describe('savings dashboard', () => {
 			'/list/list-3'
 		]);
 		// The legacy event already has a total: it shows the variance, not the prompt.
-		expect(screen.getByText('Basket variance €25.00')).toBeTruthy();
+		expect(screen.getByText('Basket variance €2.00')).toBeTruthy();
 	});
 
 	it('renders empty-state copy when there are no events at all', async () => {

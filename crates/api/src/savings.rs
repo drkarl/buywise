@@ -266,6 +266,23 @@ pub struct MonthlyBucket {
     pub lists: i64,
 }
 
+/// One calendar month's total-only legacy basket figures.
+#[derive(Debug, Serialize)]
+pub struct LegacyMonthlyBucket {
+    /// Calendar month as `"YYYY-MM"`.
+    pub month: String,
+    /// Sum of the best-single estimates used as baselines.
+    pub baseline_cents: Cents,
+    /// Sum of manually entered whole-basket totals.
+    pub manual_total_cents: Cents,
+    /// Sum of manually entered travel costs.
+    pub travel_cents: Cents,
+    /// Sum of total-only basket variances after travel.
+    pub variance_cents: Cents,
+    /// Number of savings events in the bucket.
+    pub lists: i64,
+}
+
 /// One aggregate of savings events sharing a status, with the short copy that
 /// says what it is and what it covers.
 #[derive(Debug, Serialize)]
@@ -282,6 +299,24 @@ pub struct SavingsAggregate {
     pub cumulative_cents: Cents,
     /// Per-month buckets, oldest first.
     pub monthly: Vec<MonthlyBucket>,
+}
+
+/// Legacy total-only basket variances, with figures limited to the manual
+/// comparison's baseline, entered costs, and resulting variance.
+#[derive(Debug, Serialize)]
+pub struct LegacySavingsAggregate {
+    /// Short human label for the aggregate.
+    pub label: String,
+    /// One sentence saying exactly what the aggregate is (and is not).
+    pub note: String,
+    /// Short copy naming the baseline the figures compare against.
+    pub baseline_label: String,
+    /// Short copy naming which costs the figures include.
+    pub costs_note: String,
+    /// Sum of total-only basket variances.
+    pub cumulative_cents: Cents,
+    /// Per-month buckets, oldest first.
+    pub monthly: Vec<LegacyMonthlyBucket>,
 }
 
 /// One savings event's outcome, for the dashboard's per-event table.
@@ -326,14 +361,15 @@ pub struct ListOutcome {
 /// `saved` is the only aggregate that may be called saved or net savings, and it
 /// counts only `verified` events — so it is empty until line-level reconciliation
 /// exists. `legacy` presents every total-only basket variance separately, under
-/// its own label, with its original figures; it is never counted as saved money.
+/// its own label, with baseline, manual total, travel, and variance figures; it
+/// is never counted as saved money.
 /// `lists` is the per-event breakdown the dashboard renders as a table.
 #[derive(Debug, Serialize)]
 pub struct SavingsSummaryResponse {
     /// The verified-only "saved" aggregate (empty today).
     pub saved: SavingsAggregate,
     /// The legacy total-only basket variance, shown separately.
-    pub legacy: SavingsAggregate,
+    pub legacy: LegacySavingsAggregate,
     /// Per-event outcomes, newest archive date first.
     pub lists: Vec<ListOutcome>,
 }
@@ -376,12 +412,10 @@ async fn savings_summary(
     .await
     .map_err(db_error("savings_summary.saved"))?;
 
-    // Manual whole-basket totals are shown separately, with their original
-    // figures, and are never counted as saved money.
-    let legacy = aggregate_for(
+    // Manual whole-basket totals form a separate aggregate.
+    let legacy = aggregate_legacy_for(
         &state.pool,
         &household_id,
-        STATUS_LEGACY_TOTAL_ONLY,
         "Legacy total-only basket variance",
         "Whole-basket actual spend recorded against the best single store estimate; \
          quantities and purchases unverified.",
@@ -509,6 +543,65 @@ async fn aggregate_for(
     .await?;
 
     Ok(SavingsAggregate {
+        label: label.to_string(),
+        note: note.to_string(),
+        baseline_label: BASELINE_LABEL.to_string(),
+        costs_note: COSTS_NOTE.to_string(),
+        cumulative_cents,
+        monthly,
+    })
+}
+
+async fn aggregate_legacy_for(
+    pool: &sqlx::SqlitePool,
+    household_id: &str,
+    label: &str,
+    note: &str,
+) -> Result<LegacySavingsAggregate, sqlx::Error> {
+    let monthly = sqlx::query_as::<_, (String, Cents, Cents, Cents, Cents, i64)>(
+        "SELECT strftime('%Y-%m', COALESCE(sl.archived_at, se.created_at)) AS month, \
+                SUM(se.baseline_cost_cents)                     AS baseline_cents, \
+                SUM(COALESCE(se.chosen_basket_cost_cents, 0))   AS manual_total_cents, \
+                SUM(COALESCE(se.travel_cost_cents, 0))          AS travel_cents, \
+                SUM(COALESCE(se.net_saving_cents, 0))           AS variance_cents, \
+                COUNT(*)                                        AS lists \
+         FROM savings_events se \
+         JOIN shopping_lists sl ON sl.id = se.list_id \
+         WHERE sl.household_id = ?1 AND se.status = ?2 \
+         GROUP BY month \
+         ORDER BY month",
+    )
+    .bind(household_id)
+    .bind(STATUS_LEGACY_TOTAL_ONLY)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(
+        |(month, baseline_cents, manual_total_cents, travel_cents, variance_cents, lists)| {
+            LegacyMonthlyBucket {
+                month,
+                baseline_cents,
+                manual_total_cents,
+                travel_cents,
+                variance_cents,
+                lists,
+            }
+        },
+    )
+    .collect();
+
+    let cumulative_cents: Cents = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(se.net_saving_cents), 0) \
+         FROM savings_events se \
+         JOIN shopping_lists sl ON sl.id = se.list_id \
+         WHERE sl.household_id = ?1 AND se.status = ?2",
+    )
+    .bind(household_id)
+    .bind(STATUS_LEGACY_TOTAL_ONLY)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(LegacySavingsAggregate {
         label: label.to_string(),
         note: note.to_string(),
         baseline_label: BASELINE_LABEL.to_string(),

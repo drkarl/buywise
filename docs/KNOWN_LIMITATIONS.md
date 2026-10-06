@@ -406,6 +406,11 @@ A manual whole-basket actual spend is labelled
 `legacy_total_only` and shown separately as a basket variance. Buying fewer items therefore never
 appears as saved money.
 
+**Coverage history.** Posting an actual spend replaces the row's earlier status, so an
+`unreconciled` or `unchecked` row becomes `legacy_total_only`. Migration 016 also labels every
+pre-existing row with an actual-spend total `legacy_total_only`, regardless of its earlier
+coverage. Retaining revisions of the earlier status belongs to the later event-schema slice.
+
 **Why accepted.** Issue #117's slice is honest labels and a verified-only aggregation guard;
 automatic line reconciliation is explicitly deferred until the purchase-ledger experiment
 supports it.

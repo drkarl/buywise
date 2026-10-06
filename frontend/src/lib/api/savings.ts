@@ -18,6 +18,16 @@ export interface MonthlyBucket {
 	lists: number;
 }
 
+/** One month's total-only baseline, manual spend, travel, and variance. */
+export interface LegacyMonthlyBucket {
+	month: string;
+	baseline_cents: number;
+	manual_total_cents: number;
+	travel_cents: number;
+	variance_cents: number;
+	lists: number;
+}
+
 /**
  * One aggregate of events sharing a status, with the short copy that names its
  * baseline and included costs. `saved` counts only `verified` events; `legacy`
@@ -30,6 +40,16 @@ export interface SavingsAggregate {
 	costs_note: string;
 	cumulative_cents: number;
 	monthly: MonthlyBucket[];
+}
+
+/** Legacy totals with no gross estimate or verified-saving fields. */
+export interface LegacySavingsAggregate {
+	label: string;
+	note: string;
+	baseline_label: string;
+	costs_note: string;
+	cumulative_cents: number;
+	monthly: LegacyMonthlyBucket[];
 }
 
 /**
@@ -61,7 +81,7 @@ export interface SavingsSummary {
 	/** The verified-only "saved" aggregate (empty until reconciliation exists). */
 	saved: SavingsAggregate;
 	/** The legacy total-only basket variance, shown separately. */
-	legacy: SavingsAggregate;
+	legacy: LegacySavingsAggregate;
 	/** Per-event outcomes, newest archive date first. */
 	lists: ListOutcome[];
 }
