@@ -120,6 +120,20 @@ describe('receipts', () => {
 		expect(screen.getByText(/^1 Sep/)).toBeTruthy();
 	});
 
+	it('explains receipt storage and that reading is not available yet', async () => {
+		stubReceipts([]);
+		render(Page);
+
+		expect(
+			await screen.findByText(
+				'Photos are stored privately on this household’s own server and deleted after 30 days. Reading them is not available yet.'
+			)
+		).toBeTruthy();
+		expect((screen.getByLabelText('Receipt photo') as HTMLInputElement).hasAttribute('capture')).toBe(
+			false
+		);
+	});
+
 	it('shows an empty state when the household has no receipts', async () => {
 		stubReceipts([]);
 		render(Page);

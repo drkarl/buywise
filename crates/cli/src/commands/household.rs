@@ -47,7 +47,7 @@ pub fn export_run(db_path: &str, household_id: &str, out: Option<&str>) -> Resul
 
 async fn export_run_async(db_path: &str, household_id: &str, out: Option<&str>) -> Result<()> {
     let pool = connect(db_path).await?;
-    let document = export_household(&pool, household_id).await?;
+    let document = export_household(&pool, household_id, chrono::Utc::now()).await?;
     let json = serde_json::to_string_pretty(&document).context("serialising export")?;
 
     match out {

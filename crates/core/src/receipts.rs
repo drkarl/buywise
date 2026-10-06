@@ -593,7 +593,7 @@ pub async fn store_receipt(
     };
 
     let mut tx = pool.begin().await?;
-    let (count, stored) = usage(&mut tx, household_id).await?;
+    let (count, stored) = usage(&mut tx, household_id, now).await?;
     if count >= config.max_images_per_household {
         return Err(ReceiptError::TooManyImages {
             household_id: household_id.to_string(),
@@ -655,11 +655,18 @@ pub async fn store_receipt(
 }
 
 /// A household's stored image count and total bytes.
-async fn usage(conn: &mut SqliteConnection, household_id: &str) -> Result<(i64, i64), sqlx::Error> {
+async fn usage(
+    conn: &mut SqliteConnection,
+    household_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(i64, i64), sqlx::Error> {
+    let cutoff = iso(now);
     sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM receipt_images WHERE household_id = ?1",
+        "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM receipt_images \
+         WHERE household_id = ?1 AND expires_at > ?2",
     )
     .bind(household_id)
+    .bind(cutoff)
     .fetch_one(&mut *conn)
     .await
 }

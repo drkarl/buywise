@@ -166,8 +166,8 @@
 		<section class="upload" aria-label="Add a receipt">
 			<h2>Add a receipt</h2>
 			<p class="hint">
-				Photos are stored privately on this household’s own server, kept for 30 days, and read
-				on this server (local processing) only.
+				Photos are stored privately on this household’s own server and deleted after 30 days. Reading
+				them is not available yet.
 			</p>
 			<form class="upload-form" onsubmit={upload}>
 				<label for="receipt-file">Receipt photo</label>
@@ -175,7 +175,6 @@
 					id="receipt-file"
 					type="file"
 					accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
-					capture="environment"
 					onchange={chooseFile}
 					bind:this={fileInput}
 				/>

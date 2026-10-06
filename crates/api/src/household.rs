@@ -177,7 +177,7 @@ async fn export_household(
 ) -> Result<Response, StatusCode> {
     require_member(&state, &user.user_id, &household_id).await?;
 
-    let document = household_data::export_household(&state.pool, &household_id)
+    let document = household_data::export_household(&state.pool, &household_id, (state.clock)())
         .await
         .map_err(core_error("household.export"))?;
 

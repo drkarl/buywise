@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Column, Row, SqliteConnection, SqlitePool};
@@ -70,6 +71,7 @@ pub enum HouseholdDataError {
 pub async fn export_household(
     pool: &SqlitePool,
     household_id: &str,
+    now: DateTime<Utc>,
 ) -> Result<Value, HouseholdDataError> {
     let household = fetch_rows_bound(
         pool,
@@ -260,14 +262,17 @@ pub async fn export_household(
     // stays retrievable through the app (its `id` is the handle) until its 30-day
     // expiry removes it — see `docs/household-export.md` and
     // `docs/data-flows.md` §4.
-    let receipt_images = fetch_rows_bound(
-        pool,
+    let receipt_rows = sqlx::query(
         "SELECT id, uploaded_by, uploaded_at, expires_at, content_type, byte_size, \
                 sha256_hex, processing \
-         FROM receipt_images WHERE household_id = ?1 ORDER BY uploaded_at, id",
-        household_id,
+         FROM receipt_images WHERE household_id = ?1 AND expires_at > ?2 \
+         ORDER BY uploaded_at, id",
     )
+    .bind(household_id)
+    .bind(receipts::iso(now))
+    .fetch_all(pool)
     .await?;
+    let receipt_images: Vec<Value> = receipt_rows.iter().map(row_to_object).collect();
 
     let mut lists = fetch_rows_bound(
         pool,
