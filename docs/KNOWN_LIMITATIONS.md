@@ -391,125 +391,18 @@ and make the CLI's fixture mode load the category taxonomy.
 
 ## Household data controls
 
-Exports, household deletion and the external-processing switch (issue #119, roadmap #114, branch
-`fm/bw-data-controls`). Policy and inventory: `docs/data-flows.md`; export layout:
-`docs/household-export.md`.
+Issue #119, roadmap #114. The authoritative policy, behaviour, procedures and export layout are in
+[`docs/data-flows.md`](data-flows.md) and [`docs/household-export.md`](household-export.md).
 
-### 1. Data controls ship as CLI and documentation only, with no UI
+Open follow-ups:
 
-**What happens.** `buywise-cli export-household` and `buywise-cli delete-household` are the only
-way to export or delete a household, and `LLM_FALLBACK_ENABLED` in `/etc/buywise/buywise.env` is
-the only way to turn the optional external model on or off. A household member who is not an
-operator of the server cannot reach any of it, and changing the switch needs a service restart.
-
-**Why accepted.** Issue #119 leaves CLI versus UI open; the first slice is deliberately CLI plus
-documentation so the data-flow inventory, the export format and the deletion procedure can be
-reviewed as text before any screen is built on top of them.
-
-**Workaround.** The operator runs the two commands and edits the env file on the household's behalf;
-the plan and its reasoning are recorded in `docs/data-flows.md`.
-
-**Follow-up.** Issue #119 follow-up: a settings screen exposing the external-processing switch, an
-export download, and a guarded delete — all reading the same documented format and policy.
-
-### 2. Receipt ingestion does not exist, so the external-processing gate and raw-receipt retention are policy only
-
-**What happens.** There is no receipt upload, no OCR and no receipt-image storage in the codebase
-(`purchase_events.source` merely allows `'receipt'` for a future import). The "deliberate
-external-processing choice, no community publication, no model training" gate and the proposed
-30-day raw-image retention in `docs/data-flows.md` §4 therefore constrain nothing yet: no code
-enforces them.
-
-**Why accepted.** Issue #119 asks for the policy and the gate to be documented before ingestion
-exists, so the feature cannot ship without them; there is nothing to enforce against today.
-
-**Workaround.** None needed while no receipt feature exists.
-
-**Follow-up.** Issue #119 follow-up: when receipt ingestion lands, implement the per-upload consent
-step, the provider disclosure, the retention job and the image-deletion path, and replace this entry
-with the shipped behaviour.
-
-### 3. Deletion is immediate on the server but not in the backup, and can be undone by a restore
-
-**What happens.** `delete-household --confirm` clears every household-scoped row in one transaction,
-but the Litestream replica in Cloudflare R2 keeps roughly the last 24 hours of history (Litestream's
-default `retention`; `deploy/litestream.yml` sets none), so the deleted rows remain in the bucket
-until those frames age out. A disaster restore from a pre-deletion point resurrects the household,
-and the CLI does not know it: the deletion has to be re-applied after such a restore. Removing the
-copies immediately means purging the whole `db` prefix and re-seeding the replica, which also
-destroys every older recovery point.
-
-**Why accepted.** BuyWise has no way to rewrite historical backup frames, and promising immediate
-erasure from backups would be false. The limitation is documented as a procedure
-(`docs/data-flows.md` §5.3) rather than hidden.
-
-**Workaround.** Follow `docs/data-flows.md` §5.4: export, delete, optionally `VACUUM`, and only
-purge the R2 prefix if the household requires it and accepts losing older recovery points.
-
-**Follow-up.** Decide the explicit backup `retention` and whether a `household-deleted` tombstone
-should be recorded so a post-restore check can detect — and a re-run can re-apply — a deletion.
-
-### 4. Deleted rows can survive in the local SQLite file until it is vacuumed
-
-**What happens.** The delete is a logical delete: the bytes of removed rows stay in free pages and
-in the WAL until they are reused or checkpointed, so a forensic read of
-`/var/lib/buywise/buywise.db` can still recover them. The CLI does not vacuum automatically because
-`VACUUM` rewrites the file and cannot run inside the delete transaction (it needs the service
-stopped).
-
-**Why accepted.** Stopping the API and Litestream to vacuum is an operator decision with a
-service-interruption cost, and it does not change the backup exposure in entry 3 anyway.
-
-**Workaround.** Run the documented `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` step
-(`docs/data-flows.md` §5.3) when the household needs the on-disk remnant gone.
-
-**Follow-up.** Optionally offer `delete-household --vacuum` that stops the writers itself, or a
-documented maintenance window.
-
-### 5. Aggregate API-usage counters are not household-identifiable and are never deleted
-
-**What happens.** `api_usage_events` (weekly ingest counters and the `source='llm'` per-call rows)
-carries no household id and no content, so `delete-household` leaves it in place. A household's own
-share of those totals therefore survives its deletion as an unattributable number.
-
-**Why accepted.** The table is a cost guard-rail, not household data; splitting it per household
-would add attribution the schema deliberately does not have.
-
-**Workaround.** None needed — no household is identifiable from the table.
-
-**Follow-up.** If per-household attribution is ever added, extend `delete-household` to remove the
-household's rows and revisit this entry.
-
-### 6. The backup review is documentation; the R2 token scope and a restore rehearsal are unverified
-
-**What happens.** `docs/data-flows.md` §6 records the findings on backup permissions, encryption and
-key custody, but nothing in this repository can confirm the deployed reality: the R2 token's scope,
-whether R2's server-side encryption is what the operator believes, or that a restore actually works
-and how long it takes. No encryption at rest is added by this change, and Litestream's `age`
-client-side encryption is not configured, so the bucket's key custody is Cloudflare's.
-
-**Why accepted.** Issue #119 scopes the backup work to a documented review — changing deployment,
-backup or encryption configuration is explicitly out of scope for this slice.
-
-**Workaround.** Run the documented restore drill in `deploy/README.md` and record the R2 token scope
-in the runbook.
-
-**Follow-up.** Record the drill outcome and the token scope; decide the `age` encryption and key
-custody options listed in `docs/data-flows.md` §7.
-
-### 7. The export is a point-in-time, unencrypted snapshot
-
-**What happens.** `export-household` writes a single JSON document as of the moment it runs — no
-incremental or continuous export — and writes it in the clear wherever `--out` points (or to stdout,
-where it may land in a terminal log or a shell history-adjacent file). It also contains no receipt
-images (none exist) and no shared price history.
-
-**Why accepted.** A point-in-time document is the honest shape for "readable independently of
-BuyWise"; streaming export and encryption are separate features. The document is designed to be held
-by the household, not by the server.
-
-**Workaround.** Write `--out` to a path the household controls and move or encrypt the file
-afterwards; do not pipe it into a log that outlives the export.
-
-**Follow-up.** Issue #119 follow-up: an in-app export that hands the file straight to the member,
-and guidance (or an option) for an encrypted archive.
+- Add a member-facing settings screen, export download and guarded delete; today these controls
+  require an operator.
+- When receipt ingestion is implemented, enforce a per-upload processing choice, provider
+  disclosure, no-publication/no-training terms, image expiry and deletion.
+- Decide explicit backup retention, encryption and key custody; verify the deployed R2 token scope
+  and record a restore rehearsal.
+- Consider recording deletion tombstones for post-restore reapplication, and a local vacuum option
+  for deleted SQLite pages.
+- Revisit deletion of aggregate usage counters if they become household-attributable.
+- Consider an encrypted export option for the point-in-time JSON snapshot.
