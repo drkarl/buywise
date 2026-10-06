@@ -11,92 +11,54 @@ _Last reviewed: 2026-10-06._
 
 ## Purchase ledger
 
-The household's record of what it actually bought: imported purchase transactions
-and their lines, with quantities and amounts (issue #148, roadmap #114). One
-transaction row per purchase identity, one line row per bought line, and a
-snapshot of each superseded revision. Import format and identity rules:
-`docs/purchase-ledger.md`.
+Purchase-ledger format, identity, and limits are owned by
+[`docs/purchase-ledger.md`](purchase-ledger.md).
 
 ### 1. Structured imports are the only source; nothing matches a line to a product or a saving
 
-**What happens.** A ledger is written only by the import path (`buywise-cli
-import-purchases` and `POST /api/household/{id}/purchases`). Reading receipts is
-not implemented, there is no retailer-specific importer, and there is no UI.
-Imported lines default to `match_status = 'unmatched'`; callers may supply
-`retailer_product_id` / `canonical_item_id`, but nothing connects a line to
-`product_matches`, `savings_events` or the recommendation flow, and no price
-statistics are computed. Supplied ids must exist, and canonical items must
-belong to the importing household.
+**What happens.** The ledger is populated by structured imports; receipt reading,
+retailer-specific importers, and a UI are not implemented. Lines are not linked
+to savings or recommendations, and no price statistics are computed. See the
+format document for line-link and match-status behavior.
 
-**Why accepted.** The captain's decision was to validate savings through a
-purchase-history pilot first (receipts and the household's own retailer exports)
-and defer any paid price source until the history shows which products matter.
-Matching, statistics and savings links are explicitly out of scope for this
-slice, so adding them now would guess at a shape the pilot has not settled.
+**Why accepted.** The pilot validates purchase history before adding a paid price
+source; matching, statistics, and savings links remain out of scope.
 
-**Workaround.** An operator writing an importer can supply canonical-item ids
-from the household's own export; every line stays readable in the ledger and in
-the household export whether or not it is matched.
+**Workaround.** Imported lines remain readable in the ledger and household
+export whether or not they are matched.
 
 **Follow-up.** Receipt reading (#116), retailer-specific importers, a review UI
 for unmatched lines, and linking the ledger to savings events (#117 / #118) are
 later slices.
 
-### 2. `match_status` is informational
+### 2. Fingerprint identity cannot correct fields included in its fingerprint
 
-**What happens.** `match_status` accepts `unmatched` or `matched` and defaults to
-`unmatched`, but the ledger does not interpret the value or use it to create or
-validate product links.
+**What happens.** Without a source transaction id, changing a field included in
+the fingerprint creates a new transaction. The fingerprint inputs and correction
+rules are documented in [`docs/purchase-ledger.md`](purchase-ledger.md).
 
-**Why accepted.** Matching behavior is left for later work; the pilot records
-the source's status without imposing semantics on it.
+**Why accepted.** The fingerprint is a deterministic fallback for sources with
+no transaction id.
 
-**Workaround.** Treat the value as source-provided metadata.
+**Workaround.** Use `source_transaction_id` whenever the retailer export provides
+one.
 
-**Follow-up.** Define matching semantics when the later matching work is scoped.
+**Follow-up.** None planned.
 
-### 3. Fingerprint identity can only correct fields that are not part of the fingerprint
-
-**What happens.** When an import supplies no `source_transaction_id`, the
-identity is the computed fingerprint of retailer + purchase date + total + the
-ordered line texts. A "correction" that changes one of those fields is therefore
-a different identity and creates a new transaction instead of a new revision of
-the existing one. Only a supplied `source_transaction_id` lets a correction span
-those fields.
-
-**Why accepted.** The fingerprint is the fallback for sources with no transaction
-id; it has to be deterministic from content the source repeats, or a re-import
-could never be recognised as the same purchase. Making it narrower (e.g. dropping
-the total) would merge genuinely different purchases; making it wider needs a
-prior id that does not exist.
-
-**Workaround.** Import with `source_transaction_id` whenever the retailer export
-provides one. The format document states the tradeoff at the point an importer
-author would read it.
-
-**Follow-up.** None planned; the rule is a documented part of the format, and
-`pl1:` versions it should it ever need to widen.
-
-### 4. No currency conversion and a request-size cap
+### 3. No currency conversion
 
 **What happens.** Each transaction stores its own ISO-4217 `currency` (default
 `EUR`), but nothing converts amounts between currencies, so values from different
-currencies cannot be combined into a meaningful total. Separately, one import
-document is capped at 1000 transactions / 1000 lines per transaction, and the
-API body at 1 MiB; a larger history must be split.
+currencies cannot be combined into a meaningful total. Import size limits are
+listed in [`docs/purchase-ledger.md`](purchase-ledger.md).
 
 **Why accepted.** The pilot household shops in one currency, and the ledger's
-stated job is to keep the source's amounts faithfully, not to become an FX
-ledger. The caps bound the memory one request can allocate without a streaming
-parser.
+job is to keep source amounts faithfully rather than become an FX ledger.
 
-**Workaround.** Keep amounts grouped by their `currency`; split a large export
-into several documents and import them in sequence (imports are idempotent, so
-re-running is safe).
+**Workaround.** Keep amounts grouped by their `currency`.
 
-**Follow-up.** If a household ever needs combined multi-currency reporting,
-define an explicit conversion policy with a dated rate source, and revisit the
-caps.
+**Follow-up.** If a household needs combined multi-currency reporting, define an
+explicit conversion policy with a dated rate source.
 
 ## Per-store trip view
 
@@ -487,7 +449,8 @@ Issue #117, roadmap #114. The status model, accepted rules and the three decisio
 ### 1. Nothing is verified yet — there is no line-level reconciliation
 
 **What happens.** `GET /api/savings/summary` counts only `verified` events as saved, and no
-production path writes `verified` yet (it needs the purchase ledger of #116). The dashboard's
+production path writes `verified` yet because purchase-to-plan line reconciliation is not
+implemented. The dashboard's
 verified headline therefore reads €0.00 with an empty state. See [`docs/design.md`](design.md) §10
 for the authoritative status meanings and display rules.
 
@@ -497,13 +460,12 @@ pre-existing row with an actual-spend total `legacy_total_only`, regardless of i
 coverage. Retaining revisions of the earlier status belongs to the later event-schema slice.
 
 **Why accepted.** Issue #117's slice is honest labels and a verified-only aggregation guard;
-automatic line reconciliation is explicitly deferred until the purchase-ledger experiment
-supports it.
+automatic line reconciliation on top of the purchase ledger is explicitly deferred.
 
 **Workaround.** Use each event's status and coverage label as described in [`docs/design.md`](design.md)
 §10; only `verified` events represent saved money.
 
-**Follow-up.** #116/#117: reconcile planned versus purchased quantities/products (extra, skipped,
+**Follow-up.** #117: reconcile planned versus purchased quantities/products (extra, skipped,
 substituted, unmatched lines) to produce `verified` events.
 
 ### 2. The snapshot is frozen for new runs only, and it freezes prices, not purchases
@@ -516,13 +478,13 @@ everywhere, but carry no frozen evidence), and the snapshot records the planned 
 prices only — it does not reconcile what was actually bought.
 
 **Why accepted.** The slice's scope is freezing the evidence a run was computed from; purchase
-reconciliation is #116. Backfilling old runs is impossible — the input they used no longer exists —
+reconciliation is still deferred. Backfilling old runs is impossible — the input they used no longer exists —
 so they are deliberately left NULL rather than reconstructed from mutable data.
 
 **Workaround.** Use a new run's snapshot for price and input evidence; for a pre-018 run the stored
 totals remain the only record.
 
-**Follow-up.** #116/#117: reconcile planned versus purchased lines and quantities on top of the
+**Follow-up.** #117: reconcile planned versus purchased lines and quantities on top of the
 frozen snapshot. #109: populate `usual_profile_json` with the household's written usual-shop quotes.
 
 The retailer-product ingest contract does not define whether `size_value` is per unit or per pack.
@@ -548,9 +510,9 @@ baseline and populate `usual_profile_json`.
 
 ### 4. No receipt links and no automatic purchase matching
 
-**What happens.** Purchase records and receipts are not linked to recommendations or lists; the
-only realised input remains a manual whole-basket total, which is why every reconciled-by-hand
-event is `legacy_total_only`.
+**What happens.** Imported purchase records and receipts are not linked to recommendations or
+lists. For savings, the only realised input remains a manual whole-basket total, which is why
+every reconciled-by-hand event is `legacy_total_only`.
 
 **Why accepted.** Receipt capture is a bounded validation experiment (#116), not a prerequisite
 for the manual evaluation.
@@ -558,8 +520,8 @@ for the manual evaluation.
 **Workaround.** Enter actual spend manually to get a legacy basket variance; it is labelled as
 unverified.
 
-**Follow-up.** #116 purchase ledger: link receipts/purchases to lists and recommendations, and
-support multiple receipts per shop without double-counting.
+**Follow-up.** #116: add receipt ingestion; #117: link imported purchases to lists and
+recommendations and reconcile them without double-counting.
 
 ### 5. The coverage guard compares priced lines, not quantities or pack sizes
 
