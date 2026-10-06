@@ -257,9 +257,10 @@ a deliberate operator decision recorded in the env file, with `LLM_API_KEY`,
 **Implemented** (issue #149, roadmap #114). A household member photographs a
 receipt after a shop and keeps it privately on the household's own server for 30
 days; nothing is sent anywhere to read it. The household owner's recorded
-decisions are what this section describes and what the code now does: receipt
-reading is local by default and external processing only a deliberate per-upload
-choice; raw images are kept 30 days with the derived purchase lines kept as
+decisions are what this section describes: any future reading is local by
+default and external processing is only a deliberate per-upload choice; today the
+upload path stores that choice as `local`, but does not read or process the image.
+Raw images are kept 30 days with the derived purchase lines kept as
 ordinary purchase records; no community publication and no model training.
 **Reading the image is not implemented** — this slice stores and serves the photo;
 OCR, linking an image to purchase lines and an offline upload queue are not part
@@ -290,8 +291,9 @@ of it (§4.6).
 
 ### 4.2 The per-upload processing choice
 
-Reading stays local: no external service is called, and none is configured. The
-choice is stored per upload as `processing = 'local'`.
+No reading or processing happens yet: no external service is called, and none is
+configured. The future processing choice is stored per upload as
+`processing = 'local'`.
 `processing=external` is **refused with `501` and a message saying external
 processing is not available yet**, rather than stored as if it had happened — so a
 household can never believe an image was sent out when it was not, or that it
