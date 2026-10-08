@@ -1672,6 +1672,75 @@ async fn re_adding_fuzzy_term_resolves_via_step1_alias() {
     );
 }
 
+/// Step 2 (partial whole-token → SingleMatch): a term that only CONTAINS a
+/// catalogue staple as a whole word (`coconut milk` → Milk) binds the entry for
+/// the frequency model but is NOT learned as an alias — the input is not a name
+/// for the item, so learning it would teach the matcher a wrong mapping.
+#[tokio::test]
+async fn step2_partial_match_binds_without_learning_alias() {
+    let pool = setup_pool().await;
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+    let milk_id = id_by_name_en(&pool, "Milk").await;
+
+    // "coconut milk" is not itself a catalogue name or alias (only "coconut
+    // water" is), so it matches Milk only as a whole-token partial.
+    let term = "coconut milk";
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", term)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resolved = poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(
+        resolved.canonical_item_id.as_deref(),
+        Some(milk_id.as_str()),
+        "the partial match binds Milk for the frequency model"
+    );
+    assert_eq!(
+        alias_count(&pool, term).await,
+        0,
+        "a partial match must NOT be learned as an alias"
+    );
+}
+
+/// Step 2 (exact whole-name → SingleMatch): a term equal to a catalogue name with
+/// no existing alias is learned as an `accepted_match` alias, as before.
+#[tokio::test]
+async fn step2_exact_whole_name_match_still_learns_alias() {
+    let pool = setup_pool().await;
+
+    // A fresh catalogue item whose name_en has no alias row, so the add reaches
+    // step 2 (not step 1) and matches by whole-string equality.
+    let item_id = "abababababababababababababababababababababababababababababababab";
+    let name_en = "Quince paste";
+    sqlx::query(
+        "INSERT INTO canonical_items \
+             (id, household_id, name_en, name_es, category_id, default_constraint_policy, created_at) \
+         VALUES (?1, ?2, ?3, 'Dulce de membrillo', 'c1000000-0000-0000-0000-000000000005', 'any', ?4)",
+    )
+    .bind(item_id)
+    .bind(SEED_HOUSEHOLD)
+    .bind(name_en)
+    .bind(db::now_iso())
+    .execute(&pool)
+    .await
+    .expect("insert canonical item");
+
+    let state = AppState::new(pool.clone());
+    let s = seed_seed_household_user_and_list(&pool).await;
+
+    let resp = post_mutation(&state, &s, add_item("cm-1", "entry-1", name_en)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resolved = poll_entry(&pool, "entry-1", |e| e.resolution_status == "resolved").await;
+    assert_eq!(resolved.canonical_item_id.as_deref(), Some(item_id));
+
+    let alias = alias_row(&pool, "quince paste")
+        .await
+        .expect("an exact whole-name match is still learned as an alias");
+    assert_eq!(alias.canonical_item_id, item_id);
+    assert_eq!(alias.source, "accepted_match");
+}
+
 /// Step 3 (LLM → SingleMatch): a NoMatch term resolved by the LLM is learned as a
 /// `source='llm'` alias. (The broader LLM coverage lives above; this is the
 /// P3-T4-focused source assertion alongside its siblings.)

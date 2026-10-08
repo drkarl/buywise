@@ -35,7 +35,7 @@
 //! re-resolves it. The whole task is `tokio::spawn`ed so a panic is isolated too.
 
 use buywise_core::constraint_hash::effective_constraint_hash;
-use buywise_core::matching::{self, AliasSource, ResolutionOutcome};
+use buywise_core::matching::{self, AliasSource, MatchKind, ResolutionOutcome};
 use serde_json::Value;
 use sqlx::{Sqlite, Transaction};
 
@@ -88,13 +88,12 @@ pub fn spawn_resolution(state: AppState, job: ResolutionJob) {
 /// `Result`-returning function (clean `?` propagation); the spawn wrapper logs.
 async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx::Error> {
     // Run the cascade's two steps EXPLICITLY (rather than via `matching::resolve`)
-    // so a step-1 alias hit can be distinguished from a step-2 fuzzy single-match.
-    // The distinction matters for the feedback loop: a step-1 hit ALREADY has its
+    // so a step-1 alias hit can be distinguished from a step-2 single match. The
+    // distinction matters for the feedback loop: a step-1 hit ALREADY has its
     // alias, so re-learning it would add two `infer_alias_language` SELECTs plus an
     // always-no-op `INSERT OR IGNORE` to the single most frequent path (re-adding a
     // known term). Passing `None` for the step-1 case skips that redundant write
-    // entirely; only the step-2 fuzzy match — which genuinely learns a NEW mapping —
-    // passes `Some(AcceptedMatch)`.
+    // entirely; step 2 passes `Some(AcceptedMatch)` only for a whole-name match.
     if let Some(canonical_item_id) =
         matching::alias_lookup(&job.raw_text, &job.household_id, &state.pool)
             .await
@@ -105,22 +104,26 @@ async fn resolve_entry(state: &AppState, job: &ResolutionJob) -> Result<(), sqlx
         return resolve_single_match(state, job, &canonical_item_id, None).await;
     }
 
-    // Step 2: token/fuzzy match. A single-match is a genuinely new confirmed mapping,
-    // so persist it as `source='accepted_match'` (P3-T4 rule 2) — the next add of the
-    // same term then resolves via step 1 with no fuzzy/LLM work.
+    // Step 2: token/fuzzy match. A whole-name single match is a genuinely new
+    // confirmed mapping, so persist it as `source='accepted_match'` (P3-T4 rule 2)
+    // — the next add of the same term then resolves via step 1 with no fuzzy/LLM
+    // work. A PARTIAL match (a staple found as a whole word inside a longer input,
+    // `oat milk` → `Milk`) binds the entry but is NOT learned: the input is not a
+    // name for the item, so learning it would teach the matcher a wrong alias.
     let outcome = matching::fuzzy_match(&job.raw_text, &job.household_id, &state.pool)
         .await
         .map_err(into_sqlx_error)?;
 
     match outcome {
-        ResolutionOutcome::SingleMatch { canonical_item_id } => {
-            resolve_single_match(
-                state,
-                job,
-                &canonical_item_id,
-                Some(AliasSource::AcceptedMatch),
-            )
-            .await
+        ResolutionOutcome::SingleMatch {
+            canonical_item_id,
+            kind,
+        } => {
+            let alias_source = match kind {
+                MatchKind::WholeName => Some(AliasSource::AcceptedMatch),
+                MatchKind::Partial => None,
+            };
+            resolve_single_match(state, job, &canonical_item_id, alias_source).await
         }
         ResolutionOutcome::MultipleCandidates { candidates } => {
             resolve_ambiguous(state, job, &candidates).await

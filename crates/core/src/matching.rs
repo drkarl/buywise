@@ -41,9 +41,9 @@
 //! string's whitespace-separated tokens must appear as a contiguous run of whole
 //! tokens inside the other. A catalogue staple therefore fires only when it is
 //! present as a word, never inside a longer word — `apple` does not match
-//! `pineapple`, and the Spanish alias `anana` does not match `bananas`. Because
-//! the catalogue is built from short staples (`eggs`, `milk`, `rice`, `ham`,
-//! `mop`), the minimum length is 3 so those staples still match a branded name
+//! `pineapple`, and Pineapple's `anana` alias does not match inside `bananas`.
+//! Because the catalogue is built from short staples (`eggs`, `milk`, `rice`,
+//! `ham`, `mop`), the minimum length is 3 so those staples still match a branded name
 //! that contains them verbatim (`Tesco Free Range Eggs Large Box Of 12` →
 //! `Eggs`), while a 1–2 character token is ignored as too weak a signal.
 
@@ -64,11 +64,32 @@ pub const MIN_FUZZY_LENGTH: usize = 4;
 /// `milk`, `rice`, `ham`, `mop`) match a longer branded name.
 pub const MIN_CONTAINS_LENGTH: usize = 3;
 
+/// How a [`ResolutionOutcome::SingleMatch`] was reached, so a caller can decide
+/// whether the mapping is safe to learn as an alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    /// The whole normalised input was compared against a catalogue string and
+    /// matched it — whole-string equality (an exact / whole-name match) or an
+    /// edit-distance match. The input names the item, so the mapping is safe to
+    /// persist as an alias.
+    WholeName,
+    /// The input only *contains* a catalogue string as a whole-token run inside a
+    /// longer name (`oat milk` → `Milk`, `Tesco Free Range Eggs Large` → `Eggs`).
+    /// The match binds the line for the frequency model, but the input is not
+    /// itself a name for the item, so it MUST NOT be learned as an alias.
+    Partial,
+}
+
 /// The outcome of resolving a raw term against the household catalogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionOutcome {
-    /// A single unambiguous canonical item.
-    SingleMatch { canonical_item_id: String },
+    /// A single unambiguous canonical item, with how strongly it matched.
+    SingleMatch {
+        canonical_item_id: String,
+        /// Whole-name or partial — see [`MatchKind`]. Callers that learn aliases
+        /// must only learn [`MatchKind::WholeName`].
+        kind: MatchKind,
+    },
     /// Several plausible canonical items — requires user selection (Phase 3).
     /// Candidate ids are de-duplicated and sorted for deterministic results.
     MultipleCandidates { candidates: Vec<String> },
@@ -140,10 +161,13 @@ struct CandidateString {
 /// whole-string equality beats any partial match; whole-token matches beat
 /// fuzzy-only matches; among whole-token matches the longest shared token run
 /// wins. This keeps a specific catalogue phrase ahead of a generic staple it
-/// contains (`Tesco Brown Rice 1Kg` → `Brown rice`, not `Rice`). A partial match
-/// can therefore resolve automatically and may later be learned as an alias;
-/// tied candidates stay [`ResolutionOutcome::MultipleCandidates`] for user
-/// clarification. Candidate ids are in stable sorted order.
+/// contains (`Tesco Brown Rice 1Kg` → `Brown rice`, not `Rice`). A unique
+/// partial match (a whole-token run inside a longer input, `oat milk` → `Milk`)
+/// resolves automatically but is flagged [`MatchKind::Partial`], so a caller
+/// binds the line without learning the input as an alias — the input is not a
+/// name for the item. Tied candidates stay
+/// [`ResolutionOutcome::MultipleCandidates`] for user clarification. Candidate
+/// ids are in stable sorted order.
 pub async fn fuzzy_match(
     text: &str,
     household_id: &str,
@@ -188,8 +212,18 @@ pub async fn fuzzy_match(
         .map(|(id, _)| id)
         .collect();
     if winners.len() == 1 {
+        // `(exact, whole_token, run)`: a whole-token run that is NOT a
+        // whole-string equality matched only part of a longer input, so it is a
+        // partial match. Exact equality and fuzzy matches compared the whole
+        // input and stay learnable.
+        let kind = if best_score.1 && !best_score.0 {
+            MatchKind::Partial
+        } else {
+            MatchKind::WholeName
+        };
         return Ok(ResolutionOutcome::SingleMatch {
             canonical_item_id: winners[0].clone(),
+            kind,
         });
     }
 
@@ -289,7 +323,7 @@ fn is_fuzzy_similar(a: &str, b: &str) -> bool {
 ///
 /// Matching whole tokens rather than raw substrings is what keeps a catalogue
 /// staple from firing inside a longer word: `apple` does not match `pineapple`,
-/// and the Spanish alias `anana` does not match `bananas`. The minimum length is
+/// and Pineapple's `anana` alias does not match inside `bananas`. The minimum length is
 /// measured in characters on the shorter string, so a 1–2 character token is
 /// ignored as too weak a signal.
 fn whole_token_run(a: &str, b: &str) -> Option<usize> {
@@ -331,7 +365,11 @@ pub async fn resolve(
     db: &SqlitePool,
 ) -> Result<ResolutionOutcome, DbError> {
     if let Some(canonical_item_id) = alias_lookup(raw_text, household_id, db).await? {
-        return Ok(ResolutionOutcome::SingleMatch { canonical_item_id });
+        // Step 1 is an exact normalised alias, i.e. a whole-name match.
+        return Ok(ResolutionOutcome::SingleMatch {
+            canonical_item_id,
+            kind: MatchKind::WholeName,
+        });
     }
     fuzzy_match(raw_text, household_id, db).await
 }
@@ -515,7 +553,9 @@ mod tests {
 
     fn single(outcome: ResolutionOutcome) -> String {
         match outcome {
-            ResolutionOutcome::SingleMatch { canonical_item_id } => canonical_item_id,
+            ResolutionOutcome::SingleMatch {
+                canonical_item_id, ..
+            } => canonical_item_id,
             other => panic!("expected SingleMatch, got {other:?}"),
         }
     }
@@ -753,11 +793,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bananas_does_not_match_unrelated_alias() {
+    async fn bananas_does_not_match_pineapple_alias() {
         let pool = pool().await;
-        // The Spanish alias "anana" (Pineapple) is a substring of "bananas" but
-        // not a whole token, so Pineapple must not appear; Banana matches through
-        // its own plural alias.
+        // Pineapple's alias "anana" (used in parts of Latin America) is a
+        // sub-string INSIDE the word "bananas", not a whole token, so Pineapple
+        // must not appear; Banana matches through its own plural alias
+        // ("bananas"). Banana's Spanish name is "platano", unrelated to "anana".
         assert_eq!(
             resolved_name(&pool, "greenfield small bananas six pack").await,
             "Banana"
@@ -825,6 +866,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn partial_match_binds_and_is_flagged_partial() {
+        let pool = pool().await;
+        // Invented names that only CONTAIN a staple as a whole word — and are not
+        // themselves a catalogue name or alias — bind the staple but are flagged
+        // Partial, so a caller must not learn them as an alias.
+        for term in ["coconut milk", "farmhouse fresh milk"] {
+            match resolve(term, HOUSEHOLD, &pool).await.unwrap() {
+                ResolutionOutcome::SingleMatch {
+                    canonical_item_id,
+                    kind,
+                } => {
+                    assert_eq!(kind, MatchKind::Partial, "{term:?} must be a partial match");
+                    assert_eq!(name_en(&pool, &canonical_item_id).await, "Milk");
+                }
+                other => panic!("expected SingleMatch Milk for {term:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_name_matches_are_flagged_whole_name() {
+        let pool = pool().await;
+        // A whole-string equality is flagged WholeName (learnable): an exact alias
+        // ("milk"), and a catalogue name reached by whole-string equality ("oat
+        // milk" is the seeded Oat milk alias, so it is its own item, not a partial
+        // match to Milk).
+        for term in ["milk", "oat milk"] {
+            match resolve(term, HOUSEHOLD, &pool).await.unwrap() {
+                ResolutionOutcome::SingleMatch { kind, .. } => {
+                    assert_eq!(kind, MatchKind::WholeName, "{term:?} must be whole-name");
+                }
+                other => panic!("expected SingleMatch for {term:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(resolved_name(&pool, "oat milk").await, "Oat milk");
+    }
+
     // ---- ordering: alias tried before fuzzy ---------------------------------
 
     #[tokio::test]
@@ -838,7 +917,8 @@ mod tests {
         assert_eq!(
             outcome,
             ResolutionOutcome::SingleMatch {
-                canonical_item_id: MILK_ID.to_string()
+                canonical_item_id: MILK_ID.to_string(),
+                kind: MatchKind::WholeName,
             }
         );
     }
@@ -857,7 +937,8 @@ mod tests {
         assert_eq!(
             outcome,
             ResolutionOutcome::SingleMatch {
-                canonical_item_id: HAM_ID.to_string()
+                canonical_item_id: HAM_ID.to_string(),
+                kind: MatchKind::WholeName,
             },
             "Ham matched via name + alias + both languages must count once"
         );
