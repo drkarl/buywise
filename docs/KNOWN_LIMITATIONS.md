@@ -196,10 +196,9 @@ from 43.1% to 55.1%), but it has three known edges:
 history needed. Longest shared token run breaks ties among whole-token matches,
 while fuzzy-only matches rank below them. A unique strongest partial match still
 resolves automatically to recover branded lines; equal top scores remain
-ambiguous. This can select a generic alias in some branded names: for example,
-`Coca-Cola Zero Sugar Soft Drink` can resolve to `Soda` via `soft drink` when
-that is the strongest candidate. This is the tradeoff for recovering uniquely
-matched staples from long names.
+ambiguous. This can select a generic alias when it is the unique strongest
+candidate. This is the tradeoff for recovering uniquely matched staples from
+long names.
 
 **Workaround.** Unmatched and ambiguous lines stay in the ledger for the normal
 clarification flow (matching steps 3–4); a later re-import re-runs matching, so a
