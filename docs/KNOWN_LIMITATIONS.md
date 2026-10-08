@@ -209,6 +209,98 @@ line resolved by then gains its history without a second import path.
 whole-token comparison, and a size-suffix split in the normaliser, would recover
 the inflection and glued-text cases. Neither is in scope for this fix.
 
+## Embedding suggestions for unmatched lines
+
+Follow-up of the Tesco import (#107). The suggestion shortlist ranks unmatched
+imported lines against the catalogue with a text embedding model (EmbeddingGemma
+2's text part, 768 dimensions, Apache 2.0). It never auto-merges: a line is bound
+only when a user confirms a candidate. The mechanism lives in
+`crates/core/src/embedding.rs`, the endpoints in `crates/api/src/purchases.rs`,
+and the batch step in `buywise-cli embed-suggestions`; the measurements behind
+the design are the embedding bake-off report.
+
+### 1. The embedding model is an external, opt-in command; there is no in-process runtime
+
+**What happens.** Embedding runs in a separate process configured by
+`EMBEDDING_ENABLED` / `EMBEDDING_COMMAND` (default off), speaking a small JSON
+protocol on stdin/stdout; the bundled `scripts/embed_names.py` is the default
+implementation and needs `transformers` + `torch`. The Rust binary carries no ML
+runtime, and the feature degrades gracefully: with no command configured, the
+suggestion list returns an empty candidate list rather than a guess. Weights and
+any virtualenv live outside the repository (`EMBEDDING_MODEL_PATH`, `HF_HOME`)
+and are never committed.
+
+**Why accepted.** The bake-off recommended in-process ONNX (`ort` +
+`tokenizers`), but that would add the repository's first native dependency — a
+build-time ONNX Runtime download in a deliberately pure-Rust tree (rustls over
+OpenSSL, only bundled SQLite) — plus a ~174 MB quantised model and an ONNX export
+that did not exist locally. The external-command seam follows the existing
+LLM-fallback pattern (trait + env gate, default off) and keeps the build and CI
+dependency-free.
+
+**Workaround.** None needed when the operator has Python + transformers;
+otherwise the shortlist is simply unavailable.
+
+**Follow-up.** An in-process ONNX backend (`ort` + `tokenizers`, `model_q4.onnx`
+~174 MB, ONNX Runtime ~15–50 MB) can be added behind the same `Embedder` seam if
+the external process is unacceptable; it is not built today.
+
+### 2. Suggestions are headless: an API endpoint and a CLI batch step, with no UI
+
+**What happens.** `GET /api/household/{id}/purchases/unmatched-suggestions`
+returns unmatched lines with up to five candidates and scores;
+`POST .../unmatched-suggestions/confirm` binds the chosen item. There is no screen
+for this yet, and the vectors must be filled by an explicit
+`buywise-cli embed-suggestions` run — the import does not embed automatically.
+
+**Why accepted.** The change was scoped to the ranking and confirmation
+machinery; a UI is a separate slice.
+
+**Workaround.** Call the endpoint from a script or an API client; run the batch
+step after each import.
+
+**Follow-up.** An unmatched-line review screen (the existing #108 / #116
+follow-ups) that renders the shortlist and confirms with one tap.
+
+### 3. A confirmation binds the line and learns an alias, but writes no new purchase_events
+
+**What happens.** Confirming a line writes the mapping as an `accepted_match`
+alias (the shared clarification path) and sets `canonical_item_id` /
+`match_status = 'matched'` on every unmatched line of the household that shares
+the name. It does not write `purchase_events`, so a line matched only by
+confirmation contributes no frequency evidence until it is re-imported (the
+learned alias then makes the cascade match it).
+
+**Why accepted.** Writing evidence would need a new `purchase_events.source`
+value and a table rebuild (SQLite cannot widen a CHECK), which is out of scope for
+this follow-up; the alias already makes a later import idempotently match the
+line.
+
+**Workaround.** Re-import the export after confirming to gain the history, or
+accept that the confirmed line has no frequency evidence yet.
+
+**Follow-up.** Write evidence on confirmation with a dedicated `source` (for
+example `confirmed`) once the CHECK is widened.
+
+### 4. Scores are model-specific and the shortlist is not a decision
+
+**What happens.** Candidate scores are cosine similarities from one model and one
+catalogue; they are not comparable across models or households, and the endpoint
+does not threshold them. The bake-off found a correct item in the top five for
+~79.5% of residual names, so roughly one in five shortlists omits the right item.
+
+**Why accepted.** A global similarity threshold did not separate correct from
+incorrect candidates in the bake-off, and the margin gate that did rests on a
+small sample. Auto-merging on a score was deliberately not implemented — the
+shortlist only orders the user's choice.
+
+**Workaround.** Treat the shortlist as an ordering hint; the catalogue's own
+granularity limits some lines (a staple the catalogue lacks can never be
+suggested).
+
+**Follow-up.** Re-calibrate (and possibly enable a conservative auto-merge) only
+with a larger labelled sample and a per-model, per-catalogue threshold.
+
 ## Per-store trip view
 
 Splits the chosen optimiser plan into one shopping list per store — the trip view, the store-scoped

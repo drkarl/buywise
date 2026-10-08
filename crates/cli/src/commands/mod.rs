@@ -19,6 +19,7 @@
 
 pub mod basket;
 pub mod bootstrap;
+pub mod embed;
 pub mod fixture_db;
 pub mod household;
 pub mod ingest;

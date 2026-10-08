@@ -27,6 +27,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::routing::any;
 use axum::Router;
+use buywise_core::embedding;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
@@ -87,6 +88,13 @@ pub struct AppState {
     /// [`llm::LlmConfig::from_env`]); integration tests inject a fake via
     /// [`AppState::with_llm_client`] so they never touch the network.
     pub llm_client: Arc<dyn llm::LlmClient>,
+    /// Embedder for the unmatched-line clarification shortlist (follow-up of the
+    /// Tesco import #107). Built from the environment by [`AppState::new`]
+    /// (disabled by default — see [`embedding::EmbeddingConfig::from_env`]);
+    /// integration tests inject a fake via [`AppState::with_embedder`] so they
+    /// never run an external command. The Rust binary carries no ML runtime: the
+    /// embedder shells out to a configurable command.
+    pub embedder: Arc<dyn embedding::Embedder>,
     /// Where receipt-image bytes are stored and how much each household may keep
     /// (issue #149). Built from the environment by [`AppState::new`]
     /// ([`buywise_core::receipts::ReceiptConfig::from_env`]: the `RECEIPT_DIR` directory and
@@ -108,6 +116,9 @@ impl AppState {
             sse_channels: Arc::new(DashMap::new()),
             sse_config: sse::SseConfig::default(),
             llm_client: llm::client_from_env(),
+            embedder: Arc::new(embedding::CommandEmbedder::new(
+                embedding::EmbeddingConfig::from_env(),
+            )),
             receipt_config: buywise_core::receipts::ReceiptConfig::from_env(),
             clock: Arc::new(Utc::now),
         }
@@ -124,6 +135,13 @@ impl AppState {
     /// step-3 fallback runs deterministically without a network call).
     pub fn with_llm_client(mut self, client: Arc<dyn llm::LlmClient>) -> Self {
         self.llm_client = client;
+        self
+    }
+
+    /// Override the embedder (used by tests to inject a fake so the suggestion
+    /// shortlist runs deterministically without an external command).
+    pub fn with_embedder(mut self, embedder: Arc<dyn embedding::Embedder>) -> Self {
+        self.embedder = embedder;
         self
     }
 

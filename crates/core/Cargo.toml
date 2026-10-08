@@ -20,6 +20,12 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+# Embedding suggestions (follow-up of the Tesco import #107): the embedder is an
+# external command run through `tokio::process`, so the crate carries no ML
+# runtime; `async-trait` makes the `Arc<dyn Embedder>` seam object-safe.
+async-trait = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+async-trait = { workspace = true }

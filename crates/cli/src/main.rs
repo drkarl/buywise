@@ -52,12 +52,19 @@
 //!   purchases into the same ledger, match each line with the existing cascade,
 //!   and record frequency evidence for the matched lines. Idempotent by a
 //!   computed identity. See `docs/purchase-ledger.md`.
+//!
+//! Plus the unmatched-line embedding step (follow-up of the Tesco import #107):
+//!
+//! * `embed-suggestions --db <db> --household-id <uuid>` — embed the catalogue
+//!   strings and the distinct unmatched imported line names into the vector
+//!   stores the clarification shortlist reads. The embedder is an external
+//!   command configured by the environment, so the binary carries no ML runtime.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
-    bootstrap, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches,
+    bootstrap, embed, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches,
     set_password, tesco, validate,
 };
 
@@ -288,6 +295,27 @@ enum Command {
         #[arg(long)]
         file: String,
     },
+
+    /// Embed the catalogue and the unmatched imported line names for the
+    /// clarification shortlist.
+    ///
+    /// Fills the two vector stores the unmatched-line suggestion endpoints read:
+    /// one vector per catalogue string (name or alias) and one per distinct
+    /// unmatched line name. The embedding runs in an external command configured
+    /// by the environment (`EMBEDDING_ENABLED`, `EMBEDDING_COMMAND`,
+    /// `EMBEDDING_MODEL`, `EMBEDDING_MODEL_PATH`), so this binary carries no ML
+    /// runtime; the weights live outside the repository. Idempotent — only
+    /// strings without a vector for the configured model are embedded. Only
+    /// aggregate counts are printed, never a line name. The database must
+    /// already be migrated.
+    EmbedSuggestions {
+        /// SQLite database path to read from and write the vectors into.
+        #[arg(long)]
+        db: String,
+        /// Household UUID whose unmatched lines to embed.
+        #[arg(long, value_parser = parse_household_id)]
+        household_id: String,
+    },
 }
 
 /// Validate `--household-id` parses as a UUID at parse time, so a malformed id
@@ -355,5 +383,6 @@ fn main() -> Result<()> {
             household_id,
             file,
         } => tesco::import_run(&db, &household_id, &file),
+        Command::EmbedSuggestions { db, household_id } => embed::run(&db, &household_id),
     }
 }

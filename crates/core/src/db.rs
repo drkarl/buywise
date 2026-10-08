@@ -827,6 +827,9 @@ mod tests {
             "purchase_transaction_revisions",
             // Receipt images (020, issue #149)
             "receipt_images",
+            // Embedding suggestions (022, follow-up of #107)
+            "catalogue_embeddings",
+            "line_name_embeddings",
         ];
 
         for name in expected {
@@ -836,7 +839,8 @@ mod tests {
 
         // Exactly the 9 Phase-0 + 12 Phase-1 + 1 Phase-4 + 1 sub-category + 1
         // store-settings + 2 purchase-suggestion + 1 store-category-rules + 3
-        // purchase-ledger + 1 receipt-image application tables (excluding sqlx bookkeeping).
+        // purchase-ledger + 1 receipt-image + 2 embedding-suggestion application
+        // tables (excluding sqlx bookkeeping).
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -1080,8 +1084,8 @@ mod tests {
         .await
         .expect("count tables");
         assert_eq!(
-            count, 31,
-            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules, purchase suggestion, purchase ledger and receipt image tables in the file-backed database"
+            count, 33,
+            "9 Phase-0 + 12 Phase-1 + 1 Phase-4 + sub-category, household store settings, store category rules, purchase suggestion, purchase ledger, receipt image and embedding suggestion tables in the file-backed database"
         );
 
         pool.close().await;

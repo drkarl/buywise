@@ -284,6 +284,7 @@ name = "buywise-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "chrono",
  "hex",
  "rand 0.8.6",
