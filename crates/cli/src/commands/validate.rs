@@ -52,7 +52,9 @@ fn print_table(lines: &[ResolvedLine]) {
     let mut resolved = 0usize;
     for line in lines {
         let detail = match &line.outcome {
-            buywise_core::matching::ResolutionOutcome::SingleMatch { canonical_item_id } => {
+            buywise_core::matching::ResolutionOutcome::SingleMatch {
+                canonical_item_id, ..
+            } => {
                 resolved += 1;
                 canonical_item_id.clone()
             }

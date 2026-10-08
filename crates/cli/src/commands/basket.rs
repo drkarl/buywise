@@ -50,7 +50,9 @@ impl ResolvedLine {
     /// pricing purposes (Phase 0 has no clarification step).
     pub fn canonical_item_id(&self) -> Option<&str> {
         match &self.outcome {
-            ResolutionOutcome::SingleMatch { canonical_item_id } => Some(canonical_item_id),
+            ResolutionOutcome::SingleMatch {
+                canonical_item_id, ..
+            } => Some(canonical_item_id),
             _ => None,
         }
     }

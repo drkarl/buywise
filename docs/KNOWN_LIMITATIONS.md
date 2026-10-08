@@ -172,10 +172,13 @@ has three known edges:
   Ham` adds `Ham`, `Spring Water` adds `Water`, `Salt & Vinegar` adds `Salt`.
   If multiple candidates tie at the best score, the cascade reports
   `multiple_candidates` (clarification). If one candidate has the strongest
-  score, including when it is only a partial match, it resolves automatically;
-  that mapping can later be learned as an `accepted_match` alias. This heuristic
-  can bind a generic staple when it is the only candidate, so a unique partial
-  result is not guaranteed to be correct. On the real export ~245 lines moved
+  score it resolves automatically: a whole-name match (exact equality, or a fuzzy
+  match over the whole term) is learned as an `accepted_match` alias, while a
+  unique **partial** match — a staple found as a whole word inside a longer input
+  — binds the line for the frequency model but is flagged partial and is
+  **never** learned as an alias. This heuristic can bind a generic staple when it
+  is the only candidate, so a unique partial result is not guaranteed to be
+  correct; it is bound but never taught back. On the real export ~245 lines moved
   from matched to ambiguous this way (many of them cases where the *new*
   candidate is the more correct staple, e.g. `Tuna Chunks In Spring Water` now
   offers `Tuna`).
@@ -193,9 +196,10 @@ has three known edges:
 
 **Why accepted.** The matching contract and ranking rationale live in
 [design §8](design.md#8-bilingual-resolution). The remaining risk is that a
-unique strongest partial match can select a generic alias; equal top scores
-remain ambiguous. This tradeoff recovers uniquely matched staples from long
-names.
+unique strongest partial match can bind a generic staple; equal top scores remain
+ambiguous, and a partial match is never persisted as an alias, so it cannot teach
+the matcher a wrong mapping. This tradeoff recovers uniquely matched staples from
+long names.
 
 **Workaround.** Unmatched and ambiguous lines stay in the ledger for the normal
 clarification flow (matching steps 3–4); a later re-import re-runs matching, so a

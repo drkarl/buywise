@@ -271,7 +271,9 @@ pub async fn import_tesco_export(
                 continue;
             }
             let matched = match matching::resolve(name, household_id, pool).await? {
-                ResolutionOutcome::SingleMatch { canonical_item_id } => Some(canonical_item_id),
+                ResolutionOutcome::SingleMatch {
+                    canonical_item_id, ..
+                } => Some(canonical_item_id),
                 ResolutionOutcome::MultipleCandidates { .. } | ResolutionOutcome::NoMatch => None,
             };
             resolved.insert(name.clone(), matched);
