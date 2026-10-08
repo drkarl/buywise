@@ -398,7 +398,8 @@ Items entered in English or Spanish must resolve to the same `canonical_item`. T
 
 1. **Alias lookup** — exact normalised match in `item_aliases` → single match, done
 2. **Token / fuzzy match** — normalised matching against `canonical_items.name_en`, `canonical_items.name_es`, and all aliases
-   - One result above threshold → single match, done; commit to `item_aliases`
+   - A catalogue string matches as **whole words** (a contiguous run of tokens), never as a substring of a longer word, so a staple fires only when it is present as a word (`apple` does not match `pineapple`, `anana` does not match `bananas`). The minimum length for the whole-token rule is 3 characters, so the short staples the catalogue is built from (`eggs`, `milk`, `rice`, `ham`, `mop`) match a longer branded name that contains them verbatim. Exact equality and Levenshtein distance ≤ 2 (both strings ≥ 4) are unchanged.
+   - A unique strongest candidate wins: a whole-string equality first, then the longest shared token run. Several candidates tied at the top, or no unique strongest, → `multiple_candidates` (never a guess).
    - Zero results → `no_match` outcome (go to step 3)
    - Multiple results above threshold → `multiple_candidates` outcome (go to step 4)
 3. **LLM fallback for `no_match`** — cheap LLM API call to find the most plausible canonical item; result committed to `item_aliases` with `source: 'llm'`; if LLM returns no confident match → go to step 4

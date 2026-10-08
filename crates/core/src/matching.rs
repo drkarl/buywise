@@ -32,10 +32,22 @@
 //! * [`FUZZY_DISTANCE_THRESHOLD`] = 2 — max Levenshtein distance.
 //! * [`MIN_FUZZY_LENGTH`] = 4 — both strings must be at least this long to be
 //!   compared by edit distance.
-//! * [`MIN_CONTAINS_LENGTH`] = 5 — the shorter string must be at least this long
-//!   for a bidirectional substring (`contains`) match.
+//! * [`MIN_CONTAINS_LENGTH`] = 3 — the shorter string must be at least this long
+//!   for a bidirectional **whole-token** match.
+//!
+//! ## Whole-token containment (not substring)
+//!
+//! The `contains` rule matches on **whole tokens**, not raw substrings: one
+//! string's whitespace-separated tokens must appear as a contiguous run of whole
+//! tokens inside the other. A catalogue staple therefore fires only when it is
+//! present as a word, never inside a longer word — `apple` does not match
+//! `pineapple`, and the Spanish alias `anana` does not match `bananas`. Because
+//! the catalogue is built from short staples (`eggs`, `milk`, `rice`, `ham`,
+//! `mop`), the minimum length is 3 so those staples still match a branded name
+//! that contains them verbatim (`Tesco Free Range Eggs Large Box Of 12` →
+//! `Eggs`), while a 1–2 character token is ignored as too weak a signal.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use sqlx::sqlite::{SqliteConnection, SqlitePool};
 use strsim::levenshtein;
@@ -47,8 +59,10 @@ use crate::normalise::normalize;
 pub const FUZZY_DISTANCE_THRESHOLD: usize = 2;
 /// Minimum length (both strings) required before an edit-distance comparison.
 pub const MIN_FUZZY_LENGTH: usize = 4;
-/// Minimum length of the shorter string for a bidirectional `contains` match.
-pub const MIN_CONTAINS_LENGTH: usize = 5;
+/// Minimum length (characters, on the shorter string) for a bidirectional
+/// whole-token match. Set to 3 so the catalogue's short staples (`eggs`,
+/// `milk`, `rice`, `ham`, `mop`) match a longer branded name.
+pub const MIN_CONTAINS_LENGTH: usize = 3;
 
 /// The outcome of resolving a raw term against the household catalogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,17 +129,20 @@ struct CandidateString {
 /// Step 2: token/fuzzy match against `name_en`, `name_es`, and all aliases.
 ///
 /// Builds the candidate corpus once (two queries: canonical names + aliases),
-/// normalises both sides, and marks a canonical item as a candidate if ANY of
-/// its strings matches `text` by one of three rules (see [`is_match`]):
-/// exact normalised equality, Levenshtein distance ≤ [`FUZZY_DISTANCE_THRESHOLD`]
-/// (both strings ≥ [`MIN_FUZZY_LENGTH`]), or bidirectional `contains` (shorter
-/// string ≥ [`MIN_CONTAINS_LENGTH`]).
+/// normalises both sides, and scores every string against `text` under the three
+/// Phase-0 rules (see [`match_score`]): exact normalised equality, Levenshtein
+/// distance ≤ [`FUZZY_DISTANCE_THRESHOLD`] (both strings ≥ [`MIN_FUZZY_LENGTH`]),
+/// or a bidirectional **whole-token** run (shorter string ≥
+/// [`MIN_CONTAINS_LENGTH`]). An item matched via several of its strings (or both
+/// languages) keeps its best score and counts once.
 ///
-/// Matching ids are collected into a [`BTreeSet`], so an item matched via
-/// several of its strings (or via both languages) counts once and the result
-/// is in a stable, sorted order. The count of distinct ids decides the outcome:
-/// 1 → [`ResolutionOutcome::SingleMatch`], ≥2 →
-/// [`ResolutionOutcome::MultipleCandidates`], 0 → [`ResolutionOutcome::NoMatch`].
+/// A unique strongest candidate wins: a whole-string equality always beats any
+/// partial match, and among partial matches the longest shared token run beats a
+/// shorter one. This keeps a specific catalogue phrase ahead of a generic staple
+/// it contains (`Tesco Brown Rice 1Kg` → `Brown rice`, not `Rice`) without ever
+/// guessing — several candidates tied at the top, or a top candidate that is
+/// only a partial match, stay [`ResolutionOutcome::MultipleCandidates`] for the
+/// user to clarify. The candidate ids are in a stable, sorted order.
 pub async fn fuzzy_match(
     text: &str,
     household_id: &str,
@@ -138,20 +155,45 @@ pub async fn fuzzy_match(
 
     let corpus = load_corpus(household_id, db).await?;
 
-    let mut matched: BTreeSet<String> = BTreeSet::new();
+    // Best score per candidate id: `(exact, run)`, compared lexicographically.
+    // `exact` outranks any partial match, and among partial matches a longer
+    // shared token run outranks a shorter one. `BTreeMap` keeps the ids unique
+    // and sorted, so an item matched by several of its strings counts once.
+    let mut scored: BTreeMap<String, (bool, usize)> = BTreeMap::new();
     for candidate in &corpus {
-        if is_match(&needle, &candidate.text) {
-            matched.insert(candidate.canonical_item_id.clone());
-        }
+        let Some(score) = match_score(&needle, &candidate.text) else {
+            continue;
+        };
+        scored
+            .entry(candidate.canonical_item_id.clone())
+            .and_modify(|best| {
+                if score > *best {
+                    *best = score;
+                }
+            })
+            .or_insert(score);
     }
 
-    let candidates: Vec<String> = matched.into_iter().collect();
-    Ok(match candidates.len() {
-        0 => ResolutionOutcome::NoMatch,
-        1 => ResolutionOutcome::SingleMatch {
-            canonical_item_id: candidates.into_iter().next().expect("len checked"),
-        },
-        _ => ResolutionOutcome::MultipleCandidates { candidates },
+    if scored.is_empty() {
+        return Ok(ResolutionOutcome::NoMatch);
+    }
+
+    // A unique strongest candidate is the match; a tie at the top stays
+    // ambiguous for step 4 rather than guessing between equally strong reads.
+    let best_score = scored.values().copied().max().expect("non-empty");
+    let winners: Vec<&String> = scored
+        .iter()
+        .filter(|(_, score)| **score == best_score)
+        .map(|(id, _)| id)
+        .collect();
+    if winners.len() == 1 {
+        return Ok(ResolutionOutcome::SingleMatch {
+            canonical_item_id: winners[0].clone(),
+        });
+    }
+
+    Ok(ResolutionOutcome::MultipleCandidates {
+        candidates: scored.into_keys().collect(),
     })
 }
 
@@ -193,18 +235,32 @@ async fn load_corpus(household_id: &str, db: &SqlitePool) -> Result<Vec<Candidat
     Ok(corpus)
 }
 
-/// Whether two already-normalised strings match under the Phase-0 rules:
-/// exact equality, Levenshtein distance ≤ [`FUZZY_DISTANCE_THRESHOLD`] when both
-/// are ≥ [`MIN_FUZZY_LENGTH`], or bidirectional `contains` when the shorter is
-/// ≥ [`MIN_CONTAINS_LENGTH`].
-fn is_match(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
+/// Score one already-normalised catalogue string against the input, or `None`
+/// when it does not match under the Phase-0 rules.
+///
+/// Returns `(exact, run)`:
+/// * `exact` — the catalogue string equals the whole input. This is the
+///   strongest signal (it covers the entire input) and always outranks a
+///   partial match, so a short list entry keeps resolving to the exact item it
+///   names even when a shorter staple it contains also fires (`ice cream` stays
+///   `Ice cream`, not `Ice`).
+/// * `run` — the length, in whole tokens, of the shared token run for a partial
+///   match, used to order partial candidates by specificity. Exact equality and
+///   a fuzzy (edit-distance) match report the catalogue string's own token
+///   count; a whole-token-run match reports the shared run's length.
+///
+/// Rules, in order: exact equality; Levenshtein distance ≤
+/// [`FUZZY_DISTANCE_THRESHOLD`] when both strings are ≥ [`MIN_FUZZY_LENGTH`];
+/// bidirectional whole-token run (see [`whole_token_run`]).
+fn match_score(needle: &str, candidate: &str) -> Option<(bool, usize)> {
+    let tokens = candidate.split_whitespace().count();
+    if needle == candidate {
+        return Some((true, tokens));
     }
-    if is_fuzzy_similar(a, b) {
-        return true;
+    if is_fuzzy_similar(needle, candidate) {
+        return Some((false, tokens));
     }
-    contains_bidirectional(a, b)
+    whole_token_run(needle, candidate).map(|run| (false, run))
 }
 
 /// Edit-distance rule: both strings at least [`MIN_FUZZY_LENGTH`] long and within
@@ -224,14 +280,41 @@ fn is_fuzzy_similar(a: &str, b: &str) -> bool {
     levenshtein(a, b) <= FUZZY_DISTANCE_THRESHOLD
 }
 
-/// Bidirectional `contains` rule: one string contains the other, and the
-/// SHORTER (contained) string is at least [`MIN_CONTAINS_LENGTH`] long.
-fn contains_bidirectional(a: &str, b: &str) -> bool {
+/// Bidirectional whole-token rule: one string's tokens appear as a contiguous
+/// run of whole tokens inside the other, and the SHORTER string is at least
+/// [`MIN_CONTAINS_LENGTH`] characters. Returns the shared run's length in
+/// tokens, or `None` when there is no run.
+///
+/// Matching whole tokens rather than raw substrings is what keeps a catalogue
+/// staple from firing inside a longer word: `apple` does not match `pineapple`,
+/// and the Spanish alias `anana` does not match `bananas`. The minimum length is
+/// measured in characters on the shorter string, so a 1–2 character token is
+/// ignored as too weak a signal.
+fn whole_token_run(a: &str, b: &str) -> Option<usize> {
     let shorter_len = a.chars().count().min(b.chars().count());
     if shorter_len < MIN_CONTAINS_LENGTH {
+        return None;
+    }
+    if token_run_contains(a, b) {
+        Some(b.split_whitespace().count())
+    } else if token_run_contains(b, a) {
+        Some(a.split_whitespace().count())
+    } else {
+        None
+    }
+}
+
+/// Whether `needle`'s whitespace-separated tokens appear as a contiguous run of
+/// whole tokens inside `haystack`. Both are already normalised (punctuation is a
+/// space, runs collapsed, trimmed), so a plain token comparison is exact.
+fn token_run_contains(haystack: &str, needle: &str) -> bool {
+    let hay: Vec<&str> = haystack.split_whitespace().collect();
+    let need: Vec<&str> = needle.split_whitespace().collect();
+    if need.is_empty() || need.len() > hay.len() {
         return false;
     }
-    a.contains(b) || b.contains(a)
+    hay.windows(need.len())
+        .any(|window| window == need.as_slice())
 }
 
 /// Full Phase-0 resolution cascade.
@@ -391,6 +474,8 @@ pub async fn commit_alias(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::db::{connect, run_migrations};
 
@@ -457,14 +542,45 @@ mod tests {
     }
 
     #[test]
-    fn contains_min_length_guard() {
-        // Shorter string ≥ 5 → contains match.
-        assert!(contains_bidirectional("chocolate", "choco")); // "choco" len 5
-        assert!(contains_bidirectional("choco", "chocolate")); // symmetric
-                                                               // Shorter string len 4 → no contains match.
-        assert!(!contains_bidirectional("chocolate", "late"));
-        // "milk" (len 4) inside "soy milk" must NOT contains-match.
-        assert!(!contains_bidirectional("milk", "soy milk"));
+    fn whole_token_run_matches_only_whole_words() {
+        // A catalogue staple present as a whole word matches, both directions.
+        assert_eq!(
+            whole_token_run("northfield free range eggs", "eggs"),
+            Some(1)
+        );
+        assert_eq!(
+            whole_token_run("eggs", "northfield free range eggs"),
+            Some(1)
+        );
+        assert_eq!(whole_token_run("soy milk", "milk"), Some(1));
+        // A multi-word catalogue phrase reports its run length in tokens.
+        assert_eq!(
+            whole_token_run("oakhill brown rice 1kg", "brown rice"),
+            Some(2)
+        );
+        assert_eq!(whole_token_run("oakhill brown rice 1kg", "rice"), Some(1));
+        // Substrings inside a longer word never match.
+        assert_eq!(whole_token_run("pineapple", "apple"), None);
+        assert_eq!(whole_token_run("bananas", "anana"), None);
+        assert_eq!(whole_token_run("chocolate", "choco"), None);
+        // A whole word shorter than MIN_CONTAINS_LENGTH is too weak.
+        assert_eq!(whole_token_run("ham on rye", "on"), None);
+    }
+
+    #[test]
+    fn match_score_ranks_exact_over_partial() {
+        // Whole-string equality is the strongest signal.
+        assert_eq!(match_score("milk", "milk"), Some((true, 1)));
+        // A whole-token partial match scores below any exact match.
+        assert_eq!(match_score("northfield eggs", "eggs"), Some((false, 1)));
+        assert_eq!(
+            match_score("oakhill brown rice", "brown rice"),
+            Some((false, 2))
+        );
+        // A fuzzy (edit-distance) match is a partial match.
+        assert_eq!(match_score("milks", "milk"), Some((false, 1)));
+        // No rule fires inside a longer word.
+        assert_eq!(match_score("pineapple", "apple"), None);
     }
 
     // ---- alias_lookup -------------------------------------------------------
@@ -540,9 +656,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_cream_is_multiple_candidates() {
         let pool = pool().await;
-        // No exact alias "cream"; fuzzy contains-matches every item whose name
-        // contains "cream" (Cream cheese, Heavy cream, Ice cream, Sour cream,
-        // Shaving cream, Diaper cream, ...).
+        // No exact alias "cream"; the whole-token rule matches every item whose
+        // name or alias has "cream" as a whole word (Cream cheese, Heavy cream,
+        // Ice cream, Sour cream, ...), so the word stays ambiguous.
         let outcome = resolve("cream", HOUSEHOLD, &pool).await.unwrap();
         match outcome {
             ResolutionOutcome::MultipleCandidates { candidates } => {
@@ -583,6 +699,121 @@ mod tests {
         let pool = pool().await;
         let outcome = resolve("xyzqrst_unknown", HOUSEHOLD, &pool).await.unwrap();
         assert_eq!(outcome, ResolutionOutcome::NoMatch);
+    }
+
+    // ---- whole-token matching: long branded names (issue #107 follow-up) ----
+
+    /// Resolve an invented branded name and return the matched item's `name_en`.
+    async fn resolved_name(pool: &SqlitePool, text: &str) -> String {
+        let id = single(resolve(text, HOUSEHOLD, pool).await.unwrap());
+        name_en(pool, &id).await
+    }
+
+    #[tokio::test]
+    async fn short_staples_match_as_whole_tokens_in_long_names() {
+        let pool = pool().await;
+        // Each invented name contains a 3–4 character staple verbatim; before the
+        // whole-token rule these were blocked by the ≥ 5 character minimum.
+        assert_eq!(
+            resolved_name(&pool, "northfield free range eggs large box").await,
+            "Eggs"
+        );
+        assert_eq!(
+            resolved_name(&pool, "crestwood fresh milk carton").await,
+            "Milk"
+        );
+        assert_eq!(
+            resolved_name(&pool, "sunrise basmati rice bag").await,
+            "Rice"
+        );
+        assert_eq!(
+            resolved_name(&pool, "oakhill traditional ham joint").await,
+            "Ham"
+        );
+    }
+
+    #[tokio::test]
+    async fn pineapple_does_not_match_apple() {
+        let pool = pool().await;
+        // "apple" is not a whole token of "pineapple", so Apple is not a
+        // candidate; Pineapple matches as a whole word.
+        assert_eq!(
+            resolved_name(&pool, "greenfield pineapple chunks").await,
+            "Pineapple"
+        );
+    }
+
+    #[tokio::test]
+    async fn bananas_does_not_match_unrelated_alias() {
+        let pool = pool().await;
+        // The Spanish alias "anana" (Pineapple) is a substring of "bananas" but
+        // not a whole token, so Pineapple must not appear; Banana matches through
+        // its own plural alias.
+        assert_eq!(
+            resolved_name(&pool, "greenfield small bananas six pack").await,
+            "Banana"
+        );
+    }
+
+    #[tokio::test]
+    async fn coca_cola_branded_name_stays_ambiguous() {
+        let pool = pool().await;
+        // An invented name carrying the seed alias "coca cola" plus the generic
+        // aliases "soft drink" and "sugar" as whole words. No candidate is a
+        // whole-string match, so the cascade refuses to guess between them.
+        let outcome = resolve(
+            "fizzpop coca cola zero sugar soft drink two litre",
+            HOUSEHOLD,
+            &pool,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            ResolutionOutcome::MultipleCandidates { candidates } => {
+                let cola = id_by_name_en(&pool, "Cola").await;
+                let soda = id_by_name_en(&pool, "Soda").await;
+                let sugar = id_by_name_en(&pool, "Sugar").await;
+                assert!(
+                    candidates.contains(&cola) && candidates.contains(&soda),
+                    "expected Cola and Soda among candidates: {candidates:?}"
+                );
+                assert!(
+                    candidates.contains(&sugar),
+                    "expected Sugar among candidates: {candidates:?}"
+                );
+            }
+            other => panic!("expected MultipleCandidates (never a guess), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguity_is_still_reported_for_a_generic_word() {
+        let pool = pool().await;
+        // "cream" names no single item and several catalogue items contain it as
+        // a whole token, so it stays ambiguous rather than guessing.
+        assert!(matches!(
+            resolve("cream", HOUSEHOLD, &pool).await.unwrap(),
+            ResolutionOutcome::MultipleCandidates { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn short_list_entries_resolve_as_before() {
+        let pool = pool().await;
+        // Exact aliases still resolve directly (step 1), unchanged.
+        assert_eq!(resolved_name(&pool, "milk").await, "Milk");
+        assert_eq!(resolved_name(&pool, "leche").await, "Milk");
+        assert_eq!(resolved_name(&pool, "jamon").await, "Ham");
+        // A compound short entry keeps its own exact catalogue string over the
+        // shorter staple it contains.
+        assert_eq!(resolved_name(&pool, "ice cream").await, "Ice cream");
+        assert_eq!(resolved_name(&pool, "soy milk").await, "Soy milk");
+        // A branded name carrying a longer catalogue phrase prefers that phrase
+        // over the generic staple inside it (whole-token specificity).
+        assert_eq!(
+            resolved_name(&pool, "oakhill brown rice 1kg").await,
+            "Brown rice"
+        );
     }
 
     // ---- ordering: alias tried before fuzzy ---------------------------------
