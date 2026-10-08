@@ -136,13 +136,14 @@ struct CandidateString {
 /// [`MIN_CONTAINS_LENGTH`]). An item matched via several of its strings (or both
 /// languages) keeps its best score and counts once.
 ///
-/// A unique strongest candidate wins: a whole-string equality always beats any
-/// partial match, and among partial matches the longest shared token run beats a
-/// shorter one. This keeps a specific catalogue phrase ahead of a generic staple
-/// it contains (`Tesco Brown Rice 1Kg` → `Brown rice`, not `Rice`) without ever
-/// guessing — several candidates tied at the top, or a top candidate that is
-/// only a partial match, stay [`ResolutionOutcome::MultipleCandidates`] for the
-/// user to clarify. The candidate ids are in a stable, sorted order.
+/// A unique strongest candidate wins, including a unique partial match. A
+/// whole-string equality beats any partial match; whole-token matches beat
+/// fuzzy-only matches; among whole-token matches the longest shared token run
+/// wins. This keeps a specific catalogue phrase ahead of a generic staple it
+/// contains (`Tesco Brown Rice 1Kg` → `Brown rice`, not `Rice`). A partial match
+/// can therefore resolve automatically and may later be learned as an alias;
+/// tied candidates stay [`ResolutionOutcome::MultipleCandidates`] for user
+/// clarification. Candidate ids are in stable sorted order.
 pub async fn fuzzy_match(
     text: &str,
     household_id: &str,
@@ -155,11 +156,11 @@ pub async fn fuzzy_match(
 
     let corpus = load_corpus(household_id, db).await?;
 
-    // Best score per candidate id: `(exact, run)`, compared lexicographically.
-    // `exact` outranks any partial match, and among partial matches a longer
-    // shared token run outranks a shorter one. `BTreeMap` keeps the ids unique
-    // and sorted, so an item matched by several of its strings counts once.
-    let mut scored: BTreeMap<String, (bool, usize)> = BTreeMap::new();
+    // Best score per candidate id: `(exact, whole_token, run)`, compared
+    // lexicographically. Exact outranks partial; whole-token outranks fuzzy-only;
+    // among whole-token matches a longer run wins. `BTreeMap` keeps ids unique
+    // and sorted, so an item matched by several strings counts once.
+    let mut scored: BTreeMap<String, (bool, bool, usize)> = BTreeMap::new();
     for candidate in &corpus {
         let Some(score) = match_score(&needle, &candidate.text) else {
             continue;
@@ -238,29 +239,30 @@ async fn load_corpus(household_id: &str, db: &SqlitePool) -> Result<Vec<Candidat
 /// Score one already-normalised catalogue string against the input, or `None`
 /// when it does not match under the Phase-0 rules.
 ///
-/// Returns `(exact, run)`:
+/// Returns `(exact, whole_token, run)`:
 /// * `exact` — the catalogue string equals the whole input. This is the
 ///   strongest signal (it covers the entire input) and always outranks a
 ///   partial match, so a short list entry keeps resolving to the exact item it
 ///   names even when a shorter staple it contains also fires (`ice cream` stays
 ///   `Ice cream`, not `Ice`).
+/// * `whole_token` — a contiguous run of whole tokens matched. This signal
+///   outranks a fuzzy-only match, regardless of token count.
 /// * `run` — the length, in whole tokens, of the shared token run for a partial
-///   match, used to order partial candidates by specificity. Exact equality and
-///   a fuzzy (edit-distance) match report the catalogue string's own token
-///   count; a whole-token-run match reports the shared run's length.
+///   whole-token match, used to order those candidates by specificity. Other
+///   match types use zero.
 ///
 /// Rules, in order: exact equality; Levenshtein distance ≤
 /// [`FUZZY_DISTANCE_THRESHOLD`] when both strings are ≥ [`MIN_FUZZY_LENGTH`];
 /// bidirectional whole-token run (see [`whole_token_run`]).
-fn match_score(needle: &str, candidate: &str) -> Option<(bool, usize)> {
-    let tokens = candidate.split_whitespace().count();
+fn match_score(needle: &str, candidate: &str) -> Option<(bool, bool, usize)> {
+    let run = whole_token_run(needle, candidate);
     if needle == candidate {
-        return Some((true, tokens));
+        return Some((true, true, run.unwrap_or(0)));
     }
-    if is_fuzzy_similar(needle, candidate) {
-        return Some((false, tokens));
+    if let Some(run) = run {
+        return Some((false, true, run));
     }
-    whole_token_run(needle, candidate).map(|run| (false, run))
+    is_fuzzy_similar(needle, candidate).then_some((false, false, 0))
 }
 
 /// Edit-distance rule: both strings at least [`MIN_FUZZY_LENGTH`] long and within
@@ -570,15 +572,19 @@ mod tests {
     #[test]
     fn match_score_ranks_exact_over_partial() {
         // Whole-string equality is the strongest signal.
-        assert_eq!(match_score("milk", "milk"), Some((true, 1)));
+        assert_eq!(match_score("milk", "milk"), Some((true, true, 1)));
         // A whole-token partial match scores below any exact match.
-        assert_eq!(match_score("northfield eggs", "eggs"), Some((false, 1)));
+        assert_eq!(match_score("northfield eggs", "eggs"), Some((false, true, 1)));
         assert_eq!(
             match_score("oakhill brown rice", "brown rice"),
-            Some((false, 2))
+            Some((false, true, 2))
         );
         // A fuzzy (edit-distance) match is a partial match.
-        assert_eq!(match_score("milks", "milk"), Some((false, 1)));
+        assert_eq!(match_score("milks", "milk"), Some((false, false, 0)));
+        // Fuzzy-only token count cannot outrank a real whole-token run.
+        let fuzzy = match_score("milk bread", "milk breab").unwrap();
+        let whole_token = match_score("milk bread", "milk").unwrap();
+        assert!(whole_token > fuzzy);
         // No rule fires inside a longer word.
         assert_eq!(match_score("pineapple", "apple"), None);
     }
