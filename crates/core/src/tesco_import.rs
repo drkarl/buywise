@@ -70,8 +70,9 @@
 //! `unmatched` and **kept**, never dropped or guessed, for the normal
 //! clarification flow. No paid or external service is called.
 //!
-//! For every matched line the importer also writes a `purchase_events` row with
-//! `source = 'import'` at the purchase's calendar day, so
+//! For every matched positive-value line in a non-refund purchase the importer
+//! also writes a `purchase_events` row with `source = 'import'` at the
+//! purchase's calendar day, so
 //! [`crate::suggestions::compute_suggestions`] sees the imported history. The
 //! event id is a deterministic hash of the household, the purchase identity and
 //! the canonical item, and the write is `ON CONFLICT DO NOTHING`, so re-running
@@ -305,7 +306,10 @@ pub async fn import_tesco_export(
             match &canonical {
                 Some(canonical_item_id) => {
                     matched_lines += 1;
-                    if seen_items.insert(canonical_item_id.clone()) {
+                    if purchase.gross_cents >= 0
+                        && item.line_total_cents > 0
+                        && seen_items.insert(canonical_item_id.clone())
+                    {
                         evidence.push((
                             event_id(household_id, &identity, canonical_item_id),
                             canonical_item_id.clone(),
