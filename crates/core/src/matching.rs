@@ -574,7 +574,10 @@ mod tests {
         // Whole-string equality is the strongest signal.
         assert_eq!(match_score("milk", "milk"), Some((true, true, 1)));
         // A whole-token partial match scores below any exact match.
-        assert_eq!(match_score("northfield eggs", "eggs"), Some((false, true, 1)));
+        assert_eq!(
+            match_score("northfield eggs", "eggs"),
+            Some((false, true, 1))
+        );
         assert_eq!(
             match_score("oakhill brown rice", "brown rice"),
             Some((false, true, 2))

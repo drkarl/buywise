@@ -160,12 +160,11 @@ with #108 / #116.
 
 ### 9. The whole-token matcher over- and under-matches at the margins
 
-**What happens.** Step 2 of the cascade (`crates/core/src/matching.rs`) matches a
-catalogue name or alias only as a **whole word** (a contiguous run of tokens),
-never as a substring of a longer word, and the whole-token minimum is 3
-characters so short staples (`eggs`, `milk`, `rice`, `ham`, `mop`) match a longer
-branded name. That is a large net gain on the Tesco history (matched lines rose
-from 43.1% to 55.1%), but it has three known edges:
+**What happens.** Step 2 of the cascade now uses whole-token matches and prefers
+the unique strongest candidate, as specified in [design §8](design.md#8-bilingual-resolution).
+The 3-character floor recovers short staples in branded names. That is a large
+net gain on the Tesco history (matched lines rose from 43.1% to 55.1%), but it
+has three known edges:
 
 * **Short staples add a second candidate.** A branded name that contains a 3–4
   character staple as a word now surfaces that staple too, so a previously single
@@ -180,25 +179,23 @@ from 43.1% to 55.1%), but it has three known edges:
   from matched to ambiguous this way (many of them cases where the *new*
   candidate is the more correct staple, e.g. `Tuna Chunks In Spring Water` now
   offers `Tuna`).
-* **Substring false positives are gone.** A match that existed only as a
-  substring no longer fires, so `peppers` no longer matches `Pepper`, `sugars`
-  no longer matches `Sugar`, `breadcrumb(s)` no longer matches `Bread`,
-  `pepperoni` no longer matches `Pepper`. Those were spurious; the lines become
-  unmatched and go to clarification. ~128 real lines moved from matched to
-  unmatched this way.
+* **Substring-only false positives are gone.** A raw substring match no longer
+  fires by itself when the strings do not also match by exact equality or the
+  fuzzy rule. This prevents aliases inside unrelated longer words from becoming
+  candidates; affected lines proceed through the normal fallback/clarification
+  flow. The measured export had ~128 lines move from matched to unmatched in
+  this category.
 * **Inflection and glued size text are not handled.** A plural catalogue phrase
   is not matched by its singular alias (`Ice Creams` no longer matches `Ice
   cream`; it falls to the shorter staple `Ice`), and a size suffix glued to a
   word breaks the token (`vinegar125g` no longer matches `Vinegar`; the line
   falls to `Salt`). ~14 real lines changed their matched item this way.
 
-**Why accepted.** A whole-word rule with a 3-character floor is what the Tesco
-history needed. Longest shared token run breaks ties among whole-token matches,
-while fuzzy-only matches rank below them. A unique strongest partial match still
-resolves automatically to recover branded lines; equal top scores remain
-ambiguous. This can select a generic alias when it is the unique strongest
-candidate. This is the tradeoff for recovering uniquely matched staples from
-long names.
+**Why accepted.** The matching contract and ranking rationale live in
+[design §8](design.md#8-bilingual-resolution). The remaining risk is that a
+unique strongest partial match can select a generic alias; equal top scores
+remain ambiguous. This tradeoff recovers uniquely matched staples from long
+names.
 
 **Workaround.** Unmatched and ambiguous lines stay in the ledger for the normal
 clarification flow (matching steps 3–4); a later re-import re-runs matching, so a
