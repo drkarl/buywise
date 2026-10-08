@@ -32,13 +32,14 @@
 //! not read is also 422. The route is capped at
 //! [`MAX_IMPORT_BODY_BYTES`] so one oversized body can never exhaust the server.
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use buywise_core::embedding::{self, ConfirmError, ConfirmOutcome, DEFAULT_TOP_K};
 use buywise_core::purchase_ledger::{self, ImportError, TransactionDetail, TransactionSummary};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::middleware::AuthenticatedUser;
@@ -77,6 +78,17 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/household/{household_id}/purchases/{transaction_id}/receipt",
             put(set_receipt_link),
+        )
+        // Embedding-based clarification shortlist for unmatched imported lines
+        // (follow-up of the Tesco import #107). A static path, so it takes
+        // precedence over `{transaction_id}` exactly like `purchases/manual`.
+        .route(
+            "/api/household/{household_id}/purchases/unmatched-suggestions",
+            get(list_unmatched_suggestions),
+        )
+        .route(
+            "/api/household/{household_id}/purchases/unmatched-suggestions/confirm",
+            post(confirm_unmatched_suggestion),
         )
         // Every route here may read a request body (the import and manual
         // documents, and the link body); cap them here so the limit travels with
@@ -290,6 +302,107 @@ async fn set_receipt_link(
             }
         }
         Err(err) => ledger_error("purchases.set_receipt_link", err),
+    }
+}
+
+/// Query parameters for the suggestion list: `?limit=&offset=`.
+#[derive(Debug, Deserialize)]
+struct SuggestionQuery {
+    /// Maximum lines to return (default 50, capped at 500).
+    limit: Option<i64>,
+    /// Lines to skip (default 0).
+    offset: Option<i64>,
+}
+
+/// The suggestion list response: the model that produced the scores, whether the
+/// embedder is configured, and the lines with their candidates.
+#[derive(Debug, Serialize)]
+struct UnmatchedSuggestionsResponse {
+    /// Model id the scores come from.
+    model: String,
+    /// Whether an embedder is configured. When `false`, every `candidates` list
+    /// is empty — the batch step has not been able to run.
+    embedding_enabled: bool,
+    /// Unmatched lines, newest purchase first, each with up to five candidates.
+    lines: Vec<embedding::LineSuggestion>,
+}
+
+/// Body of `POST .../unmatched-suggestions/confirm`.
+#[derive(Debug, Deserialize)]
+struct ConfirmSuggestionRequest {
+    /// `purchase_lines.id` of the line the user chose.
+    line_id: String,
+    /// `canonical_items.id` the user confirmed for that line.
+    canonical_item_id: String,
+}
+
+/// `GET /api/household/{household_id}/purchases/unmatched-suggestions` — list
+/// unmatched imported lines with their top-5 canonical candidates and scores.
+///
+/// 403 unless the caller is a member. The candidates are produced by comparing
+/// each line's stored embedding against the household's catalogue embeddings;
+/// nothing here binds a line. A line whose name has no stored vector (the batch
+/// step has not run) is returned with an empty candidate list.
+async fn list_unmatched_suggestions(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(household_id): Path<String>,
+    Query(query): Query<SuggestionQuery>,
+) -> Result<Json<UnmatchedSuggestionsResponse>, StatusCode> {
+    require_member(&state, &user.user_id, &household_id).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let model = state.embedder.model_id();
+    let lines = embedding::unmatched_suggestions(
+        &state.pool,
+        &household_id,
+        &model,
+        DEFAULT_TOP_K,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "purchases.unmatched_suggestions");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(UnmatchedSuggestionsResponse {
+        model,
+        embedding_enabled: state.embedder.is_enabled(),
+        lines,
+    }))
+}
+
+/// `POST /api/household/{household_id}/purchases/unmatched-suggestions/confirm` —
+/// confirm one line's canonical item.
+///
+/// 403 unless the caller is a member; 404 when the line or the item is not the
+/// household's; 422 when the line has no name. On success the line name is
+/// learned as an `accepted_match` alias (the shared clarification write path) and
+/// every unmatched line of the household that shares the name is bound to the
+/// chosen item. Nothing is bound without this call.
+async fn confirm_unmatched_suggestion(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(household_id): Path<String>,
+    Json(body): Json<ConfirmSuggestionRequest>,
+) -> Result<Json<ConfirmOutcome>, StatusCode> {
+    require_member(&state, &user.user_id, &household_id).await?;
+    match embedding::confirm_suggestion(
+        &state.pool,
+        &household_id,
+        &body.line_id,
+        &body.canonical_item_id,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(ConfirmError::NoSuchLine | ConfirmError::NoSuchItem) => Err(StatusCode::NOT_FOUND),
+        Err(ConfirmError::UnnamedLine) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(err @ ConfirmError::Db(_)) => {
+            tracing::error!(error = %err, "purchases.unmatched_suggestions.confirm");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 

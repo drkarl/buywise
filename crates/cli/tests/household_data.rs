@@ -104,6 +104,14 @@ const HOUSEHOLD_ROW_COUNTS: &[(&str, &str)] = &[
         "SELECT COUNT(*) FROM purchase_dismissals WHERE household_id = ?1",
     ),
     (
+        "line_name_embeddings",
+        "SELECT COUNT(*) FROM line_name_embeddings WHERE household_id = ?1",
+    ),
+    (
+        "catalogue_embeddings",
+        "SELECT COUNT(*) FROM catalogue_embeddings WHERE household_id = ?1",
+    ),
+    (
         "canonical_items",
         "SELECT COUNT(*) FROM canonical_items WHERE household_id = ?1",
     ),
@@ -249,6 +257,24 @@ async fn seed_fixture(pool: &SqlitePool) {
         "INSERT INTO item_constraints (id, canonical_item_id, brand, substitution_policy, updated_at) \
          VALUES ('ic-a', 'ci-a', 'BrandA', 'any', '{T}')"
     ))
+    .await;
+    // Derived embedding vectors for A only (B must stay untouched by A's delete).
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO catalogue_embeddings \
+             (id, household_id, canonical_item_id, text, model, dim, vector, created_at) \
+         VALUES ('ce-a', '{HH_A}', 'ci-a', 'apples', 'test-model', 2, X'0000803F00000000', '{T}')"
+        ),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+        "INSERT INTO line_name_embeddings (id, household_id, name, model, dim, vector, created_at) \
+         VALUES ('lne-a', '{HH_A}', 'Apples 1kg', 'test-model', 2, X'0000803F00000000', '{T}')"
+    ),
+    )
     .await;
     exec(pool, &format!(
         "INSERT INTO household_settings \

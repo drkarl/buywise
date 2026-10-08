@@ -87,6 +87,7 @@ in `migrations/`, and serves; the CLI and the weekly ingest open the same file.
 | `purchase_events`, `purchase_dismissals` | frequency evidence from list check-offs and qualifying imported purchases, and per-item "not now" dismissals | purchase suggestions |
 | `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported and hand-entered (`source_kind = manual`) purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links), their superseded revisions, and an optional receipt-photo link (`receipt_image_id`, cleared if the image goes) | the purchase ledger — what the household actually bought (issues #148, #156) |
 | `receipt_images` | metadata for each stored receipt photo: household, uploader, upload and expiry timestamps, detected content type, size, SHA-256, storage key and processing choice | §4; the image **bytes are not here** — they are files in the receipt directory |
+| `catalogue_embeddings`, `line_name_embeddings` | derived `f32` vectors for the catalogue strings and the distinct unmatched imported line names, tagged with the model that produced them | ranks the top-5 clarification shortlist for unmatched lines (follow-up of #107); re-derivable, so **not** part of the household export, but deleted with the household |
 
 **Receipt-image bytes live outside this file.** `receipt_images.storage_key` names
 one file in the receipt directory (`RECEIPT_DIR`, else `receipts/` beside this
@@ -230,6 +231,15 @@ Same-origin only: the SPA talks exclusively to `/api/*`. There is no analytics,
 telemetry, advertising, error-reporting, CDN or font provider. The only two
 outbound destinations in the whole system are §2.5 (prices) and §2.6 (the
 optional model).
+
+The unmatched-line embedding shortlist (follow-up of #107) adds no destination:
+it runs a **local** command configured by `EMBEDDING_ENABLED` /
+`EMBEDDING_COMMAND` (default off), which reads the catalogue strings and the
+household's own unmatched line names on stdin and returns vectors on stdout.
+Nothing is sent off the device, and the weights live in a local cache outside the
+repository (`EMBEDDING_MODEL_PATH` / `HF_HOME`). With the command unset the
+feature is inert: the suggestion endpoint returns an empty candidate list and no
+line is matched.
 
 ## 3. Turning optional external processing off
 
@@ -471,7 +481,8 @@ In one transaction, in dependency order: `list_entry_events`, `savings_events`,
 `purchase_events`, `purchase_transaction_revisions`, `purchase_lines`,
 `purchase_transactions`, `mutations`, `list_entries`, `recommendation_runs`,
 `shopping_lists`, `match_feedback`, `product_matches`, `item_constraints`,
-`item_aliases`, `purchase_dismissals`, `canonical_items`,
+`item_aliases`, `purchase_dismissals`, `line_name_embeddings`,
+`catalogue_embeddings`, `canonical_items`,
 `household_store_category_rules`, `household_store_settings`,
 `household_settings`, `store_category_orders`, `receipt_images`,
 `household_members`, `households`, then `sessions` and `users` for members left

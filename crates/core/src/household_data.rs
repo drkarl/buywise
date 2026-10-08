@@ -6,7 +6,11 @@
 //!
 //! * [`export_household`] builds every household-scoped record as one JSON
 //!   document, including the household's receipt-image METADATA (never the image
-//!   bytes, which live on disk). The layout is documented in
+//!   bytes, which live on disk). The derived embedding-suggestion vector stores
+//!   (`catalogue_embeddings` / `line_name_embeddings`, migration 022) are the one
+//!   deliberate omission: they are caches re-derivable from the catalogue and the
+//!   purchase lines the export already carries, and a raw vector has no portable
+//!   JSON meaning. They are still deleted with the household. The layout is documented in
 //!   `docs/household-export.md`; it is
 //!   plain `serde_json::Value` (no app domain types) so the document is a
 //!   stable, self-describing interchange format rather than a dump of internal
@@ -462,7 +466,8 @@ fn nest_children(
 ///
 /// Deliberately absent (shared, not household-identifiable): `categories`,
 /// `subcategories`, `retailer_products`, `product_offers`, `source_runs`,
-/// `api_usage_events`.
+/// `api_usage_events`. The embedding-suggestion vector stores ARE included: they
+/// are derived caches, but a stored line name is household data.
 pub const HOUSEHOLD_TABLES: &[&str] = &[
     "list_entry_events",
     "savings_events",
@@ -479,6 +484,11 @@ pub const HOUSEHOLD_TABLES: &[&str] = &[
     "item_constraints",
     "item_aliases",
     "purchase_dismissals",
+    // Embedding-suggestion vectors (022, follow-up of #107). Derived caches, so
+    // they are not exported, but a stored line name is household data and must go
+    // with the household.
+    "line_name_embeddings",
+    "catalogue_embeddings",
     "canonical_items",
     "household_store_category_rules",
     "household_store_settings",
@@ -575,6 +585,14 @@ const DELETE_STEPS: &[DeleteStep] = &[
     DeleteStep {
         table: "purchase_dismissals",
         delete_sql: "DELETE FROM purchase_dismissals WHERE household_id = ?1",
+    },
+    DeleteStep {
+        table: "line_name_embeddings",
+        delete_sql: "DELETE FROM line_name_embeddings WHERE household_id = ?1",
+    },
+    DeleteStep {
+        table: "catalogue_embeddings",
+        delete_sql: "DELETE FROM catalogue_embeddings WHERE household_id = ?1",
     },
     DeleteStep {
         table: "canonical_items",

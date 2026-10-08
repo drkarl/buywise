@@ -1,6 +1,7 @@
 pub mod constraint_hash;
 pub mod db;
 pub mod domain;
+pub mod embedding;
 pub mod household_data;
 pub mod matching;
 pub mod members;

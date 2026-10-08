@@ -187,6 +187,12 @@ from the Receipts page before then.
 - **Receipt image bytes.** Each stored photo is a file on the server, named by an
   internal `storage_key`; neither the bytes nor that key are in the document.
   `receipt_images` (see the layout above) carries the image **metadata** instead.
+- **Embedding-suggestion vectors.** `catalogue_embeddings` and
+  `line_name_embeddings` (migration 022, the unmatched-line shortlist) are derived
+  caches: they are re-derivable from the catalogue and the purchase lines the
+  document already carries, and a raw `f32` vector has no portable JSON meaning.
+  They are **not** exported. They **are** deleted with the household, because a
+  stored line name is household data.
 
 ## Reading the links
 
