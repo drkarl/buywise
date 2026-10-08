@@ -423,6 +423,139 @@ async fn command_embedder_refuses_a_shape_mismatch_and_a_disabled_config() {
 }
 
 #[tokio::test]
+async fn command_embedder_rejects_a_later_vector_with_the_wrong_dimension() {
+    let script = write_script(
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"dim\":3,\"vectors\":[[1,0,0],[0,1]]}'\n",
+    );
+    let embedder = command_embedder(&script);
+    assert!(matches!(
+        embedder
+            .embed(EmbedKind::Query, &["a".to_string(), "b".to_string()])
+            .await,
+        Err(EmbedError::Shape { got_dim: 2, .. })
+    ));
+    let _ = std::fs::remove_file(&script);
+}
+
+struct WrongShapeEmbedder;
+
+#[async_trait]
+impl Embedder for WrongShapeEmbedder {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn model_id(&self) -> String {
+        MODEL.to_string()
+    }
+
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    async fn embed(&self, _kind: EmbedKind, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == 1 {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![1.0, 0.0, 0.0]
+                }
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn batch_storage_rejects_a_later_vector_with_the_wrong_dimension() {
+    let pool = setup().await;
+    assert!(matches!(
+        embedding::embed_catalogue(&pool, HH, &WrongShapeEmbedder).await,
+        Err(EmbedError::Shape { got_dim: 2, .. })
+    ));
+    assert_eq!(
+        scalar_i64(&pool, "SELECT COUNT(*) FROM catalogue_embeddings").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn confirmation_rejects_alias_collisions_and_stale_lines_without_writes() {
+    let pool = setup().await;
+    seed_transaction(&pool, "tx-1", "2026-02-01", &[("ln-eggs", "eggs", 329)]).await;
+
+    assert!(matches!(
+        embedding::confirm_suggestion(&pool, HH, "ln-eggs", "ci-milk").await,
+        Err(ConfirmError::Conflict)
+    ));
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM purchase_lines WHERE canonical_item_id IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM item_aliases WHERE source = 'accepted_match'"
+        )
+        .await,
+        0
+    );
+
+    sqlx::query("UPDATE purchase_lines SET match_status = 'matched' WHERE id = 'ln-eggs'")
+        .execute(&pool)
+        .await
+        .expect("mark line stale");
+    assert!(matches!(
+        embedding::confirm_suggestion(&pool, HH, "ln-eggs", "ci-eggs").await,
+        Err(ConfirmError::Conflict)
+    ));
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM item_aliases WHERE source = 'accepted_match'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn blank_names_are_excluded_from_embedding_suggestions_and_coverage() {
+    let pool = setup().await;
+    seed_transaction(
+        &pool,
+        "tx-1",
+        "2026-02-01",
+        &[("ln-blank", "   ", 0), ("ln-eggs", "Tesco Free Range Eggs Large Box Of 12", 329)],
+    )
+    .await;
+    let embedder = FakeEmbedder::new();
+    embedding::embed_catalogue(&pool, HH, &embedder)
+        .await
+        .expect("embed catalogue");
+    let names = embedding::embed_unmatched_names(&pool, HH, &embedder)
+        .await
+        .expect("embed names");
+    assert_eq!(names.total, 1);
+    assert_eq!(names.embedded, 1);
+
+    let suggestions = embedding::unmatched_suggestions(&pool, HH, MODEL, 5, 50, 0)
+        .await
+        .expect("suggestions");
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0].line_id, "ln-eggs");
+    let coverage = embedding::coverage(&pool, HH, MODEL).await.expect("coverage");
+    assert_eq!(coverage.unmatched_lines, 1);
+    assert_eq!(coverage.distinct_names, 1);
+}
+
+#[tokio::test]
 async fn confirmation_refuses_unknown_lines_and_items() {
     let pool = setup().await;
     seed_transaction(
