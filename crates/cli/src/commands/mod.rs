@@ -30,6 +30,7 @@ pub mod purchases;
 pub mod receipts;
 pub mod seed_matches;
 pub mod set_password;
+pub mod tesco;
 pub mod validate;
 
 use serde::Deserialize;

@@ -44,13 +44,21 @@
 //!   one document of purchase transactions and their lines (idempotent by
 //!   identity; corrections keep the previous revision). Format:
 //!   `docs/purchase-ledger.md`.
+//!
+//! Plus the Tesco Clubcard history import (issue #107):
+//!
+//! * `import-tesco --db <db> --household-id <uuid> --file <export.json>` — read
+//!   a Tesco Clubcard export (its `orders` section is ignored), import its
+//!   purchases into the same ledger, match each line with the existing cascade,
+//!   and record frequency evidence for the matched lines. Idempotent by a
+//!   computed identity. See `docs/purchase-ledger.md`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use buywise_cli::commands::{
     bootstrap, household, ingest, ingest_lidl, optimise, purchases, receipts, seed_matches,
-    set_password, validate,
+    set_password, tesco, validate,
 };
 
 #[derive(Parser)]
@@ -258,6 +266,28 @@ enum Command {
         #[arg(long)]
         file: String,
     },
+
+    /// Import a Tesco Clubcard purchase-history export into a household's ledger.
+    ///
+    /// Reads one Tesco Clubcard export (`purchases`; the `orders` section is
+    /// ignored and never stored), maps every purchase onto the existing purchase
+    /// ledger with its store type, totals, savings and lines preserved, matches
+    /// each line name with the existing cascade, and records frequency evidence
+    /// for the matched lines so first-use suggestions use the imported history.
+    /// Re-importing the same export is idempotent. Unmatched lines are kept, not
+    /// guessed. The database must already be migrated (the API is the usual
+    /// migrator).
+    ImportTesco {
+        /// SQLite database path to write into.
+        #[arg(long)]
+        db: String,
+        /// Household UUID the purchases belong to.
+        #[arg(long, value_parser = parse_household_id)]
+        household_id: String,
+        /// Tesco Clubcard export JSON path (read-only; never copied).
+        #[arg(long)]
+        file: String,
+    },
 }
 
 /// Validate `--household-id` parses as a UUID at parse time, so a malformed id
@@ -320,5 +350,10 @@ fn main() -> Result<()> {
             household_id,
             file,
         } => purchases::import_run(&db, &household_id, &file),
+        Command::ImportTesco {
+            db,
+            household_id,
+            file,
+        } => tesco::import_run(&db, &household_id, &file),
     }
 }

@@ -7,7 +7,7 @@ what happens, why it was accepted, a workaround or none, and the follow-up that 
 issue, a backlog id, or an explicit open question). A limitation that must hold a release is marked
 **RELEASE BLOCKER** at the top of its section.
 
-_Last reviewed: 2026-10-06._
+_Last reviewed: 2026-10-08._
 
 ## Purchase ledger
 
@@ -98,6 +98,64 @@ receipt photo can still be linked to any purchase from its detail view.
 
 **Follow-up.** Decide whether an imported purchase should gain a first-class
 hand-correction path that survives re-import.
+
+### 6. The Tesco Clubcard export itemises only part of a basket, and its amounts do not reconcile
+
+**What happens.** `import-tesco` (issue #107) copies a Tesco Clubcard export
+faithfully, but the export itself is incomplete and internally inconsistent: its
+`numberOfItems` exceeds the itemised lines on most purchases, and a basket's line
+amounts need not equal its printed `basketValueGross`. The importer therefore
+stores `total_cents` as the printed gross total and each line's
+`line_total_cents` as `price × volume`, so the lines of a transaction may not sum
+to its total.
+
+**Why accepted.** Rebalancing or inventing a missing line would put numbers in
+the ledger the source never stated; a faithful copy with the gaps visible is more
+useful than a fabricated reconciliation.
+
+**Workaround.** The original purchase object — including the full item array,
+`weight`, `volume` and the payment entries — is preserved verbatim in
+`source_payload` and is readable from the purchase detail endpoint and the
+household export.
+
+**Follow-up.** None planned unless Tesco changes the export; the gaps are a
+property of the source, not the importer.
+
+### 7. Store type and savings are preserved but not first-class
+
+**What happens.** The ledger has no column for the store type (`IN_STORE` vs
+`GHS`) or for `overallBasketSavings`, so an imported purchase carries both only
+inside its `source_payload`. Nothing aggregates savings, and no query can filter
+or report on store type without reading the payload.
+
+**Why accepted.** Issue #107 reuses the existing purchase record rather than
+widening it; a first-class store type and savings belong with the savings and
+insights work, not with the import that first needed them.
+
+**Workaround.** Read `source_payload` from the purchase detail endpoint or the
+household export.
+
+**Follow-up.** Add first-class fields if the savings/insights slices (#117 /
+#118) need them.
+
+### 8. Imported lines match only through the Phase-0 cascade
+
+**What happens.** Matching reuses the existing resolution cascade (alias lookup
+then token/fuzzy match); the LLM and user-clarification stages are not run, so a
+branded retailer name that does not contain a catalogue name — most of a Tesco
+basket — stays `unmatched`. The importer reports a matched percentage rather than
+guaranteeing coverage, and only matched lines produce frequency evidence.
+
+**Why accepted.** Issue #107 explicitly reuses the existing cascade and forbids
+any paid or external matching service; a guessed match would be worse than a
+visible miss.
+
+**Workaround.** Unmatched lines remain in the ledger for the normal clarification
+flow; a later re-import re-runs matching, so an item matched by then gains its
+history without a second import path.
+
+**Follow-up.** The unmatched-line review UI and the matching steps 3–4 tracked
+with #108 / #116.
 
 ## Per-store trip view
 

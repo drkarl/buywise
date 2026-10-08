@@ -366,6 +366,7 @@ buywise-cli export-household --db /var/lib/buywise/buywise.db --household-id <uu
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --dry-run
 buywise-cli delete-household --db /var/lib/buywise/buywise.db --household-id <uuid> --confirm
 buywise-cli import-purchases --db /var/lib/buywise/buywise.db --household-id <uuid> --file purchases.json
+buywise-cli import-tesco --db /var/lib/buywise/buywise.db --household-id <uuid> --file tesco-export.json
 buywise-cli expire-receipts --db /var/lib/buywise/buywise.db [--receipt-dir <dir>]
 ```
 
