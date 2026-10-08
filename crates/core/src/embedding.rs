@@ -61,8 +61,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnection, SqlitePool};
-use sqlx::Row;
+use sqlx::sqlite::{Sqlite, SqliteConnection, SqlitePool};
+use sqlx::{QueryBuilder, Row};
 
 use crate::db::{self, DbError};
 use crate::matching::{self, AliasSource};
@@ -369,12 +369,20 @@ impl Embedder for CommandEmbedder {
         let got_dim = response
             .dim
             .unwrap_or_else(|| response.vectors.first().map(|v| v.len()).unwrap_or(0));
-        if response.vectors.len() != texts.len() || got_dim != self.config.dim {
+        let invalid_dim = response
+            .vectors
+            .iter()
+            .find(|vector| vector.len() != self.config.dim)
+            .map(Vec::len);
+        if response.vectors.len() != texts.len()
+            || got_dim != self.config.dim
+            || invalid_dim.is_some()
+        {
             return Err(EmbedError::Shape {
                 want: texts.len(),
                 want_dim: self.config.dim,
                 got: response.vectors.len(),
-                got_dim,
+                got_dim: invalid_dim.unwrap_or(got_dim),
             });
         }
         Ok(response.vectors)
@@ -550,6 +558,9 @@ pub enum ConfirmError {
     /// The line has no name to learn an alias for.
     #[error("the purchase line has no name")]
     UnnamedLine,
+    /// The selected line is stale or its alias already belongs to another item.
+    #[error("the line or alias conflicts with the current clarification state")]
+    Conflict,
     /// A database read or write failed.
     #[error(transparent)]
     Db(#[from] DbError),
@@ -665,16 +676,13 @@ pub async fn unmatched_suggestions(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LineSuggestion>, DbError> {
-    let catalogue = load_catalogue_vectors(pool, household_id, model).await?;
-    let names = load_line_vectors(pool, household_id, model).await?;
-    let labels = load_item_labels(pool, household_id).await?;
-
     let rows = sqlx::query(
         "SELECT pl.id, pl.transaction_id, pt.purchase_date, pl.name, pl.quantity, \
                 pl.line_total_cents \
          FROM purchase_lines pl \
          JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
-         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' AND pl.name IS NOT NULL \
+         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' \
+               AND NULLIF(trim(pl.name), '') IS NOT NULL \
          ORDER BY pt.purchase_date DESC, pl.id ASC \
          LIMIT ?2 OFFSET ?3",
     )
@@ -683,6 +691,14 @@ pub async fn unmatched_suggestions(
     .bind(offset)
     .fetch_all(pool)
     .await?;
+
+    let page_names: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    let catalogue = load_catalogue_vectors(pool, household_id, model).await?;
+    let names = load_line_vectors(pool, household_id, model, &page_names).await?;
+    let labels = load_item_labels(pool, household_id).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -734,8 +750,8 @@ pub async fn confirm_suggestion(
 ) -> Result<ConfirmOutcome, ConfirmError> {
     let mut tx = pool.begin().await?;
 
-    let row: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT pl.name FROM purchase_lines pl \
+    let row = sqlx::query(
+        "SELECT pl.name, pl.match_status FROM purchase_lines pl \
          JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
          WHERE pl.id = ?1 AND pt.household_id = ?2",
     )
@@ -743,12 +759,17 @@ pub async fn confirm_suggestion(
     .bind(household_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(name) = row else {
+    let Some(row) = row else {
         return Err(ConfirmError::NoSuchLine);
     };
+    let name: Option<String> = row.get("name");
+    let match_status: String = row.get("match_status");
     let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
         return Err(ConfirmError::UnnamedLine);
     };
+    if match_status != "unmatched" {
+        return Err(ConfirmError::Conflict);
+    }
 
     let item_exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM canonical_items WHERE id = ?1 AND household_id = ?2")
@@ -758,6 +779,21 @@ pub async fn confirm_suggestion(
             .await?;
     if item_exists.is_none() {
         return Err(ConfirmError::NoSuchItem);
+    }
+
+    let normalised_name = crate::normalise::normalize(&name);
+    let alias_conflict: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM item_aliases \
+         WHERE household_id = ?1 AND lower(alias) = ?2 \
+               AND canonical_item_id <> ?3 LIMIT 1",
+    )
+    .bind(household_id)
+    .bind(&normalised_name)
+    .bind(canonical_item_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if alias_conflict.is_some() {
+        return Err(ConfirmError::Conflict);
     }
 
     matching::commit_alias(
@@ -806,7 +842,8 @@ pub async fn coverage(
          JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
          LEFT JOIN line_name_embeddings e \
              ON e.household_id = pt.household_id AND e.name = pl.name AND e.model = ?2 \
-         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' AND pl.name IS NOT NULL",
+         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' \
+               AND NULLIF(trim(pl.name), '') IS NOT NULL",
     )
     .bind(household_id)
     .bind(model)
@@ -871,7 +908,8 @@ async fn unmatched_names(pool: &SqlitePool, household_id: &str) -> Result<Vec<St
     let rows = sqlx::query(
         "SELECT DISTINCT pl.name FROM purchase_lines pl \
          JOIN purchase_transactions pt ON pt.id = pl.transaction_id \
-         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' AND pl.name IS NOT NULL \
+         WHERE pt.household_id = ?1 AND pl.match_status = 'unmatched' \
+               AND NULLIF(trim(pl.name), '') IS NOT NULL \
          ORDER BY pl.name ASC",
     )
     .bind(household_id)
@@ -974,14 +1012,23 @@ async fn load_line_vectors(
     pool: &SqlitePool,
     household_id: &str,
     model: &str,
+    names: &std::collections::HashSet<String>,
 ) -> Result<HashMap<String, Vec<f32>>, DbError> {
-    let rows = sqlx::query(
-        "SELECT name, vector FROM line_name_embeddings WHERE household_id = ?1 AND model = ?2",
-    )
-    .bind(household_id)
-    .bind(model)
-    .fetch_all(pool)
-    .await?;
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT name, vector FROM line_name_embeddings \
+         WHERE household_id = ",
+    );
+    query.push_bind(household_id).push(" AND model = ").push_bind(model);
+    query.push(" AND name IN (");
+    let mut separated = query.separated(", ");
+    for name in names {
+        separated.push_bind(name);
+    }
+    separated.push_unseparated(")");
+    let rows = query.build().fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -1018,8 +1065,12 @@ async fn load_item_labels(
 
 /// Refuse a batch whose returned shape does not match the request.
 fn validate_shape(count: usize, dim: usize, vectors: &[Vec<f32>]) -> Result<(), EmbedError> {
-    let got_dim = vectors.first().map(|v| v.len()).unwrap_or(dim);
-    if vectors.len() != count || got_dim != dim {
+    let got_dim = vectors
+        .iter()
+        .find(|vector| vector.len() != dim)
+        .map(Vec::len)
+        .unwrap_or_else(|| vectors.first().map(|v| v.len()).unwrap_or(dim));
+    if vectors.len() != count || vectors.iter().any(|vector| vector.len() != dim) {
         return Err(EmbedError::Shape {
             want: count,
             want_dim: dim,

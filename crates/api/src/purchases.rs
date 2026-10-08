@@ -377,7 +377,8 @@ async fn list_unmatched_suggestions(
 /// confirm one line's canonical item.
 ///
 /// 403 unless the caller is a member; 404 when the line or the item is not the
-/// household's; 422 when the line has no name. On success the line name is
+/// household's; 409 when the line is stale or its alias belongs to another item;
+/// 422 when the line has no name. On success the line name is
 /// learned as an `accepted_match` alias (the shared clarification write path) and
 /// every unmatched line of the household that shares the name is bound to the
 /// chosen item. Nothing is bound without this call.
@@ -399,6 +400,7 @@ async fn confirm_unmatched_suggestion(
         Ok(outcome) => Ok(Json(outcome)),
         Err(ConfirmError::NoSuchLine | ConfirmError::NoSuchItem) => Err(StatusCode::NOT_FOUND),
         Err(ConfirmError::UnnamedLine) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(ConfirmError::Conflict) => Err(StatusCode::CONFLICT),
         Err(err @ ConfirmError::Db(_)) => {
             tracing::error!(error = %err, "purchases.unmatched_suggestions.confirm");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
