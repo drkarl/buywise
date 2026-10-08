@@ -70,9 +70,9 @@
 //! `unmatched` and **kept**, never dropped or guessed, for the normal
 //! clarification flow. No paid or external service is called.
 //!
-//! For every matched positive-value line in a non-refund purchase the importer
-//! also writes a `purchase_events` row with `source = 'import'` at the
-//! purchase's calendar day, so
+//! For every matched line with a positive line total in a purchase with a
+//! non-negative gross total, the importer also writes a `purchase_events` row
+//! with `source = 'import'` at the purchase's calendar day, so
 //! [`crate::suggestions::compute_suggestions`] sees the imported history. The
 //! event id is a deterministic hash of the household, the purchase identity and
 //! the canonical item, and the write is `ON CONFLICT DO NOTHING`, so re-running
@@ -244,8 +244,9 @@ pub fn parse_tesco_export(document: &Value) -> Result<Vec<TescoPurchase>, TescoI
 ///
 /// Parses and validates the export, maps each line name to a canonical item
 /// with the existing cascade, imports the purchases through the shared ledger,
-/// and records frequency evidence for the matched lines. `now` is the injected
-/// clock, used only as the evidence rows' `recorded_at`.
+/// and records frequency evidence for matched positive-value lines in
+/// non-negative-total purchases. `now` is the injected clock, used only as the
+/// evidence rows' `recorded_at`.
 ///
 /// The ledger import is one database transaction (all purchases or none). The
 /// evidence write follows in its own transaction and is idempotent, so a failure

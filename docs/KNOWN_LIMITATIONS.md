@@ -144,7 +144,8 @@ household export.
 then token/fuzzy match); the LLM and user-clarification stages are not run, so a
 branded retailer name that does not contain a catalogue name — most of a Tesco
 basket — stays `unmatched`. The importer reports a matched percentage rather than
-guaranteeing coverage, and only matched lines produce frequency evidence.
+guaranteeing coverage, and only matched lines with positive line totals in
+non-negative-total purchases produce frequency evidence.
 
 **Why accepted.** Issue #107 explicitly reuses the existing cascade and forbids
 any paid or external matching service; a guessed match would be worse than a
