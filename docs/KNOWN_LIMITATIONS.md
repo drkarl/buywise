@@ -171,11 +171,15 @@ from 43.1% to 55.1%), but it has three known edges:
   character staple as a word now surfaces that staple too, so a previously single
   match can become ambiguous: `Dairy Milk` chocolate adds `Milk`, `Honey Roast
   Ham` adds `Ham`, `Spring Water` adds `Water`, `Salt & Vinegar` adds `Salt`.
-  The cascade refuses to guess between them and reports `multiple_candidates`
-  (clarification), so no wrong match is made, but the line is no longer
-  auto-matched. On the real export ~245 lines moved from matched to ambiguous
-  this way (many of them cases where the *new* candidate is the more correct
-  staple, e.g. `Tuna Chunks In Spring Water` now offers `Tuna`).
+  If multiple candidates tie at the best score, the cascade reports
+  `multiple_candidates` (clarification). If one candidate has the strongest
+  score, including when it is only a partial match, it resolves automatically;
+  that mapping can later be learned as an `accepted_match` alias. This heuristic
+  can bind a generic staple when it is the only candidate, so a unique partial
+  result is not guaranteed to be correct. On the real export ~245 lines moved
+  from matched to ambiguous this way (many of them cases where the *new*
+  candidate is the more correct staple, e.g. `Tuna Chunks In Spring Water` now
+  offers `Tuna`).
 * **Substring false positives are gone.** A match that existed only as a
   substring no longer fires, so `peppers` no longer matches `Pepper`, `sugars`
   no longer matches `Sugar`, `breadcrumb(s)` no longer matches `Bread`,
@@ -189,11 +193,13 @@ from 43.1% to 55.1%), but it has three known edges:
   falls to `Salt`). ~14 real lines changed their matched item this way.
 
 **Why accepted.** A whole-word rule with a 3-character floor is what the Tesco
-history needed; every edge above is the conservative direction (unmatched or
-ambiguous, never a guessed wrong match), and the captain explicitly preferred
-"never guess" over a heuristic tie-break. A "longest match wins" tie-break was
-rejected because it resolves a branded `Coca-Cola Zero Sugar Soft Drink` to
-`Soda` via the generic alias `soft drink`, which is wrong.
+history needed. Longest shared token run breaks ties among whole-token matches,
+while fuzzy-only matches rank below them. A unique strongest partial match still
+resolves automatically to recover branded lines; equal top scores remain
+ambiguous. This can select a generic alias in some branded names: for example,
+`Coca-Cola Zero Sugar Soft Drink` can resolve to `Soda` via `soft drink` when
+that is the strongest candidate. This is the tradeoff for recovering uniquely
+matched staples from long names.
 
 **Workaround.** Unmatched and ambiguous lines stay in the ledger for the normal
 clarification flow (matching steps 3–4); a later re-import re-runs matching, so a
