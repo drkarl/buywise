@@ -11,5 +11,6 @@ pub mod product_matching;
 pub mod purchase_ledger;
 pub mod receipts;
 pub mod suggestions;
+pub mod tesco_import;
 
 pub use domain::*;

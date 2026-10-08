@@ -31,6 +31,7 @@ parses.
 9. [Reading and deleting a ledger](#reading-and-deleting-a-ledger)
 10. [Manual purchases and the receipt-photo link](#manual-purchases-and-the-receipt-photo-link)
 11. [Export and household deletion](#export-and-household-deletion)
+12. [Tesco Clubcard export importer](#tesco-clubcard-export-importer)
 
 ## Importing
 
@@ -355,3 +356,70 @@ A household's ledger — every `purchase_transactions` row (including its
 documented household export ([`docs/household-export.md`](household-export.md))
 and is removed by the household delete, so the household's own data controls
 cover it like every other household-scoped record.
+
+## Tesco Clubcard export importer
+
+```
+buywise-cli import-tesco --db /var/lib/buywise/buywise.db \
+  --household-id 00000000-0000-0000-0000-000000000001 \
+  --file a4906c75-transactions.json
+```
+
+Issue [#107](https://github.com/drkarl/buywise/issues/107) bootstraps suggestions
+with a household's past purchases. `import-tesco` turns a Tesco Clubcard
+purchase-history export into the ledger above; it is a front end over this
+format, not a second store, so its result is an ordinary set of
+`purchase_transactions` rows with the same identity and revision rules. It reads
+only the export's `purchases` array — the `orders` section carries the delivery
+address and phone numbers and is **never read, stored or printed** — validates
+the shape, and imports every purchase in one document, exactly as
+`import-purchases` would.
+
+The mapping from the export's own fields:
+
+| Export field | Ledger field |
+| --- | --- |
+| `timestamp` | `purchase_date` (the shop's own calendar day) |
+| `basketValueGross` | `total_cents` (the amount paid) |
+| `type` (`IN_STORE` / `GHS`) | preserved in `source_payload` |
+| `basketValueNet`, `overallBasketSavings`, `payment`, `items` | preserved verbatim in `source_payload` |
+| item `name` | line `original_text` and `name` (a missing name becomes `[unnamed item]`) |
+| item `quantity` | line `quantity` (omitted for a non-positive count) |
+| item `price` | line `unit_price_cents` |
+| item `price × volume` | line `line_total_cents` |
+
+The export itemises refunds: a whole refund purchase has a negative
+`basketValueGross` and `numberOfItems`, and a refund line inside an ordinary
+basket has a negative `quantity`/`volume` and a negative line total. These are
+copied as-is — a negative `total_cents` and `line_total_cents` are valid — except
+that a line's `quantity` is left unset for a non-positive count, because the
+ledger requires a positive quantity; the signed numbers survive in
+`source_payload`.
+
+`retailer` is always `tesco`; the store type is not a retailer. `source_payload`
+is the original purchase object verbatim, so store type, both totals, the savings
+and every raw line number — including `weight` and `volume`, which the ledger has
+no column for — survive even though only the total is first-class.
+
+**Identity.** The export has no per-purchase transaction id, so the importer
+supplies a stable computed `source_transaction_id`: `tesco1:` plus the SHA-256 of
+the timestamp, store type, both totals, the savings and every line's
+name/quantity/weight/volume/price. Re-importing the same export is idempotent —
+one transaction, one set of lines — while the key still separates two same-day
+purchases that differ in time, totals or content.
+
+**Matching and suggestions.** Each line name is resolved with the existing
+resolution cascade (`crate::matching::resolve`): a single unambiguous match links
+the line (`match_status = matched`); no match, or several candidates, leaves it
+`unmatched` — kept and never guessed, for the normal clarification flow. No paid
+or external service is called. Every matched line also records a `purchase_events`
+row (`source = 'import'`) on the purchase's day, so the frequency model
+(`crates/core/src/suggestions.rs`) sees the imported history; the event id is a
+deterministic hash and the write is idempotent, so re-importing never duplicates
+evidence.
+
+**Coverage caveat.** The export's own numbers do not reconcile: `numberOfItems`
+exceeds the itemised lines on most purchases, and a basket's line amounts need
+not equal its printed total. The importer copies each line faithfully and never
+rebalances or invents an amount. See
+[`docs/KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md).
