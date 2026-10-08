@@ -158,6 +158,51 @@ history without a second import path.
 **Follow-up.** The unmatched-line review UI and the matching steps 3–4 tracked
 with #108 / #116.
 
+### 9. The whole-token matcher over- and under-matches at the margins
+
+**What happens.** Step 2 of the cascade (`crates/core/src/matching.rs`) matches a
+catalogue name or alias only as a **whole word** (a contiguous run of tokens),
+never as a substring of a longer word, and the whole-token minimum is 3
+characters so short staples (`eggs`, `milk`, `rice`, `ham`, `mop`) match a longer
+branded name. That is a large net gain on the Tesco history (matched lines rose
+from 43.1% to 55.1%), but it has three known edges:
+
+* **Short staples add a second candidate.** A branded name that contains a 3–4
+  character staple as a word now surfaces that staple too, so a previously single
+  match can become ambiguous: `Dairy Milk` chocolate adds `Milk`, `Honey Roast
+  Ham` adds `Ham`, `Spring Water` adds `Water`, `Salt & Vinegar` adds `Salt`.
+  The cascade refuses to guess between them and reports `multiple_candidates`
+  (clarification), so no wrong match is made, but the line is no longer
+  auto-matched. On the real export ~245 lines moved from matched to ambiguous
+  this way (many of them cases where the *new* candidate is the more correct
+  staple, e.g. `Tuna Chunks In Spring Water` now offers `Tuna`).
+* **Substring false positives are gone.** A match that existed only as a
+  substring no longer fires, so `peppers` no longer matches `Pepper`, `sugars`
+  no longer matches `Sugar`, `breadcrumb(s)` no longer matches `Bread`,
+  `pepperoni` no longer matches `Pepper`. Those were spurious; the lines become
+  unmatched and go to clarification. ~128 real lines moved from matched to
+  unmatched this way.
+* **Inflection and glued size text are not handled.** A plural catalogue phrase
+  is not matched by its singular alias (`Ice Creams` no longer matches `Ice
+  cream`; it falls to the shorter staple `Ice`), and a size suffix glued to a
+  word breaks the token (`vinegar125g` no longer matches `Vinegar`; the line
+  falls to `Salt`). ~14 real lines changed their matched item this way.
+
+**Why accepted.** A whole-word rule with a 3-character floor is what the Tesco
+history needed; every edge above is the conservative direction (unmatched or
+ambiguous, never a guessed wrong match), and the captain explicitly preferred
+"never guess" over a heuristic tie-break. A "longest match wins" tie-break was
+rejected because it resolves a branded `Coca-Cola Zero Sugar Soft Drink` to
+`Soda` via the generic alias `soft drink`, which is wrong.
+
+**Workaround.** Unmatched and ambiguous lines stay in the ledger for the normal
+clarification flow (matching steps 3–4); a later re-import re-runs matching, so a
+line resolved by then gains its history without a second import path.
+
+**Follow-up.** Plural/possessive normalisation (or a cheap stem) before the
+whole-token comparison, and a size-suffix split in the normaliser, would recover
+the inflection and glued-text cases. Neither is in scope for this fix.
+
 ## Per-store trip view
 
 Splits the chosen optimiser plan into one shopping list per store — the trip view, the store-scoped
