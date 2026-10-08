@@ -1021,7 +1021,10 @@ async fn load_line_vectors(
         "SELECT name, vector FROM line_name_embeddings \
          WHERE household_id = ",
     );
-    query.push_bind(household_id).push(" AND model = ").push_bind(model);
+    query
+        .push_bind(household_id)
+        .push(" AND model = ")
+        .push_bind(model);
     query.push(" AND name IN (");
     let mut separated = query.separated(", ");
     for name in names {
