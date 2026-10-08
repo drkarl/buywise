@@ -401,13 +401,14 @@ pub fn encode_vector(vector: &[f32]) -> Vec<u8> {
 /// Decode a little-endian `f32` vector, or `None` when the byte length is not a
 /// multiple of four.
 pub fn decode_vector(bytes: &[u8]) -> Option<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return None;
     }
     Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        chunks
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect(),
     )
 }
