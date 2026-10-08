@@ -378,6 +378,51 @@ async fn refund_lines_keep_their_signed_amounts() {
 }
 
 #[tokio::test]
+async fn refunds_do_not_create_frequency_evidence() {
+    let pool = setup_pool().await;
+    seed_item(&pool, "item-milk", HH_A, "Milk", "milk").await;
+    let document = export(vec![
+        purchase(
+            "2026-03-27 14:22:30.028",
+            "GHS",
+            2.49,
+            0.0,
+            vec![
+                item(Some("milk"), 1.0, 0.0, 2.49, 1.0),
+                item(Some("milk"), -1.0, 0.0, 2.49, -1.0),
+            ],
+        ),
+        purchase(
+            "2026-03-28 14:22:30.028",
+            "GHS",
+            -2.49,
+            0.0,
+            vec![item(Some("milk"), 1.0, 0.0, 2.49, 1.0)],
+        ),
+    ]);
+
+    let outcome = import(&pool, &document).await;
+    assert_eq!(outcome.matched_lines, 3);
+    assert_eq!(outcome.events_recorded, 1);
+
+    let events = scalar(
+        &pool,
+        "SELECT COUNT(*) FROM purchase_events WHERE source = 'import'",
+    )
+    .await;
+    assert_eq!(events, 1, "only the ordinary positive line is evidence");
+    let (refund_line_total, refund_quantity): (i64, Option<f64>) = sqlx::query_as(
+        "SELECT line_total_cents, quantity FROM purchase_lines \
+         WHERE line_total_cents < 0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refund_line_total, -249);
+    assert_eq!(refund_quantity, None);
+}
+
+#[tokio::test]
 async fn the_orders_section_is_never_read() {
     let pool = setup_pool().await;
     let mut document = export(vec![purchase(
