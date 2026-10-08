@@ -84,7 +84,7 @@ in `migrations/`, and serves; the CLI and the weekly ingest open the same file.
 | `mutations` | append-only offline-sync log: idempotency keys, device id, operation, payload, and the stored response | sync, replay |
 | `recommendation_runs`, `savings_events` | optimiser runs (`plans_json`) and realised/estimated savings | savings history |
 | `product_matches`, `match_feedback` | accepted/rejected/suggested canonical↔retailer-product links, and accept/reject/prefer/undo feedback | price matching + learning |
-| `purchase_events`, `purchase_dismissals` | one row per observed purchase (`check_off` today), and per-item "not now" dismissals | purchase suggestions |
+| `purchase_events`, `purchase_dismissals` | frequency evidence from list check-offs and qualifying imported purchases, and per-item "not now" dismissals | purchase suggestions |
 | `purchase_transactions`, `purchase_lines`, `purchase_transaction_revisions` | imported and hand-entered (`source_kind = manual`) purchase transactions with their lines (quantity, size, unit price, line total, deposit, optional product/item links), their superseded revisions, and an optional receipt-photo link (`receipt_image_id`, cleared if the image goes) | the purchase ledger — what the household actually bought (issues #148, #156) |
 | `receipt_images` | metadata for each stored receipt photo: household, uploader, upload and expiry timestamps, detected content type, size, SHA-256, storage key and processing choice | §4; the image **bytes are not here** — they are files in the receipt directory |
 

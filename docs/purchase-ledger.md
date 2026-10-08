@@ -8,10 +8,12 @@ receipt (issue [#156](https://github.com/drkarl/buywise/issues/156)); a later
 slice adds reading receipts. All feed the same model
 (issue [#148](https://github.com/drkarl/buywise/issues/148), roadmap #114).
 
-It is deliberately separate from `purchase_events`: that table records only the
-*check-off timing* of a canonical item and has no quantity, product or amount, so
-it is not a money record. Nothing in this feature changes `purchase_events` or
-the suggestion logic.
+It is deliberately separate from `purchase_events`: that table records
+frequency evidence for a canonical item — from list check-offs and, for the
+Tesco importer below, qualifying imported purchases — and has no quantity,
+product or amount, so it is not a money record. The Tesco importer writes
+evidence there; the ledger remains the authoritative record of purchase amounts
+and lines.
 
 This document is the complete import-format contract: an importer for any
 retailer can be written from this page alone, and
