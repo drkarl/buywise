@@ -613,7 +613,7 @@ Implement `crates/core/src/matching.rs`. This is the resolution logic used by Ph
 ```rust
 pub enum ResolutionOutcome {
     /// Single unambiguous match — resolved canonical_item_id
-    SingleMatch { canonical_item_id: String },
+    SingleMatch { canonical_item_id: String, kind: MatchKind },
     /// Multiple plausible candidates — requires user selection
     MultipleCandidates { candidates: Vec<String> },  // canonical_item_ids
     /// No match found via alias or fuzzy — requires LLM or user
@@ -629,8 +629,7 @@ pub fn alias_lookup(
 
 /// Step 2: token/fuzzy match against name_en, name_es, and all aliases
 /// Returns SingleMatch, MultipleCandidates, or NoMatch
-/// Threshold: Levenshtein distance ≤ 2, minLength ≥ 4, bidirectional contains (minLength ≥ 5)
-/// (see §15: port fuzzy.ts thresholds)
+/// Matching and ranking rules are owned by design §8.
 pub fn fuzzy_match(
     text: &str,
     household_id: &str,
@@ -646,7 +645,7 @@ pub async fn resolve(
 ) -> Result<ResolutionOutcome>
 ```
 
-Use the `strsim` crate for Levenshtein distance (provides `levenshtein` function). Thresholds from §15: distance ≤ 2, minimum string length 4, bidirectional contains minimum length 5.
+Use the `strsim` crate for Levenshtein distance (provides `levenshtein` function). Matching thresholds and ranking are owned by design §8.
 
 Phase 0 `resolve` calls step 1 then step 2. If step 2 returns `NoMatch` or `MultipleCandidates`, return those outcomes directly without calling LLM or user clarification (those are added in Phase 3).
 
