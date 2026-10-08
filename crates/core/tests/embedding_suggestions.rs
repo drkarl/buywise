@@ -532,7 +532,10 @@ async fn blank_names_are_excluded_from_embedding_suggestions_and_coverage() {
         &pool,
         "tx-1",
         "2026-02-01",
-        &[("ln-blank", "   ", 0), ("ln-eggs", "Tesco Free Range Eggs Large Box Of 12", 329)],
+        &[
+            ("ln-blank", "   ", 0),
+            ("ln-eggs", "Tesco Free Range Eggs Large Box Of 12", 329),
+        ],
     )
     .await;
     let embedder = FakeEmbedder::new();
@@ -550,7 +553,9 @@ async fn blank_names_are_excluded_from_embedding_suggestions_and_coverage() {
         .expect("suggestions");
     assert_eq!(suggestions.len(), 1);
     assert_eq!(suggestions[0].line_id, "ln-eggs");
-    let coverage = embedding::coverage(&pool, HH, MODEL).await.expect("coverage");
+    let coverage = embedding::coverage(&pool, HH, MODEL)
+        .await
+        .expect("coverage");
     assert_eq!(coverage.unmatched_lines, 1);
     assert_eq!(coverage.distinct_names, 1);
 }

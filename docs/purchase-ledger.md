@@ -413,9 +413,13 @@ purchases that differ in time, totals or content.
 **Matching and suggestions.** Each line name is resolved with the existing
 resolution cascade (`crate::matching::resolve`): a single unambiguous match links
 the line (`match_status = matched`); no match, or several candidates, leaves it
-`unmatched` — kept and never guessed, for the normal clarification flow. No paid
-or external service is called. Every matched line with a positive line total in
-a purchase with a non-negative gross total also records a `purchase_events` row
+`unmatched` — kept and never guessed, for the normal clarification flow. The
+import itself calls no paid or remote service. A separate, opt-in local
+embedding command can rank candidates for unmatched lines; it never binds them
+without confirmation. See
+[known limitations](KNOWN_LIMITATIONS.md#embedding-suggestions-for-unmatched-lines)
+for the suggestion endpoint and batch-step details. Every matched line with a
+positive line total in a purchase with a non-negative gross total also records a `purchase_events` row
 (`source = 'import'`) on the purchase's day, so the frequency model
 (`crates/core/src/suggestions.rs`) sees the imported history; the event id is a
 deterministic hash and the write is idempotent, so re-importing never duplicates
