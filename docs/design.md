@@ -2,7 +2,7 @@
 
 **Status:** Draft v13 — eleventh Codex review applied  
 **Household:** one family household  
-**Purpose:** Private household utility; not a public product
+**Purpose:** Personal grocery tool prepared for open-source publication; never deployed, no releases
 
 ---
 
