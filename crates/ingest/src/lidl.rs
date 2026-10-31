@@ -519,6 +519,10 @@ fn no_network() -> bool {
 
 /// Read and parse the no-network fixture (`fixtures/lidl_offers.json`).
 ///
+/// The committed fixture is synthetic — invented products, brands, prices and
+/// `example.test` URLs — but keeps the live feed's JSON shape so the no-network
+/// path exercises the same parsing and normalisation as a real response.
+///
 /// The path is resolved relative to the crate's `CARGO_MANIFEST_DIR` so it works
 /// regardless of the process CWD.
 fn load_fixture_offers() -> Result<Vec<RawLidlProduct>, IngestError> {
