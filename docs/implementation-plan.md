@@ -1,7 +1,7 @@
 # BuyWise — Implementation Plan
 
 **Based on:** `docs/design.md` v13  
-**Repository:** Rust workspace at `/home/drkarl/projects/buywise/`  
+**Repository:** Rust workspace (`crates/`) with a SvelteKit PWA in `frontend/`  
 **Date:** 2026-05-28
 
 ---

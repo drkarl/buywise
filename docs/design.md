@@ -1,7 +1,7 @@
 # Household Grocery Optimiser — Design Document
 
 **Status:** Draft v13 — eleventh Codex review applied  
-**Household:** 2 adults, 2 children, Ireland  
+**Household:** one family household  
 **Purpose:** Private household utility; not a public product
 
 ---
@@ -34,7 +34,7 @@ The app must track savings evidence so the household can judge whether the effor
 
 ## 3. Users
 
-Two users: a couple. Both have equal rights to view and modify the shared list. Household includes two children (relevant for constraints: nappy sizes, child-specific items).
+One family household. Every member has equal rights to view and modify the shared list. Members' needs differ (household-specific item sizes and constraints), which the constraints model has to accommodate.
 
 The data model should use `households / users / household_members` — not hardcoded two-user assumptions — but multi-household SaaS is not a goal.
 
