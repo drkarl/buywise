@@ -568,8 +568,10 @@ interval later (issue #106, part of roadmap #114). Statistics only — no AI.
 `crates/api/src/mutations.rs`). Checking off an unresolved or ambiguous entry records nothing,
 because there is no canonical item to attribute it to. Evidence is keyed by household, not list, so
 an item still active on one list is not excluded from the Suggested section of a *different* list
-of the same household. The `purchase_events.source` column exists so a later receipt/import source
-can be added, but no such importer is built (a non-goal of this issue).
+of the same household. Evidence also comes from the Tesco purchase-history import (#107), which
+writes `purchase_events` rows with deterministic ids; same-day evidence collapses to one purchase
+day, so a check-off and an imported line for the same shop do not count twice. Receipt-photo
+ingestion is not built (that is #116).
 
 **Why accepted.** The captain's version-one scope treats check-offs as a proxy for purchases,
 distinct from receipt-confirmed purchases, and explicitly excludes importing purchases. Resolved

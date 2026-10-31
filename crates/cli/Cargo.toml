@@ -2,6 +2,7 @@
 name = "buywise-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 name = "buywise_cli"
