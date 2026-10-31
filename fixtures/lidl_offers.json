@@ -1,10 +1,10 @@
 [
   {
-    "external_id": "lidl-200145",
-    "name": "Lidl Milbona Irish Semi Skimmed Milk 2L",
-    "brand": "Milbona",
+    "external_id": "synth-1001",
+    "name": "Semi Skimmed Milk 2L",
+    "brand": "Fernway",
     "category": "Dairy",
-    "url": "https://www.lidl.ie/p/milbona-semi-skimmed-milk/p200145",
+    "url": "https://example.test/lidl/synth-1001",
     "price_cents": 199,
     "previous_price_cents": null,
     "offer_text": null,
@@ -13,11 +13,11 @@
     "cache_expires_at": "2026-06-05T03:00:00.000Z"
   },
   {
-    "external_id": "lidl-301288",
-    "name": "Lidl Deluxe Irish Mature Cheddar 400g",
-    "brand": "Deluxe",
+    "external_id": "synth-1002",
+    "name": "Mature Cheddar 400g",
+    "brand": "Copperloaf",
     "category": "Dairy",
-    "url": "https://www.lidl.ie/p/deluxe-mature-cheddar/p301288",
+    "url": "https://example.test/lidl/synth-1002",
     "price_cents": 289,
     "previous_price_cents": 329,
     "offer_text": "Was €3.29 Now €2.89",
@@ -26,11 +26,11 @@
     "cache_expires_at": "2026-06-05T03:00:00.000Z"
   },
   {
-    "external_id": "lidl-415002",
-    "name": "Lidl Combino Spaghetti 500g",
-    "brand": "Combino",
+    "external_id": "synth-1003",
+    "name": "Spaghetti 500g",
+    "brand": "Hearthside",
     "category": "Pantry",
-    "url": "https://www.lidl.ie/p/combino-spaghetti/p415002",
+    "url": "https://example.test/lidl/synth-1003",
     "price_cents": 79,
     "previous_price_cents": null,
     "offer_text": null,
@@ -39,11 +39,11 @@
     "cache_expires_at": "2026-06-05T03:00:00.000Z"
   },
   {
-    "external_id": "lidl-528177",
-    "name": "Lidl W5 Lemon Washing Up Liquid 750ml",
-    "brand": "W5",
+    "external_id": "synth-1004",
+    "name": "Lemon Washing Up Liquid 750ml",
+    "brand": "Brightwell",
     "category": "Household",
-    "url": "https://www.lidl.ie/p/w5-washing-up-liquid/p528177",
+    "url": "https://example.test/lidl/synth-1004",
     "price_cents": 99,
     "previous_price_cents": null,
     "offer_text": null,
@@ -52,11 +52,11 @@
     "cache_expires_at": "2026-06-05T03:00:00.000Z"
   },
   {
-    "external_id": "lidl-630441",
-    "name": "Lidl Floralys Toilet Roll 9 Pack",
-    "brand": "Floralys",
+    "external_id": "synth-1005",
+    "name": "Toilet Roll 9 Pack",
+    "brand": "Softfold",
     "category": "Household",
-    "url": "https://www.lidl.ie/p/floralys-toilet-roll/p630441",
+    "url": "https://example.test/lidl/synth-1005",
     "price_cents": 349,
     "previous_price_cents": null,
     "offer_text": null,
@@ -65,11 +65,11 @@
     "cache_expires_at": "2026-06-05T03:00:00.000Z"
   },
   {
-    "external_id": "lidl-701903",
-    "name": "Lidl Greek Style Natural Yogurt 500g",
-    "brand": "Milbona",
+    "external_id": "synth-1006",
+    "name": "Greek Style Natural Yogurt 500g",
+    "brand": "Fernway",
     "category": "Dairy",
-    "url": "https://www.lidl.ie/p/greek-style-yogurt/p701903",
+    "url": "https://example.test/lidl/synth-1006",
     "price_cents": 149,
     "previous_price_cents": null,
     "offer_text": null,
@@ -79,7 +79,7 @@
   },
   {
     "external_id": null,
-    "name": "Lidl Mystery Product With No External ID 1L",
+    "name": "Mystery Product With No External ID 1L",
     "brand": null,
     "category": null,
     "url": null,
