@@ -12,6 +12,8 @@ BuyWise is built in six phases. Each phase has a concrete gate — do not begin 
 
 The **critical path** is: Phase 0 (validate savings ≥ €50/month) → Phase 1 (persistent API) → Phase 2 (PWA + offline) → Phases 3–5 (progressively smarter). The first three phases constitute the minimum useful product. Phases 4–5 are meaningful only if Phase 0 confirms the savings case.
 
+**AI is optional, not a milestone.** No phase requires an AI provider or a model download. The LLM fallback (P3-T2) and the embedding shortlist are off by default, are not gate criteria for any phase, and the product described above works fully without either. The plan keeps them where they sit rather than treating them as committed requirements.
+
 **Architectural principles enforced throughout:**
 
 - Money is always stored as integer cents (or micros for unit prices). No floats.
@@ -83,8 +85,8 @@ Phase 2 tasks (P2):
 
 Phase 3 tasks (P3):
   P2 complete
-    └─► P3-T1  server-side resolution cascade (alias → token/fuzzy → LLM → user)
-          └─► P3-T2  LLM fallback integration (no_match only)
+    └─► P3-T1  server-side resolution cascade (alias → token/fuzzy → optional LLM → user)
+          └─► P3-T2  LLM fallback integration (no_match only) — optional, off by default
           └─► P3-T3  ambiguity confirmation flow in PWA
           └─► P3-T4  item_aliases feedback persistence
 
@@ -2008,6 +2010,8 @@ Build the shopping mode view at `frontend/src/routes/(app)/list/[id]/shopping/+p
 
 **Gate:** A new item typed in Spanish resolves to the correct canonical item without user prompting (for unambiguous terms). Ambiguous terms show a clarification prompt. Confirmed mappings persist and are used on next entry.
 
+**AI status:** P3-T2 (the LLM fallback) is implemented as an optional, off-by-default extra. It is not part of this gate and is not committed work for the phase; with the switch unset, an unmatched term stays `unresolved` for user clarification, which is the shipped default. The embedding shortlist is likewise offline by default and lives outside the phase plan.
+
 ---
 
 ### P3-T1: Server-side resolution cascade — alias and fuzzy steps
@@ -2058,6 +2062,8 @@ The cascade must apply the normaliser from P0-T5 to the `raw_text` before matchi
 ---
 
 ### P3-T2: LLM fallback for no_match
+
+**Status:** Implemented as an optional, off-by-default extra (`LLM_FALLBACK_ENABLED`, `crates/api/src/llm.rs`). It is not a requirement of Phase 3: the phase gate and every feature above it are met without it, and the shipped default leaves an unmatched term `unresolved` for user clarification. The scope below is kept as written for reference.
 
 **Type:** feature
 

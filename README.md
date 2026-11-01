@@ -13,7 +13,12 @@ A self-hosted household grocery list and savings app for Ireland. It compares pr
 - Live price ingest is untested against a live supplier: the BasketWatch adapter needs an API key and the Lidl adapter needs a feed URL, and neither has been run against a current, verified source. Price comparison therefore works only with imported or fixture offers plus household `product_matches` rows.
 - The savings figures are estimates until purchases are reconciled with plans (tracked in [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md)).
 
-**Optional, off by default:** an external LLM fallback for unmatched list terms (`LLM_FALLBACK_ENABLED`) and a local embedding shortlist for imported-line suggestions (`EMBEDDING_ENABLED`). Both are documented in [`docs/data-flows.md`](docs/data-flows.md); the app runs fully without either.
+**Optional, off by default:** two AI features ship as extras, not requirements, and the app runs fully without either:
+
+- LLM assistance for unmatched list terms and for ranking proposed product matches (`LLM_FALLBACK_ENABLED`) — can send household terms to a configured provider.
+- A local embedding shortlist that ranks catalogue candidates for unmatched imported lines (`EMBEDDING_ENABLED`) — a local command, so no data leaves the server; API- and CLI-only for now, with no screen.
+
+The core of the project is grocery ingestion, product matching, shared lists, offline sync and basket optimisation. What the optional features send and to whom is in [`docs/data-flows.md`](docs/data-flows.md) §2.6.
 
 ## What it does
 
@@ -220,14 +225,16 @@ See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for accepted gaps a
 ## Build phases
 
 All six phases are implemented locally and covered by the test suites; none has
-been exercised against a real deployment or live price feed.
+been exercised against a real deployment or live price feed. No phase requires an
+AI provider or a model download: the optional LLM fallback and the embedding
+shortlist are off by default and are not phase requirements.
 
 | Phase | Scope |
 |---|---|
 | 0 | CLI optimiser with fixture data — validates the core logic end-to-end |
 | 1 | Axum API: auth, list CRUD, mutation endpoint, SSE stream |
 | 2 | SvelteKit PWA: list UI, offline sync, shopping mode |
-| 3 | Bilingual resolution cascade + optional LLM fallback |
+| 3 | Bilingual resolution cascade; the LLM fallback is an optional, off-by-default extra |
 | 4 | Optimiser UI: four plans, plain-language recommendation |
 | 5 | Household learning, match feedback, savings ledger |
 
