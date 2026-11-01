@@ -402,7 +402,7 @@ Items entered in English or Spanish must resolve to the same `canonical_item`. T
    - A unique strongest candidate wins: a whole-string equality ranks first, then whole-token matches by longest shared token run, then fuzzy-only matches. A unique **whole-name** match (exact equality, or a fuzzy match over the whole term) is a name for the item, so it is learned as an `accepted_match` alias. A unique **partial** match — a staple found as a whole word inside a longer input (`oat milk` → `Milk`) — binds the line for the frequency model but is **not** learned as an alias; the input is not a name for the item.
    - Zero results → `no_match` outcome (go to step 3)
    - Candidates tied at the top → `multiple_candidates` outcome (go to step 4)
-3. **LLM fallback for `no_match`** — cheap LLM API call to find the most plausible canonical item; result committed to `item_aliases` with `source: 'llm'`; if LLM returns no confident match → go to step 4
+3. **Optional LLM fallback for `no_match`** — off unless `LLM_FALLBACK_ENABLED=true` with credentials configured; then a cheap LLM API call looks for the most plausible canonical item, committed to `item_aliases` with `source: 'llm'`. If the fallback is off, or returns no confident match → go to step 4. The phase's committed scope is steps 1, 2 and 4; this step is an extra.
 4. **User clarification** — for `multiple_candidates` (go here directly from step 2) and for unresolved `no_match` (arrive here from step 3); surface choices explicitly (e.g. "cream" → single / double / sour / face / ice cream); confirmed mapping committed to `item_aliases`
 
 `multiple_candidates` goes straight to user clarification, not through the LLM — when the catalogue already contains several plausible matches, the LLM would also be ambiguous and adding a round-trip before the user prompt serves no purpose. The user knows what they want. (See Open Questions §16 if this decision needs revisiting.)
@@ -410,6 +410,19 @@ Items entered in English or Spanish must resolve to the same `canonical_item`. T
 Note: `product_matches` maps `canonical_item → retailer_product` and is not part of this cascade. All confirmed raw-text→canonical mappings are persisted in `item_aliases` (step 1 covers them on next use).
 
 The app must never silently create duplicates or hallucinate a match. Obvious mappings ("leche" → milk) should not generate questions. Confirmed mappings improve all future recognition.
+
+### Optional AI assistance (implemented, off by default)
+
+Two AI features exist in the code. Neither is required: with both switches unset, the cascade, the optimiser and the purchase ledger behave exactly as described above, and no household data leaves the server.
+
+| Feature | What it does | Enabled by | Default |
+|---|---|---|---|
+| LLM fallback (`crates/api/src/llm.rs`, `resolution.rs`, `preferences.rs`) | Step 3 above; also reorders the proposed retailer products for one canonical item | `LLM_FALLBACK_ENABLED=true` plus `LLM_API_KEY` and `LLM_MODEL` (optionally `LLM_BASE_URL`) | off |
+| Embedding shortlist (`crates/core/src/embedding.rs`, `crates/api/src/purchases.rs`, `buywise-cli embed-suggestions`) | Ranks up to five catalogue candidates for each unmatched imported line | `EMBEDDING_ENABLED=true` plus `EMBEDDING_COMMAND` (bundled `scripts/embed_names.py`) | off |
+
+Both features only propose; neither writes a canonical item on its own. A confirmed suggestion goes through the same alias write path as step 4, and the embedding shortlist never merges a line without that confirmation. The embedding model runs as a local command, so the shortlist sends nothing off the server; it is currently headless — an API endpoint and a CLI batch step, with no screen, and its vectors are filled by an explicit batch run rather than by import. Section 2.6 of [`data-flows.md`](data-flows.md) records what each feature sends and to whom; the accepted gaps are in [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md#embedding-suggestions-for-unmatched-lines).
+
+**Possible future enhancements (not planned).** An in-process ONNX embedder, a review screen for the shortlist, and a calibrated score threshold (possibly a conservative auto-merge) are recorded as follow-ups only. They are not part of any build phase, are not committed work and should not be read as milestones.
 
 ---
 
@@ -838,9 +851,9 @@ Build in this sequence to validate assumptions before investing in the polished 
 
 ### Phase 3 — Bilingual matching
 - Alias lookup and resolution cascade in the API (§8)
-- LLM fallback for unresolved `no_match` terms (not for `multiple_candidates` — those go straight to user clarification)
 - Ambiguity confirmation flow in the PWA
 - `item_aliases` feedback loop (confirmed mappings persist)
+- Optional, off by default: LLM fallback for unresolved `no_match` terms (not for `multiple_candidates` — those go straight to user clarification). It ships as an extra, not a requirement of this phase; the phase works without it.
 
 ### Phase 4 — Optimiser UI (implemented)
 - Optimisation endpoint in Axum
