@@ -2010,7 +2010,7 @@ Build the shopping mode view at `frontend/src/routes/(app)/list/[id]/shopping/+p
 
 **Gate:** A new item typed in Spanish resolves to the correct canonical item without user prompting (for unambiguous terms). Ambiguous terms show a clarification prompt. Confirmed mappings persist and are used on next entry.
 
-**AI status:** P3-T2 (the LLM fallback) is implemented as an optional, off-by-default extra. It is not part of this gate and is not committed work for the phase; with the switch unset, an unmatched term stays `unresolved` for user clarification, which is the shipped default. The embedding shortlist is likewise offline by default and lives outside the phase plan.
+**AI status:** P3-T2 is implemented as an optional, disabled-by-default enhancement. It is not a prerequisite for completing Phase 3 or using the core application. The embedding shortlist is likewise disabled by default and lives outside the phase plan.
 
 ---
 
@@ -2063,7 +2063,7 @@ The cascade must apply the normaliser from P0-T5 to the `raw_text` before matchi
 
 ### P3-T2: LLM fallback for no_match
 
-**Status:** Implemented as an optional, off-by-default extra (`LLM_FALLBACK_ENABLED`, `crates/api/src/llm.rs`). It is not a requirement of Phase 3: the phase gate and every feature above it are met without it, and the shipped default leaves an unmatched term `unresolved` for user clarification. The scope below is kept as written for reference.
+**Status:** P3-T2 is implemented as an optional, disabled-by-default enhancement. It is not a prerequisite for completing Phase 3 or using the core application.
 
 **Type:** feature
 

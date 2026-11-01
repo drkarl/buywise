@@ -413,7 +413,7 @@ The app must never silently create duplicates or hallucinate a match. Obvious ma
 
 ### Optional AI assistance (implemented, off by default)
 
-Two AI features exist in the code. Neither is required: with both switches unset, the cascade, the optimiser and the purchase ledger behave exactly as described above, and no household data leaves the server.
+Two AI features exist in the code. Neither is required: with both switches unset, the cascade, the optimiser and the purchase ledger behave exactly as described above. With both optional AI features disabled, neither feature sends household data to an external AI provider.
 
 | Feature | What it does | Enabled by | Default |
 |---|---|---|---|
